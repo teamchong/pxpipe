@@ -324,6 +324,19 @@ export class DashboardState {
   private latestPngMeta = '';
   private latestPngWidth = 0;
   private latestPngHeight = 0;
+  /** Runtime kill switch for compression. When false, the proxy forwards
+   *  /v1/messages unchanged to upstream — pure passthrough, no images,
+   *  no transforms. Controlled by the dashboard "passthrough" toggle so
+   *  the operator can disable the proxy's transform instantly when
+   *  upstream is unhealthy or when triaging a bad release. In-memory
+   *  only — restart resets to true. */
+  private compressionEnabled = true;
+  setCompressionEnabled(on: boolean): void {
+    this.compressionEnabled = on;
+  }
+  getCompressionEnabled(): boolean {
+    return this.compressionEnabled;
+  }
   /** Resolved disk paths for the events.jsonl + 4xx-bodies sidecar dir. The
    *  new sessions / cleanup endpoints need this; legacy callers that don't
    *  pass `paths` opt out of those endpoints by returning 503. */
@@ -872,6 +885,11 @@ export class DashboardState {
         source: 'docs.anthropic.com/en/docs/about-claude/pricing (verified 2026-05-19)',
       },
       uptime_sec: uptimeSec,
+      // Runtime kill switch. When false, the proxy is in PASSTHROUGH
+      // mode — /v1/messages forwards untransformed. Dashboard renders a
+      // red banner so the operator knows the proxy is intentionally
+      // not compressing.
+      compression_enabled: this.compressionEnabled,
       // Empirical cost fit — null until ≥3 cold-miss events with the new
       // instrumentation accumulate. When present, contains the live model's
       // chars/token and per-image-shape token cost so the dashboard can
@@ -1008,6 +1026,15 @@ export class DashboardState {
     });
     return jsonResponse(report);
   }
+
+  /** POST /api/compression — flip the runtime kill switch.
+   *  Body: { enabled: boolean }. Returns the new state. In-memory only;
+   *  restart resets to true. */
+  handleCompressionToggle(body: { enabled?: unknown }): Response {
+    const on = body.enabled === true;
+    this.compressionEnabled = on;
+    return jsonResponse({ compression_enabled: on });
+  }
 }
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -1066,6 +1093,7 @@ export type DashboardRoute =
   | { kind: 'api-disk' } // /api/disk.json
   | { kind: 'api-stats' } // /api/stats.json
   | { kind: 'api-prune' } // /api/sessions/prune (POST)
+  | { kind: 'api-compression' } // /api/compression (POST {enabled}) — runtime kill switch
   | { kind: 'session-html'; sessionId: string }; // /sessions/${id}
 
 /** Match dashboard paths (handle query strings on /proxy-latest-png). */
@@ -1078,6 +1106,7 @@ export function dashboardPath(pathname: string): DashboardRoute | null {
   if (pathname === '/api/disk.json') return { kind: 'api-disk' };
   if (pathname === '/api/stats.json') return { kind: 'api-stats' };
   if (pathname === '/api/sessions/prune') return { kind: 'api-prune' };
+  if (pathname === '/api/compression') return { kind: 'api-compression' };
   // /api/sessions/${id}.json — id is [a-f0-9]{1,16} (sha8 prefix) plus
   // '<unknown>' literal. Reject anything else to keep paths sanitized.
   const apiSess = /^\/api\/sessions\/([A-Za-z0-9<>_-]{1,32})\.json$/.exec(pathname);
@@ -1158,6 +1187,28 @@ const DASHBOARD_HTML = `<!doctype html>
 <body>
 <h1><span class="dot"></span>pixelpipe</h1>
 <div class="sub" id="sub">connecting...</div>
+
+<!--
+  Passthrough banner. Hidden by default; shown in red when the dashboard
+  state has compressionEnabled=false. Runtime kill switch for when
+  upstream is unhealthy or the operator wants to bypass compression.
+-->
+<div id="passthrough_banner" style="display:none;margin-bottom:16px;padding:10px 14px;background:#3c1618;border:1px solid #f85149;border-radius:6px;color:#f85149">
+  <strong>PASSTHROUGH MODE</strong> — compression disabled. Every /v1/messages forwards unchanged to upstream. No image encoding, no break-even gate, no transforms.
+</div>
+
+<!--
+  Compression toggle (always visible). Sits above the savings cards so
+  the operator can flip it without scrolling. Persists in memory only —
+  restart resets to enabled.
+-->
+<div style="margin-bottom:14px;display:flex;align-items:center;gap:10px">
+  <button id="toggle_btn" type="button"
+    style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:6px 14px;cursor:pointer;border-radius:6px;font:inherit">
+    loading...
+  </button>
+  <span class="small" id="toggle_hint" style="color:#6e7681">runtime kill switch · not persisted across restart</span>
+</div>
 
 <div class="grid">
   <div class="card"><div class="label">requests</div>
@@ -1278,18 +1329,40 @@ async function tick() {
     const r = await fetch('/proxy-recent').then(r => r.json());
     document.getElementById('sub').textContent =
       \`port :__PORT__   ·   uptime \${formatDuration(s.uptime_sec)}   ·   live\`;
+
+    // Compression kill-switch UI: banner + button text track server state.
+    const compOn = s.compression_enabled !== false;
+    document.getElementById('passthrough_banner').style.display = compOn ? 'none' : 'block';
+    const btn = document.getElementById('toggle_btn');
+    btn.textContent = compOn ? 'Disable compression (passthrough)' : 'Enable compression';
+    btn.style.color = compOn ? '#c9d1d9' : '#f85149';
+    btn.style.borderColor = compOn ? '#30363d' : '#f85149';
+
     document.getElementById('m_req').textContent = s.requests;
     document.getElementById('m_req_sub').textContent = \`\${s.compressed_requests} compressed\`;
     document.getElementById('m_saved').textContent = numFmt(s.saved_effective_tokens);
     document.getElementById('m_saved_sub').textContent =
       \`\${numFmt(s.effective_cost_actual)} paid · \${numFmt(s.effective_cost_baseline)} baseline\`;
-    // Dynamic subtitle reflects the actual rate exposed in pricing_assumptions
-    // so the operator can audit what we multiplied saved tokens by.
-    document.getElementById('m_usd').textContent = \`$\${s.saved_usd_estimated.toFixed(4)}\`;
+    // $ saved card: mirror the % card's range behavior. We have
+    // saved_effective_tokens_{low,high} already in the payload; compute
+    // the corresponding $ low/high by applying the same input rate. Show
+    // a range when low/high differ from the point by ≥ 1¢; collapse to a
+    // single $ otherwise. Keeps the headline consistent with %.
     const inRate = s.pricing_assumptions && s.pricing_assumptions.input_per_mtok;
+    const usdPoint = s.saved_usd_estimated;
+    const usdLo = (typeof s.saved_effective_tokens_low === 'number' && typeof inRate === 'number')
+      ? (s.saved_effective_tokens_low * inRate) / 1e6 : usdPoint;
+    const usdHi = (typeof s.saved_effective_tokens_high === 'number' && typeof inRate === 'number')
+      ? (s.saved_effective_tokens_high * inRate) / 1e6 : usdPoint;
+    const usdSpread = Math.abs(usdHi - usdLo);
+    const usdShowRange = usdSpread >= 0.01;
+    document.getElementById('m_usd').textContent = usdShowRange
+      ? \`$\${usdLo.toFixed(2)}–$\${usdHi.toFixed(2)}\`
+      : \`$\${usdPoint.toFixed(4)}\`;
     if (typeof inRate === 'number') {
-      document.getElementById('m_usd_sub').textContent =
-        \`at $\${inRate}/M input tokens · see pricing_assumptions\`;
+      document.getElementById('m_usd_sub').textContent = usdShowRange
+        ? \`point $\${usdPoint.toFixed(4)} · at $\${inRate}/M input tokens\`
+        : \`at $\${inRate}/M input tokens · see pricing_assumptions\`;
     }
     // Headline priority:
     //   1. Ground-truth measured saved_pct (count_tokens on both bodies) —
@@ -1438,7 +1511,7 @@ function renderSavingsMath(s) {
   if (typeof s.saved_pct_low === 'number' && typeof s.saved_pct_high === 'number') {
     savedTokensRows.push(fmtRow(
       'range', \`\${s.saved_pct_low}% – \${s.saved_pct_high}%\`,
-      '(p10/p90 of per-sample α)'
+      '(low/high bounds from recent traffic\\'s chars-per-token spread)'
     ));
   }
   document.getElementById('m_saved_math').innerHTML =
@@ -1493,7 +1566,7 @@ function renderSavingsMath(s) {
                         '<span class="op">=</span> saved / baseline × 100'));
     if (typeof s.saved_pct_low === 'number' && typeof s.saved_pct_high === 'number') {
       pctRows.push(fmtRow('range', \`\${s.saved_pct_low}% – \${s.saved_pct_high}%\`,
-                          '(p10/p90 of per-sample α across fit ring)'));
+                          '(low/high bounds from recent traffic\\'s chars-per-token spread)'));
     }
   }
   // Image-cost formula reference — applies on the actual side because
@@ -1772,6 +1845,33 @@ document.getElementById('prune_btn').addEventListener('click', () => {
   pruneOlderThan().catch(e => {
     document.getElementById('prune_result').textContent = 'error: ' + e.message;
   });
+});
+
+// Toggle compression kill switch. Reads the current state from the
+// button text (which tick() keeps in sync with the server), then POSTs
+// the opposite. Server returns new state and the next tick() repaints.
+document.getElementById('toggle_btn').addEventListener('click', async () => {
+  const btn = document.getElementById('toggle_btn');
+  const currentlyOn = btn.textContent.startsWith('Disable');
+  const next = !currentlyOn;
+  if (!next) {
+    if (!window.confirm('Disable compression?\\n\\n/v1/messages will forward unchanged to upstream. Use this when upstream is unhealthy or to A/B test the proxy. Restart resets to enabled.')) return;
+  }
+  btn.disabled = true;
+  try {
+    await fetch('/api/compression', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ enabled: next }),
+    });
+    // Force an immediate refresh so the banner/button update without
+    // waiting for the next 1s tick.
+    tick();
+  } catch (e) {
+    window.alert('failed to toggle: ' + e.message);
+  } finally {
+    btn.disabled = false;
+  }
 });
 // One delegated listener handles every row's del button + per-row checkbox.
 // Survives diff renders.

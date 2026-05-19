@@ -238,6 +238,25 @@ async function dispatchDashboard(
         sessionId: typeof body.sessionId === 'string' ? body.sessionId : undefined,
       });
     }
+    case 'api-compression': {
+      if (method !== 'POST') {
+        return new Response(
+          JSON.stringify({ error: 'use POST' }),
+          { status: 405, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      let body: Record<string, unknown> = {};
+      try {
+        const raw = await readRequestBody(req);
+        body = raw ? JSON.parse(raw) : {};
+      } catch (e) {
+        return new Response(
+          JSON.stringify({ error: 'bad request body', detail: (e as Error).message }),
+          { status: 400, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      return dashboard.handleCompressionToggle({ enabled: body.enabled });
+    }
   }
 }
 
@@ -425,10 +444,16 @@ async function main(): Promise<void> {
 
   const config: ProxyConfig = {
     upstream: opts.upstream,
-    // Per-request transform options: inject the dashboard's live
-    // empirical chars/token into the break-even gate when the regression
-    // has converged. Everything else comes from DEFAULTS in transform.ts.
+    // Per-request transform options:
+    //   1. Runtime kill switch — when the dashboard "passthrough" toggle
+    //      is off, force compress=false so /v1/messages forwards
+    //      untransformed. Lets the operator instantly disable the proxy
+    //      when upstream is unhealthy without restarting.
+    //   2. Otherwise inject the dashboard's live empirical chars/token
+    //      into the break-even gate when the regression has converged.
+    //      All other options come from DEFAULTS in transform.ts.
     transform: () => {
+      if (!dashboard.getCompressionEnabled()) return { compress: false };
       const fit = dashboard.fitCosts();
       return fit && fit.chars_per_token > 0
         ? { charsPerToken: fit.chars_per_token }

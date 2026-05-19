@@ -358,10 +358,24 @@ export class DashboardState {
    *  worse than showing the stale-constants fallback (stable wrong vs.
    *  unstable wrong).
    *
-   *  TODO: when collinear, fall back to a constrained fit using Anthropic's
-   *  published image-cost rate (β = 1/750) and solving α only. Until then,
-   *  the dashboard sticks with stale constants and the operator sees a
-   *  predictable number. */
+   *  THREE-MODE LADDER (most → least preferred):
+   *    1. `'joint'`        — α and β both fit by OLS. Needs CV ≥ 5% on both
+   *                          columns. The honest answer when traffic supplies
+   *                          enough variance across distinct cached images.
+   *    2. `'constrained'`  — β pinned to Anthropic's published 1/750 rate
+   *                          (≈ 0.001333 tokens/pixel for the default tiling).
+   *                          Solves α only via 1-D OLS on residuals
+   *                          `tokens - β·pixels = α·text`. Used when the
+   *                          pixels column is collinear (single cached image
+   *                          dominating the ring). Still gives a *measured*
+   *                          α; only β leans on Anthropic's docs.
+   *    3. `null`           — even constrained fit can't run (text column
+   *                          also collinear, or n<3). Caller falls back to
+   *                          the stale 4-chars/tok + 2500-tok/img constants.
+   *
+   *  The returned `mode` field tells the dashboard HTML which regime it's
+   *  showing so the operator can distinguish "honest empirical 25%" from
+   *  "constrained, β-pinned 25%" from "stale-constants wandering 25%". */
   fitCosts(): {
     alpha: number;
     beta: number;
@@ -370,6 +384,7 @@ export class DashboardState {
     single_col_tokens_per_img: number;
     multicol2_tokens_per_img: number;
     n: number;
+    mode: 'joint' | 'constrained';
   } | null {
     const samples = this.fitSamples;
     const n = samples.length;
@@ -404,23 +419,61 @@ export class DashboardState {
     const cvX = meanX > 0 ? Math.sqrt(varX) / meanX : 0;
     const cvP = meanP > 0 ? Math.sqrt(varP) / meanP : 0;
     const MIN_CV = 0.05;
-    if (cvX < MIN_CV || cvP < MIN_CV) return null;
 
-    const det = sxx * syy - sxy * sxy;
-    if (det === 0) return null; // belt-and-braces: shouldn't reach here past the CV guard
-    const alpha = (syy * sxt - sxy * syt) / det;
-    const beta = (sxx * syt - sxy * sxt) / det;
-    // Guard against degenerate fits (negative rates mean the data is too
-    // noisy / multi-modal to give a clean linear answer).
-    if (alpha <= 0 || beta <= 0) return null;
+    // Anthropic's published per-pixel rate for the default image tiling:
+    // 1 token per ~750 pixels (≈ 0.001333). Used by the constrained fallback
+    // when the live pixels column doesn't vary enough for joint OLS to
+    // identify β separately. See the THREE-MODE LADDER docstring above.
+    const ANTHROPIC_BETA = 1 / 750;
+
+    // ---- Mode 1: joint OLS (both columns vary) ----
+    if (cvX >= MIN_CV && cvP >= MIN_CV) {
+      const det = sxx * syy - sxy * sxy;
+      if (det !== 0) {
+        const alpha = (syy * sxt - sxy * syt) / det;
+        const beta = (sxx * syt - sxy * sxt) / det;
+        // Guard against degenerate fits (negative rates mean the data is too
+        // noisy / multi-modal to give a clean linear answer).
+        if (alpha > 0 && beta > 0) {
+          return {
+            alpha: round4(alpha),
+            beta: round4(beta * 1000) / 1000, // β is tiny — keep 6 sig figs effectively
+            chars_per_token: round1(1 / alpha),
+            pixels_per_token: Math.round(1 / beta),
+            single_col_tokens_per_img: Math.round(508 * 1559 * beta),
+            multicol2_tokens_per_img: Math.round(1028 * 1559 * beta),
+            n,
+            mode: 'joint',
+          };
+        }
+      }
+      // Joint fit was degenerate (negative rate or singular matrix) — fall
+      // through to constrained fit rather than returning null. Better to
+      // show a β-pinned answer than the stale-constants regime.
+    }
+
+    // ---- Mode 2: constrained (β pinned to Anthropic's 1/750), solve α only ----
+    // Needs only the text column to vary. Subtract the assumed-known image
+    // cost from each sample's total tokens, then do a 1-D OLS through the
+    // origin: residual ≈ α · text_chars.
+    //
+    //   α* = Σ(residual_i · text_i) / Σ(text_i²)
+    //      = (sxt − β · sxy) / sxx
+    //
+    // (derivation: minimize Σ(α·x − r)² → dL/dα = 0 → α = Σxr / Σx²
+    //  where r_i = tokens_i − β · pixels_i, so Σx·r = sxt − β·sxy.)
+    if (cvX < MIN_CV || sxx === 0) return null;
+    const alphaConstrained = (sxt - ANTHROPIC_BETA * sxy) / sxx;
+    if (alphaConstrained <= 0) return null;
     return {
-      alpha: round4(alpha),
-      beta: round4(beta * 1000) / 1000, // β is tiny — keep 6 sig figs effectively
-      chars_per_token: round1(1 / alpha),
-      pixels_per_token: Math.round(1 / beta),
-      single_col_tokens_per_img: Math.round(508 * 1559 * beta),
-      multicol2_tokens_per_img: Math.round(1028 * 1559 * beta),
+      alpha: round4(alphaConstrained),
+      beta: round4(ANTHROPIC_BETA * 1000) / 1000,
+      chars_per_token: round1(1 / alphaConstrained),
+      pixels_per_token: Math.round(1 / ANTHROPIC_BETA),
+      single_col_tokens_per_img: Math.round(508 * 1559 * ANTHROPIC_BETA),
+      multicol2_tokens_per_img: Math.round(1028 * 1559 * ANTHROPIC_BETA),
       n,
+      mode: 'constrained',
     };
   }
 
@@ -789,6 +842,7 @@ const DASHBOARD_HTML = `<!doctype html>
   <div class="card"><div class="label">reduction</div>
     <div class="value pos" id="m_pct">0%</div>
     <div class="small" id="m_pct_sub">vs uncompressed baseline</div>
+    <div class="small" id="m_pct_regime" style="margin-top:4px;color:#6e7681"></div>
   </div>
 </div>
 
@@ -876,6 +930,25 @@ async function tick() {
       \`\${numFmt(s.effective_input_actual)} paid · \${numFmt(s.effective_input_baseline_est)} baseline\`;
     document.getElementById('m_usd').textContent = \`$\${s.saved_usd_opus47.toFixed(4)}\`;
     document.getElementById('m_pct').textContent = \`\${s.saved_pct.toFixed(1)}%\`;
+    // Surface which cost-model regime the headline number came from. Three
+    // states (mirror the THREE-MODE LADDER in dashboard.ts fitCosts):
+    //   joint        — α and β both measured (≥10 samples = high confidence)
+    //   constrained  — α measured, β pinned to Anthropic's 1/750
+    //   stale        — no fit yet, using hardcoded 4-chars/tok + 2500-tok/img
+    // Operator can tell at a glance if the number is grounded or guessed.
+    const fit = s.cost_fit;
+    const regime = document.getElementById('m_pct_regime');
+    if (!fit) {
+      regime.textContent = 'stale constants (no fit yet)';
+      regime.style.color = '#d29922'; // amber: be skeptical
+    } else if (fit.mode === 'joint') {
+      const tier = fit.n >= 10 ? 'high' : 'tentative';
+      regime.textContent = \`empirical · joint OLS (n=\${fit.n}, \${tier})\`;
+      regime.style.color = fit.n >= 10 ? '#3fb950' : '#d29922';
+    } else {
+      regime.textContent = \`constrained · α-only (n=\${fit.n}, β pinned 1/750)\`;
+      regime.style.color = '#58a6ff'; // blue: measured but partial
+    }
     const tbody = document.getElementById('rows');
     tbody.innerHTML = '';
     let i = 0;

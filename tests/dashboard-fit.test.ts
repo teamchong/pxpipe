@@ -76,17 +76,27 @@ describe('DashboardState.fitCosts() — empirical α/β regression', () => {
     expect(dash.fitCosts()).toBeNull();
   });
 
-  it('returns null when pixels column is constant (single-session collinearity guard)', () => {
-    // The trap we're guarding against: a single Claude Code session sends
-    // warm hits with the SAME cached image, so `pixels` doesn't vary across
-    // samples. OLS still produces an (α, β) pair but the split between them
-    // is unidentifiable — the headline saved_pct would wander wildly as new
-    // samples land. Better to return null and fall back to stable stale
-    // constants than show an oscillating empirical number.
-    dash.update(ev({ textChars: 130_000, pixels: 21_000_000, input: 5, cacheCreate: 500, cacheRead: 141_680 }));
-    dash.update(ev({ textChars: 132_000, pixels: 21_000_000, input: 5, cacheCreate: 300, cacheRead: 142_447 }));
-    dash.update(ev({ textChars: 134_000, pixels: 21_000_000, input: 5, cacheCreate: 200, cacheRead: 143_119 }));
-    expect(dash.fitCosts()).toBeNull();
+  it('falls back to constrained (β pinned) when pixels column is constant', () => {
+    // Single-session-style traffic: cached image is identical across warm
+    // hits → `pixels` is collinear. Joint OLS can't split α and β so we
+    // fall back to β = 1/750 (Anthropic's published rate) and solve α only
+    // from the text-vs-(tokens - β·pixels) residuals. The headline number
+    // still has a measured α; only β leans on docs.
+    // Text varies enough (CV > 5%) to pass the α-identification gate, but
+    // pixels are pinned to the same cached-image area so β can't be measured.
+    dash.update(ev({ textChars:  80_000, pixels: 21_000_000, input: 5, cacheCreate: 500, cacheRead:  50_000 }));
+    dash.update(ev({ textChars: 130_000, pixels: 21_000_000, input: 5, cacheCreate: 300, cacheRead:  80_000 }));
+    dash.update(ev({ textChars: 180_000, pixels: 21_000_000, input: 5, cacheCreate: 200, cacheRead: 110_000 }));
+    const fit = dash.fitCosts();
+    expect(fit).not.toBeNull();
+    expect(fit!.mode).toBe('constrained');
+    // β is pinned to Anthropic's 1/750 ≈ 0.001333 (rounded to 3 sig figs).
+    expect(fit!.beta).toBeCloseTo(0.001, 3);
+    expect(fit!.pixels_per_token).toBe(750);
+    // α is measured — should be positive and recover a sensible chars/token.
+    expect(fit!.alpha).toBeGreaterThan(0);
+    expect(fit!.chars_per_token).toBeGreaterThan(0);
+    expect(fit!.n).toBe(3);
   });
 
   it('returns null when text_chars column is constant', () => {
@@ -96,6 +106,18 @@ describe('DashboardState.fitCosts() — empirical α/β regression', () => {
     dash.update(ev({ textChars: 130_000, pixels: 23_000_000, input: 5, cacheCreate: 300, cacheRead: 142_447 }));
     dash.update(ev({ textChars: 130_000, pixels: 25_000_000, input: 5, cacheCreate: 200, cacheRead: 143_119 }));
     expect(dash.fitCosts()).toBeNull();
+  });
+
+  it('returns mode="joint" when both columns vary (full empirical fit)', () => {
+    // Both columns vary > 5% — joint OLS is identifiable. mode tags the
+    // headline number as fully empirical so the operator can distinguish
+    // this from a constrained-β regime in the dashboard label.
+    dash.update(ev({ textChars: 100_000, pixels: 10_000_000, input: 5, cacheCreate: 500, cacheRead:  43_095 }));
+    dash.update(ev({ textChars: 130_000, pixels: 18_000_000, input: 5, cacheCreate: 300, cacheRead:  63_875 }));
+    dash.update(ev({ textChars: 160_000, pixels: 24_000_000, input: 5, cacheCreate: 200, cacheRead:  81_555 }));
+    const fit = dash.fitCosts();
+    expect(fit).not.toBeNull();
+    expect(fit!.mode).toBe('joint');
   });
 
   it('activates the fit when BOTH columns vary > 5% (cross-session-style samples)', () => {

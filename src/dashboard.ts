@@ -35,6 +35,10 @@ import * as readline from 'node:readline';
 import type { ProxyEvent } from './core/proxy.js';
 import type { TrackEvent } from './core/tracker.js';
 import {
+  computeActualInputEff,
+  computeBaselineInputEff,
+} from './core/baseline.js';
+import {
   aggregateSessions,
   claudeCodeMap,
   collectSessionEvents,
@@ -55,9 +59,12 @@ const RECENT_CAP = 50;
 /** One row in the dashboard's "recent requests" table. Compact on purpose —
  *  this lives in memory and gets serialized on every poll.
  *
- *  Convention: every "actual"/"baseline" number here is input-side only
- *  (input + cache_create×1.25 + cache_read×0.10). Output is excluded —
- *  identical with or without compression, would only inflate every row. */
+ *  The "input" numbers (`actual_input`, `baseline_input`) are input-side
+ *  only — input + cache_create×1.25 + cache_read×0.10 — because that's
+ *  the slice the proxy can move. `output_tokens` is reported separately so
+ *  the operator can see what fraction of the bill is unaffected by
+ *  compression (and decide whether the headline % makes sense for their
+ *  workload). */
 export interface RecentRow {
   ts: number;
   method: string;
@@ -67,6 +74,10 @@ export interface RecentRow {
   compressed: boolean;
   cc_added?: number;
   input_tokens?: number;
+  /** From /v1/messages `usage.output_tokens`. Identical with/without
+   *  compression — shown so the operator can see why an output-heavy
+   *  turn moves the headline less than a cache-create-heavy one. */
+  output_tokens?: number;
   cache_create?: number;
   cache_read?: number;
   /** input + cache_create×1.25 + cache_read×0.10, from the upstream usage
@@ -82,27 +93,34 @@ export interface RecentRow {
 /** Aggregate over the whole session. Reset on process restart unless
  *  replay() is called to seed from the JSONL file.
  *
- *  Both sides of the savings math are INPUT-ONLY, and the baseline is
- *  CACHE-AWARE — it weights the unproxied path's tokens by the SAME cache
- *  class the proxied request actually landed in, so the comparison is
- *  apples-to-apples (caching vs caching, not caching vs no-caching).
+ *  The savings numerator is input-only — output is identical with and
+ *  without compression, so it cancels. The denominator is the FULL bill
+ *  (input + output×5 in input-token-equivalents) so the headline percentage
+ *  drops honestly toward zero on output-heavy workloads instead of hiding
+ *  the fact that the proxy only moves part of the cost.
  *
- *    Per event:
+ *    Per event (see src/core/baseline.ts for the derivation):
  *      cacheable = baseline_cacheable_tokens || 0     (tokens up to last cache_control)
  *      cold_tail = baseline_tokens − cacheable        (always-cold input on both paths)
- *      weight    = cr > 0 ? 0.10                      (warm hit — both paths would have cached)
- *                : cc > 0 ? 1.25                      (cold create — both paths would create cache)
- *                : 1.0                                (no caching — marker rejected or absent)
- *      baseline_input_eff = cacheable × weight + cold_tail × 1.0
+ *      cc_u, cr_u = the unproxied path's counterfactual cache_create / cache_read split:
+ *                   cr > 0 ?  cc_u = min(cc, cacheable),  cr_u = cacheable − cc_u   (warm turn)
+ *                 : cc > 0 ?  cc_u = cacheable,           cr_u = 0                  (cold start)
+ *                 :           cc_u = 0,                   cr_u = 0                  (no caching)
+ *      baseline_input_eff = cc_u × 1.25 + cr_u × 0.10
+ *                         + (cacheable − cc_u − cr_u) × 1.0 + cold_tail × 1.0
  *      actual_input_eff   = input + cache_create×1.25 + cache_read×0.10
+ *      output_equiv       = output × 5                (input-token-equivalent at the 5× output rate)
  *      saved              = baseline_input_eff − actual_input_eff
+ *      baseline_total     = baseline_input_eff + output_equiv
+ *      actual_total       = actual_input_eff + output_equiv
  *
  *    Roll-up:
- *      saved_pct = Σ saved / Σ baseline_input_eff × 100
+ *      saved_pct = Σ saved / Σ baseline_total × 100
  *
- *  Output is deliberately excluded — identical with/without compression,
- *  same prompt → same response, so it cancels and would only drag the
- *  percentage toward zero. Headline reads "% of input bill saved." */
+ *  This is what Anthropic's weekly-limit meter actually counts — input +
+ *  output×5 in input-token-equivalents. The dashboard headline matches it
+ *  so a "20% saved" number means weekly-limit consumption dropped by 20%,
+ *  not "20% off the slice we touched while the other half stayed full." */
 interface Totals {
   requests: number;
   compressedRequests: number;
@@ -114,6 +132,12 @@ interface Totals {
    *  events that contributed to `actualInputWeighted`. The honest counter-
    *  factual cost of the unproxied path. */
   baselineInputWeighted: number;
+  /** Sum of output_tokens × OUTPUT_TOKEN_RATE across the same events. Added
+   *  to BOTH sides of the savings math denominator so the headline % counts
+   *  output toward the total bill (it cancels in the numerator — proxy
+   *  doesn't touch output). Without this the headline ignores half the
+   *  bill on output-heavy sessions. */
+  outputWeighted: number;
   startedAt: number;
 }
 
@@ -156,6 +180,7 @@ export class DashboardState {
     compressedRequests: 0,
     actualInputWeighted: 0,
     baselineInputWeighted: 0,
+    outputWeighted: 0,
     startedAt: Date.now() / 1000,
   };
   private latestPng: Uint8Array | null = null;
@@ -230,24 +255,34 @@ export class DashboardState {
     const haveBaseline = typeof baseline === 'number' && baseline > 0;
 
     // Weighted INPUT cost we actually paid this turn.
-    const actualInputEff = haveUsage ? inp + cc * 1.25 + cr * 0.1 : 0;
+    const actualInputEff = haveUsage ? computeActualInputEff(inp, cc, cr) : 0;
 
     // Cache-aware baseline: decompose the unproxied counterfactual into
     // (cacheable_prefix, cold_tail) using the second count_tokens probe,
-    // then weight the prefix by the SAME cache class the actual request
-    // landed in. No assumptions — every input is a measurement.
-    //   cacheable = tokens up to last cache_control marker (or 0 if no markers)
-    //   cold_tail = baseline − cacheable                  (always cold input)
-    //   weight    = cr > 0 ? 0.10  (warm hit — both paths cache)
-    //             : cc > 0 ? 1.25  (cold create — both paths build the cache)
-    //             :          1.0   (no caching — marker rejected or absent)
-    let baselineInputEff = 0;
-    if (haveBaseline && haveUsage) {
-      const cacheable = Math.min(info?.baselineCacheableTokens ?? 0, baseline);
-      const coldTail = baseline - cacheable;
-      const weight = cr > 0 ? 0.1 : cc > 0 ? 1.25 : 1.0;
-      baselineInputEff = cacheable * weight + coldTail * 1.0;
-    }
+    // then split the prefix into (cc_u, cr_u) using the SAME absolute
+    // cc bucket the proxied path paid this turn — because user-typed
+    // content (the new tail that becomes cc) is NOT compressed, so its
+    // absolute token count is approximately the same on both paths.
+    // See src/core/baseline.ts for the full derivation and the May-2026
+    // regression that motivated the rewrite.
+    const baselineInputEff =
+      haveBaseline && haveUsage
+        ? computeBaselineInputEff(
+            baseline,
+            info?.baselineCacheableTokens ?? 0,
+            cc,
+            cr,
+          )
+        : 0;
+
+    // Output tokens are identical with/without compression — the proxy never
+    // touches the response body. They show up on BOTH sides of the savings
+    // ratio at their actual rate (OUTPUT_TOKEN_RATE × input rate) so the
+    // denominator reflects the full bill the user actually pays. Without
+    // this, an output-heavy turn would silently inflate the "saved %"
+    // headline relative to what Anthropic's weekly limit meters as token
+    // consumption (input + output × 5).
+    const outputEquiv = haveUsage ? out * OUTPUT_TOKEN_RATE : 0;
 
     this.totals.requests += 1;
     if (compressed) this.totals.compressedRequests += 1;
@@ -255,6 +290,7 @@ export class DashboardState {
     if (haveBaseline && haveUsage) {
       this.totals.baselineInputWeighted += baselineInputEff;
       this.totals.actualInputWeighted += actualInputEff;
+      this.totals.outputWeighted += outputEquiv;
     }
 
     const row: RecentRow = {
@@ -265,6 +301,7 @@ export class DashboardState {
       compressed,
       cc_added: compressed ? 1 : undefined,
       input_tokens: haveUsage ? inp : undefined,
+      output_tokens: haveUsage ? out : undefined,
       cache_create: haveUsage ? cc : undefined,
       cache_read: haveUsage ? cr : undefined,
       actual_input: haveUsage ? round1(actualInputEff) : undefined,
@@ -302,21 +339,21 @@ export class DashboardState {
     }
     for (const t of tail) {
       const inp = t.input_tokens ?? 0;
+      const out = t.output_tokens ?? 0;
       const cc = t.cache_create_tokens ?? 0;
       const cr = t.cache_read_tokens ?? 0;
-      const haveUsage = inp > 0 || cc > 0 || cr > 0;
+      const haveUsage = inp > 0 || out > 0 || cc > 0 || cr > 0;
       const baseline = (t as { baseline_tokens?: number }).baseline_tokens;
       const cacheable = (t as { baseline_cacheable_tokens?: number })
         .baseline_cacheable_tokens ?? 0;
       const haveBaseline = typeof baseline === 'number' && baseline > 0;
-      const actualInputEff = haveUsage ? inp + cc * 1.25 + cr * 0.1 : 0;
-      let baselineInputEff = 0;
-      if (haveBaseline && haveUsage) {
-        const c = Math.min(cacheable, baseline as number);
-        const coldTail = (baseline as number) - c;
-        const weight = cr > 0 ? 0.1 : cc > 0 ? 1.25 : 1.0;
-        baselineInputEff = c * weight + coldTail * 1.0;
-      }
+      const actualInputEff = haveUsage ? computeActualInputEff(inp, cc, cr) : 0;
+      const baselineInputEff =
+        haveBaseline && haveUsage
+          ? computeBaselineInputEff(baseline as number, cacheable, cc, cr)
+          : 0;
+      // Output tokens land in the row for the table; totals are not
+      // restored on replay (see header comment on cumulative totals).
       const row: RecentRow = {
         ts: Date.parse(t.ts) / 1000,
         method: t.method,
@@ -325,6 +362,7 @@ export class DashboardState {
         compressed: t.compressed === true,
         cc_added: t.compressed === true ? 1 : undefined,
         input_tokens: t.input_tokens,
+        output_tokens: t.output_tokens,
         cache_create: t.cache_create_tokens,
         cache_read: t.cache_read_tokens,
         actual_input: haveUsage ? round1(actualInputEff) : undefined,
@@ -338,19 +376,31 @@ export class DashboardState {
   // ---- HTTP handlers ------------------------------------------------------
 
   serveStats(): Response {
-    // Real cache-aware saved%:
-    //   per event: baseline_input_eff = cacheable × weight + cold_tail × 1.0
-    //              where weight matches the actual response's cache class
-    //              (cr>0 → 0.10, cc>0 → 1.25, neither → 1.0)
-    //   actual_input_eff = input + cache_create×1.25 + cache_read×0.10
-    //   saved_pct = Σ saved / Σ baseline_input_eff × 100
-    // Both sides input-only; output excluded because it's identical with
-    // or without compression. Events missing either probe stay out of the
-    // rollup — operator sees the requests counter but not phantom savings.
+    // Two headline numbers, derived from the same per-event accumulators:
+    //
+    //   saved_pct_input_only = Σ saved / Σ baseline_input_eff × 100
+    //     What the proxy actually saved on the slice it can move (input).
+    //     Numerator = input tokens we didn't pay for (cache-aware).
+    //     Denominator = input tokens we WOULD have paid (cache-aware).
+    //     Output is excluded because the proxy doesn't touch it.
+    //
+    //   saved_pct_of_total_bill = Σ saved / Σ (baseline_input + output × 5) × 100
+    //     What share of the TOTAL bill the proxy saved. Honest counter to the
+    //     input-only number: on output-heavy sessions (long thinking blocks,
+    //     big edits) the percentage shrinks because output dominates.
+    //
+    //   token_equivalent_total = Σ (actual_input + output × 5)
+    //     What Anthropic's weekly limit actually meters — input × 1.0 +
+    //     output × 5.0 (the same ratio as the per-MTok price card). This is
+    //     the number that moves your "%% used this week" indicator.
     const baseline = this.totals.baselineInputWeighted;
     const actual = this.totals.actualInputWeighted;
+    const output = this.totals.outputWeighted; // already × OUTPUT_TOKEN_RATE
     const saved = baseline - actual;
-    const pct = baseline > 0 ? (saved / baseline) * 100 : 0;
+    const pctInput = baseline > 0 ? (saved / baseline) * 100 : 0;
+    const baselineTotal = baseline + output;
+    const actualTotal = actual + output;
+    const pctTotal = baselineTotal > 0 ? (saved / baselineTotal) * 100 : 0;
     const uptimeSec = Date.now() / 1000 - this.totals.startedAt;
     const payload = {
       requests: this.totals.requests,
@@ -358,8 +408,15 @@ export class DashboardState {
       baseline_input_weighted: Math.round(baseline),
       actual_input_weighted: Math.round(actual),
       saved_input_tokens: Math.round(saved),
-      saved_pct: round1(pct),
+      // saved_pct kept for back-compat with existing dashboard HTML; it is
+      // the input-only number. New code should read saved_pct_input_only.
+      saved_pct: round1(pctInput),
+      saved_pct_input_only: round1(pctInput),
+      saved_pct_of_total_bill: round1(pctTotal),
       saved_usd: round4((saved * ASSUMED_INPUT_USD_PER_MTOK) / 1e6),
+      output_weighted: Math.round(output),
+      baseline_token_equivalent: Math.round(baselineTotal),
+      actual_token_equivalent: Math.round(actualTotal),
       pricing_assumptions: {
         input_per_mtok: ASSUMED_INPUT_USD_PER_MTOK,
         output_multiplier: OUTPUT_TOKEN_RATE,
@@ -689,9 +746,9 @@ const DASHBOARD_HTML = `<!doctype html>
     <div class="value" id="m_req">0</div>
     <div class="small" id="m_req_sub">— compressed</div>
   </div>
-  <div class="card"><div class="label">tokens saved</div>
+  <div class="card"><div class="label">input tokens saved</div>
     <div class="value pos" id="m_saved">0</div>
-    <div class="small" id="m_saved_sub">effective tokens (full bill)</div>
+    <div class="small" id="m_saved_sub">cache-aware, input-side only</div>
     <details class="math"><summary>show calculation</summary>
       <div class="formula" id="m_saved_math"></div>
     </details>
@@ -703,9 +760,9 @@ const DASHBOARD_HTML = `<!doctype html>
       <div class="formula" id="m_usd_math"></div>
     </details>
   </div>
-  <div class="card"><div class="label">reduction</div>
+  <div class="card"><div class="label">share of total bill saved</div>
     <div class="value pos" id="m_pct">0%</div>
-    <div class="small" id="m_pct_sub">share of input bill saved</div>
+    <div class="small" id="m_pct_sub">total bill (input + output×5) · input-only: <span id="m_pct_total">0%</span></div>
     <details class="math"><summary>show calculation</summary>
       <div class="formula" id="m_pct_math"></div>
     </details>
@@ -813,22 +870,32 @@ async function tick() {
 
     document.getElementById('m_req').textContent = s.requests;
     document.getElementById('m_req_sub').textContent = \`\${s.compressed_requests} compressed\`;
-    // Tokens-saved card: baseline − actual on the input side, both measured.
-    // baseline = sum of /v1/messages/count_tokens(originalBody)
-    // actual   = sum of (input + cc·1.25 + cr·0.10) from upstream usage block
-    // No estimation, no α, no range — just two real numbers subtracted.
+    // Effective-tokens card: input-side tokens we didn't have to pay for
+    // (cache-aware). This is the part of the bill the proxy actually moves —
+    // showing the BIG saved number on the headline without hiding that output
+    // also lands on the weekly limit. The sub-line gives the full picture:
+    // counterfactual baseline (input only) and the output cost that's
+    // identical with or without compression (proxy doesn't touch responses).
     document.getElementById('m_saved').textContent = numFmt(s.saved_input_tokens);
     document.getElementById('m_saved_sub').textContent =
-      \`\${numFmt(s.actual_input_weighted)} paid · \${numFmt(s.baseline_input_weighted)} baseline\`;
-    // $ saved card: saved input tokens × input rate. Single number, no range.
+      \`input-only · baseline \${numFmt(s.baseline_input_weighted)} · output \${numFmt(s.output_weighted)} (unchanged by proxy)\`;
+    // $ saved card: input-side savings × input rate. Output cancels (proxy
+    // doesn't touch the response body) so dollar savings are input-only.
     const inRate = s.pricing_assumptions && s.pricing_assumptions.input_per_mtok;
     document.getElementById('m_usd').textContent = \`$\${(s.saved_usd || 0).toFixed(4)}\`;
     if (typeof inRate === 'number') {
       document.getElementById('m_usd_sub').textContent =
-        \`at $\${inRate}/M input tokens · see pricing_assumptions\`;
+        \`saved \${numFmt(s.saved_input_tokens)} input tokens at $\${inRate}/M\`;
     }
-    // % reduction card: (baseline − actual) / baseline × 100. Single number.
-    document.getElementById('m_pct').textContent = \`\${(s.saved_pct || 0).toFixed(1)}%\`;
+    // Share-of-bill card: lead with the HONEST total-bill number so a heavy
+    // output session doesn't look like a 73% win when it isn't.
+    // saved_pct_of_total_bill = saved_input / (baseline_input + output×5) × 100
+    // The sub-line keeps the input-only number visible for cache-quality
+    // diagnostics (the input-only % is what tells you whether compression is
+    // doing its job, independent of how output-heavy the session is).
+    document.getElementById('m_pct').textContent = \`\${(s.saved_pct_of_total_bill || 0).toFixed(1)}%\`;
+    document.getElementById('m_pct_total').textContent =
+      \`\${(s.saved_pct_input_only || 0).toFixed(1)}%\`;
 
     // Populate "show calculation" blocks under each savings card.
     renderSavingsMath(s);

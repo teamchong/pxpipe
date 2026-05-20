@@ -29,6 +29,10 @@ import * as os from 'node:os';
 import * as crypto from 'node:crypto';
 import * as readline from 'node:readline';
 import type { TrackEvent } from './core/tracker.js';
+import {
+  computeActualInputEff,
+  computeBaselineInputEff,
+} from './core/baseline.js';
 
 // ---- Types -----------------------------------------------------------------
 
@@ -161,12 +165,11 @@ export async function aggregateSessions(
     // Cling to whichever cwd we saw first; sessions that hop directories are
     // rare and the first cwd is the most stable identifier.
     if (s.project === undefined && ev.cwd) s.project = ev.cwd;
-    // Real per-session savings, cache-aware (mirrors dashboard.update()):
-    //   cacheable = baseline_cacheable_tokens or 0
-    //   cold_tail = baseline_tokens − cacheable
-    //   weight    = cr>0 ? 0.10 : cc>0 ? 1.25 : 1.0
-    //   baseline_eff = cacheable·weight + cold_tail
-    //   actual_eff   = input + cc·1.25 + cr·0.10
+    // Real per-session savings, cache-aware. See src/core/baseline.ts for
+    // the full derivation and the May-2026 regression that motivated the
+    // rewrite — the previous formula collapsed every warm turn's unproxied
+    // counterfactual to 100% cache_read × 0.10 and flipped the headline
+    // negative whenever the proxied path paid real cache_create.
     // Events missing either probe stay out of the rollup — no estimation.
     const inp = ev.input_tokens ?? 0;
     const cc = ev.cache_create_tokens ?? 0;
@@ -178,14 +181,13 @@ export async function aggregateSessions(
       baseline > 0 &&
       haveUsage
     ) {
-      const cacheable = Math.min(
-        ev.baseline_cacheable_tokens ?? 0,
+      const baselineEff = computeBaselineInputEff(
         baseline,
+        ev.baseline_cacheable_tokens ?? 0,
+        cc,
+        cr,
       );
-      const coldTail = baseline - cacheable;
-      const weight = cr > 0 ? 0.1 : cc > 0 ? 1.25 : 1.0;
-      const baselineEff = cacheable * weight + coldTail * 1.0;
-      const actualEff = inp + cc * 1.25 + cr * 0.1;
+      const actualEff = computeActualInputEff(inp, cc, cr);
       const tokensSaved = baselineEff - actualEff;
       s.tokensSavedEst += Math.round(tokensSaved);
       s.charsSaved += Math.round(tokensSaved * 4);

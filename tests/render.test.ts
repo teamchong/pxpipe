@@ -14,6 +14,7 @@ import {
   isCompressionProfitable,
   maxCharsPerImage,
   estimateImageCount,
+  compactSlabWhitespace,
 } from '../src/core/transform.js';
 import {
   atlasRank,
@@ -23,6 +24,59 @@ import {
   ATLAS_WIDE_FLAGS,
   ATLAS_NUM_GLYPHS,
 } from '../src/core/atlas.js';
+
+describe('compactSlabWhitespace', () => {
+  it('returns empty string unchanged', () => {
+    expect(compactSlabWhitespace('')).toBe('');
+  });
+
+  it('strips trailing spaces and tabs per line', () => {
+    const input = 'alpha   \nbeta\t\t\ngamma';
+    expect(compactSlabWhitespace(input)).toBe('alpha\nbeta\ngamma');
+  });
+
+  it('collapses 3+ consecutive newlines to exactly 2', () => {
+    expect(compactSlabWhitespace('a\n\n\nb')).toBe('a\n\nb');
+    expect(compactSlabWhitespace('a\n\n\n\n\n\nb')).toBe('a\n\nb');
+  });
+
+  it('preserves single blank lines (paragraph breaks)', () => {
+    expect(compactSlabWhitespace('a\n\nb')).toBe('a\n\nb');
+  });
+
+  it('preserves leading indentation', () => {
+    const input = '  function f() {\n    return 1;   \n  }';
+    expect(compactSlabWhitespace(input)).toBe('  function f() {\n    return 1;\n  }');
+  });
+
+  it('is idempotent', () => {
+    const input = 'x   \n\n\n\ny\t\nz   ';
+    const once = compactSlabWhitespace(input);
+    const twice = compactSlabWhitespace(once);
+    expect(twice).toBe(once);
+  });
+
+  it('shrinks a realistic markdown-ish slab', () => {
+    const input = [
+      '# Heading   ',
+      '',
+      '',
+      '',
+      'Paragraph with trailing space.   ',
+      '',
+      '- bullet one   ',
+      '- bullet two\t',
+      '',
+      '',
+      '',
+      '## Sub',
+    ].join('\n');
+    const out = compactSlabWhitespace(input);
+    expect(out.length).toBeLessThan(input.length);
+    expect(out).not.toMatch(/[ \t]+\n/);
+    expect(out).not.toMatch(/\n{3,}/);
+  });
+});
 
 describe('png encoder', () => {
   it('produces a valid PNG signature', async () => {

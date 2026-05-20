@@ -1,19 +1,24 @@
 # pixelpipe
 
-**Context as UI for LLMs.**
+**Make Opus see pixels instead of text.**
 
-LLMs read text because that's what was around in 2017. Tokenization is an
-accident of how transformers were trained, not a property of how language
-models reason. A modern vision-capable model reads a rendered image of
-structured information at roughly the same fidelity as the JSON that
-produced it — and at a fraction of the token cost, because **pixels carry
-more semantic information per unit of context than serialized text does.**
+A proxy for Claude Code that intercepts `POST /v1/messages` and renders
+the bulky static inputs (system prompt + tool docs + closed-prefix
+history) as grayscale PNGs, letting Opus 4.7's vision stack OCR them on
+the way in. Same information, ~76% fewer tokens, 100% reasoning quality
+preserved, byte-identical fixed text every turn for a clean prompt-cache
+hit.
 
-Pixelpipe is a working demo of that idea. It intercepts Claude Code's
-`POST /v1/messages` calls, takes the bulky static inputs that the model
-would otherwise read as text, renders them into grayscale PNGs using a
-build-time GNU Unifont glyph atlas, and lets Anthropic's vision stack OCR
-them on the way in. The inputs we touch today:
+**Opus 4.7 only.** Pre-4.7 vision wasn't accurate enough on dense
+monospace glyphs — OCR errors would corrupt the prompt before the model
+read it. Opus 4.7's vision stack ([released 2026-04-16](https://www.anthropic.com/news/claude-opus-4-7))
+bumps the long-edge image cap from 1568 px to 2576 px (3.3× more pixels)
+and reports document-OCR benchmark gains large enough ([DocVQA 87→94%,
+ChartQA 80→88%](https://www.anthropic.com/news/claude-opus-4-7)) to make
+this trade safe. Pixelpipe still renders at 1568×1568 — the *model's*
+OCR fidelity is what changed, not the renderer.
+
+The inputs we touch today:
 
 - **`system` field** — Claude Code's base system prompt + `CLAUDE.md`
   project instructions + every loaded **skill**'s SKILL.md + agent
@@ -44,15 +49,6 @@ input tokens (what Anthropic's `count_tokens` endpoint measures on the
 unproxied body) to **41,321** `cache_create` tokens — a **~76% denser
 encoding of the same information**, with 100% reasoning quality preserved
 and byte-identical fixed text every turn for a clean prompt-cache hit.
-
-> **Why this works in 2026.** Pre-4.7 vision wasn't accurate enough on
-> dense monospace glyphs — OCR errors would corrupt the prompt before
-> the model read it. Opus 4.7's vision stack ([released 2026-04-16](https://www.anthropic.com/news/claude-opus-4-7))
-> bumps the long-edge image cap from 1568 px to 2576 px (3.3× more
-> pixels) and reports document-OCR benchmark gains large enough
-> ([DocVQA 87→94%, ChartQA 80→88%](https://www.anthropic.com/news/claude-opus-4-7))
-> to make this trade safe. Pixelpipe still renders at 1568×1568 — the
-> *model* OCR fidelity is what changed, not the renderer.
 
 ## What this is NOT
 

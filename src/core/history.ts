@@ -44,8 +44,18 @@ import { bytesToBase64 } from './png.js';
  *  caller (transform.ts) rather than imported here to keep `src/core/history.ts`
  *  free of a cycle with `src/core/transform.ts`. transform.ts already imports
  *  history.ts to invoke `collapseHistory`; importing back the other way would
- *  create an evaluation-order trap. */
-export type ProfitableFn = (textLen: number, cols: number) => boolean;
+ *  create an evaluation-order trap.
+ *
+ *  IMPORTANT — takes the full `text`, NOT `text.length`. The downstream
+ *  `isCompressionProfitable` has two paths: a row-aware path for strings
+ *  (matches renderTextToPngs() image budgeting exactly) and a looser
+ *  chars-only fallback for numbers (assumes dense lines, no newlines).
+ *  History text is *newline-heavy* — `--- role ---` headers, JSON args,
+ *  `[tool_use]` / `[tool_result]` labels — so the chars-only estimate
+ *  under-predicts image count by ~5-10× and used to let net-losers
+ *  through. The 2026-05-19 production -250% savings measurement traces
+ *  back to that asymmetry. Always pass the string. */
+export type ProfitableFn = (text: string, cols: number) => boolean;
 
 /** Configuration for history collapse. */
 export interface HistoryCollapseOptions {
@@ -167,13 +177,16 @@ export function blocksToText(content: string | ContentBlock[]): string {
         break;
       case 'tool_use': {
         const tu = blk as ToolUseBlock;
-        // Render as a labelled block so the model can re-attribute. The
-        // arg JSON is included verbatim — for very large args this will
-        // bloat the history image, but the alternative (dropping args)
-        // breaks model self-attribution worse than the bloat does.
+        // Render as a labelled block so the model can re-attribute. Args
+        // are serialised COMPACT (no 2-space indent) — pretty-printing
+        // bloats the history text ~5× via per-field newlines, which
+        // multiplies image cost since the renderer is row-aware and
+        // every JSON field gets its own row. Compact JSON wraps at
+        // `cols` like normal text, packing ~14k chars per single-col
+        // image instead of one short line per field.
         let argsStr: string;
         try {
-          argsStr = JSON.stringify(tu.input, null, 2);
+          argsStr = JSON.stringify(tu.input);
         } catch {
           argsStr = String(tu.input);
         }
@@ -287,7 +300,8 @@ export async function collapseHistory(
     info.reason = 'render_empty';
     return { messages, info };
   }
-  if (!isProfitable(text.length, o.cols)) {
+  // Row-aware: pass the string, not its length. See ProfitableFn jsdoc.
+  if (!isProfitable(text, o.cols)) {
     info.reason = 'not_profitable';
     info.collapsedChars = text.length; // surface what we DIDN'T compress
     return { messages, info };

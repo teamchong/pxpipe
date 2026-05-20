@@ -24,11 +24,6 @@ export interface Env {
   COMPRESS_SCHEMAS?: string;
   COMPRESS_REMINDERS?: string;
   COMPRESS_TOOL_RESULTS?: string;
-  /** Variant C history-image compression. OFF by default — round-3 spec
-   *  rated savings as MARGINAL vs HIGH cache-topology risk. */
-  COMPRESS_HISTORY?: string;
-  HISTORY_KEEP_TAIL?: string;
-  HISTORY_MIN_PREFIX?: string;
   MIN_COMPRESS_CHARS?: string;
   MIN_REMINDER_CHARS?: string;
   MIN_TOOL_RESULT_CHARS?: string;
@@ -53,12 +48,6 @@ export default {
       compressSchemas: truthy(env.COMPRESS_SCHEMAS, true),
       compressReminders: truthy(env.COMPRESS_REMINDERS, true),
       compressToolResults: truthy(env.COMPRESS_TOOL_RESULTS, true),
-      // Variant C history-image: OFF by default. Round-3 spec marks the
-      // savings as MARGINAL (~1% per-call) against HIGH cache-topology risk.
-      // Flip via COMPRESS_HISTORY=1 once telemetry confirms safe rollout.
-      compressHistory: truthy(env.COMPRESS_HISTORY, false),
-      historyKeepTail: env.HISTORY_KEEP_TAIL ? Number(env.HISTORY_KEEP_TAIL) : 4,
-      historyMinPrefix: env.HISTORY_MIN_PREFIX ? Number(env.HISTORY_MIN_PREFIX) : 10,
       minCompressChars: env.MIN_COMPRESS_CHARS ? Number(env.MIN_COMPRESS_CHARS) : 2000,
       // Raised to 10,000 — per-block break-even point at current renderer
       // config (Unifont 10px, cell 5×11, 100 cols). Real gate is

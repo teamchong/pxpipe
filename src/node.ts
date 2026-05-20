@@ -419,8 +419,10 @@ async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const opts = parseCli(argv);
   // Transform options pass through empty — the proxy uses the DEFAULTS
-  // baked into transform.ts (every compression on, history on, all
-  // tuning parameters at their measured-best values). Per-request α
+  // baked into transform.ts. There are no behavior toggles: system slab,
+  // reminders, tool_results, and history compression all run
+  // unconditionally; the per-block break-even gate decides per-call
+  // whether to actually image each piece. Per-request α
   // injection happens later via the function-form `transform` in
   // ProxyConfig so the gate gets the dashboard's live empirical rate.
   const tracker: Tracker = new FileTracker(opts.eventsFile);

@@ -123,7 +123,9 @@ describe('blocksToText', () => {
     ).toBe('first paragraph\n\nsecond paragraph');
   });
 
-  it('serialises tool_use with its name and JSON-pretty args', () => {
+  it('serialises tool_use with its name and COMPACT JSON args', () => {
+    // Compact JSON (no 2-space indent) keeps row counts low so the
+    // history image stays small — pretty-printing inflates rows ~5×.
     const out = blocksToText([
       {
         type: 'tool_use',
@@ -133,8 +135,11 @@ describe('blocksToText', () => {
       },
     ]);
     expect(out).toContain('[tool_use Read]');
-    expect(out).toContain('"file_path": "/etc/hosts"');
-    expect(out).toContain('"limit": 50');
+    expect(out).toContain('"file_path":"/etc/hosts"');
+    expect(out).toContain('"limit":50');
+    // Negative: no pretty-print artefacts.
+    expect(out).not.toContain('  "file_path"');
+    expect(out).not.toContain('"limit": 50');
   });
 
   it('serialises tool_result string content', () => {
@@ -300,9 +305,13 @@ describe('collapseHistory', () => {
 
   it('preserves a tool_use sequence that straddles the live-tail boundary', async () => {
     // 14 turns: 10 closed turns, then an open tool_use at index 10 that closes at index 12.
+    // Per-turn body bumped to 3500 chars so the row-aware gate (numCols=1) clears
+    // the per-block break-even point. The tool_use/tool_result block labels
+    // add ~65 chars of header overhead that pushes a tighter fixture under
+    // the boundary; 3500-char turns leave headroom.
     const msgs: Message[] = [];
     for (let i = 0; i < 10; i++) {
-      const body = `turn ${i}: ` + 'x'.repeat(2500);
+      const body = `turn ${i}: ` + 'x'.repeat(3500);
       msgs.push(i % 2 === 0 ? usr(body) : asst(body));
     }
     msgs.push(asst([{ type: 'tool_use', id: 'X', name: 't', input: {} }]));
@@ -359,7 +368,7 @@ describe('collapseHistory', () => {
   });
 });
 
-describe('transformRequest + compressHistory', () => {
+describe('transformRequest history compression (always-on)', () => {
   function bigPlain(n: number): string {
     return 'x'.repeat(n);
   }
@@ -393,19 +402,19 @@ describe('transformRequest + compressHistory', () => {
     expect(Array.isArray(reparsed.messages)).toBe(true);
   });
 
-  it('compressHistory:true collapses an 8-closed + 2-live conversation', async () => {
-    // 12 turns total. With keepTail=2 + minPrefix=5, we expect 10 turns to
-    // collapse into 1 synthetic prepended user + 2 live tail = 3 total.
+  it('collapses a 10-closed + 4-live conversation under the default keepTail=4', async () => {
+    // 14 turns total. Default keepTail=4 + minPrefix=10 means 10 turns
+    // collapse into 1 synthetic prepended user + 4 live tail = 5 total.
+    // Per-turn body 3500 chars puts the fixture comfortably above the
+    // row-aware profitability gate (numCols=1 at the renderer means each
+    // 3500-char `x` line wraps to 35 rows; 10 turns × ~36 rows = ~360 rows
+    // = 3 single-col images ≪ text-cost).
     const msgs: Message[] = [];
-    for (let i = 0; i < 12; i++) {
-      const body = `turn ${i}: ` + bigPlain(2500);
+    for (let i = 0; i < 14; i++) {
+      const body = `turn ${i}: ` + bigPlain(3500);
       msgs.push(i % 2 === 0 ? usr(body) : asst(body));
     }
-    const { body, info } = await transformRequest(mkBody(msgs, bigPlain(80_000)), {
-      compressHistory: true,
-      historyKeepTail: 2,
-      historyMinPrefix: 5,
-    });
+    const { body, info } = await transformRequest(mkBody(msgs, bigPlain(80_000)));
     expect(info.collapsedTurns).toBe(10);
     expect(info.collapsedChars).toBeGreaterThan(0);
     expect(info.collapsedImages).toBeGreaterThanOrEqual(1);
@@ -413,7 +422,7 @@ describe('transformRequest + compressHistory', () => {
     expect(info.imageCount).toBeGreaterThanOrEqual(1 + (info.collapsedImages ?? 0));
 
     const reparsed = JSON.parse(new TextDecoder().decode(body));
-    expect(reparsed.messages.length).toBe(3); // 1 synthetic + 2 live tail
+    expect(reparsed.messages.length).toBe(5); // 1 synthetic + 4 live tail
     expect(reparsed.messages[0].role).toBe('user');
     const content = reparsed.messages[0].content;
     expect(Array.isArray(content)).toBe(true);
@@ -424,34 +433,28 @@ describe('transformRequest + compressHistory', () => {
     });
   });
 
-  it('compressHistory:true sets historyReason when no closed prefix exists', async () => {
-    // First message opens a tool_use; nothing closes it.
+  it('sets historyReason=no_closed_prefix when an open tool_use precedes the tail', async () => {
+    // First message opens a tool_use; nothing closes it. With default
+    // keepTail=4 and 4 messages total, cutoff=0, so the boundary search
+    // runs over an empty range [0..-1] and returns -1 → no_closed_prefix.
     const msgs: Message[] = [
       asst([{ type: 'tool_use', id: 'X', name: 't', input: {} }]),
       usr('plain'),
       asst('plain'),
       usr('plain'),
     ];
-    const { info } = await transformRequest(mkBody(msgs, bigPlain(80_000)), {
-      compressHistory: true,
-      historyKeepTail: 1,
-      historyMinPrefix: 2,
-    });
+    const { info } = await transformRequest(mkBody(msgs, bigPlain(80_000)));
     expect(info.collapsedTurns).toBeUndefined();
     expect(info.historyReason).toBe('no_closed_prefix');
   });
 
   it('history-image blocks carry NO cache_control (conservative first-cut)', async () => {
     const msgs: Message[] = [];
-    for (let i = 0; i < 12; i++) {
-      const body = `turn ${i}: ` + bigPlain(2500);
+    for (let i = 0; i < 14; i++) {
+      const body = `turn ${i}: ` + bigPlain(3500);
       msgs.push(i % 2 === 0 ? usr(body) : asst(body));
     }
-    const { body, info } = await transformRequest(mkBody(msgs, bigPlain(80_000)), {
-      compressHistory: true,
-      historyKeepTail: 2,
-      historyMinPrefix: 5,
-    });
+    const { body, info } = await transformRequest(mkBody(msgs, bigPlain(80_000)));
     expect(info.collapsedImages).toBeGreaterThanOrEqual(1);
     const reparsed = JSON.parse(new TextDecoder().decode(body));
     const synth = reparsed.messages[0];

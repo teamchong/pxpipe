@@ -285,6 +285,35 @@ flag; it was wiring a `chars_per_token` value derived from a parallel
 decision. The same fix applied at the history call site unlocks
 `historyReason: "collapsed"` for long sessions.
 
+**Image density / font size: more DPI is not the answer.** Recent
+VLM/OCR work points the tuning direction pretty clearly. ReadBench
+([arXiv:2505.19091](https://arxiv.org/abs/2505.19091)) renders text-only
+benchmarks as images and reports that *text resolution has negligible
+effects* once the text is readable, while performance drops sharply on
+longer multi-page visual contexts. Typographic attack studies over GPT-4o,
+Claude Sonnet 4.5, Mistral, and Qwen
+([arXiv:2604.12371](https://arxiv.org/abs/2604.12371),
+[arXiv:2604.25102](https://arxiv.org/abs/2604.25102)) find a real
+small-font cliff: very small fonts (~6 px) become ineffective, while
+mid-range font sizes are read reliably. A typography-gap study
+([arXiv:2603.08497](https://arxiv.org/abs/2603.08497)) reinforces the
+practical lesson: VLMs are much better at reading *what text says* than
+recognizing font family/style. For pixelpipe this means:
+
+- Do **not** increase DPI / pixel dimensions to improve savings. More
+  pixels usually means more image tokens.
+- Tiny margins are fine, but shrinking `PAD_X/PAD_Y` from 4 px to 2 px is
+  only a ~1% win; it is not the main lever.
+- There is no separate letter-spacing knob — density is mostly the atlas
+  cell (`ATLAS_CELL_W × ATLAS_CELL_H`).
+- The promising foundational experiment is a denser-but-readable bitmap
+  atlas (e.g. current Unifont 5×11 → candidate 4×8 or 4×7), with exact
+  retrieval tests on code/tool-doc slabs before making it default. Avoid
+  jumping to ~6 px effective text height without quality evidence.
+- Gutter/padding changes are secondary; the gutter is an OCR-ordering cue
+  for multi-column layouts, so removing it can save pixels while silently
+  causing row-interleaved reads.
+
 **Multi-column packing has an OCR cliff.** Two columns side-by-side
 double the per-image text capacity, but the renderer must guarantee
 Anthropic's vision stack reads column 1 fully top-to-bottom before

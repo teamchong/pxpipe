@@ -182,8 +182,8 @@ export function blocksToText(content: string | ContentBlock[]): string {
         // bloats the history text ~5× via per-field newlines, which
         // multiplies image cost since the renderer is row-aware and
         // every JSON field gets its own row. Compact JSON wraps at
-        // `cols` like normal text, packing ~14k chars per single-col
-        // image instead of one short line per field.
+        // `cols` like normal text, packing ~19.5k chars per single-col
+        // image at the current 5×8 atlas instead of one short line per field.
         let argsStr: string;
         try {
           argsStr = JSON.stringify(tu.input);

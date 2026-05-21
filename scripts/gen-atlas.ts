@@ -8,7 +8,8 @@
  *
  * Why hybrid instead of replacing Unifont outright:
  * - Spleen 5×8 is a real bitmap/code font and is materially denser than
- *   Unifont 10px: 5×8 cells vs 5×11, ~38% more rows per 1568px image.
+ *   historical Unifont 10px atlas: 5×8 cells vs 5×11, ~38% more rows
+ *   per 1568px image.
  * - Spleen intentionally targets small code/terminal glyphs, but does not
  *   cover CJK/symbol blocks. Unifont remains the broad fallback so existing
  *   dropped-glyph behavior does not regress for non-ASCII text.

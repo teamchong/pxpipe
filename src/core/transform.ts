@@ -137,8 +137,9 @@ const DEFAULTS: Required<TransformOptions> = {
   // because the system-field path is API-rejected. (Removed `placement` +
   // `compressSystem` knobs that gated the dead system-field branch.)
   cols: 100,
-  // Cap at 10 images per tool_result. With ~14k chars/image at current cell,
-  // a single tool_result can grow to ~140k chars before paging kicks in. A
+  // Cap at 10 images per tool_result. With ~19.5k chars/image at the current
+  // 5×8 atlas, a single-column tool_result can grow to ~195k chars before
+  // paging kicks in. A
   // `find` over a big tree or `grep -r` can easily exceed this; the paging
   // marker tells the model what was elided. Tuneable per session.
   maxImagesPerToolResult: 10,

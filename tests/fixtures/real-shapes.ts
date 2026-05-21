@@ -87,7 +87,7 @@ export const PRODUCTION_SLAB_135K_DENSE: RealShape = {
   name: 'production slab (135k chars, newline-heavy)',
   origChars: 130665,
   numCols: 2,
-  approxCharsPerRow: 19, // 24 images × 141 × 2 ≈ 6768 rows
+  approxCharsPerRow: 19, // ~6877 rows → ~18 images at 195 lines/image × 2 cols
   decision: 'reject',
   gate: 'slab',
   capturedAt: '2026-05-20',
@@ -109,9 +109,9 @@ export const PRODUCTION_SLAB_169K_HEAVY: RealShape = {
   name: 'production slab (169k chars, very dense)',
   origChars: 169632,
   numCols: 2,
-  approxCharsPerRow: 16, // 37 images × 141 × 2 ≈ 10434 rows
+  approxCharsPerRow: 16, // ~10602 rows → ~28 images at 195 lines/image × 2 cols
   // At numCols=2 the gate uses `numCols × imageCount × 5500` so the threshold
-  // doubles — and even the 2.5 cpt estimate doesn't clear it. Pass-through.
+  // doubles — and even the built-in 2.0 cpt estimate doesn't clear it. Pass-through.
   decision: 'reject',
   gate: 'slab',
   capturedAt: '2026-05-20',

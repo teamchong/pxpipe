@@ -1848,7 +1848,7 @@ describe('transform', () => {
     });
     const bytes = new TextEncoder().encode(req);
 
-    // Default ch/tok=4 at single-col: rejected as not_profitable.
+    // Built-in slab ch/tok=2.0 at single-col: rejected as not_profitable.
     const stale = await transformRequest(bytes, { multiCol: 1 });
     expect(stale.info.compressed).toBe(false);
     expect(stale.info.reason).toMatch(/^not_profitable/);
@@ -1859,13 +1859,13 @@ describe('transform', () => {
     expect(live.info.imageCount ?? 0).toBeGreaterThan(0);
   });
 
-  // --- Slab-specific cpt: built-in 2.5 cpt unlocks production-shape slabs ---
+  // --- Slab-specific cpt: built-in 2.0 cpt unlocks production-shape slabs ---
   //
   // Empirical: N=354 production count_tokens probes (2026-05-18..2026-05-20)
   // give body-level chars/token median 1.17, max 2.62. The English-prose
   // CHARS_PER_TOKEN=4 default was 3.4× too high for the slab call site,
   // silently rejecting every realistic slab. The slab gate now uses
-  // SLAB_CHARS_PER_TOKEN=2.5 — the upper bound of empirical data — which
+  // SLAB_CHARS_PER_TOKEN=2.0 — conservative versus the empirical max — which
   // unlocks the production-shape slab while preserving the prime-directive
   // safety (no net-loss compressions on shapes we've actually observed).
 
@@ -2023,7 +2023,8 @@ describe('transform', () => {
   });
 
   it('isCompressionProfitable: 5x8 atlas lets 16k blocks become 1-image wins', () => {
-    // The old Unifont 5×11 atlas packed 14,100 chars/image, so 16k chars
+    // Historical comparison: the previous Unifont 5×11 atlas packed
+    // 14,100 chars/image, so 16k chars
     // needed 2 images and failed break-even. The 5×8 hybrid atlas packs
     // 19,500 chars/image, so the same block fits in one image and wins.
     expect(isCompressionProfitable(16_000, 100)).toBe(true);

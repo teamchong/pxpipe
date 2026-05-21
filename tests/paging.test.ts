@@ -292,7 +292,7 @@ function makeReq(toolResultText: string) {
 describe('paging end-to-end (transformRequest)', () => {
   it('tool_result under cap renders normally (no truncation counters)', async () => {
     // Above the multi-col break-even (~22k chars), well under the 10-image
-    // budget (~140k chars).
+    // single-column budget (~195k chars at the current 5×8 atlas).
     const text = 'x'.repeat(50_000);
     const { info } = await transformRequest(makeReq(text));
     expect(info.compressed).toBe(true);

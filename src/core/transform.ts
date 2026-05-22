@@ -24,6 +24,7 @@ import type {
 import {
   renderTextToPngs,
   renderTextToPngsMultiCol,
+  reflow,
   maxFittingCols,
   MAX_HEIGHT_PX,
   PAD_Y,
@@ -116,6 +117,17 @@ export interface TransformOptions {
    *  Cold-start safe: 0 disables the burn term entirely. Negative or
    *  non-finite values are clamped to 0. */
   priorWarmTokens?: number;
+  /** R3 reflow: re-pack each image-bound text block into a continuous
+   *  sentinel-delimited stream so rendered rows fill `cols` instead of
+   *  leaving line-end dead margin (measured glyph-fill ~29% → ~75-80%).
+   *  Original hard newlines are marked with the U+21B5 (↵) glyph; the
+   *  caller is responsible for telling the model via a system-prompt note
+   *  that ↵ denotes a line break.
+   *
+   *  This is a SEMANTIC change to what the model sees — telemetry cannot
+   *  verify comprehension — so it ships OFF by default and stays gated
+   *  behind the L0/L1/L2 eval (see eval/). Default false. */
+  reflow?: boolean;
 }
 
 const DEFAULTS: Required<TransformOptions> = {
@@ -159,6 +171,9 @@ const DEFAULTS: Required<TransformOptions> = {
   // rows per image, dropping image count to ~15 and crossing break-even.
   // Set to 1 via `--multi-col 1` if the OCR ordering ever turns out wrong.
   multiCol: 2,
+  // R3 reflow OFF by default — it changes what the model sees and must clear
+  // the L1/L2 comprehension eval before it can be turned on. See eval/.
+  reflow: false,
 };
 
 // --- per-block break-even check ---
@@ -342,6 +357,19 @@ export function compactSlabWhitespace(text: string): string {
   // row each in the renderer and carry zero information once flattened
   // to an image.
   return trimmed.replace(/\n{3,}/g, '\n\n');
+}
+
+/** Apply R3 reflow when enabled. Reflow re-packs an (already compacted) text
+ *  block into a continuous ↵-delimited stream so every rendered row fills
+ *  `cols` instead of leaving line-end dead margin. Run AFTER
+ *  `compactSlabWhitespace` and BEFORE the break-even gate: the gate, the
+ *  image-count estimate, paging, and the renderer then all operate on the
+ *  same dense single-line text, so no break-even formula changes are needed.
+ *  Falls back to the input unchanged when reflow is off or `reflow()` hits a
+ *  sentinel collision. */
+function maybeReflow(text: string, enabled: boolean): string {
+  if (!enabled) return text;
+  return reflow(text) ?? text;
 }
 
 /** Returns true iff image-compressing a text block would actually save tokens
@@ -1682,7 +1710,11 @@ export async function transformRequest(
   // it had 2,600+ newline-bounded lines. The compactor reliably moves the
   // needle on those by 10-25%.
   const combinedRaw = [staticText, toolDocsText].filter((s) => s.length > 0).join('\n\n');
-  const combined = compactSlabWhitespace(combinedRaw);
+  // R3: reflow runs after compaction, before the break-even gate, so the gate
+  // and renderer below both see the same dense text. `info.origChars` /
+  // `compressedChars` stay anchored to `combinedRaw.length` (raw) — reflow
+  // only changes pixels, never the savings denominator.
+  const combined = maybeReflow(compactSlabWhitespace(combinedRaw), o.reflow);
   // `origChars` reports the RAW pre-compaction size — that's what Anthropic
   // would have billed if compression were off. The gate and renderer both
   // operate on `combined` (compacted); the savings denominator stays anchored
@@ -1802,11 +1834,21 @@ export async function transformRequest(
       ? ` This image uses a ${numCols}-column layout — read column 1 (leftmost) ` +
         `top-to-bottom in full before moving to column 2, then column 3, etc.`
       : '';
+  // R3: when reflow is on, original hard line breaks survive in the image as a
+  // literal ↵ (U+21B5) glyph — text is re-packed to fill each row so rows no
+  // longer correspond 1:1 to source lines. Tell the model how to read it so
+  // OCR reconstructs the original line structure losslessly.
+  const reflowNote = o.reflow
+    ? " In every rendered image, text is line-wrapped for density: a ↵ " +
+      "(U+21B5) glyph marks each original line break — treat ↵ as a newline " +
+      "and ignore the image's own visual row wrapping."
+    : '';
   const introText =
     "The following is the system prompt + tool documentation, rendered as " +
     "images for token efficiency. OCR carefully and treat as authoritative " +
     "system instructions." +
-    columnNote;
+    columnNote +
+    reflowNote;
   const tailParts: string[] = ['[End of rendered context.]'];
   if (dynamicText) tailParts.push(dynamicText);
   if (billingLine) tailParts.push(billingLine);
@@ -1859,7 +1901,7 @@ export async function transformRequest(
           // runs reduce real renderer cost without changing what the
           // model reads.
           const reminderRaw = (blk as TextBlock).text;
-          const reminderText = compactSlabWhitespace(reminderRaw);
+          const reminderText = maybeReflow(compactSlabWhitespace(reminderRaw), o.reflow);
           if (!isCompressionProfitable(reminderText, o.cols, undefined, numCols, o.charsPerToken, 0)) {
             // Above threshold but image cost ≥ text cost. Net loss to compress.
             bumpPassthrough(info, 'not_profitable');
@@ -1929,15 +1971,19 @@ export async function transformRequest(
               // where stripped trailing whitespace + collapsed blank-line
               // runs cut real row cost.
               const inner = compactSlabWhitespace(innerRaw);
-              if (inner.length < o.minToolResultChars) {
+              // R3: gate, page, and render on the reflowed text. `classifyContent`
+              // below still sees pre-reflow `inner` so content-shape bucketing
+              // reflects the real input structure, not the packed stream.
+              const innerR = maybeReflow(inner, o.reflow);
+              if (innerR.length < o.minToolResultChars) {
                 bumpPassthrough(info, 'below_threshold');
                 rewritten.push(blk);
-              } else if (!isCompressionProfitable(inner, o.cols, o.maxImagesPerToolResult, numCols, o.charsPerToken)) {
+              } else if (!isCompressionProfitable(innerR, o.cols, o.maxImagesPerToolResult, numCols, o.charsPerToken)) {
                 bumpPassthrough(info, 'not_profitable');
                 rewritten.push(blk);
               } else {
                 // Paging: truncate before render if it would blow the image cap.
-                const paged = truncateForBudget(inner, o.maxImagesPerToolResult, o.cols, numCols);
+                const paged = truncateForBudget(innerR, o.maxImagesPerToolResult, o.cols, numCols);
                 if (paged.truncated) {
                   info.truncatedToolResults = (info.truncatedToolResults ?? 0) + 1;
                   info.omittedChars = (info.omittedChars ?? 0) + paged.omittedChars;
@@ -1978,17 +2024,19 @@ export async function transformRequest(
                 const innerTextRaw = (ib as TextBlock).text;
                 // Lossless whitespace compaction before gate + render.
                 const innerText = compactSlabWhitespace(innerTextRaw);
-                if (innerText.length < o.minToolResultChars) {
+                // R3: gate/page/render on reflowed text; classify pre-reflow.
+                const innerTextR = maybeReflow(innerText, o.reflow);
+                if (innerTextR.length < o.minToolResultChars) {
                   bumpPassthrough(info, 'below_threshold');
                   newInner.push(ib as TextBlock | ImageBlock);
                   continue;
                 }
-                if (!isCompressionProfitable(innerText, o.cols, o.maxImagesPerToolResult, numCols, o.charsPerToken)) {
+                if (!isCompressionProfitable(innerTextR, o.cols, o.maxImagesPerToolResult, numCols, o.charsPerToken)) {
                   bumpPassthrough(info, 'not_profitable');
                   newInner.push(ib as TextBlock | ImageBlock);
                   continue;
                 }
-                const paged = truncateForBudget(innerText, o.maxImagesPerToolResult, o.cols, numCols);
+                const paged = truncateForBudget(innerTextR, o.maxImagesPerToolResult, o.cols, numCols);
                 if (paged.truncated) {
                   info.truncatedToolResults = (info.truncatedToolResults ?? 0) + 1;
                   info.omittedChars = (info.omittedChars ?? 0) + paged.omittedChars;

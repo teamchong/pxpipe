@@ -98,6 +98,56 @@ export function minifyForRender(text: string): string {
     .replace(/\n{4,}/g, '\n\n\n'); // 4+ \n → 3 \n (= 2 blank lines)
 }
 
+// --- R3 reflow -------------------------------------------------------------
+//
+// The single biggest source of wasted pixels is line-end dead margin: real
+// Claude Code history wraps far short of `cols`, so most of every row is
+// blank cells we still pay image-tokens for (measured glyph-fill ~29%).
+//
+// Reflow re-packs the text into a continuous stream that fills every row to
+// `cols`, marking each original hard newline with a visible sentinel glyph
+// (U+21B5 ↵). The model is told via a system-prompt note that ↵ denotes a
+// line break. Inline whitespace (indentation, spaces between words) is kept —
+// only the dead right-margin and blank-line rows are recovered.
+//
+// FIDELITY: reflow is gated behind a flag and an A/B eval. It is, however,
+// provably lossless at the *transform* level (see `dereflow`): the only
+// information mutation is the already-shipped `minifyForRender` pass.
+
+/** Sentinel glyph marking an original hard newline in reflowed text. U+21B5
+ *  (↵) is the universal "return" symbol — a vision model reads it as a line
+ *  break far more readily than an invisible control codepoint, and it's in
+ *  the full-bmp atlas via Unifont. */
+export const NL_SENTINEL = '↵';
+
+/** Re-pack `text` into a single sentinel-delimited line so `wrapLines` fills
+ *  every row to `cols` instead of leaving line-end dead margin.
+ *
+ *  Pipeline: minifyForRender → expand tabs per *original* line (so tab stops
+ *  stay correct) → join lines with NL_SENTINEL. The result contains no '\n',
+ *  so downstream soft-wrap packs it densely.
+ *
+ *  Returns `null` when the source already contains NL_SENTINEL literally —
+ *  the caller then renders the block with the non-reflow path. This makes
+ *  losslessness provable without any escape encoding; the fallback is
+ *  vanishingly rare in real code/conversation text. */
+export function reflow(text: string): string | null {
+  if (text.indexOf(NL_SENTINEL) >= 0) return null;
+  return minifyForRender(text)
+    .split('\n')
+    .map(expandTabsInLine)
+    .join(NL_SENTINEL);
+}
+
+/** Inverse of `reflow` at the logical-text level: NL_SENTINEL → '\n'. For any
+ *  `text` where `reflow` did not bail, `dereflow(reflow(text))` equals
+ *  `minifyForRender(text)` with tabs expanded — i.e. exactly the text the
+ *  *current* (non-reflow) renderer also displays. Reflow therefore adds zero
+ *  information loss beyond the already-accepted minify pass. */
+export function dereflow(reflowed: string): string {
+  return reflowed.split(NL_SENTINEL).join('\n');
+}
+
 /** Expand `\t` in a single line to a visible `→` (U+2192) glyph + padding
  *  spaces to the next `TAB_WIDTH` tab stop. Honors visual columns: wide
  *  chars (CJK) count as 2 columns so tab alignment after `中\tx` lands
@@ -288,6 +338,18 @@ export async function renderChunkToPng(
 
   const png = await encodeGrayPng(fb, width, height);
   return { png, width, height, charsRendered, droppedChars, droppedCodepoints };
+}
+
+/** Reflow-aware variant of `renderTextToPngs`. When `text` can be reflowed
+ *  (no sentinel collision) it renders the densely-packed stream; otherwise it
+ *  falls back to the identical non-reflow output. Same return contract as
+ *  `renderTextToPngs` so call sites only differ by which function they pick. */
+export async function renderTextToPngsReflow(
+  text: string,
+  cols: number = DEFAULT_COLS,
+): Promise<RenderedImage[]> {
+  const packed = reflow(text);
+  return renderTextToPngs(packed ?? text, cols);
 }
 
 /** Split `text` into N PNGs, each ≤ MAX_HEIGHT_PX tall. */
@@ -500,4 +562,17 @@ export async function renderTextToPngsMultiCol(
     images.push(await renderMultiColChunkFromLines(slice, cols, numCols, chars));
   }
   return images;
+}
+
+/** Reflow-aware variant of `renderTextToPngsMultiCol`. Reflow and multi-column
+ *  packing compose: reflow fills each row to `cols`, multi-col then stacks
+ *  `numCols` of those dense rows side-by-side. Falls back to identical
+ *  non-reflow output on sentinel collision. */
+export async function renderTextToPngsReflowMultiCol(
+  text: string,
+  cols: number = DEFAULT_COLS,
+  numCols: number = 2,
+): Promise<RenderedImage[]> {
+  const packed = reflow(text);
+  return renderTextToPngsMultiCol(packed ?? text, cols, numCols);
 }

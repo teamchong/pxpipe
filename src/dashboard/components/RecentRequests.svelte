@@ -8,7 +8,6 @@
   import { numFmt } from '../lib/format.js';
 
   $: rows = $recent.data?.recent ?? [];
-  $: imageIds = $recent.data?.image_ids ?? [];
 
   function statusCls(status: number): string {
     if (status >= 500) return 'bad';
@@ -26,7 +25,7 @@
   <thead>
     <tr>
       <th>#</th>
-      <th>status</th>
+      <th class="num">status</th>
       <th>path</th>
       <th class="num">cc</th>
       <th class="num">cr</th>
@@ -43,6 +42,7 @@
         <td class="num {statusCls(e.status)}">{e.status}</td>
         <td class="small">{shortPath(e.path)}</td>
         <td class="num">{e.cc_added ? '✓' : '-'}</td>
+        <td class="num">{e.cache_read != null ? numFmt(e.cache_read) : '-'}</td>
         <td class="num">{e.baseline_input != null ? numFmt(e.baseline_input) : '-'}</td>
         <td class="num">{e.actual_input != null ? numFmt(e.actual_input) : '-'}</td>
         <td class="num pos">
@@ -52,11 +52,7 @@
         </td>
         <td class="num">
           {#if e.img_id != null}
-            {#if imageIds.includes(e.img_id)}
-              <button class="view-btn" on:click={() => selectedImageId.set(e.img_id ?? null)}>view</button>
-            {:else}
-              <span class="muted">-</span>
-            {/if}
+            <button class="view-btn" on:click={() => selectedImageId.set(e.img_id ?? null)}>view</button>
           {:else}
             <span class="muted">-</span>
           {/if}

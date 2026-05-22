@@ -13,6 +13,7 @@
 import type {
   ContentBlock,
   ImageBlock,
+  Message,
   MessagesRequest,
   SystemField,
   TextBlock,
@@ -686,6 +687,15 @@ export interface TransformInfo {
    *  into `info.imageCount` too — surfaced separately so dashboards can
    *  attribute image-count growth to history vs system-slab vs reminders. */
   collapsedImages?: number;
+  /** Variant C: sha8 of the concatenated history-image base64 emitted this
+   *  request. The quantized collapse boundary keeps the synthetic history
+   *  message byte-identical for a full `collapseChunk` window — an UNCHANGED
+   *  `history_image_sha8` across consecutive collapsed events is the
+   *  ground-truth proof that the upstream prompt cache can `cache_read` the
+   *  history prefix (0.1x) instead of re-billing `cache_create` (1.25x). A
+   *  hash that changes every turn ⟹ the cache-key drift bug is back. Only
+   *  set when a collapse actually produced image blocks. */
+  historyImageSha?: string;
   /** Variant C: why the history collapse didn't run (or did). Diagnostic
    *  only — see `HistoryCollapseInfo.reason` for the value set. */
   historyReason?:
@@ -839,6 +849,35 @@ export async function sha8(text: string): Promise<string> {
   let hex = '';
   for (let i = 0; i < 4; i++) hex += bytes[i]!.toString(16).padStart(2, '0');
   return hex;
+}
+
+/**
+ * Hash the concatenated base64 of every image block carried by the synthetic
+ * history message. `collapseHistory` returns `[syntheticUser, ...tail]`, so
+ * the history images — if any — live on `messages[0]`.
+ *
+ * Logging this per request makes the cache-key drift bug (#28) observable
+ * straight from `events.jsonl`: while the quantized collapse boundary holds,
+ * consecutive collapsed events MUST report an identical `history_image_sha8`.
+ * That byte-stability is exactly what lets Anthropic's prompt cache serve the
+ * history prefix as a `cache_read` (0.1x) instead of re-billing a fresh
+ * `cache_create` (1.25x) every turn. A hash that moves turn-over-turn is the
+ * signature of the regression — the proxy can't *see* Anthropic's cache
+ * decision, so this hash is our ground-truth proxy for it.
+ *
+ * Returns `undefined` when `messages[0]` carries no image blocks (i.e. no
+ * collapse happened this request) — callers gate on `collapsedTurns` anyway.
+ */
+async function historyImageSha8(
+  messages: Message[],
+): Promise<string | undefined> {
+  const synthetic = messages[0];
+  if (!synthetic || !Array.isArray(synthetic.content)) return undefined;
+  let concat = '';
+  for (const blk of synthetic.content) {
+    if (blk.type === 'image') concat += blk.source.data;
+  }
+  return concat ? sha8(concat) : undefined;
 }
 
 /**
@@ -1494,6 +1533,7 @@ async function runHistoryCollapseAndFinalize(
       }
       info.historyReason = 'collapsed';
       info.historyTextChars = histInfo.collapsedChars;
+      info.historyImageSha = await historyImageSha8(newMessages);
       bumpBucket(info, 'history', histInfo.collapsedChars);
       collapsedFlag = true;
     } else if (histInfo.reason) {
@@ -2050,6 +2090,7 @@ export async function transformRequest(
       // from system slabs and tool_results. The chars that fed the history
       // renderer are exactly what `collapsedChars` already tracks.
       info.historyTextChars = histInfo.collapsedChars;
+      info.historyImageSha = await historyImageSha8(newMessages);
       bumpBucket(info, 'history', histInfo.collapsedChars);
     } else if (histInfo.reason) {
       info.historyReason = histInfo.reason;

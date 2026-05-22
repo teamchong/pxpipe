@@ -104,6 +104,14 @@ export interface TrackEvent {
    *  text growth even on no-collapse turns (when this is 0). Pairs with the
    *  history-bucket entry in `bucket_chars`. */
   history_text_chars?: number;
+  /** Variant C: sha8 of the concatenated history-image base64 emitted this
+   *  request. The quantized collapse boundary is supposed to keep this
+   *  byte-identical for a full `collapseChunk` window — so an UNCHANGED hash
+   *  across consecutive `collapsed` events is ground-truth proof the upstream
+   *  prompt cache can `cache_read` the history prefix (0.1x) instead of
+   *  re-billing `cache_create` (1.25x). A hash that moves every turn ⟹ the
+   *  cache-key drift bug (#28) is back. Absent on no-collapse turns. */
+  history_image_sha8?: string;
 
   // From TransformInfo.env:
   cwd?: string;
@@ -288,6 +296,12 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
       // Variant C history-image text length, surfaced separately from the
       // bucket map because history credits a synthetic prepended user message.
       out.history_text_chars = info.historyTextChars;
+    }
+    if (info.historyImageSha) {
+      // Byte-stability fingerprint of the collapsed history image — lets the
+      // dashboard verify the prompt cache is actually being hit (unchanged
+      // hash across collapsed turns) rather than drifting every request.
+      out.history_image_sha8 = info.historyImageSha;
     }
     if (info.unknownStaticTags && info.unknownStaticTags.length > 0)
       out.unknown_static_tags = info.unknownStaticTags;

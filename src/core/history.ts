@@ -69,12 +69,20 @@ export interface HistoryCollapseOptions {
    *  configured `cols` so the history image visually matches the system
    *  image. Default 100. */
   cols: number;
+  /** Quantize the collapse boundary onto a fixed grid of this many
+   *  messages. The collapsed prefix only advances in `collapseChunk`-sized
+   *  steps, so the rendered history image stays byte-identical between
+   *  steps and keeps hitting Anthropic's prompt cache instead of forcing a
+   *  fresh `cache_create` (1.25x) of the whole prefix on every single turn.
+   *  Set to 0 for the legacy per-turn moving boundary. Default 50. */
+  collapseChunk: number;
 }
 
 export const HISTORY_DEFAULTS: HistoryCollapseOptions = {
   keepTail: 4,
   minCollapsePrefix: 10,
   cols: 100,
+  collapseChunk: 50,
 };
 
 /** Per-request telemetry surfaced back to TransformInfo. */
@@ -280,7 +288,33 @@ export async function collapseHistory(
   }
   // The live tail must contain at least `keepTail` messages. The boundary
   // search cuts off at `len - keepTail` so the tail is always preserved.
-  const cutoff = messages.length - o.keepTail;
+  //
+  // Quantize that cutoff onto a fixed grid of `collapseChunk` messages.
+  // A moving boundary re-renders the history image — and changes its PNG
+  // bytes — on every turn, which misses Anthropic's prompt cache and
+  // forces a full `cache_create` (1.25x) of the whole prefix every turn.
+  // Snapping to a grid keeps the collapsed prefix — and thus the rendered
+  // image — byte-identical for `collapseChunk` turns at a stretch, so the
+  // history image caches like Claude Code's native byte-stable history.
+  const rawCutoff = messages.length - o.keepTail;
+  // Snap the cutoff to the grid, but never below `minCollapsePrefix`. A
+  // conversation shorter than one full `collapseChunk` would otherwise
+  // floor straight to 0 and skip history compression entirely. Flooring
+  // at `minCollapsePrefix` instead keeps the boundary — and therefore the
+  // rendered image — byte-stable (the prefix is append-only, so its first
+  // `minCollapsePrefix` messages never change) while still collapsing
+  // short histories. Clamp to `rawCutoff` so a floor can never reach past
+  // the live tail when `rawCutoff < minCollapsePrefix`.
+  const cutoff =
+    o.collapseChunk > 0
+      ? Math.min(
+          rawCutoff,
+          Math.max(
+            o.minCollapsePrefix,
+            Math.floor(rawCutoff / o.collapseChunk) * o.collapseChunk,
+          ),
+        )
+      : rawCutoff;
   const boundary = findClosedPrefixBoundary(messages, cutoff);
   if (boundary < 0) {
     info.reason = 'no_closed_prefix';

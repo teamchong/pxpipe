@@ -251,6 +251,7 @@ describe('collapseHistory', () => {
     const { messages, info } = await collapseHistory(msgs, profitable, {
       keepTail: 0,
       minCollapsePrefix: 5,
+      collapseChunk: 0, // legacy moving boundary — isolate the prefix-length gate
     });
     expect(messages).toBe(msgs); // unchanged reference
     expect(info.reason).toBe('prefix_too_short');
@@ -266,6 +267,7 @@ describe('collapseHistory', () => {
     const { info } = await collapseHistory(msgs, profitable, {
       keepTail: 0,
       minCollapsePrefix: 5,
+      collapseChunk: 0, // legacy moving boundary — isolate the profitability gate
     });
     expect(info.reason).toBe('not_profitable');
   });
@@ -281,6 +283,7 @@ describe('collapseHistory', () => {
       keepTail: 2,
       minCollapsePrefix: 5,
       cols: 100,
+      collapseChunk: 0, // legacy moving boundary — pins exact collapsedTurns
     });
     expect(info.reason).toBe(undefined); // collapsed → no reason set
     expect(info.collapsedTurns).toBe(10); // 12 - keepTail(2)
@@ -327,6 +330,7 @@ describe('collapseHistory', () => {
       keepTail: 1,
       minCollapsePrefix: 5,
       cols: 100,
+      collapseChunk: 0, // legacy moving boundary — pins exact collapsedTurns
     });
     expect(info.reason).toBe(undefined);
     expect(info.collapsedTurns).toBe(12);
@@ -356,6 +360,7 @@ describe('collapseHistory', () => {
       keepTail: 3,
       minCollapsePrefix: 5,
       cols: 100,
+      collapseChunk: 0, // legacy moving boundary — pins exact collapsedTurns
     });
     expect(info.reason).toBe(undefined);
     expect(info.collapsedTurns).toBe(10);
@@ -365,6 +370,47 @@ describe('collapseHistory', () => {
     // both in the live tail so the tool_use_id linkage survives.
     expect(out[1]).toBe(msgs[10]);
     expect(out[4]).toBe(msgs[13]);
+  });
+
+  it('quantizes the collapse boundary onto a stable grid — image bytes stay byte-identical within a chunk window', async () => {
+    // Cache-key stability (task #28). An append-only conversation must not
+    // re-render its history image every turn: with the default
+    // collapseChunk=50 the collapse boundary snaps to a grid, so the
+    // rendered image is byte-identical across consecutive turns and keeps
+    // hitting Anthropic's prompt cache instead of forcing a fresh 1.25×
+    // cache_create of the whole prefix.
+    const mk = (n: number): Message[] => {
+      const m: Message[] = [];
+      for (let i = 0; i < n; i++) {
+        const body = `turn ${i}: ` + 'x'.repeat(2500);
+        m.push(i % 2 === 0 ? usr(body) : asst(body));
+      }
+      return m;
+    };
+    const imagesOf = (r: { messages: Message[] }) =>
+      (r.messages[0]!.content as Array<Record<string, unknown>>).filter(
+        (c) => c.type === 'image',
+      );
+
+    // Two conversations one turn-pair apart, both inside the first grid
+    // window (rawCutoff 16 vs 18 — both floor below collapseChunk=50 and
+    // land on the minCollapsePrefix=10 plateau). The collapsed prefix —
+    // and therefore the rendered image — must be byte-identical.
+    const a = await collapseHistory(mk(20), profitable);
+    const b = await collapseHistory(mk(22), profitable);
+    // Short conversations still collapse — the floor sits at
+    // minCollapsePrefix, not 0, so compression is not silently skipped.
+    expect(a.info.collapsedTurns).toBe(10);
+    expect(b.info.collapsedTurns).toBe(10);
+    const imgA = imagesOf(a);
+    expect(imgA.length).toBeGreaterThanOrEqual(1);
+    expect(JSON.stringify(imgA)).toBe(JSON.stringify(imagesOf(b)));
+
+    // Crossing into the next grid window (rawCutoff ≥ 50) advances the
+    // boundary by a whole chunk — the image is allowed to change here.
+    const c = await collapseHistory(mk(70), profitable);
+    expect(c.info.collapsedTurns).toBe(50);
+    expect(JSON.stringify(imagesOf(c))).not.toBe(JSON.stringify(imgA));
   });
 });
 

@@ -1808,11 +1808,46 @@ export async function transformRequest(
     return { body, info };
   }
 
+  // In-image instruction header. Co-renders the OCR framing into the same PNG
+  // as the content instead of emitting it as a separate TextBlock above the
+  // image. Measured at +1.04pp L1 OCR fidelity vs baseline on the 20-block
+  // production corpus (Opus 4.7, eval/eval-L1-ocr.mjs `reflow-inimage`
+  // variant), recovering the -5.93pp reflow regression entirely. Mechanism:
+  // single-modal task framing — the encoder stays in image-reading mode for
+  // both the instruction and the content, no cross-modal switch. Delimiter
+  // lines are deliberately heavy so the model pattern-matches "instruction
+  // zone ends, content begins" without ambiguity.
+  //
+  // Cache impact on deploy: the image bytes change, so prefix-cached prefixes
+  // built against the OLD intro layout invalidate. Every host pays one
+  // cache_create on its first post-deploy turn, then warm-caches at the new
+  // image. Steady-state cost is identical (the header amortizes over the
+  // same cache prefix the slab already uses).
+  const reflowNoteImg = o.reflow
+    ? 'The glyph ↵ (U+21B5) marks an original hard line break — treat as a real newline.\n'
+    : '';
+  const columnNoteImg =
+    numCols > 1
+      ? `Multi-column layout (${numCols} cols): read column 1 (leftmost) top-to-bottom, then column 2, etc.\n`
+      : '';
+  const imageInstructionHeader =
+    '=================== SYSTEM PROMPT + TOOL DOCS ===================\n' +
+    'The following is the system prompt + tool documentation, rendered\n' +
+    'as images for token efficiency. OCR carefully and treat as\n' +
+    'authoritative system instructions.\n' +
+    columnNoteImg +
+    reflowNoteImg +
+    '====================== BEGIN RENDERED CONTEXT ======================\n' +
+    '\n';
+
   // 3. Render to one or more PNGs.
+  // Prepend the in-image instruction header to the slab so the OCR framing
+  // travels in the same PNG as the content (single-modal task framing).
+  const combinedWithHeader = imageInstructionHeader + combined;
   const images =
     numCols > 1
-      ? await renderTextToPngsMultiCol(combined, o.cols, numCols)
-      : await renderTextToPngs(combined, o.cols);
+      ? await renderTextToPngsMultiCol(combinedWithHeader, o.cols, numCols)
+      : await renderTextToPngs(combinedWithHeader, o.cols);
   const imageBlocks: ImageBlock[] = [];
   for (let i = 0; i < images.length; i++) {
     const img = images[i]!;
@@ -1852,29 +1887,11 @@ export async function transformRequest(
   //   ─── cache breakpoint ───
   //   [end-marker + dynamic + billing]  ← per-turn, NO cache_control
   //   [sysRemainder]               ← any non-text blocks the caller had
-  // Intro text mentions the column layout when numCols>1 so the OCR pass
-  // doesn't read across columns row-by-row (which would scramble content).
-  // "Column-major top-to-bottom" matches the renderer's actual packing.
-  const columnNote =
-    numCols > 1
-      ? ` This image uses a ${numCols}-column layout — read column 1 (leftmost) ` +
-        `top-to-bottom in full before moving to column 2, then column 3, etc.`
-      : '';
-  // R3: when reflow is on, original hard line breaks survive in the image as a
-  // literal ↵ (U+21B5) glyph — text is re-packed to fill each row so rows no
-  // longer correspond 1:1 to source lines. Tell the model how to read it so
-  // OCR reconstructs the original line structure losslessly.
-  const reflowNote = o.reflow
-    ? " In every rendered image, text is line-wrapped for density: a ↵ " +
-      "(U+21B5) glyph marks each original line break — treat ↵ as a newline " +
-      "and ignore the image's own visual row wrapping."
-    : '';
-  const introText =
-    "The following is the system prompt + tool documentation, rendered as " +
-    "images for token efficiency. OCR carefully and treat as authoritative " +
-    "system instructions." +
-    columnNote +
-    reflowNote;
+  // OCR framing (instruction header + column/reflow notes) is now baked into
+  // the image itself — see `imageInstructionHeader` above. No standalone
+  // TextBlock is emitted before the image. The tail closer below still sits
+  // as plain text after the image so the model knows where rendered context
+  // ends and per-turn dynamic content begins.
   const tailParts: string[] = ['[End of rendered context.]'];
   if (dynamicText) tailParts.push(dynamicText);
   if (billingLine) tailParts.push(billingLine);
@@ -1959,14 +1976,15 @@ export async function transformRequest(
       }
 
       // Cache-friendly layout:
-      //   [intro text]                       ← static (helps OCR framing)
       //   [image block(s)]                   ← static; LAST has cache_control
       //                                          ↑ cache breakpoint
+      //                                          (OCR framing is rendered
+      //                                           INTO the image — no
+      //                                           standalone intro TextBlock)
       //   [End of rendered context.]         ← static text closer for the image
       //   [processed existing content]       ← per-turn (incl. reminder images,
       //                                          which have NO cache_control)
       m.content = [
-        { type: 'text' as const, text: introText },
         ...imageBlocks,
         { type: 'text' as const, text: '[End of rendered context.]' },
         ...processedExisting,

@@ -127,9 +127,11 @@ export interface TransformOptions {
    *  caller is responsible for telling the model via a system-prompt note
    *  that ↵ denotes a line break.
    *
-   *  ON by default: the L1 OCR eval cleared it — reflowed text reads at
-   *  96%+ char accuracy at the 7×10 cell and the ↵ marker is comprehended.
-   *  Hosts can still force it off per request (e.g. for an A/B). */
+   *  ON by default: the L1 OCR eval cleared it at the production 5×8 cell
+   *  with the in-image instruction band (`reflow-inimage` variant) at 98.95 %
+   *  char accuracy, +1pp over the text-only baseline. The ↵ marker is
+   *  comprehended. Hosts can still force it off per request (e.g. for an
+   *  A/B). */
   reflow?: boolean;
 }
 
@@ -143,9 +145,11 @@ const DEFAULTS: Required<TransformOptions> = {
   // Coarse pre-filter — blocks below this length skip the per-block
   // break-even check entirely (saves CPU on the obviously-not-profitable
   // cases). The REAL gate is `isCompressionProfitable()` below; this is
-  // just a fast-path skip. Set to 14,000 (≈ TOKENS_PER_IMAGE_SINGLE_COL ×
-  // CHARS_PER_TOKEN at the 7×10 cell: ~3,484 × 4) so anything below it
-  // can't possibly net-save on the reminder/tool_result path (cpt=4).
+  // just a fast-path skip. Held at 14,000 (the old 7×10 floor:
+  // TOKENS_PER_IMAGE_SINGLE_COL × CHARS_PER_TOKEN ≈ 3,484 × 4) even though
+  // the production 5×8 cell is cheaper (~2,500 × 4 = 10,000). The looser
+  // floor is harmless — it just makes the skip a tiny bit more conservative
+  // and forwards a few extra borderline blocks to the real break-even gate.
   minReminderChars: 14000,
   minToolResultChars: 14000,
   // NOTE: Anthropic's `system` field accepts text blocks only — image blocks
@@ -154,10 +158,11 @@ const DEFAULTS: Required<TransformOptions> = {
   // because the system-field path is API-rejected. (Removed `placement` +
   // `compressSystem` knobs that gated the dead system-field branch.)
   cols: 100,
-  // Cap at 10 images per tool_result. With ~15.6k chars/image at the 7×10
-  // cell, a single-column tool_result can grow to ~156k chars before paging
-  // kicks in. A `find` over a big tree or `grep -r` can easily exceed this;
-  // the paging marker tells the model what was elided. Tuneable per session.
+  // Cap at 10 images per tool_result. With ~19.5k chars/image at the 5×8
+  // production cell, a single-column tool_result can grow to ~195k chars
+  // before paging kicks in. A `find` over a big tree or `grep -r` can easily
+  // exceed this; the paging marker tells the model what was elided. Tuneable
+  // per session.
   maxImagesPerToolResult: 10,
   // English ~4 chars/tok default (= the CHARS_PER_TOKEN constant declared
   // later in this file — kept as a literal here to avoid forward-reference).
@@ -174,10 +179,10 @@ const DEFAULTS: Required<TransformOptions> = {
   // rows per image, dropping image count to ~15 and crossing break-even.
   // Set to 1 via `--multi-col 1` if the OCR ordering ever turns out wrong.
   multiCol: 2,
-  // R3 reflow ON by default — the L1 OCR eval cleared it: at the 7×10 cell
-  // reflowed text reads at 96%+ char accuracy (≈ baseline), and the ↵
-  // newline marker is comprehended (enlarging it changed nothing; the −15pp
-  // drop at the old 5×8 cell was pure pixel density, since fixed). See eval/.
+  // R3 reflow ON by default — the L1 OCR eval cleared it at the production
+  // 5×8 cell with the in-image instruction band (`reflow-inimage`): 98.95 %
+  // char accuracy on the 20-block corpus, +1pp over the text-only baseline.
+  // The ↵ newline marker is comprehended. See eval/.
   reflow: true,
 };
 
@@ -189,8 +194,8 @@ const DEFAULTS: Required<TransformOptions> = {
 // theoretical formula `(w × h) / 750` underpredicts actual Anthropic
 // billing by ~2.4×, so we anchor on the empirical number. Billing is ∝
 // pixel area, so we scale that anchor on two axes: by canvas WIDTH for the
-// cell-size change (the 7×10 production cell widens the cols=100 canvas to
-// 708 px — see TOKENS_PER_IMAGE_SINGLE_COL) and LINEARLY by numCols for
+// cell-size change (the production 5×8 cell keeps the cols=100 canvas at
+// 508 px — see TOKENS_PER_IMAGE_SINGLE_COL) and LINEARLY by numCols for
 // multi-col packing (N text columns side-by-side multiplies pixel area).
 //
 // Safety: the gate's job is to compress a block only when doing so saves
@@ -284,9 +289,11 @@ const TOKENS_PER_IMAGE_ANCHOR = 2500;
 const ANCHOR_CANVAS_WIDTH_PX = 508;
 /** Single-col per-image token cost at the CURRENT render cell. Derived from
  *  the 5×8 anchor by canvas-width ratio so it tracks cell-size changes the
- *  same way LINES_PER_IMAGE tracks cell height. The production cell is now
- *  7×10 (render.ts CELL_W/CELL_H), widening the cols=100 canvas to 708 px →
- *  ~3,484 tokens/image. */
+ *  same way LINES_PER_IMAGE tracks cell height. The production cell is the
+ *  bare 5×8 (render.ts DEFAULT_CELL_W_BONUS=0, DEFAULT_CELL_H_BONUS=0), so
+ *  the cols=100 canvas stays at 508 px → ~2,500 tokens/image (identity
+ *  with the anchor). The 7×10 path remains exercised by the eval harness'
+ *  cellWBonus / cellHBonus overrides and will recompute correctly here. */
 const TOKENS_PER_IMAGE_SINGLE_COL = Math.round(
   TOKENS_PER_IMAGE_ANCHOR *
     ((2 * PAD_X + DEFAULTS.cols * CELL_W) / ANCHOR_CANVAS_WIDTH_PX),
@@ -317,8 +324,8 @@ function effectiveTokensPerImage(numCols: number): number {
  *
  *  Formula: `floor((MAX_HEIGHT_PX − 2·PAD_Y) / CELL_H)`
  *
- *  At the production 7×10 cell, cols=100:
- *    floor((1568 − 8) / 10) = 156 rows → maxCharsPerImage = 100 × 156 = 15,600
+ *  At the production 5×8 cell, cols=100:
+ *    floor((1568 − 8) / 8) = 195 rows → maxCharsPerImage = 100 × 195 = 19,500
  *
  *  When the cell changes (render.ts DEFAULT_CELL_*_BONUS or a new atlas),
  *  this auto-updates and the break-even threshold moves with it. */

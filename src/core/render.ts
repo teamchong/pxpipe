@@ -43,11 +43,14 @@ export const PAD_X = 4;
 export const PAD_Y = 4;
 
 /** Default render-cell padding. The atlas glyph is ATLAS_CELL_W×ATLAS_CELL_H
- *  (5×8); production pads it to a 7×10 cell — the size the L1 OCR eval proved
- *  legible for dense, reflowed text on Opus 4.7 (96%+ char accuracy vs ~82%
- *  at a bare 5×8 cell, where adjacent glyphs bleed together under the vision
- *  encoder's downsample). RenderStyle.cellWBonus/cellHBonus override these
- *  (eval use only); with no style the renderer produces 7×10 cells. */
+ *  (5×8) and production ships the BARE cell — both bonuses are 0. The L1 OCR
+ *  sweep originally landed at 7×10 (96 % char accuracy vs ~82 % at naïve 5×8
+ *  on dense text), but the later combination of packed reflow + grayscale
+ *  atlas + the in-image instruction band (`reflow-inimage`) brought 5×8 back
+ *  to 98.95 % on Opus 4.7 — slightly above the text-only baseline — so the
+ *  production default reverted to the dense cell. RenderStyle.cellWBonus /
+ *  cellHBonus override these (eval use only); with no style the renderer
+ *  produces 5×8 cells. */
 export const DEFAULT_CELL_W_BONUS = 0;
 export const DEFAULT_CELL_H_BONUS = 0;
 /** Effective production render-cell pixel dimensions (atlas glyph + default
@@ -78,7 +81,7 @@ export interface RenderedImage {
 }
 
 /** Optional render-time styling. With every field unset the renderer renders
- *  at the production default 7×10 cell (see DEFAULT_CELL_W_BONUS /
+ *  at the production default 5×8 cell (see DEFAULT_CELL_W_BONUS /
  *  DEFAULT_CELL_H_BONUS). The eval harness overrides these per variant to
  *  A/B structure aids and cell sizes against OCR fidelity on densely-packed
  *  (reflowed) text. */
@@ -93,11 +96,11 @@ export interface RenderStyle {
   markerRed?: boolean;
   /** Blank pixel rows over the 8px atlas glyph (cell height = 8 + this). The
    *  glyph bitmap stays 8px tall; this widens the vertical pitch. Unset =
-   *  DEFAULT_CELL_H_BONUS (production 7×10 cell). */
+   *  DEFAULT_CELL_H_BONUS (production 5×8 cell). */
   cellHBonus?: number;
   /** Blank pixel columns over the 5px atlas glyph (cell width = 5 + this).
    *  The glyph bitmap stays 5px wide; a negative value makes adjacent glyphs
-   *  overlap. Unset = DEFAULT_CELL_W_BONUS (production 7×10 cell). */
+   *  overlap. Unset = DEFAULT_CELL_W_BONUS (production 5×8 cell). */
   cellWBonus?: number;
   /** Use the anti-aliased grayscale atlas (atlas-gray.ts) instead of the
    *  default 1-bit atlas. EVAL-ONLY — gated on this flag; the default path
@@ -708,8 +711,8 @@ export async function renderTextToPngs(
 // --- R2 multi-column rendering --------------------------------------------
 //
 // Single-column packing leaves Anthropic's 1568×1568 image area badly
-// under-used: at the 7×10 cell and cols=100, our render canvas is only
-// 708 px wide — ~45% of the horizontal budget. Most real Claude Code tool
+// under-used: at the 5×8 cell and cols=100, our render canvas is only
+// 508 px wide — ~32% of the horizontal budget. Most real Claude Code tool
 // docs + CLAUDE.md content wraps well under 100 chars/row, so we end up
 // paying the full per-image cost for an image that's mostly whitespace.
 //

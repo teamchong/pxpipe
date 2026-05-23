@@ -159,6 +159,23 @@ interface Totals {
    *  doesn't touch output). Without this the headline ignores half the
    *  bill on output-heavy sessions. */
   outputWeighted: number;
+  /** Sum of weighted actual input tokens across ALL requests that had a
+   *  usage block, regardless of whether the probe succeeded — i.e. every
+   *  request the user actually paid for, measured or not, transformed or
+   *  passthrough. Forms the honest denominator for "share of total spend
+   *  saved": you can only credit savings against the slice where pixelpipe
+   *  ran AND we measured, but you have to divide by the full bill (passthrough
+   *  + probe-failed + unmeasured + measured) to answer "did pixelpipe move
+   *  my real bill" instead of "did pixelpipe help on rows where it ran". */
+  allActualInputWeighted: number;
+  /** Sum of output_tokens × OUTPUT_TOKEN_RATE across the same all-rows set
+   *  as allActualInputWeighted. Output is on both sides of the savings ratio
+   *  at its actual 5× rate; numerator stays measured-rows-only because saved
+   *  cancels output (proxy doesn't touch it). */
+  allOutputWeighted: number;
+  /** Count of requests that contributed to allActualInputWeighted (had a
+   *  usage block). Lets the UI annotate "N of M paid requests". */
+  allUsageRequests: number;
   /** Sum of ground-truth output character counts from the SSE/JSON scanner
    *  (see `OutputMeasurement` in proxy.ts). These three accumulators are
    *  independent of Anthropic's `usage.output_tokens` — they let the operator
@@ -226,6 +243,9 @@ export class DashboardState {
     actualInputWeighted: 0,
     baselineInputWeighted: 0,
     outputWeighted: 0,
+    allActualInputWeighted: 0,
+    allOutputWeighted: 0,
+    allUsageRequests: 0,
     textCharsMeasured: 0,
     thinkingCharsMeasured: 0,
     toolUseCharsMeasured: 0,
@@ -377,6 +397,15 @@ export class DashboardState {
       this.totals.actualInputWeighted += actualInputEff;
       this.totals.outputWeighted += outputEquiv;
     }
+    // All-rows spend, ungated on the probe. The "share of total bill saved"
+    // headline divides measured-rows savings into this, so passthrough rows,
+    // probe-failed rows, and uncompressed rows all dilute the headline the
+    // same way they dilute the user's real bill.
+    if (haveUsage) {
+      this.totals.allActualInputWeighted += actualInputEff;
+      this.totals.allOutputWeighted += outputEquiv;
+      this.totals.allUsageRequests += 1;
+    }
 
     // Measurement totals are independent of usage/baseline gating — they
     // accumulate whenever the scanner produced numbers. The scanner sets
@@ -505,6 +534,18 @@ export class DashboardState {
     const baselineTotal = baseline + output;
     const actualTotal = actual + output;
     const pctTotal = baselineTotal > 0 ? (saved / baselineTotal) * 100 : 0;
+
+    // Share-of-all-spend: honest denominator. The numerator can only credit
+    // savings against rows where we have a probe baseline (otherwise it's
+    // estimation), but the denominator MUST include every request the user
+    // actually paid for — including passthrough rows, probe-failed rows,
+    // and untransformed turns the gate said no to. Otherwise the headline
+    // answers "did pixelpipe help on the rows where it ran" instead of
+    // "did pixelpipe move my real bill". The first is a cherry-pick.
+    const allActual = this.totals.allActualInputWeighted;
+    const allOutput = this.totals.allOutputWeighted;
+    const allSpend = allActual + allOutput;
+    const pctAllSpend = allSpend > 0 ? (saved / allSpend) * 100 : 0;
     const uptimeSec = Date.now() / 1000 - this.totals.startedAt;
     const payload = {
       requests: this.totals.requests,
@@ -517,6 +558,15 @@ export class DashboardState {
       saved_pct: round1(pctInput),
       saved_pct_input_only: round1(pctInput),
       saved_pct_of_total_bill: round1(pctTotal),
+      // Honest "share of total bill saved" — measured-rows numerator over
+      // ALL paid requests in the denominator (compressed + passthrough +
+      // probe-failed). This is the number users actually want when they
+      // ask "is pixelpipe helping". Negative when flap-pollution from
+      // passthrough turns exceeds the collapse win on measured turns.
+      saved_pct_of_all_spend: round1(pctAllSpend),
+      all_actual_input_weighted: Math.round(allActual),
+      all_output_weighted: Math.round(allOutput),
+      all_usage_requests: this.totals.allUsageRequests,
       saved_usd: round4((saved * ASSUMED_INPUT_USD_PER_MTOK) / 1e6),
       output_weighted: Math.round(output),
       baseline_token_equivalent: Math.round(baselineTotal),

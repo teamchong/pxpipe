@@ -53,35 +53,37 @@
 
   $: pctMath = s && pa
     ? `<div><span class="k">formula:</span> <span class="v">` +
-      ` share_of_bill = saved / (baseline_input + output × ` +
+      ` share_of_spend = saved / (all_actual_input + all_output × ` +
       (pa.output_multiplier ?? 5) +
       `)</span></div>` +
-      `<div><span class="k">why include output:</span> <span class="v">` +
-      `Anthropic's weekly meter counts input + output × 5, the proxy only moves input</span></div>` +
+      `<div><span class="k">why this denominator:</span> <span class="v">` +
+      `the question is "did pixelpipe move my real bill", not "did pixelpipe help on the slice it ran on". ` +
+      `The denominator is every paid request — compressed, passthrough, probe-failed — so passthrough rows ` +
+      `and flap-polluted turns count against the proxy the same way they count against the user.</span></div>` +
       `<div style="height:6px"></div>` +
-      row('saved', s.saved_input_tokens, '(input savings - proxy doesn\'t touch output)') +
-      row('baseline_input', s.baseline_input_weighted, '(cache-aware counterfactual)') +
+      row('saved', s.saved_input_tokens, '(measured-rows numerator; cache-aware)') +
+      row('all_actual_input', s.all_actual_input_weighted, '(every paid request, weighted)') +
       row(
-        'output',
-        ` × ` + (pa.output_multiplier ?? 5),
-        s.output_weighted + ' (weighted output tokens)',
+        'all_output × ' + (pa.output_multiplier ?? 5),
+        s.all_output_weighted,
+        '(every paid request, output × ' + (pa.output_multiplier ?? 5) + ')',
       ) +
       row(
-        'baseline_total',
-        s.baseline_input_weighted + s.output_weighted,
-        `<span class="op">=</span> baseline_input + output`,
+        'all_spend_total',
+        s.all_actual_input_weighted + s.all_output_weighted,
+        `<span class="op">=</span> all_actual_input + all_output`,
       ) +
       row(
-        'share_of_bill',
-        (s.saved_pct_of_total_bill || 0).toFixed(1) + '%',
-        `<span class="op">=</span> saved / baseline_total × 100`,
+        'share_of_spend',
+        (s.saved_pct_of_all_spend || 0).toFixed(1) + '%',
+        `<span class="op">=</span> saved / all_spend_total × 100`,
       ) +
       row(
-        'input-only %',
-        (s.saved_pct_input_only || 0).toFixed(1) + '%',
-        '(sub-line: saved / baseline_input × 100 - output excluded)',
+        'all_usage_requests',
+        s.all_usage_requests,
+        '(denominator request count - compressed + passthrough + probe-failed)',
       ) +
-      `<span class="src">measured - no estimation</span>`
+      `<span class="src">measured numerator, all-rows denominator - no cherry-pick</span>`
     : '';
 
   $: tokeqMath = s && pa
@@ -171,11 +173,10 @@
     {/if}
   </div>
   <div class="card">
-    <div class="label">share of total bill saved</div>
-    <div class="value pos">{(s?.saved_pct_of_total_bill ?? 0).toFixed(1)}%</div>
+    <div class="label">share of spend saved</div>
+    <div class="value" class:pos={(s?.saved_pct_of_all_spend ?? 0) >= 0} class:neg={(s?.saved_pct_of_all_spend ?? 0) < 0}>{(s?.saved_pct_of_all_spend ?? 0).toFixed(1)}%</div>
     <div class="small">
-      ÷ (input + 5×output) - output billed at 5× input rate · input-only:
-      <span class="pos">{(s?.saved_pct_input_only ?? 0).toFixed(1)}%</span>
+      ÷ all paid requests ({numFmt(s?.all_usage_requests)} req · compressed + passthrough + probe-failed) · negative = pixelpipe added cost
     </div>
     {#if s && pa}
       <details class="math">
@@ -235,6 +236,9 @@
   }
   .value.pos {
     color: #3fb950;
+  }
+  .value.neg {
+    color: #f85149;
   }
   .small {
     font-size: 11px;

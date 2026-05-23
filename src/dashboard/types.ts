@@ -15,7 +15,15 @@ export interface StatsPayload {
   /** Back-compat duplicate of `saved_pct_input_only`. */
   saved_pct: number;
   saved_pct_input_only: number;
+  /** DEPRECATED — denominator was filtered to measured-rows-only, which
+   *  cherry-picks the wins. Kept on the wire for back-compat. */
   saved_pct_of_total_bill: number;
+  /** Honest "share of total bill saved": measured-rows savings ÷ ALL paid
+   *  requests in the window (compressed + passthrough + probe-failed). */
+  saved_pct_of_all_spend: number;
+  all_actual_input_weighted: number;
+  all_output_weighted: number;
+  all_usage_requests: number;
   saved_usd: number;
   output_weighted: number;
   baseline_token_equivalent: number;

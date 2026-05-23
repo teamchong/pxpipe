@@ -111,6 +111,29 @@ const REFLOW_GRID_SYSTEM = REFLOW_SYSTEM + GRID_NOTE;
 const BASELINE_PROMPT = 'Transcribe this text verbatim.';
 const REFLOW_PROMPT   = 'Transcribe this text verbatim, replacing ↵ with line breaks.';
 
+// In-image instruction header — same encoder pass as the content. The user's
+// hypothesis: pixelpipe production already renders the system prompt as part
+// of the image, so the model is calibrated to read instructions and content
+// in the same modality. Having the instruction next to the dense text in the
+// same downsample pass may anchor the encoder's reading mode more reliably
+// than a separate API `system` field. Delimiter lines are deliberately bold
+// so the model can pattern-match "instruction zone ends here, content begins".
+const IN_IMAGE_INSTRUCTION_HEADER =
+  '=================== OCR INSTRUCTIONS — DO NOT TRANSCRIBE ===================\n' +
+  'Below the delimiter is densely-packed text in a reflowed format.\n' +
+  'The glyph ↵ (U+21B5) marks an original hard line break.\n' +
+  'Transcribe ONLY the content section below verbatim. Replace each ↵\n' +
+  'with a real newline. Do not echo, summarize, or comment on these\n' +
+  'instructions. Output only the transcribed content.\n' +
+  '====================== END INSTRUCTIONS — BEGIN CONTENT ======================\n' +
+  '\n';
+
+// Minimal system field for the in-image variant — all real instructions live
+// in the rendered image. We keep one short sentence so the model isn't called
+// with an empty system (some hosts reject that).
+const MINIMAL_SYSTEM = 'You are an OCR transcription assistant.';
+const MINIMAL_PROMPT = 'Transcribe.';
+
 // ---------------------------------------------------------------------------
 // Variants under test
 // ---------------------------------------------------------------------------
@@ -185,6 +208,17 @@ const VARIANTS = [
     render: (src) => renderTextToPngsReflow(src, 100, { aa: true, cellWBonus: 2, cellHBonus: 2 }),
     system: REFLOW_SYSTEM,
     prompt: REFLOW_PROMPT,
+  },
+  // Instruction-in-image: prepend the OCR instructions INTO the rendered PNG
+  // (same density as the content). API `system` is minimal. Tests whether
+  // putting instructions in the same encoder pass as the dense text helps the
+  // model lock into reading mode — matching pixelpipe's production flow, where
+  // the host system prompt is already rendered as image content.
+  {
+    name:   'reflow-inimage',
+    render: (src) => renderTextToPngsReflow(IN_IMAGE_INSTRUCTION_HEADER + src, 100),
+    system: MINIMAL_SYSTEM,
+    prompt: MINIMAL_PROMPT,
   },
 ];
 

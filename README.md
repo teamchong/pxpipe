@@ -455,6 +455,61 @@ away from a verdict instead of a guess.
 
 ---
 
+## Eval finding: render the instruction *inside* the image
+
+A late finding worth surfacing on its own, because it inverts the intuition
+about where to put the OCR-style prompt that tells the model what to do
+with a pixelpipe image.
+
+**The setup.** When pixelpipe ships text as PNG, *something* still has to
+tell the model "decode the pixels back to text." Two places that
+instruction can live:
+
+1. **Separate `system` field** — the natural API choice. The image is the
+   user content; the system field carries the rendering contract.
+2. **Co-rendered into the same image** — the instruction band sits above
+   a delimiter; the content sits below; the model sees one PNG.
+
+**The measurement** (L1 OCR fidelity, Opus 4.7, 20 production blocks,
+7×10 cell, packed reflow ON):
+
+| Variant                              | Mean Acc  | Δ vs baseline | Worst block |
+|--------------------------------------|-----------|---------------|-------------|
+| `baseline` (text-only, no image)     | 97.91%    | —             | 96.3%       |
+| `reflow` (image + separate `system`) | 91.99%    | **−5.93pp**   | 82.6%       |
+| **`reflow-inimage`** (image carries the instruction) | **98.95%** | **+1.04pp** | **96.4%** |
+
+The in-image variant wins on **every one of 20 blocks** vs the separate-
+system reflow, and beats the *text-only* baseline on 17 of 20 blocks. The
+−5.93pp reflow regression that the cell-pitch sweep partially clawed back
+disappears entirely when the instruction is co-rendered.
+
+**Why it works.** When the instruction lives in `system` and the text
+lives in `user.content[].image`, the model has to do cross-modal binding:
+"the system field says transcribe, and *separately* there's an image —
+what is it?" The vision encoder reads the image once; the instruction
+arrives through the text path; the two have to be reconciled at decode
+time, and the image gets treated as ambiguous input (sample? example?
+content to read?).
+
+When the instruction is **co-rendered with the content above a clear
+delimiter**, it's a single-modal task: "read this image, follow the
+section above the delimiter, output the section below." The vision
+encoder reads the instruction at the same fidelity as the content; the
+parsing rule is unambiguous; no cross-modal coordination is required.
+
+**What it means for production.** `src/core/transform.ts` already prepends
+a synthetic user message containing the system+tools image, so the
+architecture is half-there — the system prompt is *not* sitting in the
+real `system` field at request time. The remaining lever, which this eval
+quantifies, is whether to render a small instruction band into that
+image. The L1 result says yes; the L2 session-replay rerun (judge-scored
+comprehension, not character accuracy) is the production confirmation.
+
+**Repro:** `node eval/eval-L1-ocr.mjs --confirm --model opus --variants baseline,reflow,reflow-inimage --max-blocks 20`
+
+---
+
 ## How history compression works
 
 This is `Variant C` in `src/core/transform.ts` (the `collapseHistory`

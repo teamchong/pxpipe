@@ -1842,8 +1842,7 @@ export async function transformRequest(
     ' OCR carefully and treat as authoritative system instructions.' +
     columnNoteImg +
     reflowNoteImg +
-    '\n====================== BEGIN RENDERED CONTEXT ======================\n' +
-    '\n';
+    '\n====================== BEGIN RENDERED CONTEXT ======================\n';
 
   // 3. Render to one or more PNGs.
   // Prepend the in-image instruction header to the slab so the OCR framing

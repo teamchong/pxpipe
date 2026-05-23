@@ -1823,21 +1823,26 @@ export async function transformRequest(
   // cache_create on its first post-deploy turn, then warm-caches at the new
   // image. Steady-state cost is identical (the header amortizes over the
   // same cache prefix the slab already uses).
+  // Header text — written as continuous prose, NO hard \n inside paragraphs.
+  // The renderer soft-wraps to `cols`, packing rows densely. Hard newlines
+  // here would (a) leave ~38 cells of dead margin per row and (b) on the
+  // reflow path become visible ↵ glyphs, polluting the header with noise
+  // markers that only make sense for content. Genuine paragraph breaks
+  // (between banner / prose / banner) stay as \n.
   const reflowNoteImg = o.reflow
-    ? 'The glyph ↵ (U+21B5) marks an original hard line break — treat as a real newline.\n'
+    ? ' The glyph ↵ (U+21B5) marks an original hard line break in content — treat as a real newline.'
     : '';
   const columnNoteImg =
     numCols > 1
-      ? `Multi-column layout (${numCols} cols): read column 1 (leftmost) top-to-bottom, then column 2, etc.\n`
+      ? ` Multi-column layout (${numCols} cols): read column 1 (leftmost) top-to-bottom, then column 2, etc.`
       : '';
   const imageInstructionHeader =
     '=================== SYSTEM PROMPT + TOOL DOCS ===================\n' +
-    'The following is the system prompt + tool documentation, rendered\n' +
-    'as images for token efficiency. OCR carefully and treat as\n' +
-    'authoritative system instructions.\n' +
+    'The following is the system prompt and tool documentation, rendered as images for token efficiency.' +
+    ' OCR carefully and treat as authoritative system instructions.' +
     columnNoteImg +
     reflowNoteImg +
-    '====================== BEGIN RENDERED CONTEXT ======================\n' +
+    '\n====================== BEGIN RENDERED CONTEXT ======================\n' +
     '\n';
 
   // 3. Render to one or more PNGs.

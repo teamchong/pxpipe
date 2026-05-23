@@ -120,6 +120,32 @@ export interface TransformOptions {
    *  Cold-start safe: 0 disables the burn term entirely. Negative or
    *  non-finite values are clamped to 0. */
   priorWarmTokens?: number;
+  /** Symmetric counterpart of `priorWarmTokens` for the IMAGE-mode side.
+   *
+   *  When the prior turn rendered the static prefix as image blocks
+   *  (pixelpipe applied), Anthropic's prompt cache holds the IMAGE prefix,
+   *  not the text prefix. Declining compression on this turn — sending
+   *  plain text — invalidates the image-prefix cache key and forces a
+   *  fresh `cache_create` on the un-rewritten text prefix. Symmetric to
+   *  `priorWarmTokens`, the burn cost is
+   *
+   *    burn = priorWarmImageTokens × (CACHE_CREATE_RATE − CACHE_READ_RATE)
+   *
+   *  and is added to the TEXT side of the break-even comparison so the
+   *  gate stays in image mode when the image cache is already warm. This
+   *  is the foundational fix for gate flapping: without it the gate
+   *  re-decides every turn purely on per-turn cost and ping-pongs between
+   *  modes, paying cache_create on both sides.
+   *
+   *  Set by the host from a session-keyed LRU that remembers the prior
+   *  turn's chosen mode AND the upstream-observed cacheable prefix size
+   *  on that turn. Hosts populating `priorWarmTokens` SHOULD also
+   *  populate this; supplying one without the other biases the gate
+   *  toward whichever side has the asymmetric burn term.
+   *
+   *  Cold-start safe: 0 disables the burn term entirely. Negative or
+   *  non-finite values are clamped to 0. */
+  priorWarmImageTokens?: number;
   /** R3 reflow: re-pack each image-bound text block into a continuous
    *  sentinel-delimited stream so rendered rows fill `cols` instead of
    *  leaving line-end dead margin (measured glyph-fill ~29% → ~75-80%).
@@ -173,6 +199,7 @@ const DEFAULTS: Required<TransformOptions> = {
   // integer ≥ 2 via `historyAmortizationHorizon`. See option jsdoc.
   historyAmortizationHorizon: 1,
   priorWarmTokens: 0,
+  priorWarmImageTokens: 0,
   // R2 multi-column ON (2 cols) — at single-col the break-even gate
   // correctly rejects compression on real tool-doc-shaped slabs (~38 chars/
   // row → ~29 imgs vs 39k text tokens → net loss). Two columns packs ~2×
@@ -413,6 +440,65 @@ function maybeReflow(text: string, enabled: boolean): string {
  *  tests that pass only `textLen` keep working byte-identically at the
  *  current atlas. New call sites should pass `o.cols` so a runtime
  *  `--cols` override flows into the break-even math too. */
+/** Decompose the slab break-even gate's evaluation into its components.
+ *  Returns the exact `imageTokens`, `textTokens`, and symmetric burn
+ *  terms the gate uses internally. Pairs with `isCompressionProfitable`
+ *  for telemetry: callers can record the numbers without re-implementing
+ *  the formula and risking drift.
+ *
+ *  Returns `null` when the inputs are not finite or `textLen ≤ 0`.
+ *  Stays in sync with `isCompressionProfitable` because both use the
+ *  same constants and `effectiveTokensPerImage`. */
+export function evalCompressionProfitability(
+  textOrLen: string | number,
+  cols: number,
+  imageCountCap: number | undefined = undefined,
+  numCols: number = 1,
+  charsPerToken: number = CHARS_PER_TOKEN,
+  priorWarmTokens: number = 0,
+  priorWarmImageTokens: number = 0,
+): {
+  imageTokens: number;
+  textTokens: number;
+  burnImageSide: number;
+  burnTextSide: number;
+  profitable: boolean;
+} | null {
+  const n = Math.max(1, numCols | 0);
+  let estImages: number;
+  let textLen: number;
+  if (typeof textOrLen === 'string') {
+    estImages = estimateImageCount(textOrLen, cols, n);
+    textLen = textOrLen.length;
+  } else {
+    const charsPerImage = maxCharsPerImage(cols) * n;
+    estImages = Math.max(1, Math.ceil(textOrLen / charsPerImage));
+    textLen = textOrLen;
+  }
+  if (imageCountCap !== undefined && imageCountCap > 0) {
+    estImages = Math.min(estImages, imageCountCap);
+  }
+  if (!Number.isFinite(textLen) || textLen <= 0) return null;
+  const cpt = Number.isFinite(charsPerToken) && charsPerToken > 0
+    ? charsPerToken
+    : CHARS_PER_TOKEN;
+  const imageTokens = estImages * effectiveTokensPerImage(n);
+  const textTokens = textLen / cpt;
+  const burnImageSide = Number.isFinite(priorWarmTokens) && priorWarmTokens > 0
+    ? priorWarmTokens * (CACHE_CREATE_RATE - CACHE_READ_RATE)
+    : 0;
+  const burnTextSide = Number.isFinite(priorWarmImageTokens) && priorWarmImageTokens > 0
+    ? priorWarmImageTokens * (CACHE_CREATE_RATE - CACHE_READ_RATE)
+    : 0;
+  return {
+    imageTokens,
+    textTokens,
+    burnImageSide,
+    burnTextSide,
+    profitable: imageTokens + burnImageSide < textTokens + burnTextSide,
+  };
+}
+
 export function isCompressionProfitable(
   textOrLen: string | number,
   cols: number = DEFAULTS.cols,
@@ -428,6 +514,14 @@ export function isCompressionProfitable(
    *  rewritten prefix invalidates Anthropic's prior cache key. Default 0
    *  (cold-start behavior; matches pre-burn-aware callers byte-for-byte). */
   priorWarmTokens: number = 0,
+  /** Symmetric image-side burn: tokens the rewritten (IMAGE) path would
+   *  have hit cache on. Adds a one-time burn penalty of
+   *  `priorWarmImageTokens × (CACHE_CREATE_RATE − CACHE_READ_RATE)` to the
+   *  TEXT side — the cost of forcing a fresh cache_create on the
+   *  un-rewritten text prefix when the rewritten image prefix was warm.
+   *  Default 0 (back-compat; existing single-arg callers behave unchanged).
+   *  See PixelpipeOptions.priorWarmImageTokens for the foundational rationale. */
+  priorWarmImageTokens: number = 0,
 ): boolean {
   const n = Math.max(1, numCols | 0);
   let estImages: number;
@@ -457,16 +551,28 @@ export function isCompressionProfitable(
     : CHARS_PER_TOKEN;
   const imageTokensCost = estImages * effectiveTokensPerImage(n);
   const textTokensEquivalent = textLen / cpt;
-  // Cache-burn penalty: rewriting the cacheable prefix invalidates
-  // Anthropic's prior cache key. The un-rewritten path would have paid
-  // CACHE_READ_RATE on `priorWarmTokens`; the rewritten path pays
-  // CACHE_CREATE_RATE on the new prefix. The delta is borne entirely on
-  // this turn (subsequent turns warm the new prefix). Per-turn gate uses
-  // the full delta with no amortization; that's what `horizon=1` means.
-  const safeBurn = Number.isFinite(priorWarmTokens) && priorWarmTokens > 0
+  // Cache-burn penalty (symmetric form, ANTI-FLAPPING):
+  //
+  //   text→image flip: invalidate the warm text cache. Burn applied to
+  //                    the IMAGE side — discourages compressing when
+  //                    the text prefix is already warm.
+  //   image→text flip: invalidate the warm image cache. Burn applied to
+  //                    the TEXT side — discourages decompressing when
+  //                    the image prefix is already warm.
+  //
+  // Without the symmetric term the gate ping-pongs: once a session
+  // commits to a mode, single-turn cost can favor flipping, but the
+  // flip forces cache_create on the new side, then the next turn flips
+  // back. We pay cache_create twice. The symmetric burn pins the
+  // session in its current mode unless the per-turn delta exceeds the
+  // burn cost.
+  const burnImageSide = Number.isFinite(priorWarmTokens) && priorWarmTokens > 0
     ? priorWarmTokens * (CACHE_CREATE_RATE - CACHE_READ_RATE)
     : 0;
-  return imageTokensCost + safeBurn < textTokensEquivalent;
+  const burnTextSide = Number.isFinite(priorWarmImageTokens) && priorWarmImageTokens > 0
+    ? priorWarmImageTokens * (CACHE_CREATE_RATE - CACHE_READ_RATE)
+    : 0;
+  return imageTokensCost + burnImageSide < textTokensEquivalent + burnTextSide;
 }
 
 /**
@@ -517,9 +623,12 @@ export function isCompressionProfitableAmortized(
    *  Amortized across `horizon` turns at this gate (the prior cache is
    *  burned exactly once, on the first rewritten turn). Default 0. */
   priorWarmTokens: number = 0,
+  /** Symmetric image-side burn — see same-named param on
+   *  `isCompressionProfitable`. Default 0 (back-compat). */
+  priorWarmImageTokens: number = 0,
 ): boolean {
   if (!Number.isFinite(horizon) || horizon <= 1) {
-    return isCompressionProfitable(textOrLen, cols, imageCountCap, numCols, charsPerToken, priorWarmTokens);
+    return isCompressionProfitable(textOrLen, cols, imageCountCap, numCols, charsPerToken, priorWarmTokens, priorWarmImageTokens);
   }
   const N = Math.max(2, Math.floor(horizon));
   const n = Math.max(1, numCols | 0);
@@ -547,12 +656,16 @@ export function isCompressionProfitableAmortized(
   // assumptions.
   const imageLifetime = imageTokens * (CACHE_CREATE_RATE + CACHE_READ_RATE * (N - 1));
   const textLifetime = textTokens * CACHE_READ_RATE * N;
-  // Burn is paid exactly once (on the rewritten-prefix's first turn),
-  // amortized across N turns. Adds to the image side.
-  const safeBurn = Number.isFinite(priorWarmTokens) && priorWarmTokens > 0
+  // Symmetric burn — each side pays its own cache_create invalidation
+  // cost when the verdict flips its mode. See
+  // `isCompressionProfitable` for the full anti-flapping argument.
+  const burnImageSide = Number.isFinite(priorWarmTokens) && priorWarmTokens > 0
     ? priorWarmTokens * (CACHE_CREATE_RATE - CACHE_READ_RATE)
     : 0;
-  return imageLifetime + safeBurn < textLifetime;
+  const burnTextSide = Number.isFinite(priorWarmImageTokens) && priorWarmImageTokens > 0
+    ? priorWarmImageTokens * (CACHE_CREATE_RATE - CACHE_READ_RATE)
+    : 0;
+  return imageLifetime + burnImageSide < textLifetime + burnTextSide;
 }
 
 
@@ -706,6 +819,34 @@ export interface TransformInfo {
    *      returned false (image cost ≥ text cost at current cell config)
    *  Only emitted when at least one counter is > 0. */
   passthroughReasons?: { below_threshold?: number; not_profitable?: number };
+  /** Per-gate-call diagnostics — exactly what the slab break-even gate
+   *  saw and compared. Foundational observability for why a turn flipped
+   *  or stayed: hosts that persist this can compute the verdict margin
+   *  (`textTokens + burnTextSide − imageTokens − burnImageSide`),
+   *  measure flap-prevention efficacy (`burnTextSide` > 0 rows that
+   *  declined despite `imageTokens < textTokens`), and tune
+   *  `historyAmortizationHorizon` against observed cache lifetimes.
+   *
+   *  Currently emitted for the session-anchor slab gate only. Per-block
+   *  reminder / tool_result gates remain summarised in `passthroughReasons`
+   *  + `bucketChars` — adding per-call diagnostics there would multiply
+   *  event size without commensurate signal (those gates don't flap). */
+  gateEval?: {
+    /** "slab" today; reserved for future gates if they grow flapping risk. */
+    readonly site: 'slab';
+    /** Image-side cost estimate the gate used (token-equivalents). */
+    readonly imageTokens: number;
+    /** Text-side cost estimate the gate used (token-equivalents). */
+    readonly textTokens: number;
+    /** `priorWarmTokens × (1.25 − 0.10)` applied to the image side. */
+    readonly burnImageSide: number;
+    /** `priorWarmImageTokens × (1.25 − 0.10)` applied to the text side.
+     *  Non-zero rows are the anti-flapping anchor — text would otherwise
+     *  have looked cheaper. */
+    readonly burnTextSide: number;
+    /** Gate's verdict; `true` ⇒ compression applied on this turn. */
+    readonly profitable: boolean;
+  };
   /** Per-bucket sum of TEXT chars that flowed through each gate-call site
    *  (static slab, reminder, tool_result by classifyContent shape, history).
    *  Pre-compaction lengths — stays comparable to `origChars` and to what
@@ -1801,7 +1942,20 @@ export async function transformRequest(
   const slabCpt = opts.charsPerToken !== undefined
     ? o.charsPerToken
     : SLAB_CHARS_PER_TOKEN;
-  if (!isCompressionProfitable(combined, o.cols, undefined, numCols, slabCpt, o.priorWarmTokens)) {
+  const slabGateEval = evalCompressionProfitability(
+    combined, o.cols, undefined, numCols, slabCpt, o.priorWarmTokens, o.priorWarmImageTokens,
+  );
+  if (slabGateEval) {
+    info.gateEval = {
+      site: 'slab',
+      imageTokens: slabGateEval.imageTokens,
+      textTokens: slabGateEval.textTokens,
+      burnImageSide: slabGateEval.burnImageSide,
+      burnTextSide: slabGateEval.burnTextSide,
+      profitable: slabGateEval.profitable,
+    };
+  }
+  if (!isCompressionProfitable(combined, o.cols, undefined, numCols, slabCpt, o.priorWarmTokens, o.priorWarmImageTokens)) {
     info.reason = `not_profitable (slab=${combined.length} chars)`;
     bumpPassthrough(info, 'not_profitable');
     // Slab failed the break-even gate, but message history may still be

@@ -1714,8 +1714,17 @@ async function runHistoryCollapseAndFinalize(
       ? o.charsPerToken
       : HISTORY_CHARS_PER_TOKEN;
     const horizon = Math.max(1, Math.floor(o.historyAmortizationHorizon));
+    // Pass the symmetric warm-cache burn through to the history-collapse
+    // gate as well. The slab gate alone got the symmetric treatment, which
+    // let the history gate flip a session out of image mode even when
+    // symmetric burn would have kept the slab gate in. Production data
+    // 2026-05-23 showed three-turn sessions paying cache_create every
+    // turn because the history gate ignored priorWarmImageTokens.
     const historyProfitable = (text: string, cols: number): boolean =>
-      isCompressionProfitableAmortized(text, cols, undefined, 1, historyCpt, horizon, 0);
+      isCompressionProfitableAmortized(
+        text, cols, undefined, 1, historyCpt, horizon,
+        o.priorWarmTokens, o.priorWarmImageTokens,
+      );
     const { messages: newMessages, info: histInfo } = await collapseHistory(
       req.messages,
       historyProfitable,
@@ -2322,8 +2331,17 @@ export async function transformRequest(
       ? o.charsPerToken
       : HISTORY_CHARS_PER_TOKEN;
     const horizon = Math.max(1, Math.floor(o.historyAmortizationHorizon));
+    // Pass the symmetric warm-cache burn through to the history-collapse
+    // gate as well. The slab gate alone got the symmetric treatment, which
+    // let the history gate flip a session out of image mode even when
+    // symmetric burn would have kept the slab gate in. Production data
+    // 2026-05-23 showed three-turn sessions paying cache_create every
+    // turn because the history gate ignored priorWarmImageTokens.
     const historyProfitable = (text: string, cols: number): boolean =>
-      isCompressionProfitableAmortized(text, cols, undefined, 1, historyCpt, horizon, 0);
+      isCompressionProfitableAmortized(
+        text, cols, undefined, 1, historyCpt, horizon,
+        o.priorWarmTokens, o.priorWarmImageTokens,
+      );
     const { messages: newMessages, info: histInfo } = await collapseHistory(
       req.messages,
       historyProfitable,

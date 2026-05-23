@@ -3,12 +3,13 @@
  * eval/eval-l2-session.mjs  —  Level 2: Task-level A/B Session Replay
  *
  * For each session in eval/corpus/sessions.json:
- *   1. Render the conversation history both ways:
+ *   1. Render the conversation history three ways:
  *        baseline  → renderTextToPngs()
  *        reflow    → renderTextToPngsReflow()
+ *        aa        → renderTextToPngsReflow(..., { aa: true })
  *   2. Ask the model to produce the next turn in the conversation,
  *      using each rendered history as context
- *   3. Use a model-judge to score whether the reflow-history answer is
+ *   3. Use a model-judge to score whether the reflow/aa-history answer is
  *      as good as the baseline-history answer (0–1 scale)
  *   4. Aggregate and write eval/results/l2-report.md
  *
@@ -174,12 +175,13 @@ for (let idx = 0; idx < sessions.length; idx++) {
   const questionText = session.questionText;
   const expectedAnswer = session.expectedAnswer;
 
-  // --- Render history both ways ---
-  let baselineImages, reflowImages;
+  // --- Render history three ways ---
+  let baselineImages, reflowImages, aaImages;
   try {
-    [baselineImages, reflowImages] = await Promise.all([
+    [baselineImages, reflowImages, aaImages] = await Promise.all([
       renderTextToPngs(historyText),
       renderTextToPngsReflow(historyText),
+      renderTextToPngsReflow(historyText, 100, { aa: true }),
     ]);
   } catch (err) {
     console.error(`  ERROR rendering session ${idx}: ${err.message}`);
@@ -187,7 +189,7 @@ for (let idx = 0; idx < sessions.length; idx++) {
   }
 
   if (VERBOSE) {
-    console.log(`  baseline: ${baselineImages.length} PNG(s), reflow: ${reflowImages.length} PNG(s)`);
+    console.log(`  baseline: ${baselineImages.length} PNG(s), reflow: ${reflowImages.length} PNG(s), aa: ${aaImages.length} PNG(s)`);
     console.log(`  question: ${questionText.slice(0, 80)}…`);
   }
 
@@ -224,11 +226,28 @@ for (let idx = 0; idx < sessions.length; idx++) {
     },
   ];
 
-  let baselineResp, reflowResp;
+  // --- AA replay call ---
+  const aaMessages = [
+    {
+      role: 'user',
+      content: [
+        ...toImageBlocks(aaImages),
+        {
+          type: 'text',
+          text: `The above images contain the conversation history in reflowed format.\n` +
+                `Note: the ↵ glyph (U+21B5) in the images denotes a hard line break.\n\n` +
+                `User question: ${questionText}`,
+        },
+      ],
+    },
+  ];
+
+  let baselineResp, reflowResp, aaResp;
   try {
-    [baselineResp, reflowResp] = await Promise.all([
+    [baselineResp, reflowResp, aaResp] = await Promise.all([
       replayClient.messages({ system: REPLAY_SYSTEM, messages: baselineMessages, max_tokens: 512 }),
       replayClient.messages({ system: REPLAY_SYSTEM, messages: reflowMessages,   max_tokens: 512 }),
+      replayClient.messages({ system: REPLAY_SYSTEM, messages: aaMessages,       max_tokens: 512 }),
     ]);
   } catch (err) {
     console.error(`  ERROR in replay calls for session ${idx}: ${err.message}`);
@@ -237,9 +256,10 @@ for (let idx = 0; idx < sessions.length; idx++) {
 
   const baselineAnswer = baselineResp.content?.[0]?.text ?? '';
   const reflowAnswer   = reflowResp.content?.[0]?.text ?? '';
+  const aaAnswer       = aaResp.content?.[0]?.text ?? '';
 
-  // --- Judge call ---
-  const judgeMessages = [
+  // --- Judge calls (reflow vs baseline, aa vs baseline) ---
+  const judgeMessagesReflow = [
     {
       role: 'user',
       content: `QUESTION:\n${questionText}\n\n` +
@@ -248,43 +268,66 @@ for (let idx = 0; idx < sessions.length; idx++) {
     },
   ];
 
-  let judgeResp;
+  const judgeMessagesAa = [
+    {
+      role: 'user',
+      content: `QUESTION:\n${questionText}\n\n` +
+               `REFERENCE ANSWER (baseline rendering):\n${baselineAnswer}\n\n` +
+               `CANDIDATE ANSWER (aa rendering):\n${aaAnswer}`,
+    },
+  ];
+
+  let judgeRespReflow, judgeRespAa;
   try {
-    judgeResp = await judgeClient.messages({ system: JUDGE_SYSTEM, messages: judgeMessages, max_tokens: 256 });
+    [judgeRespReflow, judgeRespAa] = await Promise.all([
+      judgeClient.messages({ system: JUDGE_SYSTEM, messages: judgeMessagesReflow, max_tokens: 256 }),
+      judgeClient.messages({ system: JUDGE_SYSTEM, messages: judgeMessagesAa,     max_tokens: 256 }),
+    ]);
   } catch (err) {
-    console.error(`  ERROR in judge call for session ${idx}: ${err.message}`);
+    console.error(`  ERROR in judge calls for session ${idx}: ${err.message}`);
     continue;
   }
 
-  // Parse judge response
-  let judgeResult = { score: 0.5, verdict: 'borderline', reasoning: 'parse error' };
-  try {
-    const text = judgeResp.content?.[0]?.text ?? '{}';
-    // Strip any accidental markdown fencing
-    const cleaned = text.replace(/^```[^\n]*\n?/m, '').replace(/```$/m, '').trim();
-    judgeResult = JSON.parse(cleaned);
-  } catch (e) {
-    console.error(`  WARNING: Could not parse judge JSON: ${judgeResp.content?.[0]?.text?.slice(0, 100)}`);
-  }
+  // Parse judge responses
+  const parseJudge = (resp, label) => {
+    try {
+      const text = resp.content?.[0]?.text ?? '{}';
+      const cleaned = text.replace(/^```[^\n]*\n?/m, '').replace(/```$/m, '').trim();
+      return JSON.parse(cleaned);
+    } catch (e) {
+      console.error(`  WARNING: Could not parse ${label} judge JSON: ${resp.content?.[0]?.text?.slice(0, 100)}`);
+      return { score: 0.5, verdict: 'borderline', reasoning: 'parse error' };
+    }
+  };
+
+  const judgeResultReflow = parseJudge(judgeRespReflow, 'reflow');
+  const judgeResultAa     = parseJudge(judgeRespAa, 'aa');
 
   if (VERBOSE) {
-    console.log(`  Judge score: ${judgeResult.score}  verdict: ${judgeResult.verdict}`);
-    console.log(`  Reasoning:   ${judgeResult.reasoning}`);
+    console.log(`  Reflow judge score: ${judgeResultReflow.score}  verdict: ${judgeResultReflow.verdict}`);
+    console.log(`  AA     judge score: ${judgeResultAa.score}  verdict: ${judgeResultAa.verdict}`);
+    console.log(`  Reflow reasoning:   ${judgeResultReflow.reasoning}`);
+    console.log(`  AA     reasoning:   ${judgeResultAa.reasoning}`);
   }
 
   results.push({
-    sessionIdx:         idx,
-    sessionId:          session.sessionId,
-    totalTurns:         session.totalTurns,
-    historyCharCount:   session.historyCharCount,
-    baselineImageCount: baselineImages.length,
-    reflowImageCount:   reflowImages.length,
-    baselineAnswer:     baselineAnswer.slice(0, 300),
-    reflowAnswer:       reflowAnswer.slice(0, 300),
-    judgeScore:         judgeResult.score,
-    judgeVerdict:       judgeResult.verdict,
-    judgeReasoning:     judgeResult.reasoning,
-    dryRun:             DRY_RUN,
+    sessionIdx:           idx,
+    sessionId:            session.sessionId,
+    totalTurns:           session.totalTurns,
+    historyCharCount:     session.historyCharCount,
+    baselineImageCount:   baselineImages.length,
+    reflowImageCount:     reflowImages.length,
+    aaImageCount:         aaImages.length,
+    baselineAnswer:       baselineAnswer.slice(0, 300),
+    reflowAnswer:         reflowAnswer.slice(0, 300),
+    aaAnswer:             aaAnswer.slice(0, 300),
+    judgeScore:           judgeResultReflow.score,
+    judgeVerdict:         judgeResultReflow.verdict,
+    judgeReasoning:       judgeResultReflow.reasoning,
+    aaJudgeScore:         judgeResultAa.score,
+    aaJudgeVerdict:       judgeResultAa.verdict,
+    aaJudgeReasoning:     judgeResultAa.reasoning,
+    dryRun:               DRY_RUN,
   });
 }
 
@@ -292,6 +335,7 @@ for (let idx = 0; idx < sessions.length; idx++) {
 // Aggregate
 // ---------------------------------------------------------------------------
 
+// Reflow arm aggregates
 const scores   = results.map(r => r.judgeScore);
 const verdicts = results.map(r => r.judgeVerdict);
 
@@ -303,6 +347,21 @@ const passRate    = results.length > 0 ? passCount / results.length : 0;
 
 const imageSavingsPct = results.length > 0
   ? (1 - results.reduce((s, r) => s + r.reflowImageCount, 0) /
+         Math.max(1, results.reduce((s, r) => s + r.baselineImageCount, 0))) * 100
+  : 0;
+
+// AA arm aggregates
+const aaScores   = results.map(r => r.aaJudgeScore);
+const aaVerdicts = results.map(r => r.aaJudgeVerdict);
+
+const aaMeanScore   = aaScores.length > 0 ? aaScores.reduce((s, v) => s + v, 0) / aaScores.length : 0;
+const aaPassCount   = aaVerdicts.filter(v => v === 'pass').length;
+const aaBorderCount = aaVerdicts.filter(v => v === 'borderline').length;
+const aaFailCount   = aaVerdicts.filter(v => v === 'fail').length;
+const aaPassRate    = results.length > 0 ? aaPassCount / results.length : 0;
+
+const aaImageSavingsPct = results.length > 0
+  ? (1 - results.reduce((s, r) => s + r.aaImageCount, 0) /
          Math.max(1, results.reduce((s, r) => s + r.baselineImageCount, 0))) * 100
   : 0;
 
@@ -323,26 +382,26 @@ const reportLines = [
   ``,
   `## Summary`,
   ``,
-  `| Metric | Value |`,
-  `|--------|-------|`,
-  `| Mean judge score | ${(meanScore * 100).toFixed(1)}% |`,
-  `| Pass rate (score ≥ 0.75) | ${(passRate * 100).toFixed(1)}% (${passCount}/${results.length}) |`,
-  `| Borderline (0.5–0.75) | ${borderCount} |`,
-  `| Fail (< 0.5) | ${failCount} |`,
-  `| Image count savings | ${imageSavingsPct.toFixed(1)}% fewer images |`,
+  `| Metric | Reflow | AA |`,
+  `|--------|--------|----|`,
+  `| Mean judge score | ${(meanScore * 100).toFixed(1)}% | ${(aaMeanScore * 100).toFixed(1)}% |`,
+  `| Pass rate (score ≥ 0.75) | ${(passRate * 100).toFixed(1)}% (${passCount}/${results.length}) | ${(aaPassRate * 100).toFixed(1)}% (${aaPassCount}/${results.length}) |`,
+  `| Borderline (0.5–0.75) | ${borderCount} | ${aaBorderCount} |`,
+  `| Fail (< 0.5) | ${failCount} | ${aaFailCount} |`,
+  `| Image count savings | ${imageSavingsPct.toFixed(1)}% fewer images | ${aaImageSavingsPct.toFixed(1)}% fewer images |`,
   ``,
   `## Interpretation`,
   ``,
-  `- **Mean score ≥ 0.80 + pass rate ≥ 80%** → reflow history is production-safe`,
+  `- **Mean score ≥ 0.80 + pass rate ≥ 80%** → arm history is production-safe`,
   `- **Mean score 0.65–0.79 or pass rate 60–79%** → borderline; investigate failing sessions`,
-  `- **Mean score < 0.65 or pass rate < 60%** → reflow causes material comprehension loss; do not ship`,
+  `- **Mean score < 0.65 or pass rate < 60%** → arm causes material comprehension loss; do not ship`,
   ``,
   `## Per-Session Results`,
   ``,
-  `| # | Session | Turns | Hist Chars | Base PNGs | Reflow PNGs | Judge Score | Verdict |`,
-  `|---|---------|-------|------------|-----------|-------------|-------------|---------|`,
+  `| # | Session | Turns | Hist Chars | Base PNGs | Reflow PNGs | AA PNGs | Reflow Score | Reflow Verdict | AA Score | AA Verdict |`,
+  `|---|---------|-------|------------|-----------|-------------|---------|--------------|----------------|----------|------------|`,
   ...results.map(r =>
-    `| ${r.sessionIdx + 1} | ${r.sessionId.slice(0, 12)}… | ${r.totalTurns} | ${r.historyCharCount} | ${r.baselineImageCount} | ${r.reflowImageCount} | ${(r.judgeScore * 100).toFixed(0)}% | ${r.judgeVerdict} |`
+    `| ${r.sessionIdx + 1} | ${r.sessionId.slice(0, 12)}… | ${r.totalTurns} | ${r.historyCharCount} | ${r.baselineImageCount} | ${r.reflowImageCount} | ${r.aaImageCount} | ${(r.judgeScore * 100).toFixed(0)}% | ${r.judgeVerdict} | ${(r.aaJudgeScore * 100).toFixed(0)}% | ${r.aaJudgeVerdict} |`
   ),
   ``,
   `## Session Details`,
@@ -350,15 +409,20 @@ const reportLines = [
   ...results.flatMap(r => [
     `### Session ${r.sessionIdx + 1}: ${r.sessionId.slice(0, 20)}`,
     ``,
-    `**Judge score:** ${(r.judgeScore * 100).toFixed(0)}%  **Verdict:** ${r.judgeVerdict}`,
+    `**Reflow judge score:** ${(r.judgeScore * 100).toFixed(0)}%  **Verdict:** ${r.judgeVerdict}`,
+    `**AA judge score:** ${(r.aaJudgeScore * 100).toFixed(0)}%  **Verdict:** ${r.aaJudgeVerdict}`,
     ``,
-    `**Reasoning:** ${r.judgeReasoning}`,
+    `**Reflow reasoning:** ${r.judgeReasoning}`,
+    `**AA reasoning:** ${r.aaJudgeReasoning}`,
     ``,
     `**Baseline answer (excerpt):**`,
     `> ${r.baselineAnswer.slice(0, 200).replace(/\n/g, '\n> ')}`,
     ``,
     `**Reflow answer (excerpt):**`,
     `> ${r.reflowAnswer.slice(0, 200).replace(/\n/g, '\n> ')}`,
+    ``,
+    `**AA answer (excerpt):**`,
+    `> ${r.aaAnswer.slice(0, 200).replace(/\n/g, '\n> ')}`,
     ``,
     `---`,
     ``,
@@ -370,19 +434,30 @@ const reportPath = join(OUT_DIR, 'l2-report.md');
 writeFileSync(reportPath, reportLines.join('\n'), 'utf8');
 
 const jsonPath = join(OUT_DIR, 'l2-results.json');
-writeFileSync(jsonPath, JSON.stringify({ results, meanScore, passRate, imageSavingsPct, dryRun: DRY_RUN }, null, 2), 'utf8');
+writeFileSync(jsonPath, JSON.stringify({
+  results,
+  meanScore, passRate, imageSavingsPct,
+  aaMeanScore, aaPassRate, aaImageSavingsPct,
+  dryRun: DRY_RUN,
+}, null, 2), 'utf8');
 
 // ---------------------------------------------------------------------------
 // Console summary
 // ---------------------------------------------------------------------------
 
-console.log(`\n${'─'.repeat(60)}`);
+console.log(`\n${'─'.repeat(64)}`);
 console.log(`  L2 SESSION REPLAY SUMMARY  (${DRY_RUN ? 'DRY RUN' : 'REAL'})`);
-console.log(`${'─'.repeat(60)}`);
-console.log(`  Sessions evaluated:  ${results.length}`);
-console.log(`  Mean judge score:    ${(meanScore * 100).toFixed(1)}%`);
-console.log(`  Pass / borderline / fail: ${passCount} / ${borderCount} / ${failCount}`);
-console.log(`  Pass rate:           ${(passRate * 100).toFixed(1)}%`);
-console.log(`  Image savings:       ${imageSavingsPct.toFixed(1)}%`);
-console.log(`  Report:              ${reportPath}`);
-console.log(`${'─'.repeat(60)}\n`);
+console.log(`${'─'.repeat(64)}`);
+console.log(`  Sessions evaluated:        ${results.length}`);
+console.log(`  ── reflow arm ──────────────────────────────────────────`);
+console.log(`  Mean judge score:          ${(meanScore * 100).toFixed(1)}%`);
+console.log(`  Pass / borderline / fail:  ${passCount} / ${borderCount} / ${failCount}`);
+console.log(`  Pass rate:                 ${(passRate * 100).toFixed(1)}%`);
+console.log(`  Image savings:             ${imageSavingsPct.toFixed(1)}%`);
+console.log(`  ── aa arm ──────────────────────────────────────────────`);
+console.log(`  Mean judge score:          ${(aaMeanScore * 100).toFixed(1)}%`);
+console.log(`  Pass / borderline / fail:  ${aaPassCount} / ${aaBorderCount} / ${aaFailCount}`);
+console.log(`  Pass rate:                 ${(aaPassRate * 100).toFixed(1)}%`);
+console.log(`  Image savings:             ${aaImageSavingsPct.toFixed(1)}%`);
+console.log(`  Report:                    ${reportPath}`);
+console.log(`${'─'.repeat(64)}\n`);

@@ -125,6 +125,43 @@ export async function encodeGrayPng(pixels: Uint8Array, width: number, height: n
 }
 
 /**
+ * Encode an RGB buffer as PNG bytes (color type 2 = truecolor).
+ *
+ * @param pixels  3 bytes/pixel (R,G,B), row-major, length = width × height × 3.
+ * @param width   Pixel width.
+ * @param height  Pixel height.
+ */
+export async function encodeRgbPng(pixels: Uint8Array, width: number, height: number): Promise<Uint8Array> {
+  if (pixels.length !== width * height * 3) {
+    throw new Error(`encodeRgbPng: pixels.length=${pixels.length} != ${width}×${height}×3=${width * height * 3}`);
+  }
+
+  // IHDR: width(4) height(4) bitDepth(1) colorType(1=2 truecolor) ...
+  const ihdr = new Uint8Array(13);
+  ihdr.set(u32be(width), 0);
+  ihdr.set(u32be(height), 4);
+  ihdr[8] = 8; // bit depth per channel
+  ihdr[9] = 2; // color type 2 = truecolor RGB
+
+  // Per-scanline filter byte (0 = None); 3 bytes per pixel.
+  const stride = width * 3 + 1;
+  const raw = new Uint8Array(stride * height);
+  for (let y = 0; y < height; y++) {
+    raw[y * stride] = 0; // filter: None
+    raw.set(pixels.subarray(y * width * 3, (y + 1) * width * 3), y * stride + 1);
+  }
+
+  const compressed = await deflateZlib(raw);
+
+  return concat([
+    PNG_SIGNATURE,
+    chunk('IHDR', ihdr),
+    chunk('IDAT', compressed),
+    chunk('IEND', new Uint8Array(0)),
+  ]);
+}
+
+/**
  * Base64-encode bytes in a way that works in both Node and Workers.
  * `btoa` is global in both, but only accepts binary strings — we hand-roll
  * to avoid the `String.fromCharCode(...big array)` blow-up.

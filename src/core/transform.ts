@@ -27,10 +27,13 @@ import {
   reflow,
   maxFittingCols,
   MAX_HEIGHT_PX,
+  NL_SENTINEL,
+  PAD_X,
   PAD_Y,
+  CELL_W,
+  CELL_H,
 } from './render.js';
 import { bytesToBase64 } from './png.js';
-import { ATLAS_CELL_H } from './atlas.js';
 import { collapseHistory } from './history.js';
 import { CACHE_CREATE_RATE, CACHE_READ_RATE } from './baseline.js';
 
@@ -124,9 +127,9 @@ export interface TransformOptions {
    *  caller is responsible for telling the model via a system-prompt note
    *  that ↵ denotes a line break.
    *
-   *  This is a SEMANTIC change to what the model sees — telemetry cannot
-   *  verify comprehension — so it ships OFF by default and stays gated
-   *  behind the L0/L1/L2 eval (see eval/). Default false. */
+   *  ON by default: the L1 OCR eval cleared it — reflowed text reads at
+   *  96%+ char accuracy at the 7×10 cell and the ↵ marker is comprehended.
+   *  Hosts can still force it off per request (e.g. for an A/B). */
   reflow?: boolean;
 }
 
@@ -140,21 +143,21 @@ const DEFAULTS: Required<TransformOptions> = {
   // Coarse pre-filter — blocks below this length skip the per-block
   // break-even check entirely (saves CPU on the obviously-not-profitable
   // cases). The REAL gate is `isCompressionProfitable()` below; this is
-  // just a fast-path skip. Set to 10,000 (= break-even point at the
-  // current cell config) so anything below it can't possibly net-save.
-  minReminderChars: 10000,
-  minToolResultChars: 10000,
+  // just a fast-path skip. Set to 14,000 (≈ TOKENS_PER_IMAGE_SINGLE_COL ×
+  // CHARS_PER_TOKEN at the 7×10 cell: ~3,484 × 4) so anything below it
+  // can't possibly net-save on the reminder/tool_result path (cpt=4).
+  minReminderChars: 14000,
+  minToolResultChars: 14000,
   // NOTE: Anthropic's `system` field accepts text blocks only — image blocks
   // there come back as `400 system.N.type: Input should be 'text'`. Images
   // are always attached to the first user message; there's no flag for this
   // because the system-field path is API-rejected. (Removed `placement` +
   // `compressSystem` knobs that gated the dead system-field branch.)
   cols: 100,
-  // Cap at 10 images per tool_result. With ~19.5k chars/image at the current
-  // 5×8 atlas, a single-column tool_result can grow to ~195k chars before
-  // paging kicks in. A
-  // `find` over a big tree or `grep -r` can easily exceed this; the paging
-  // marker tells the model what was elided. Tuneable per session.
+  // Cap at 10 images per tool_result. With ~15.6k chars/image at the 7×10
+  // cell, a single-column tool_result can grow to ~156k chars before paging
+  // kicks in. A `find` over a big tree or `grep -r` can easily exceed this;
+  // the paging marker tells the model what was elided. Tuneable per session.
   maxImagesPerToolResult: 10,
   // English ~4 chars/tok default (= the CHARS_PER_TOKEN constant declared
   // later in this file — kept as a literal here to avoid forward-reference).
@@ -171,21 +174,24 @@ const DEFAULTS: Required<TransformOptions> = {
   // rows per image, dropping image count to ~15 and crossing break-even.
   // Set to 1 via `--multi-col 1` if the OCR ordering ever turns out wrong.
   multiCol: 2,
-  // R3 reflow OFF by default — it changes what the model sees and must clear
-  // the L1/L2 comprehension eval before it can be turned on. See eval/.
-  reflow: false,
+  // R3 reflow ON by default — the L1 OCR eval cleared it: at the 7×10 cell
+  // reflowed text reads at 96%+ char accuracy (≈ baseline), and the ↵
+  // newline marker is comprehended (enlarging it changed nothing; the −15pp
+  // drop at the old 5×8 cell was pure pixel density, since fixed). See eval/.
+  reflow: true,
 };
 
 // --- per-block break-even check ---
 //
-// Anthropic's real per-image cost is ~2,500 tokens at SINGLE-COL
-// (history-researcher's round-3 N=33 measurement on cold-miss events
-// 2026-05-18, single-col 508×1559 PNGs). The published theoretical
-// formula `(w × h) / 750` gives ~1,056 tokens for that geometry and
-// underpredicts actual Anthropic billing by ~2.4×. We use the empirical
-// 2,500 at numCols=1 and SCALE LINEARLY by numCols for wider canvases
-// (multi-col packs N text columns side-by-side, multiplying pixel area
-// and — per Anthropic's area-proportional billing model — token cost).
+// Anthropic's real per-image cost is ~2,500 tokens for a single-col PNG at
+// the OLD 5×8 atlas cell — a 508×1559 canvas (history-researcher's round-3
+// N=33 measurement on cold-miss events 2026-05-18). The published
+// theoretical formula `(w × h) / 750` underpredicts actual Anthropic
+// billing by ~2.4×, so we anchor on the empirical number. Billing is ∝
+// pixel area, so we scale that anchor on two axes: by canvas WIDTH for the
+// cell-size change (the 7×10 production cell widens the cols=100 canvas to
+// 708 px — see TOKENS_PER_IMAGE_SINGLE_COL) and LINEARLY by numCols for
+// multi-col packing (N text columns side-by-side multiplies pixel area).
 //
 // Safety: the gate's job is to compress a block only when doing so saves
 // tokens. The constants below bias CONSERVATIVE — every uncertainty
@@ -267,10 +273,24 @@ export const SLAB_CHARS_PER_TOKEN = 2.0;
  *  see it in the dashboard before any net-loss compression. */
 export const HISTORY_CHARS_PER_TOKEN = 2.0;
 
-/** Empirical per-image cost at numCols=1. Source: dashboard.ts measurement
- *  trace. Kept here as a constant rather than imported from dashboard.ts
- *  to keep `src/core/` free of dashboard imports — that's a one-way edge. */
-const TOKENS_PER_IMAGE_SINGLE_COL = 2500;
+/** Empirical per-image cost ANCHOR: 2,500 tokens for a single-col PNG at the
+ *  OLD 5×8 atlas cell — a 508 px-wide canvas at cols=100 (history-researcher
+ *  N=33 cold-miss measurement, 2026-05-18). Anthropic bills ∝ pixel area; a
+ *  full image is always height-capped at MAX_HEIGHT_PX, so per-image cost
+ *  scales with canvas WIDTH. Kept as a constant rather than imported from
+ *  dashboard.ts to keep `src/core/` free of dashboard imports. */
+const TOKENS_PER_IMAGE_ANCHOR = 2500;
+/** Canvas width the anchor was measured at: 2·PAD_X + 100·5 (old 5×8 cell). */
+const ANCHOR_CANVAS_WIDTH_PX = 508;
+/** Single-col per-image token cost at the CURRENT render cell. Derived from
+ *  the 5×8 anchor by canvas-width ratio so it tracks cell-size changes the
+ *  same way LINES_PER_IMAGE tracks cell height. The production cell is now
+ *  7×10 (render.ts CELL_W/CELL_H), widening the cols=100 canvas to 708 px →
+ *  ~3,484 tokens/image. */
+const TOKENS_PER_IMAGE_SINGLE_COL = Math.round(
+  TOKENS_PER_IMAGE_ANCHOR *
+    ((2 * PAD_X + DEFAULTS.cols * CELL_W) / ANCHOR_CANVAS_WIDTH_PX),
+);
 
 /** Effective per-image token cost at the given `numCols`. Single-col is
  *  the calibrated measurement; multi-col scales linearly with the number
@@ -291,22 +311,18 @@ function effectiveTokensPerImage(numCols: number): number {
   return Math.ceil(TOKENS_PER_IMAGE_SINGLE_COL * n * 1.10);
 }
 
-/** Characters per rendered image at the current renderer config. Derived
- *  at runtime from `ATLAS_CELL_H` (cell height) and the render canvas
- *  dimensions imported from render.ts — single source of truth.
+/** Visual rows per image at the current render cell. Derived once at module
+ *  load from render.ts CELL_H (single source of truth) so the break-even
+ *  math always tracks the renderer's real geometry.
  *
- *  Formula: `cols × floor((MAX_HEIGHT_PX − 2·PAD_Y) / ATLAS_CELL_H)`
+ *  Formula: `floor((MAX_HEIGHT_PX − 2·PAD_Y) / CELL_H)`
  *
- *  At the shipping config (Spleen/Unifont hybrid, cell 5×8, cols=100):
- *    100 × floor((1568 − 8) / 8) = 100 × 195 = 19,500
+ *  At the production 7×10 cell, cols=100:
+ *    floor((1568 − 8) / 10) = 156 rows → maxCharsPerImage = 100 × 156 = 15,600
  *
- *  When the atlas swaps again, this auto-updates and the break-even
- *  threshold moves with the actual renderer geometry. Without this, a
- *  stale hardcoded chars/image constant would silently mis-price image
- *  compressions. */
-/** Visual rows per image at the current atlas cell. Derived once at module
- *  load. Auto-updates when gen-atlas regenerates with a different font/size. */
-export const LINES_PER_IMAGE = Math.max(1, Math.floor((MAX_HEIGHT_PX - 2 * PAD_Y) / ATLAS_CELL_H));
+ *  When the cell changes (render.ts DEFAULT_CELL_*_BONUS or a new atlas),
+ *  this auto-updates and the break-even threshold moves with it. */
+export const LINES_PER_IMAGE = Math.max(1, Math.floor((MAX_HEIGHT_PX - 2 * PAD_Y) / CELL_H));
 
 export function maxCharsPerImage(cols: number): number {
   return cols * LINES_PER_IMAGE;
@@ -1272,14 +1288,20 @@ function lineRows(line: string, cols: number): number {
   return Math.max(1, Math.ceil(line.length / cols));
 }
 
-/** Count the visual rows `text` will consume after soft-wrap at `cols`. */
+/** Count the visual rows `text` will consume after soft-wrap at `cols`.
+ *  Wrap-the-line reflow breaks the render row at every ↵, so both `\n` and
+ *  the ↵ sentinel end a counted line — and the ↵ glyph occupies a cell on
+ *  the line it terminates. */
 function countVisualRows(text: string, cols: number): number {
   let rows = 0;
   let lineStart = 0;
   const len = text.length;
   for (let i = 0; i <= len; i++) {
-    if (i === len || text.charCodeAt(i) === 10 /* \n */) {
-      const lineLen = i - lineStart;
+    const cc = i < len ? text.charCodeAt(i) : -1;
+    const isSentinel = cc === 0x21b5 /* ↵ */;
+    if (i === len || cc === 10 /* \n */ || isSentinel) {
+      // ↵ renders as a glyph on the line it ends — count it in the length.
+      const lineLen = (isSentinel ? i + 1 : i) - lineStart;
       rows += Math.max(1, Math.ceil(lineLen / cols));
       lineStart = i + 1;
     }
@@ -1374,7 +1396,11 @@ export function truncateForBudget(
   if (estImages <= maxImages) return { text, omittedChars: 0, truncated: false };
   const totalRowBudget = Math.max(8, maxImages * LINES_PER_IMAGE * n - 6);
   const shape = classifyContent(text);
-  const lines = text.split('\n');
+  // Reflowed text uses NL_SENTINEL (↵ U+21B5) as line separator instead of \n.
+  // Split on whichever delimiter the text uses so we can truncate at logical
+  // line boundaries rather than treating the entire reflowed blob as one line.
+  const nlChar = text.indexOf('\n') >= 0 ? '\n' : NL_SENTINEL;
+  const lines = text.split(nlChar);
   const originalLines = lines.length;
   const originalChars = text.length;
 
@@ -1388,7 +1414,7 @@ export function truncateForBudget(
       cut = i + 1;
     }
     if (cut === 0) cut = 1;
-    const head = lines.slice(0, cut).join('\n');
+    const head = lines.slice(0, cut).join(nlChar);
     const omitted = originalChars - head.length;
     return {
       text:
@@ -1428,7 +1454,7 @@ export function truncateForBudget(
     tailStart = i;
   }
   if (tailStart <= headCut || tailStart >= lines.length) {
-    const head = lines.slice(0, headCut).join('\n');
+    const head = lines.slice(0, headCut).join(nlChar);
     const omitted = originalChars - head.length;
     return {
       text:
@@ -1446,8 +1472,8 @@ export function truncateForBudget(
       truncated: true,
     };
   }
-  const headText = lines.slice(0, headCut).join('\n');
-  const tailText = lines.slice(tailStart).join('\n');
+  const headText = lines.slice(0, headCut).join(nlChar);
+  const tailText = lines.slice(tailStart).join(nlChar);
   const shownChars = headText.length + tailText.length;
   const omitted = originalChars - shownChars;
   return {

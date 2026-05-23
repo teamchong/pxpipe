@@ -116,17 +116,19 @@ Anthropic bills images by area
 image_tokens ≈ (width × height) / 750
 ```
 
-Pixelpipe ships 508×1559 PNGs, so the textbook estimate is:
+Pixelpipe renders at a 7×10-px cell (see *Why it's hard → Image density*);
+a single-column `cols=100` PNG is 708×1568, so the textbook estimate is:
 
 ```
-508 × 1559 / 750 ≈ 1,056 tokens/image
+708 × 1568 / 750 ≈ 1,480 tokens/image
 ```
 
-Real `count_tokens` probes against those PNGs measure ≈ **5,500 tokens/image**
-at `multiCol=2` — a 5× gap that the renderer accounts for via the empirical
-`effectiveTokensPerImage(numCols)` constant in `src/core/transform.ts`.
-The textbook formula is the lower bound; the empirical number is what gets
-billed.
+Real `count_tokens` probes bill far above that textbook lower bound.
+Pixelpipe anchors on a measured **2,500 tokens** for a single-col PNG at
+the old 5×8 cell (a 508-px-wide canvas) and scales it by canvas width: the
+7×10 cell's 708-px canvas works out to ≈ **3,484 tokens/image** single-col
+and ≈ **7,665** at `multiCol=2`. Those are the `TOKENS_PER_IMAGE_SINGLE_COL`
+/ `effectiveTokensPerImage(numCols)` constants in `src/core/transform.ts`.
 
 ### Step 2 — text → tokens
 
@@ -304,16 +306,54 @@ recognizing font family/style. For pixelpipe this means:
   pixels usually means more image tokens.
 - Tiny margins are fine, but shrinking `PAD_X/PAD_Y` from 4 px to 2 px is
   only a ~1% win; it is not the main lever.
-- There is no separate letter-spacing knob — density is mostly the atlas
-  cell (`ATLAS_CELL_W × ATLAS_CELL_H`).
-- The promising foundational experiment is a denser-but-readable bitmap
-  atlas. We now ship a conservative version of that idea: Spleen 5×8 for
-  ASCII/code plus Unifont 8px fallback, after 4×8 proved too brittle in
-  exact code-reading tests. Avoid
-  jumping to ~6 px effective text height without quality evidence.
+- Density is the *cell pitch*, not a letter-spacing knob: the production
+  render cell is **7×10 px** — the 5×8 Spleen glyph bitmap plus a 2-px
+  `DEFAULT_CELL_W_BONUS` / `DEFAULT_CELL_H_BONUS` pad per axis. The
+  `eval/`-only `cellWBonus` / `cellHBonus` overrides sweep other sizes.
+- We ship Spleen 5×8 glyphs for ASCII/code plus Unifont 8px fallback,
+  after 4×8 proved too brittle in exact code-reading tests.
 - Gutter/padding changes are secondary; the gutter is an OCR-ordering cue
   for multi-column layouts, so removing it can save pixels while silently
   causing row-interleaved reads.
+
+**Measured (`eval/`): 5×8 is below the legible floor for dense text — so
+production renders at 7×10.** An L1 OCR-fidelity harness renders real
+Claude Code transcript blocks, sends them through Anthropic's vision
+stack, and scores the
+transcription character-for-character against the source. The result:
+5×8 reads *sparse* text (real newlines, lots of whitespace) at ~97 %, but
+**corrupts *dense* text — ~81 % mean, with individual blocks below 25 %.**
+This is content-agnostic: the encoder sees pixels, not newlines. A
+reflow-packed block and a zero-newline minified JSON produce the same
+dense pixels and fail the same way. Density is density. A cell-pitch
+sweep on Opus 4.7 (20 blocks) located the floor:
+
+| Render cell | Mean accuracy | Δ vs baseline |
+|-------------|---------------|---------------|
+| 5×8 (dense) | 81 %          | −16 pp        |
+| 6×9         | 90 %          | −7 pp         |
+| 7×9 / 6×10  | ~93 %         | −4 pp         |
+| **7×10**    | **96.5 %**    | **−0.8 pp**   |
+| 8×10        | 93 %          | −5 pp         |
+
+**7×10 is the floor** — the densest cell where OCR still holds. Below it
+text corrupts; above it (8×10) over-spacing dilutes the glyph just as
+badly. This is a property of the *renderer*, not of reflow, so the
+production cell default is now 7×10 (`DEFAULT_CELL_W_BONUS` /
+`DEFAULT_CELL_H_BONUS` in `render.ts`) and the break-even gate is
+recalibrated to it: `TOKENS_PER_IMAGE_SINGLE_COL` and `LINES_PER_IMAGE`
+both derive from the 7×10 cell, so a 7×10 image — ~75 % more pixels per
+character than 5×8 — is now priced as it actually bills. Compressions
+that only "won" on corrupt-but-cheap 5×8 images now correctly fail the
+gate.
+
+One honest caveat remains: **the glyph is not purpose-built for the
+cell.** The 7×10 result came purely from *spacing* a 5×8 Spleen bitmap —
+a small glyph floating in 2 px of padding per axis. At 7×10 the token
+economics are close to break-even for average text; the real win narrows
+to genuinely dense content and the cache-stability of a byte-identical
+image prefix. The one untested lever that could lower the legible floor
+again is an **anti-aliased glyph** — see *Limitations*.
 
 **Multi-column packing has an OCR cliff.** Two columns side-by-side
 double the per-image text capacity, but the renderer must guarantee
@@ -321,8 +361,8 @@ Anthropic's vision stack reads column 1 fully top-to-bottom before
 column 2. Layouts with line lengths near 1568 px and a weak column
 divider can produce row-interleaved OCR output. The renderer adds a
 light-gray gutter divider, a per-image break-even check specifically
-for `multiCol=2` (image cost doubles, text savings double, but the 10%
-extrapolation margin on top of 2× = 5500 also doubles), and a global
+for `multiCol=2` (image cost scales with `numCols` plus a 10 %
+extrapolation margin — `effectiveTokensPerImage(2)` ≈ 7,665), and a global
 `multiCol: 2` default that can be overridden to 1 if OCR ordering ever
 turns out wrong on a specific deployment.
 
@@ -371,6 +411,47 @@ and sample size. The proxy logs every request to `events.jsonl` with
 at `/` regresses `total_tokens = α·outgoingTextChars + β·imagePixels`
 on every cold-miss event to keep the per-image cost estimate honest as
 the model and atlas evolve.
+
+**Proving a compression is safe needs the real workload — not SWE-bench.**
+Pixelpipe has one speculative lever, *reflow*, that packs text denser by
+replacing newlines with a `↵` (U+21B5) glyph so the renderer fits ~970
+chars/image instead of ~470. Whether that lever is safe to pull depends
+entirely on one question: *can the model still read the text it is given?*
+SWE-bench is the wrong instrument for that question. SWE-bench instances
+are essentially single-shot bug-fix tasks — they never accumulate the
+hundreds of turns of `tool_result` history that reflow actually operates
+on, and a SWE-bench score moves for a hundred reasons unrelated to whether
+one `↵` glyph was resolved correctly. The workload that genuinely stresses
+reflow is *our own* multi-turn Claude Code sessions, and those already
+exist on disk: `~/.claude/projects/` holds real transcripts and
+`events.jsonl` holds ~7,900 real proxied requests. So the eval harness
+(`eval/`) replays that real corpus instead of a synthetic benchmark, in
+two tiers. **L1 — OCR fidelity:** render each text block both ways
+(baseline newlines vs. reflow `↵`), ask the model to transcribe it
+verbatim, and score against ground truth by character-level Levenshtein
+distance. Cheap, deterministic, and it isolates the one variable.
+**L2 — session replay:** rebuild whole sessions with the collapsed-history
+PNG, ask a real question, and have a separate judge model score whether
+the reflowed answer is equivalent to the baseline answer. The shipping
+gate requires L1 accuracy delta ≥ −2pp, L1 macro accuracy ≥ 95%, L2 judge
+score ≥ 0.80, and L2 pass rate ≥ 80%. All four must hold.
+
+**The eval must run against the production model, and it found the real
+bottleneck.** Run at the old 5×8 cell on Opus 4.7, reflow dropped L1
+character accuracy from **97.67% → 80.59%** (−17pp) while saving 0.0%
+image area, and L2 session replay scored a **49.5% mean judge score**. A
+Sonnet 4.5 control produced near-identical numbers (−17.09pp at L1) — and
+*that* was the key finding: the failure was not model vision capability
+(Opus reads the *baseline* render at 97.67%) and not `↵` comprehension
+(enlarging and recoloring the marker in dedicated variants changed
+nothing). It was raw pixel density. The cell-pitch sweep above followed
+directly from that result. **Re-run at the 7×10 cell, reflowed text reads
+at ~96.5% L1 character accuracy — within ~1 pp of baseline.** Reflow
+therefore ships **on by default** (`reflow: true` in `DEFAULTS`), paired
+with the 7×10 cell that makes it legible. An L2 session-replay re-run at
+7×10 is the remaining confirmation — the harness makes it one
+`node eval/run-eval.mjs --level all --confirm --model <production-model>`
+away from a verdict instead of a guess.
 
 ---
 
@@ -780,6 +861,17 @@ ATLAS_PROFILE=practical pnpm run build:atlas  # drops Hangul (~24k cp; for Worke
   drops Hangul). Right-to-left scripts render left-to-right in source
   order (no bidi shaping); Devanagari / Thai / similar
   complex shaping is also unsupported.
+- The render cell is **7×10 px** — the measured OCR-legible floor for
+  *dense* input (minified JSON, long log lines, reflow-packed history).
+  At 7×10 a character costs ~75 % more pixels than the old 5×8 cell, so
+  the token economics are close to break-even for average text; the win
+  is concentrated in genuinely dense content and the cache-stability of a
+  byte-identical image prefix. The one untested lever that could lower
+  the legible floor below 7×10 — and widen the margin again — is an
+  **anti-aliased glyph**: the renderer currently blits 1-bit (hard
+  black/white) pixels, and grayscale glyph edges may survive the vision
+  encoder's downsample at a smaller cell. Eval pending. See *Why it's
+  hard → Image density*.
 - Compression sets a 5-minute prompt-cache TTL. Adding `cache_control:
   ephemeral` causes warm-cache rotation, not eviction.
 - A 5KB break-even point: if input is `< MIN_COMPRESS_CHARS` chars we

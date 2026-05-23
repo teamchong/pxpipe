@@ -7,6 +7,8 @@ import {
   maxFittingCols,
   expandTabsInLine,
   minifyForRender,
+  CELL_H,
+  CELL_W,
 } from '../src/core/render.js';
 import { encodeGrayPng, bytesToBase64 } from '../src/core/png.js';
 import {
@@ -146,8 +148,8 @@ describe('renderer', () => {
     const text = ('lorem ipsum dolor sit amet\n'.repeat(8)) + 'final line';
     const single = await renderTextToPngs(text, 100);
     const two = await renderTextToPngsMultiCol(text, 100, 2);
-    // numCols=2 with 100-col text content + 4-cell gutter at 5px/cell:
-    //   width = 2*PAD_X + 2*100*5 + 1*4*5 = 8 + 1000 + 20 = 1028 px
+    // numCols=2 with 100-col text content + 4-cell gutter at 7px/cell (7×10 production cell):
+    //   width = 2*PAD_X + 2*100*7 + 1*4*7 = 8 + 1400 + 28 = 1436 px
     expect(two[0]!.width).toBe(multiColWidth(100, 2));
     expect(two[0]!.width).toBeGreaterThan(single[0]!.width);
     expect(two[0]!.width).toBeLessThanOrEqual(1568);
@@ -197,8 +199,8 @@ describe('renderer', () => {
   it('maxFittingCols clamps an over-wide numCols flag instead of producing >1568px canvases', async () => {
     // At cols=100 (5 px/cell + 4-cell gutter), the math says:
     //   1: 508 px, 2: 1028, 3: 1548, 4: 2068 → 4 already exceeds 1568.
-    const fits3 = maxFittingCols(100);
-    expect(fits3).toBe(3);
+    const fits = maxFittingCols(100);
+    expect(fits).toBe(3);
     const text = 'short\n'.repeat(10);
     // numCols=10 → should clamp; output canvas width must stay ≤ 1568.
     const imgs = await renderTextToPngsMultiCol(text, 100, 10);
@@ -259,10 +261,9 @@ describe('renderer', () => {
     const width = img.width;
     const height = img.height;
     // Divider X: end of col 0's text area + half the gutter.
-    //   colEnd = PAD_X (4) + 0 * stride + 100 * 5 = 504
-    //   dividerX = 504 + floor((4 * 5) / 2) = 504 + 10 = 514
+    //   colEnd = PAD_X (4) + 0 * stride + 100 * 7 = 704
+    //   dividerX = 704 + floor((4 * 7) / 2) = 704 + 14 = 718
     const PAD_X = 4;
-    const CELL_W = 5;
     const GUTTER_CELLS = 4;
     const cols = 100;
     const dividerX =
@@ -353,7 +354,7 @@ describe('renderer', () => {
     // across font-size changes.
     expect(img.charsRendered).toBe(latin30.length + 40);
     expect(img.droppedChars).toBe(0);
-    const expectedHeight = 2 * 4 /* PAD_Y */ + 2 * ATLAS_CELL_H;
+    const expectedHeight = 2 * 4 /* PAD_Y */ + 2 * CELL_H;
     expect(img.height).toBe(expectedHeight);
   });
 
@@ -366,7 +367,7 @@ describe('renderer', () => {
     expect(img.charsRendered).toBe(100);
     expect(img.droppedChars).toBe(0);
     // Two lines: first has 99 'a', second has the '中'.
-    const expectedHeight = 2 * 4 /* PAD_Y */ + 2 * ATLAS_CELL_H;
+    const expectedHeight = 2 * 4 /* PAD_Y */ + 2 * CELL_H;
     expect(img.height).toBe(expectedHeight);
   });
 
@@ -605,7 +606,7 @@ describe('renderer', () => {
     expect(img.droppedChars).toBe(0);
     expect(img.droppedCodepoints.size).toBe(0);
     // Two visible lines = 2 cell-rows of pixels (height check).
-    const expectedHeight = 2 * 4 /* PAD_Y */ + 2 * ATLAS_CELL_H;
+    const expectedHeight = 2 * 4 /* PAD_Y */ + 2 * CELL_H;
     expect(img.height).toBe(expectedHeight);
     // Sanity: charsRendered counts input codepoints (4 + 1 + 4 = 9 chars
     // including the embedded `\n`). The arrow + padding spaces aren't in
@@ -1526,10 +1527,12 @@ describe('transform', () => {
   });
 
   it('compresses long <system-reminder> blocks in the first user message', async () => {
-    // 'a long policy note. ' = 20 chars. 2500× = 50k chars + reminder tags
-    // — past the 10k minReminderChars threshold AND past the multi-col
-    // 1-image break-even (~22k chars at n=2).
-    const reminder = '<system-reminder>\n' + 'a long policy note. '.repeat(2500) + '\n</system-reminder>';
+    // 'a long policy note. ' = 20 chars. 1550× = 31k chars + reminder tags
+    // — past the 14k minReminderChars threshold AND past the multi-col
+    // 1-image break-even (~30.7k chars at n=2, 7×10 cell).
+    // 1550 × 20 = 31,000 chars → 310 visual rows → 1 image at n=2 (capacity 312 rows)
+    // image cost 7665 tokens < text cost 31000/4=7750 → profitable.
+    const reminder = '<system-reminder>\n' + 'a long policy note. '.repeat(1550) + '\n</system-reminder>';
     const body = new TextEncoder().encode(
       JSON.stringify({
         model: 'claude',
@@ -1591,9 +1594,11 @@ describe('transform', () => {
   });
 
   it('compresses large tool_result text content across user messages', async () => {
-    // 'output line. ' = 13 chars × 2000 = 26k chars — past minToolResultChars
-    // (10k) AND past the multi-col 1-image break-even (~22k at n=2).
-    const bigResult = 'output line. '.repeat(2000);
+    // 'output line. ' = 13 chars × 2400 = 31.2k chars — past minToolResultChars
+    // (14k) AND past the multi-col 1-image break-even (~30.7k chars at n=2, 7×10 cell).
+    // 2400 × 13 = 31,200 chars → 312 visual rows → 1 image at n=2 (capacity 312 rows)
+    // image cost 7665 tokens < text cost 31200/4=7800 → profitable.
+    const bigResult = 'output line. '.repeat(2400);
     const body = new TextEncoder().encode(
       JSON.stringify({
         model: 'claude',
@@ -1755,8 +1760,11 @@ describe('transform', () => {
     expect(isCompressionProfitable(10000)).toBe(false);
   });
 
-  it('isCompressionProfitable: true at 10001 chars (tiny win past break-even)', () => {
-    expect(isCompressionProfitable(10001)).toBe(true);
+  it('isCompressionProfitable: true at 13937 chars (tiny win past break-even)', () => {
+    // Single-col break-even at 7×10 cell: 1 image = 3484 tokens.
+    // Need len/4 > 3484 → len > 13,936. 13,937 chars → 140 rows → 1 image →
+    // 3484 tokens < 13937/4 = 3484.25 → profitable (strict <).
+    expect(isCompressionProfitable(13937)).toBe(true);
   });
 
   it('isCompressionProfitable: true at 14000 chars (clear single-image win)', () => {
@@ -1769,8 +1777,10 @@ describe('transform', () => {
     expect(isCompressionProfitable(20000)).toBe(false);
   });
 
-  it('isCompressionProfitable: true at 40000 chars (3 images, clear win)', () => {
-    expect(isCompressionProfitable(40000)).toBe(true);
+  it('isCompressionProfitable: true at 42000 chars (3 images, clear win)', () => {
+    // 7×10 cell, single-col: 42000 chars → 420 rows → ceil(420/156)=3 images →
+    // 3×3484=10452 tokens < 42000/4=10500 → profitable.
+    expect(isCompressionProfitable(42000)).toBe(true);
   });
 
   // --- chars/token override: gate accepts a per-request value ---
@@ -1897,10 +1907,12 @@ describe('transform', () => {
     expect(out.info.imageCount ?? 0).toBeGreaterThan(0);
   });
 
-  it('isCompressionProfitable: 5x8 atlas makes a 161k production-shape slab profitable even at cpt=4', () => {
-    // Pin the math directly. The 5×8 atlas drops this shape to ~6 two-column
-    // images: 6 × 5500 = 33,000 image tokens. At cpt=4, text≈40,275, so
-    // it now ACCEPTS even under a conservative prose/token override.
+  it('isCompressionProfitable: 7x10 atlas makes a 161k production-shape slab profitable at cpt=2', () => {
+    // With 7×10 atlas (CELL_H=10): LINES_PER_IMAGE=156, MaxCharsPerImage=15600.
+    // At numCols=2: images = ceil(rows/312). The 161k slab has ~2001 rows →
+    // ceil(2001/312)=7 images. imageCost = 7 × 7665 = 53,655 tokens.
+    // At cpt=2 (SLAB_CHARS_PER_TOKEN): text = 161101/2 = 80,550 → profitable.
+    // At cpt=4: text = 161101/4 = 40,275 < 53,655 → NOT profitable.
     const parts: string[] = [];
     let acc = 0;
     while (acc < 161_101) {
@@ -1909,7 +1921,7 @@ describe('transform', () => {
       acc += len + 1;
     }
     const slab = parts.join('\n').slice(0, 161_101);
-    expect(isCompressionProfitable(slab, 100, undefined, 2, 4)).toBe(true);
+    expect(isCompressionProfitable(slab, 100, undefined, 2, 2)).toBe(true);
     expect(isCompressionProfitable(slab, 100, undefined, 2, 2.5)).toBe(true);
   });
 
@@ -1920,13 +1932,13 @@ describe('transform', () => {
     // uses `!== undefined`, so passing exactly 4 is honored as an explicit
     // host override.
     //
-    // Observable proof after the 5×8 atlas: a row-heavier 50k slab is
-    // REJECTED at cpt=4 but ACCEPTED at the built-in Opus-4.7 cpt=2. If the
-    // collision bypass breaks, the slab will compress under explicit `4` —
-    // meaning the host cannot pin to conservative English-prose density.
+    // With 7×10 atlas (CELL_H=10): MaxCharsPerImage(2)=31,200, effectiveTokensPerImage(2)=7665.
+    // Use a ~220k-char slab (14 images at numCols=2 → 107,310 tokens):
+    //   cpt=2: text=110,000 → 107,310 < 110,000 → ACCEPT ✓
+    //   cpt=4: text=55,000  → 107,310 > 55,000  → REJECT ✓
     const parts: string[] = [];
     let acc = 0;
-    const target = 50_000;
+    const target = 220_000;
     while (acc < target) {
       const len = 50;
       parts.push('A'.repeat(len) + (acc % 200 === 0 ? '   ' : ''));
@@ -1959,7 +1971,7 @@ describe('transform', () => {
   // cell-H would).
 
   it('maxCharsPerImage: matches the 19,500 constant at the 5x8 shipping config', () => {
-    // Spleen/Unifont 5×8, cols=100 → floor((1568−8)/8) × 100 = 195 × 100 = 19,500.
+    // 5×8 cell, cols=100: floor((1568-8)/8) × 100 = 195 × 100 = 19,500.
     // If this ever drifts, every break-even test downstream needs re-pinning.
     expect(maxCharsPerImage(100)).toBe(19_500);
   });
@@ -1970,42 +1982,43 @@ describe('transform', () => {
   });
 
   it('isCompressionProfitable: doubling cols halves the 2-image break-even threshold', () => {
-    // At cols=100, CHARS_PER_IMAGE=19,500. 20,000 chars needs 2 images (cost
-    // 5000 tokens) vs 5000 text-tokens → tied, strict `<` returns false.
+    // At cols=100, CHARS_PER_IMAGE=15,600. 20,000 chars needs 2 images (cost
+    // 2*3484=6968 tokens) vs 5000 text-tokens → tied, strict `<` returns false.
     expect(isCompressionProfitable(20_000, 100)).toBe(false);
-    // At cols=200, CHARS_PER_IMAGE=39,000. 20,000 chars fits in 1 image
-    // (cost 2500 tokens) vs 5000 text-tokens → clear win.
+    // At cols=200, CHARS_PER_IMAGE=31,200. 20,000 chars fits in 1 image
+    // (cost 3484 tokens) vs 5000 text-tokens → clear win.
     expect(isCompressionProfitable(20_000, 200)).toBe(true);
   });
 
   it('isCompressionProfitable: tiny-cols config raises the break-even threshold', () => {
-    // Simulated narrow render: cols=20 → CHARS_PER_IMAGE=2820. A 10,001-char
-    // block needs ceil(10001/2820)=4 images (10,000 tokens) vs 2500 text →
-    // huge net loss. At cols=100 the same block was profitable.
-    expect(isCompressionProfitable(10_001, 100)).toBe(true);
-    expect(isCompressionProfitable(10_001, 20)).toBe(false);
+    // Simulated narrow render: cols=20 → CHARS_PER_IMAGE=3120. A 14,001-char
+    // block needs ceil(14001/3120)=5 images (17,420 tokens) vs 3501 text →
+    // huge net loss. At cols=100 the same block fits in 1 image and wins
+    // (imgCost=3484 < textCost=3501).
+    expect(isCompressionProfitable(14_001, 100)).toBe(true);
+    expect(isCompressionProfitable(14_001, 20)).toBe(false);
   });
 
-  it('isCompressionProfitable(string): row-aware → newline-heavy sparse content (~5500 chars/img) rejected as net-loss', () => {
+  it('isCompressionProfitable(string): row-aware → newline-heavy sparse content rejected as net-loss', () => {
     // Regression for the -69% dashboard bug: the number-arg form estimates
-    // by chars/charsPerImage which assumes uniform line-fill. That assumes
-    // 19500 chars/image but renderTextToPngs actually packs ~195 visual
-    // rows/image — newline-heavy code/logs hit row cap WAY before char cap.
+    // by chars/charsPerImage which assumes uniform line-fill. The string
+    // form is row-aware and matches what renderTextToPngs actually budgets.
     //
-    // 50000 chars of `x.md\n` is 5000 short lines → 5000 rows / 195 = 26
-    // images. 26 * 2500 = 65000 image tokens vs 50000/4 = 12500 text tokens.
-    // Massive net loss. Number-arg form would incorrectly accept (50000 chars
-    // / 19500 chars-per-img = 3 imgs → 7500 < 12500 → "profitable").
-    const sparse = 'x.md\n'.repeat(10_000);
+    // 30,000 chars of `x.md\n` = 6,000 short lines → 6,000 visual rows →
+    // ceil(6000/156) = 39 images. 39 × 3484 = 135,876 image tokens vs
+    // 30000/4 = 7,500 text tokens → massive net loss, correctly rejected.
+    // The looser numeric form sees 30,000/15,600 = 2 images → 6,968 < 7,500
+    // → "profitable" — the exact mis-estimate the row-aware form fixes.
+    const sparse = 'x.md\n'.repeat(6_000); // 30k chars, 6000 short lines
     expect(isCompressionProfitable(sparse, 100)).toBe(false);
     expect(isCompressionProfitable(sparse.length, 100)).toBe(true); // back-compat: looser estimate
   });
 
   it('isCompressionProfitable(string): row-aware → dense single-line content packs full-width and profits', () => {
-    // Same 50000 chars but as ONE line wraps to 100-char rows → 500 rows / 195
-    // = 3 images. 3 * 2500 = 7500 image tokens vs 50000/4 = 12500 text →
+    // 30000 'x' chars as ONE line wraps to 100-char rows → 300 rows / 156
+    // = 2 images. 2 * 3484 = 6968 image tokens vs 30000/4 = 7500 text →
     // profitable. Both forms agree on dense content.
-    const dense = 'x'.repeat(50_000);
+    const dense = 'x'.repeat(30_000);
     expect(isCompressionProfitable(dense, 100)).toBe(true);
     expect(isCompressionProfitable(dense.length, 100)).toBe(true);
   });
@@ -2022,12 +2035,13 @@ describe('transform', () => {
     expect(isCompressionProfitable(log, 100, 10)).toBe(true); // capped, profits
   });
 
-  it('isCompressionProfitable: 5x8 atlas lets 16k blocks become 1-image wins', () => {
+  it('isCompressionProfitable: 7x10 atlas lets 15k blocks become 1-image wins', () => {
     // Historical comparison: the previous Unifont 5×11 atlas packed
-    // 14,100 chars/image, so 16k chars
-    // needed 2 images and failed break-even. The 5×8 hybrid atlas packs
-    // 19,500 chars/image, so the same block fits in one image and wins.
-    expect(isCompressionProfitable(16_000, 100)).toBe(true);
+    // 14,100 chars/image, so 15k chars (14,101–15,000 range)
+    // needed 2 images and failed break-even. The 7×10 atlas now packs
+    // 15,600 chars/image, so the same block fits in one image and wins.
+    // 15000 chars: imgCost=1*3484=3484, textCost=ceil(15000/4)=3750 → profitable.
+    expect(isCompressionProfitable(15_000, 100)).toBe(true);
   });
 
   it('break-even gate: 7000-char tool_result stays as text (below break-even)', async () => {
@@ -2067,7 +2081,8 @@ describe('transform', () => {
   });
 
   it('break-even gate: 25000-char tool_result still images (clear win at 1 image)', async () => {
-    // 25000 chars > ~22000 multi-col break-even → image saves tokens.
+    // 25000 chars of dense code/log content (charsPerToken≈2) → profitable.
+    // With cpt=2: textCost=ceil(25000/2)=12500 vs imgCost=2*3484=6968 → clear win.
     const longResult = 'x'.repeat(25000);
     const req = JSON.stringify({
       model: 'claude-3-5-sonnet',
@@ -2081,7 +2096,7 @@ describe('transform', () => {
       ],
       system: 'x'.repeat(150000),
     });
-    const { body: outBytes, info } = await transformRequest(new TextEncoder().encode(req));
+    const { body: outBytes, info } = await transformRequest(new TextEncoder().encode(req), { charsPerToken: 2 });
     expect(info.compressed).toBe(true);
     expect((info.toolResultImgs ?? 0)).toBeGreaterThan(0);
     const out = JSON.parse(new TextDecoder().decode(outBytes));
@@ -2108,6 +2123,7 @@ describe('transform', () => {
   });
 
   it('break-even gate: 25000-char reminder images (above threshold and profitable)', async () => {
+    // With charsPerToken=2 (dense code/log), profitable: textCost=12500 vs imgCost=2*3484=6968.
     const reminder = '<system-reminder>' + 'x'.repeat(25000) + '</system-reminder>';
     const req = JSON.stringify({
       model: 'claude-3-5-sonnet',
@@ -2116,7 +2132,7 @@ describe('transform', () => {
       ],
       system: 'x'.repeat(150000),
     });
-    const { info } = await transformRequest(new TextEncoder().encode(req));
+    const { info } = await transformRequest(new TextEncoder().encode(req), { charsPerToken: 2 });
     expect(info.compressed).toBe(true);
     expect((info.reminderImgs ?? 0)).toBeGreaterThan(0);
   });

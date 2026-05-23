@@ -29,7 +29,7 @@ import type { ProxyEvent } from '../src/core/proxy.js';
 // lines fully fill the width. For shorter lines, the budget is dominated
 // by row count (each line takes ≥1 row regardless of length).
 const COLS = 100;
-const ROWS_PER_IMG = 195; // floor((1568 - 8) / 8), Spleen 5×8 hybrid atlas
+const ROWS_PER_IMG = 195; // floor((1568 - 8) / 8), Spleen 5×8 production cell
 
 describe('estimateImageCount', () => {
   it('returns 1 for empty / tiny text', () => {
@@ -293,8 +293,10 @@ describe('paging end-to-end (transformRequest)', () => {
   it('tool_result under cap renders normally (no truncation counters)', async () => {
     // Above the multi-col break-even (~22k chars), well under the 10-image
     // single-column budget (~195k chars at the current 5×8 atlas).
+    // charsPerToken:2 reflects reality (tool_result content is code/logs, ~2 ch/tok)
+    // and ensures the gate accepts this size at numCols=1.
     const text = 'x'.repeat(50_000);
-    const { info } = await transformRequest(makeReq(text));
+    const { info } = await transformRequest(makeReq(text), { multiCol: 1, charsPerToken: 2 });
     expect(info.compressed).toBe(true);
     expect((info.toolResultImgs ?? 0)).toBeGreaterThan(0);
     expect(info.truncatedToolResults ?? 0).toBe(0);
@@ -310,7 +312,7 @@ describe('paging end-to-end (transformRequest)', () => {
     const log = lines.join('\n');
     expect(log.length).toBeGreaterThan(400_000);
 
-    const { info } = await transformRequest(makeReq(log));
+    const { info } = await transformRequest(makeReq(log), { multiCol: 1, charsPerToken: 2 });
     expect(info.compressed).toBe(true);
     expect(info.truncatedToolResults).toBe(1);
     expect(info.omittedChars).toBeGreaterThan(0);
@@ -328,6 +330,8 @@ describe('paging end-to-end (transformRequest)', () => {
 
     // Tight budget of 2 images = ~28k chars.
     const { info } = await transformRequest(makeReq(log), {
+      multiCol: 1,
+      charsPerToken: 2,
       maxImagesPerToolResult: 2,
     });
     expect(info.truncatedToolResults).toBe(1);
@@ -357,12 +361,11 @@ describe('paging end-to-end (transformRequest)', () => {
         ],
       }),
     );
-    const { info } = await transformRequest(req);
+    const { info } = await transformRequest(req, { multiCol: 1, charsPerToken: 2 });
     expect(info.truncatedToolResults).toBe(2);
     // Both should have been truncated → omittedChars roughly doubled. The
     // exact bound depends on renderer config: at multiCol=1 each image
-    // packs ~19.5k chars worst-case, multiCol=2 packs ~39k → less omitted
-    // at the same maxImagesPerToolResult cap. Threshold below covers both.
+    // packs ~19.5k chars worst-case. Threshold below covers the single-col case.
     expect(info.omittedChars).toBeGreaterThan(600_000);
   });
 
@@ -392,7 +395,7 @@ describe('paging end-to-end (transformRequest)', () => {
         ],
       }),
     );
-    const { info } = await transformRequest(req);
+    const { info } = await transformRequest(req, { multiCol: 1, charsPerToken: 2 });
     expect(info.truncatedToolResults).toBe(1);
     expect(info.omittedChars).toBeGreaterThan(0);
     expect(info.toolResultImgs).toBeLessThanOrEqual(11);

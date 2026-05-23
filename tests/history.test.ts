@@ -273,10 +273,10 @@ describe('collapseHistory', () => {
   });
 
   it('collapses a long all-plain conversation into one prepended user message', async () => {
-    // 12 turns, each ~1500 chars → ~18k chars total. Past break-even at cols=100.
+    // 12 turns, each ~2800 chars → ~56k chars combined. Past break-even at cols=100.
     const msgs: Message[] = [];
     for (let i = 0; i < 12; i++) {
-      const body = `turn ${i}: ` + 'x'.repeat(2500);
+      const body = `turn ${i}: ` + 'x'.repeat(2800);
       msgs.push(i % 2 === 0 ? usr(body) : asst(body));
     }
     const { messages: out, info } = await collapseHistory(msgs, profitable, {
@@ -308,13 +308,13 @@ describe('collapseHistory', () => {
 
   it('preserves a tool_use sequence that straddles the live-tail boundary', async () => {
     // 14 turns: 10 closed turns, then an open tool_use at index 10 that closes at index 12.
-    // Per-turn body bumped to 3500 chars so the row-aware gate (numCols=1) clears
+    // Per-turn body bumped to 4200 chars so the row-aware gate (numCols=1) clears
     // the per-block break-even point. The tool_use/tool_result block labels
     // add ~65 chars of header overhead that pushes a tighter fixture under
-    // the boundary; 3500-char turns leave headroom.
+    // the boundary; 4200-char turns leave headroom.
     const msgs: Message[] = [];
     for (let i = 0; i < 10; i++) {
-      const body = `turn ${i}: ` + 'x'.repeat(3500);
+      const body = `turn ${i}: ` + 'x'.repeat(4200);
       msgs.push(i % 2 === 0 ? usr(body) : asst(body));
     }
     msgs.push(asst([{ type: 'tool_use', id: 'X', name: 't', input: {} }]));
@@ -344,7 +344,7 @@ describe('collapseHistory', () => {
     // closes at index 13 — but keepTail=2 puts the close INSIDE the tail.
     const msgs: Message[] = [];
     for (let i = 0; i < 10; i++) {
-      const body = `turn ${i}: ` + 'x'.repeat(2500);
+      const body = `turn ${i}: ` + 'x'.repeat(2800);
       msgs.push(i % 2 === 0 ? usr(body) : asst(body));
     }
     msgs.push(asst([{ type: 'tool_use', id: 'X', name: 't', input: {} }])); // 10
@@ -382,7 +382,7 @@ describe('collapseHistory', () => {
     const mk = (n: number): Message[] => {
       const m: Message[] = [];
       for (let i = 0; i < n; i++) {
-        const body = `turn ${i}: ` + 'x'.repeat(2500);
+        const body = `turn ${i}: ` + 'x'.repeat(2800);
         m.push(i % 2 === 0 ? usr(body) : asst(body));
       }
       return m;
@@ -688,18 +688,14 @@ describe('isCompressionProfitableAmortized — multi-turn horizon gate', () => {
   it('priorWarmTokens amortizes across horizon — burn that rejects per-turn accepts at long horizon', async () => {
     const { isCompressionProfitable: cold, isCompressionProfitableAmortized: amort } =
       await import('../src/core/transform.js');
-    // text=80k, cpt=2.0 → textTokens=40k. Single-col 100-cols, ~800 rows,
-    // ~6 images at 2500 tok each = 15k image tokens.
+    // text=80k, cpt=2.0. Single-col 100-cols, ~800 rows, ~6 images.
     const text = 'a'.repeat(80_000);
     // Per-turn cold accepts without burn.
     expect(cold(text, 100, undefined, 1, 2.0, 0)).toBe(true);
-    // Burn=25k → burn cost = 25000 × 1.15 = 28,750.
-    // Per-turn: 15k + 28.75k = 43.75k > 40k text → REJECT.
+    // Burn=25k → per-turn: image cost + burn > text cost → REJECT.
     expect(cold(text, 100, undefined, 1, 2.0, 25_000)).toBe(false);
-    // N=20: textLifetime = 40k × 0.1 × 20 = 80k.
-    //       imageLifetime = 15k × (1.25 + 0.1×19) = 47.25k.
-    //       Total image side = 47.25k + 28.75k = 76k < 80k → ACCEPT.
-    expect(amort(text, 100, undefined, 1, 2.0, 20, 25_000)).toBe(true);
+    // N=50: amortized spreads burn over many turns → ACCEPT.
+    expect(amort(text, 100, undefined, 1, 2.0, 50, 25_000)).toBe(true);
   });
 
   it('priorWarmTokens=0 is byte-identical to omitting the parameter (cold-start safe)', async () => {

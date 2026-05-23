@@ -1,6 +1,6 @@
 # pixelpipe
 
-**Make Opus see pixels instead of text.**
+**Make Opus see pixels instead of a transcript, the context window as UI.**
 
 A proxy for Claude Code that intercepts `POST /v1/messages` and renders
 the bulky static inputs (system prompt + tool docs + closed-prefix

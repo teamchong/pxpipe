@@ -53,37 +53,43 @@
 
   $: pctMath = s && pa
     ? `<div><span class="k">formula:</span> <span class="v">` +
-      ` share_of_spend = saved / (all_actual_input + all_output × ` +
+      ` share_of_spend = saved / (all_baseline_equivalent + all_output × ` +
       (pa.output_multiplier ?? 5) +
       `)</span></div>` +
       `<div><span class="k">why this denominator:</span> <span class="v">` +
       `the question is "did pixelpipe move my real bill", not "did pixelpipe help on the slice it ran on". ` +
-      `The denominator is every paid request — compressed, passthrough, probe-failed — so passthrough rows ` +
-      `and flap-polluted turns count against the proxy the same way they count against the user.</span></div>` +
+      `Denominator = what the user WOULD have paid with no pixelpipe — measured rows use their cache-aware ` +
+      `baseline, unmeasured/passthrough rows fall back to actual (pixelpipe didn't run there, so counterfactual = actual). ` +
+      `Dividing by counterfactual bill instead of actual bill keeps the ratio bounded at 100%; saved/actual ` +
+      `is unbounded because pixelpipe shrinks the denominator.</span></div>` +
       `<div style="height:6px"></div>` +
       row('saved', s.saved_input_tokens, '(measured-rows numerator; cache-aware)') +
-      row('all_actual_input', s.all_actual_input_weighted, '(every paid request, weighted)') +
+      row(
+        'all_baseline_equivalent',
+        s.all_baseline_equivalent_weighted,
+        '(every paid request, weighted; baseline on measured + actual on the rest)',
+      ) +
       row(
         'all_output × ' + (pa.output_multiplier ?? 5),
         s.all_output_weighted,
         '(every paid request, output × ' + (pa.output_multiplier ?? 5) + ')',
       ) +
       row(
-        'all_spend_total',
-        s.all_actual_input_weighted + s.all_output_weighted,
-        `<span class="op">=</span> all_actual_input + all_output`,
+        'all_counterfactual_total',
+        s.all_baseline_equivalent_weighted + s.all_output_weighted,
+        `<span class="op">=</span> all_baseline_equivalent + all_output`,
       ) +
       row(
         'share_of_spend',
         (s.saved_pct_of_all_spend || 0).toFixed(1) + '%',
-        `<span class="op">=</span> saved / all_spend_total × 100`,
+        `<span class="op">=</span> saved / all_counterfactual_total × 100`,
       ) +
       row(
         'all_usage_requests',
         s.all_usage_requests,
         '(denominator request count - compressed + passthrough + probe-failed)',
       ) +
-      `<span class="src">measured numerator, all-rows denominator - no cherry-pick</span>`
+      `<span class="src">measured numerator, all-rows counterfactual denominator - bounded at 100%</span>`
     : '';
 
   $: tokeqMath = s && pa

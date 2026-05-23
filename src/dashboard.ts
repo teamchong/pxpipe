@@ -159,19 +159,28 @@ interface Totals {
    *  doesn't touch output). Without this the headline ignores half the
    *  bill on output-heavy sessions. */
   outputWeighted: number;
-  /** Sum of weighted actual input tokens across ALL requests that had a
-   *  usage block, regardless of whether the probe succeeded — i.e. every
-   *  request the user actually paid for, measured or not, transformed or
-   *  passthrough. Forms the honest denominator for "share of total spend
-   *  saved": you can only credit savings against the slice where pixelpipe
-   *  ran AND we measured, but you have to divide by the full bill (passthrough
-   *  + probe-failed + unmeasured + measured) to answer "did pixelpipe move
-   *  my real bill" instead of "did pixelpipe help on rows where it ran". */
+  /** Sum of weighted COUNTERFACTUAL input tokens across ALL requests
+   *  with a usage block. For measured rows: cache-aware baseline (what the
+   *  unproxied path would have billed). For unmeasured/probe-failed rows:
+   *  actual_input_eff (best available estimate — these rows didn't run
+   *  pixelpipe or we can't measure what it would have cost, so the
+   *  counterfactual ≈ actual).
+   *
+   *  This is the right denominator for "share of bill saved": dividing
+   *  by what-you-would-have-paid is bounded at 100% (you can't save more
+   *  than you would have spent). Dividing by what-you-DID-pay is not
+   *  bounded — a single big cold-miss compressed request can make
+   *  saved/actual exceed 100% because pixelpipe shrunk the actual to
+   *  near zero. */
+  allBaselineEquivalentWeighted: number;
+  /** Sum of weighted ACTUAL input tokens across the same all-rows set.
+   *  Kept for the diagnostic sub-line and the back-compat saved_usd math. */
   allActualInputWeighted: number;
-  /** Sum of output_tokens × OUTPUT_TOKEN_RATE across the same all-rows set
-   *  as allActualInputWeighted. Output is on both sides of the savings ratio
-   *  at its actual 5× rate; numerator stays measured-rows-only because saved
-   *  cancels output (proxy doesn't touch it). */
+  /** Sum of output_tokens × OUTPUT_TOKEN_RATE across the same all-rows set.
+   *  Output is identical with/without compression, so it appears in both
+   *  numerator and denominator at the same value and cancels in the savings
+   *  numerator. Included in the denominator so the headline drops honestly
+   *  toward zero on output-heavy workloads. */
   allOutputWeighted: number;
   /** Count of requests that contributed to allActualInputWeighted (had a
    *  usage block). Lets the UI annotate "N of M paid requests". */
@@ -243,6 +252,7 @@ export class DashboardState {
     actualInputWeighted: 0,
     baselineInputWeighted: 0,
     outputWeighted: 0,
+    allBaselineEquivalentWeighted: 0,
     allActualInputWeighted: 0,
     allOutputWeighted: 0,
     allUsageRequests: 0,
@@ -397,11 +407,17 @@ export class DashboardState {
       this.totals.actualInputWeighted += actualInputEff;
       this.totals.outputWeighted += outputEquiv;
     }
-    // All-rows spend, ungated on the probe. The "share of total bill saved"
-    // headline divides measured-rows savings into this, so passthrough rows,
-    // probe-failed rows, and uncompressed rows all dilute the headline the
-    // same way they dilute the user's real bill.
+    // All-rows COUNTERFACTUAL spend, ungated on the probe — the honest
+    // denominator for "did pixelpipe move my real bill". Measured rows
+    // contribute their cache-aware baseline (what the unproxied path
+    // would have billed); unmeasured/probe-failed/passthrough rows
+    // contribute their actual input (pixelpipe either didn't run or we
+    // can't measure the counterfactual, so actual ≈ baseline). This
+    // keeps the ratio bounded at 100% — you can't save more than you
+    // would have paid.
     if (haveUsage) {
+      this.totals.allBaselineEquivalentWeighted +=
+        haveBaseline ? baselineInputEff : actualInputEff;
       this.totals.allActualInputWeighted += actualInputEff;
       this.totals.allOutputWeighted += outputEquiv;
       this.totals.allUsageRequests += 1;
@@ -542,10 +558,16 @@ export class DashboardState {
     // and untransformed turns the gate said no to. Otherwise the headline
     // answers "did pixelpipe help on the rows where it ran" instead of
     // "did pixelpipe move my real bill". The first is a cherry-pick.
+    const allBaselineEquiv = this.totals.allBaselineEquivalentWeighted;
     const allActual = this.totals.allActualInputWeighted;
     const allOutput = this.totals.allOutputWeighted;
-    const allSpend = allActual + allOutput;
-    const pctAllSpend = allSpend > 0 ? (saved / allSpend) * 100 : 0;
+    // Denominator = counterfactual all-rows bill: what the user would have
+    // paid with no pixelpipe. Bounded ratio at 100%; a single cold-miss
+    // compressed request on an otherwise empty session shows ~99% saved,
+    // not 280%.
+    const allCounterfactualBill = allBaselineEquiv + allOutput;
+    const pctAllSpend =
+      allCounterfactualBill > 0 ? (saved / allCounterfactualBill) * 100 : 0;
     const uptimeSec = Date.now() / 1000 - this.totals.startedAt;
     const payload = {
       requests: this.totals.requests,
@@ -564,6 +586,7 @@ export class DashboardState {
       // ask "is pixelpipe helping". Negative when flap-pollution from
       // passthrough turns exceeds the collapse win on measured turns.
       saved_pct_of_all_spend: round1(pctAllSpend),
+      all_baseline_equivalent_weighted: Math.round(allBaselineEquiv),
       all_actual_input_weighted: Math.round(allActual),
       all_output_weighted: Math.round(allOutput),
       all_usage_requests: this.totals.allUsageRequests,

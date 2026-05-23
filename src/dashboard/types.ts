@@ -21,6 +21,7 @@ export interface StatsPayload {
   /** Honest "share of total bill saved": measured-rows savings ÷ ALL paid
    *  requests in the window (compressed + passthrough + probe-failed). */
   saved_pct_of_all_spend: number;
+  all_baseline_equivalent_weighted: number;
   all_actual_input_weighted: number;
   all_output_weighted: number;
   all_usage_requests: number;

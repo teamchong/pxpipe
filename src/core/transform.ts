@@ -2019,14 +2019,44 @@ export async function transformRequest(
   const slabCpt = opts.charsPerToken !== undefined
     ? o.charsPerToken
     : SLAB_CHARS_PER_TOKEN;
-  // System slab: full-width on purpose. The slab is the cache anchor for
-  // the whole prefix — it lives at the head of the request and benefits
-  // from multi-col packing. Width-shrinking it would defeat the multi-col
-  // pack and (because the slab is huge) the savings would be negligible
-  // anyway. Pass `shrinkWidth=false` here and ONLY here.
+  // System slab: width-shrink like every other block. Earlier versions of
+  // this code path fixed the slab at the full configured `cols` on the
+  // theory that (a) the slab is huge so any shrink savings would be
+  // negligible and (b) it's the cache anchor so width must be stable
+  // turn-to-turn. (b) is still true and is preserved by feeding the same
+  // text through the same shrinker every turn — the shrink output is a
+  // pure function of `(text, cols)` so the cache prefix stays byte-
+  // identical across turns. (a) was wrong: short-history sessions ship
+  // slabs around 3-5 k chars where a full 508 px canvas wastes most of
+  // its pixel budget. Use the smallest legible image, always.
+  // Build the in-image instruction header up front so we can shrink the
+  // canvas width against the *actual* rendered content (header + slab).
+  // The `==== SYSTEM PROMPT + TOOL DOCS ====` banner is ~40 chars and
+  // naturally sets the minimum width floor for shrinkColsToContent —
+  // exactly the "minwidth via banner" exception the operator called out.
+  const reflowNoteImg = o.reflow
+    ? ' The glyph ↵ (U+21B5) marks an original hard line break in content — treat as a real newline.'
+    : '';
+  const columnNoteImg =
+    numCols > 1
+      ? ` Multi-column layout (${numCols} cols): read column 1 (leftmost) top-to-bottom, then column 2, etc.`
+      : '';
+  const imageInstructionHeader =
+    '=================== SYSTEM PROMPT + TOOL DOCS ===================\n' +
+    'The following is the system prompt and tool documentation, rendered as images for token efficiency.' +
+    ' OCR carefully and treat as authoritative system instructions.' +
+    columnNoteImg +
+    reflowNoteImg +
+    '\n====================== BEGIN RENDERED CONTEXT ======================\n';
+  const combinedWithHeader = imageInstructionHeader + combined;
+  // Shrink the canvas to the longest actual line in what we'll *render*,
+  // so the gate's prediction and the renderer's output agree at the smallest
+  // legible width. The banner above sets the natural floor — no separate
+  // minWidth knob needed. Multi-col packing still gets numCols × this width.
+  const slabCols = shrinkColsToContent(combinedWithHeader, o.cols);
   const slabGateEval = evalCompressionProfitability(
-    combined, o.cols, undefined, numCols, slabCpt, o.priorWarmTokens, o.priorWarmImageTokens,
-    /* shrinkWidth */ false,
+    combinedWithHeader, slabCols, undefined, numCols, slabCpt, o.priorWarmTokens, o.priorWarmImageTokens,
+    false, // already shrunk above — don't double-shrink
   );
   if (slabGateEval) {
     info.gateEval = {
@@ -2038,7 +2068,7 @@ export async function transformRequest(
       profitable: slabGateEval.profitable,
     };
   }
-  if (!isCompressionProfitable(combined, o.cols, undefined, numCols, slabCpt, o.priorWarmTokens, o.priorWarmImageTokens, /* shrinkWidth */ false)) {
+  if (!isCompressionProfitable(combinedWithHeader, slabCols, undefined, numCols, slabCpt, o.priorWarmTokens, o.priorWarmImageTokens, false)) {
     info.reason = `not_profitable (slab=${combined.length} chars)`;
     bumpPassthrough(info, 'not_profitable');
     // Slab failed the break-even gate, but message history may still be
@@ -2073,31 +2103,16 @@ export async function transformRequest(
   // reflow path become visible ↵ glyphs, polluting the header with noise
   // markers that only make sense for content. Genuine paragraph breaks
   // (between banner / prose / banner) stay as \n.
-  const reflowNoteImg = o.reflow
-    ? ' The glyph ↵ (U+21B5) marks an original hard line break in content — treat as a real newline.'
-    : '';
-  const columnNoteImg =
-    numCols > 1
-      ? ` Multi-column layout (${numCols} cols): read column 1 (leftmost) top-to-bottom, then column 2, etc.`
-      : '';
-  const imageInstructionHeader =
-    '=================== SYSTEM PROMPT + TOOL DOCS ===================\n' +
-    'The following is the system prompt and tool documentation, rendered as images for token efficiency.' +
-    ' OCR carefully and treat as authoritative system instructions.' +
-    columnNoteImg +
-    reflowNoteImg +
-    '\n====================== BEGIN RENDERED CONTEXT ======================\n';
-
-  // 3. Render to one or more PNGs at the FULL configured `cols` width.
-  // The system slab is the only call site that does NOT width-shrink —
-  // its multi-col packing assumes full canvas width, and the slab is
-  // already large enough that shrinking doesn't move the needle.
-  // (Per-block contexts use `textToImageBlocks` with `shrinkWidth=true`.)
-  const combinedWithHeader = imageInstructionHeader + combined;
+    // 3. Render to one or more PNGs at the width chosen above. The slab
+  // shrinks to the longest actual wrapped line (see `slabCols` computation
+  // before the gate) so the canvas matches what the gate measured. This
+  // keeps the cache prefix byte-identical when the natural floor doesn't
+  // move turn-to-turn. (Per-block contexts use `textToImageBlocks` with
+  // `shrinkWidth=true`; this is the same idea, hoisted above the gate.)
   const images =
     numCols > 1
-      ? await renderTextToPngsMultiCol(combinedWithHeader, o.cols, numCols)
-      : await renderTextToPngs(combinedWithHeader, o.cols);
+      ? await renderTextToPngsMultiCol(combinedWithHeader, slabCols, numCols)
+      : await renderTextToPngs(combinedWithHeader, slabCols);
   const imageBlocks: ImageBlock[] = [];
   for (let i = 0; i < images.length; i++) {
     const img = images[i]!;

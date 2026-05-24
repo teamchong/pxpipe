@@ -37,7 +37,7 @@
  */
 
 import type { ContentBlock, ImageBlock, Message, TextBlock, ToolUseBlock, ToolResultBlock } from './types.js';
-import { renderTextToPngs } from './render.js';
+import { renderTextToPngs, shrinkColsToContent } from './render.js';
 import { bytesToBase64 } from './png.js';
 
 /** Function predicate signature for the break-even gate. Passed in by the
@@ -341,7 +341,14 @@ export async function collapseHistory(
     return { messages, info };
   }
   // Render. No cache_control here — caller decides placement.
-  const imgs = await renderTextToPngs(text, o.cols);
+  // Width-shrink: history collapse always renders a single image-set of
+  // collapsed conversation prose, which is typically much narrower than
+  // the configured `cols` (100 default). Shrinking the canvas to the
+  // longest wrapped line saves ~50% of pixel area on short collapsed
+  // history blocks. The gate's `imageTokensCost()` is computed with the
+  // same `shrinkColsToContent` so prediction matches reality.
+  const effCols = shrinkColsToContent(text, o.cols);
+  const imgs = await renderTextToPngs(text, effCols);
   if (imgs.length === 0) {
     info.reason = 'render_empty';
     return { messages, info };

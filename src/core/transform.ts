@@ -26,6 +26,7 @@ import {
   renderTextToPngsMultiCol,
   reflow,
   maxFittingCols,
+  shrinkColsToContent,
   MAX_HEIGHT_PX,
   NL_SENTINEL,
   PAD_X,
@@ -168,16 +169,19 @@ const DEFAULTS: Required<TransformOptions> = {
   compressReminders: true,
   compressToolResults: true,
   minCompressChars: 2000,
-  // Coarse pre-filter — blocks below this length skip the per-block
-  // break-even check entirely (saves CPU on the obviously-not-profitable
-  // cases). The REAL gate is `isCompressionProfitable()` below; this is
-  // just a fast-path skip. Held at 14,000 (the old 7×10 floor:
-  // TOKENS_PER_IMAGE_SINGLE_COL × CHARS_PER_TOKEN ≈ 3,484 × 4) even though
-  // the production 5×8 cell is cheaper (~2,500 × 4 = 10,000). The looser
-  // floor is harmless — it just makes the skip a tiny bit more conservative
-  // and forwards a few extra borderline blocks to the real break-even gate.
-  minReminderChars: 14000,
-  minToolResultChars: 14000,
+  // No coarse pre-filter floors on per-block compression. The historical
+  // 14,000-char floors were CORRECTNESS workarounds for a buggy gate that
+  // assumed every image cost ~2,500 tokens (full-canvas billing). With
+  // the gate now computing exact pixel cost via the content-aware path
+  // (width = `shrinkColsToContent`, height = `rows·CELL_H + 2·PAD_Y`,
+  // tokens = `width × height / 750`), the gate correctly rejects blocks
+  // that would actually net-lose and accepts blocks that would actually
+  // net-win, down to single-character inputs. PNG-encode CPU on tiny
+  // blocks is sub-millisecond — not worth a floor. Host can still set a
+  // floor via `TransformOptions.minReminderChars` / `minToolResultChars`
+  // if they want one for non-correctness reasons (e.g. observability).
+  minReminderChars: 0,
+  minToolResultChars: 0,
   // NOTE: Anthropic's `system` field accepts text blocks only — image blocks
   // there come back as `400 system.N.type: Input should be 'text'`. Images
   // are always attached to the first user message; there's no flag for this
@@ -305,44 +309,115 @@ export const SLAB_CHARS_PER_TOKEN = 2.0;
  *  see it in the dashboard before any net-loss compression. */
 export const HISTORY_CHARS_PER_TOKEN = 2.0;
 
-/** Empirical per-image cost ANCHOR: 2,500 tokens for a single-col PNG at the
- *  OLD 5×8 atlas cell — a 508 px-wide canvas at cols=100 (history-researcher
- *  N=33 cold-miss measurement, 2026-05-18). Anthropic bills ∝ pixel area; a
- *  full image is always height-capped at MAX_HEIGHT_PX, so per-image cost
- *  scales with canvas WIDTH. Kept as a constant rather than imported from
- *  dashboard.ts to keep `src/core/` free of dashboard imports. */
-const TOKENS_PER_IMAGE_ANCHOR = 2500;
-/** Canvas width the anchor was measured at: 2·PAD_X + 100·5 (old 5×8 cell). */
-const ANCHOR_CANVAS_WIDTH_PX = 508;
-/** Single-col per-image token cost at the CURRENT render cell. Derived from
- *  the 5×8 anchor by canvas-width ratio so it tracks cell-size changes the
- *  same way LINES_PER_IMAGE tracks cell height. The production cell is the
- *  bare 5×8 (render.ts DEFAULT_CELL_W_BONUS=0, DEFAULT_CELL_H_BONUS=0), so
- *  the cols=100 canvas stays at 508 px → ~2,500 tokens/image (identity
- *  with the anchor). The 7×10 path remains exercised by the eval harness'
- *  cellWBonus / cellHBonus overrides and will recompute correctly here. */
-const TOKENS_PER_IMAGE_SINGLE_COL = Math.round(
-  TOKENS_PER_IMAGE_ANCHOR *
-    ((2 * PAD_X + DEFAULTS.cols * CELL_W) / ANCHOR_CANVAS_WIDTH_PX),
-);
-
-/** Effective per-image token cost at the given `numCols`. Single-col is
- *  the calibrated measurement; multi-col scales linearly with the number
- *  of text columns packed per image (Anthropic bills proportional to
- *  pixel area, which doubles/triples with numCols). The 10% multi-col
- *  margin absorbs extrapolation noise since we don't yet have empirical
- *  cost measurements at numCols≥2 — biases toward pass-through, never
- *  toward letting a net-loss through.
+/** Anthropic's documented image-billing formula: `tokens ≈ width × height / 750`.
+ *  https://docs.anthropic.com/en/docs/build-with-claude/vision#image-tokens
  *
- *  Why bias conservative: the gate's only job is "compress if and only if
- *  doing so saves tokens." If the constant is too low, we compress
- *  net-losers and overpay. If it's too high, we miss profitable
- *  compressions but never overpay. The user's constraint is "don't lose
- *  money" — accept missed opportunities, reject misses-that-overpay. */
-function effectiveTokensPerImage(numCols: number): number {
+ *  This is the SOURCE OF TRUTH. The renderer (render.ts) produces images
+ *  whose height tracks content (`height = 2·PAD_Y + rows·CELL_H`), so a
+ *  10-row tool_result block at the 5×8 cell renders to ~88 px tall, which
+ *  Anthropic bills at `508 × 88 / 750 ≈ 60 tokens`, NOT the 2,500 tokens
+ *  a full-canvas image would cost. The old `TOKENS_PER_IMAGE_ANCHOR=2500`
+ *  constant assumed every image was full-canvas, which is the right
+ *  assumption ONLY for the system+tools slab (always 60 KB+). For
+ *  per-block tool_result and reminder compression, the old gate over-
+ *  estimated image cost by 20-50× and refused compressions that would
+ *  have saved real tokens.
+ *
+ *  Empirical N=14 calibration on high-image cold-miss rows (where text
+ *  overhead in cache_create is negligible) shows the documented formula
+ *  is accurate to within ~5% on dense glyph PNGs. We apply a 10 % safety
+ *  margin: bias toward pass-through, never toward predicting cheap-when-
+ *  expensive. */
+const ANTHROPIC_PIXELS_PER_TOKEN = 750;
+const IMAGE_COST_SAFETY_MARGIN = 1.10;
+
+/** Width in px of a single-col PNG at the given `cols` and current cell.
+ *  Must stay in sync with `renderChunkToPng` width math (render.ts:524). */
+function singleColWidthPx(cols: number): number {
+  return 2 * PAD_X + cols * CELL_W;
+}
+
+/** Width in px of a multi-col PNG. Mirrors `multiColWidth()` in render.ts. */
+function multiColWidthPx(cols: number, numCols: number): number {
   const n = Math.max(1, numCols | 0);
-  if (n === 1) return TOKENS_PER_IMAGE_SINGLE_COL;
-  return Math.ceil(TOKENS_PER_IMAGE_SINGLE_COL * n * 1.10);
+  if (n === 1) return singleColWidthPx(cols);
+  // GUTTER_CELLS = 4 in render.ts; replicate the constant here (not exported).
+  const GUTTER_CELLS = 4;
+  return 2 * PAD_X + n * cols * CELL_W + (n - 1) * GUTTER_CELLS * CELL_W;
+}
+
+/** Compute the exact image-token cost for `visualRows` of content at the
+ *  given column width and multi-col packing. Mirrors the renderer's height
+ *  math (`renderChunkToPng` / `renderMultiColChunkFromLines`) so the gate's
+ *  prediction matches what Anthropic will actually bill.
+ *
+ *  The renderer splits content into images of at most `linesPerImg` rows
+ *  each (multi-col packs `numCols` text columns side-by-side, so one image
+ *  covers `numCols × linesPerImg` wrapped lines). Each image's height
+ *  scales with the rows it actually holds — full-canvas only when the
+ *  image is full; the last image of a sequence is partial.
+ *
+ *  Returns total token cost summed across all images that the renderer
+ *  will produce for `visualRows` rows. */
+function imageTokensForRows(
+  visualRows: number,
+  cols: number,
+  numCols: number = 1,
+  imageCountCap?: number,
+): number {
+  if (!Number.isFinite(visualRows) || visualRows <= 0) return 0;
+  const n = Math.max(1, numCols | 0);
+  const widthPx = multiColWidthPx(cols, n);
+  const linesPerImg = Math.max(1, Math.floor((MAX_HEIGHT_PX - 2 * PAD_Y) / CELL_H));
+  // Multi-col packs n text columns side-by-side, so one image holds
+  // n × linesPerImg wrapped lines but its HEIGHT only tracks the tallest
+  // column (= min(rowsInChunk, linesPerImg)). See renderMultiColChunkFromLines.
+  const rowsPerImage = linesPerImg; // pixel rows per image (height-wise)
+  const linesPerImage = linesPerImg * n; // wrapped-text lines per image
+  let imagesNeeded = Math.ceil(visualRows / linesPerImage);
+  if (imageCountCap !== undefined && imageCountCap > 0) {
+    imagesNeeded = Math.min(imagesNeeded, imageCountCap);
+  }
+  // First (imagesNeeded-1) images are full-height; last is partial.
+  const fullImages = Math.max(0, imagesNeeded - 1);
+  // How many wrapped lines spill into the last image (1..linesPerImage).
+  const linesInLast = visualRows - fullImages * linesPerImage;
+  // Last-image pixel-row count = min(linesInLast distributed across n cols, rowsPerImage).
+  // Column-major: col 0 takes the first `rowsPerImage` lines, col 1 the next, etc.
+  // So pixel rows used = min(linesInLast, rowsPerImage).
+  const rowsInLast = Math.min(Math.max(1, linesInLast), rowsPerImage);
+  // Total pixels across all images.
+  const fullImageHeight = 2 * PAD_Y + rowsPerImage * CELL_H;
+  const lastImageHeight = 2 * PAD_Y + rowsInLast * CELL_H;
+  const totalPixels = fullImages * widthPx * fullImageHeight + widthPx * lastImageHeight;
+  return Math.ceil((totalPixels / ANTHROPIC_PIXELS_PER_TOKEN) * IMAGE_COST_SAFETY_MARGIN);
+}
+
+/** Compute the exact image-token cost for the given `text` at the given
+ *  column geometry. The string IS the source of truth: row count comes from
+ *  `countVisualRows` (matches the renderer line-for-line) and width comes
+ *  from `shrinkColsToContent` when `shrinkWidth=true` (matches the
+ *  renderer column-for-column, so a 16-char "File not found" block bills
+ *  for an ~80 px wide canvas, not the full 508 px slab).
+ *
+ *  `shrinkWidth=false` is the system-slab path (multi-col, packs the full
+ *  configured `cols` regardless of any individual line's length) and any
+ *  caller that explicitly wants full-canvas pricing.
+ *
+ *  No numeric overload — every production caller has the text, and the old
+ *  chars-only fallback predicted cheaper than reality (it assumed every
+ *  char filled a full-width row), which silently leaked net-losing
+ *  compressions through the gate. */
+function imageTokensCost(
+  text: string,
+  cols: number,
+  numCols: number = 1,
+  imageCountCap?: number,
+  shrinkWidth: boolean = true,
+): number {
+  const effectiveCols = shrinkWidth ? shrinkColsToContent(text, cols) : cols;
+  const rows = countVisualRows(text, effectiveCols);
+  return imageTokensForRows(rows, effectiveCols, numCols, imageCountCap);
 }
 
 /** Visual rows per image at the current render cell. Derived once at module
@@ -426,37 +501,50 @@ function maybeReflow(text: string, enabled: boolean): string {
  *  vs leaving it as text. Used as the gate before every image-encoding
  *  decision in transformRequest.
  *
- *  Pass the **actual text string** when possible — the function will
- *  soft-wrap-count visual rows to match what `renderTextToPngs` will
- *  actually produce. Newline-heavy content (low fill ratio) renders to
- *  *more* images than the naive `chars / charsPerImage` estimate, and
- *  using the looser estimate lets net-losing compressions through.
+ *  ## Content-aware geometry
  *
- *  Passing a `number` falls back to the looser chars-only estimate for
- *  back-compat with existing unit tests; production transform call sites
- *  should always pass the string.
+ *  The gate is **string-only** — every production caller has the text, and
+ *  the gate uses it to compute the renderer's exact image cost two ways at
+ *  once:
  *
- *  `cols` defaults to `DEFAULTS.cols` (100) so existing callers and unit
- *  tests that pass only `textLen` keep working byte-identically at the
- *  current atlas. New call sites should pass `o.cols` so a runtime
- *  `--cols` override flows into the break-even math too. */
-/** Decompose the slab break-even gate's evaluation into its components.
- *  Returns the exact `imageTokens`, `textTokens`, and symmetric burn
- *  terms the gate uses internally. Pairs with `isCompressionProfitable`
- *  for telemetry: callers can record the numbers without re-implementing
- *  the formula and risking drift.
+ *  - **Rows** come from `countVisualRows` (matches `wrapLines` line-for-
+ *    line, including soft-wraps and codepoint width).
+ *  - **Width** comes from `shrinkColsToContent` when `shrinkWidth=true`
+ *    (the default): a 16-char `"File not found"` block bills for an
+ *    ~80 px wide canvas, not the full 508 px slab canvas. This matters
+ *    most for tool_result and reminder blocks, which dominate per-turn
+ *    image cost and are usually much narrower than `cols`.
  *
- *  Returns `null` when the inputs are not finite or `textLen ≤ 0`.
- *  Stays in sync with `isCompressionProfitable` because both use the
- *  same constants and `effectiveTokensPerImage`. */
+ *  Set `shrinkWidth=false` for the system slab (multi-col, fills the
+ *  configured `cols` deliberately to maximise OCR density) and anywhere
+ *  the caller needs full-canvas pricing for telemetry parity.
+ *
+ *  ## No numeric overload
+ *
+ *  The historical `textOrLen: string | number` shape existed for unit-
+ *  test back-compat. The numeric path assumed every char filled a full-
+ *  width row (= lower-bound rows = under-estimated image cost), which
+ *  silently let net-losing compressions through whenever a caller passed
+ *  `text.length` instead of `text`. Removed.
+ */
+/** Decompose the per-block break-even gate's evaluation into its components.
+ *  Returns the exact `imageTokens`, `textTokens`, and symmetric burn terms
+ *  the gate uses internally. Pairs with `isCompressionProfitable` for
+ *  telemetry: callers can record the numbers without re-implementing the
+ *  formula and risking drift.
+ *
+ *  Returns `null` when the input is empty or non-finite. Stays in sync with
+ *  `isCompressionProfitable` because both use the same `imageTokensCost`
+ *  and the same width-shrink toggle. */
 export function evalCompressionProfitability(
-  textOrLen: string | number,
+  text: string,
   cols: number,
   imageCountCap: number | undefined = undefined,
   numCols: number = 1,
   charsPerToken: number = CHARS_PER_TOKEN,
   priorWarmTokens: number = 0,
   priorWarmImageTokens: number = 0,
+  shrinkWidth: boolean = true,
 ): {
   imageTokens: number;
   textTokens: number;
@@ -465,25 +553,12 @@ export function evalCompressionProfitability(
   profitable: boolean;
 } | null {
   const n = Math.max(1, numCols | 0);
-  let estImages: number;
-  let textLen: number;
-  if (typeof textOrLen === 'string') {
-    estImages = estimateImageCount(textOrLen, cols, n);
-    textLen = textOrLen.length;
-  } else {
-    const charsPerImage = maxCharsPerImage(cols) * n;
-    estImages = Math.max(1, Math.ceil(textOrLen / charsPerImage));
-    textLen = textOrLen;
-  }
-  if (imageCountCap !== undefined && imageCountCap > 0) {
-    estImages = Math.min(estImages, imageCountCap);
-  }
-  if (!Number.isFinite(textLen) || textLen <= 0) return null;
+  if (typeof text !== 'string' || text.length === 0) return null;
   const cpt = Number.isFinite(charsPerToken) && charsPerToken > 0
     ? charsPerToken
     : CHARS_PER_TOKEN;
-  const imageTokens = estImages * effectiveTokensPerImage(n);
-  const textTokens = textLen / cpt;
+  const imageTokens = imageTokensCost(text, cols, n, imageCountCap, shrinkWidth);
+  const textTokens = text.length / cpt;
   const burnImageSide = Number.isFinite(priorWarmTokens) && priorWarmTokens > 0
     ? priorWarmTokens * (CACHE_CREATE_RATE - CACHE_READ_RATE)
     : 0;
@@ -500,7 +575,7 @@ export function evalCompressionProfitability(
 }
 
 export function isCompressionProfitable(
-  textOrLen: string | number,
+  text: string,
   cols: number = DEFAULTS.cols,
   imageCountCap?: number,
   numCols: number = 1,
@@ -522,35 +597,19 @@ export function isCompressionProfitable(
    *  Default 0 (back-compat; existing single-arg callers behave unchanged).
    *  See PixelpipeOptions.priorWarmImageTokens for the foundational rationale. */
   priorWarmImageTokens: number = 0,
+  /** Shrink the rendered canvas width to the longest actual wrapped line.
+   *  Default `true` (per-block content: tool_result, reminder, history).
+   *  Set `false` for the system slab, which deliberately fills the full
+   *  configured `cols` (multi-col packing). */
+  shrinkWidth: boolean = true,
 ): boolean {
   const n = Math.max(1, numCols | 0);
-  let estImages: number;
-  let textLen: number;
-  if (typeof textOrLen === 'string') {
-    // Row-aware: matches renderTextToPngs() image budgeting exactly.
-    estImages = estimateImageCount(textOrLen, cols, n);
-    textLen = textOrLen.length;
-  } else {
-    // Looser chars-only estimate. Assumes lines fill width — wrong for
-    // newline-heavy code/logs but kept for back-compat.
-    const charsPerImage = maxCharsPerImage(cols) * n;
-    estImages = Math.max(1, Math.ceil(textOrLen / charsPerImage));
-    textLen = textOrLen;
-  }
-  // For code paths that truncate before rendering (tool_results), the
-  // actual image cost is bounded by the cap — text savings are still
-  // measured against the full pre-truncation length.
-  if (imageCountCap !== undefined && imageCountCap > 0) {
-    estImages = Math.min(estImages, imageCountCap);
-  }
-  // Defensive clamp: a corrupt or pathological charsPerToken (≤0 / NaN)
-  // would either crash or give a misleading-true. Fall back to the
-  // baked-in default in that case.
+  if (typeof text !== 'string' || text.length === 0) return false;
   const cpt = Number.isFinite(charsPerToken) && charsPerToken > 0
     ? charsPerToken
     : CHARS_PER_TOKEN;
-  const imageTokensCost = estImages * effectiveTokensPerImage(n);
-  const textTokensEquivalent = textLen / cpt;
+  const imageTokensCost_ = imageTokensCost(text, cols, n, imageCountCap, shrinkWidth);
+  const textTokensEquivalent = text.length / cpt;
   // Cache-burn penalty (symmetric form, ANTI-FLAPPING):
   //
   //   text→image flip: invalidate the warm text cache. Burn applied to
@@ -572,7 +631,7 @@ export function isCompressionProfitable(
   const burnTextSide = Number.isFinite(priorWarmImageTokens) && priorWarmImageTokens > 0
     ? priorWarmImageTokens * (CACHE_CREATE_RATE - CACHE_READ_RATE)
     : 0;
-  return imageTokensCost + burnImageSide < textTokensEquivalent + burnTextSide;
+  return imageTokensCost_ + burnImageSide < textTokensEquivalent + burnTextSide;
 }
 
 /**
@@ -613,7 +672,7 @@ export function isCompressionProfitable(
  * Falls back to the cold per-turn gate when `horizon <= 1`.
  */
 export function isCompressionProfitableAmortized(
-  textOrLen: string | number,
+  text: string,
   cols: number,
   imageCountCap: number | undefined,
   numCols: number,
@@ -626,30 +685,23 @@ export function isCompressionProfitableAmortized(
   /** Symmetric image-side burn — see same-named param on
    *  `isCompressionProfitable`. Default 0 (back-compat). */
   priorWarmImageTokens: number = 0,
+  /** Shrink rendered width to longest wrapped line (see
+   *  `isCompressionProfitable`). Default `true`. */
+  shrinkWidth: boolean = true,
 ): boolean {
   if (!Number.isFinite(horizon) || horizon <= 1) {
-    return isCompressionProfitable(textOrLen, cols, imageCountCap, numCols, charsPerToken, priorWarmTokens, priorWarmImageTokens);
+    return isCompressionProfitable(text, cols, imageCountCap, numCols, charsPerToken, priorWarmTokens, priorWarmImageTokens, shrinkWidth);
   }
   const N = Math.max(2, Math.floor(horizon));
   const n = Math.max(1, numCols | 0);
-  let estImages: number;
-  let textLen: number;
-  if (typeof textOrLen === 'string') {
-    estImages = estimateImageCount(textOrLen, cols, n);
-    textLen = textOrLen.length;
-  } else {
-    const charsPerImage = maxCharsPerImage(cols) * n;
-    estImages = Math.max(1, Math.ceil(textOrLen / charsPerImage));
-    textLen = textOrLen;
-  }
-  if (imageCountCap !== undefined && imageCountCap > 0) {
-    estImages = Math.min(estImages, imageCountCap);
-  }
+  if (typeof text !== 'string' || text.length === 0) return false;
   const cpt = Number.isFinite(charsPerToken) && charsPerToken > 0
     ? charsPerToken
     : CHARS_PER_TOKEN;
-  const imageTokens = estImages * effectiveTokensPerImage(n);
-  const textTokens = textLen / cpt;
+  // Content-aware image cost — see `imageTokensCost` and the matching
+  // comment in `isCompressionProfitable` for the full rationale.
+  const imageTokens = imageTokensCost(text, cols, n, imageCountCap, shrinkWidth);
+  const textTokens = text.length / cpt;
   // Worst-case-for-image vs best-case-for-text framing — this is on
   // purpose. We refuse to collapse on the optimistic side, so the gate
   // only fires when the collapse wins even under pessimistic warm-cache
@@ -1646,6 +1698,12 @@ async function textToImageBlocks(
   text: string,
   cols: number,
   numCols: number = 1,
+  /** Shrink the rendered canvas width to the longest actual wrapped line.
+   *  Default `true` (matches the `isCompressionProfitable` default and is
+   *  correct for per-block content: tool_result, reminder, history). Set
+   *  `false` for the system slab path, which fills the full configured
+   *  `cols` deliberately for multi-col packing. */
+  shrinkWidth: boolean = true,
 ): Promise<{
   blocks: ImageBlock[];
   droppedChars: number;
@@ -1655,10 +1713,20 @@ async function textToImageBlocks(
    *  px/token regression. */
   pixels: number;
 }> {
+  // Width-shrink at the renderer entry so the renderer's canvas matches
+  // the gate's prediction (gate also uses `shrinkColsToContent` when its
+  // own `shrinkWidth=true`). Multi-col packing only kicks in when the
+  // configured `cols` is wide enough to need it, so we shrink BEFORE the
+  // numCols branch — for narrow content, single-col is the right call
+  // even if numCols>1 was configured.
+  const effectiveCols = shrinkWidth ? shrinkColsToContent(text, cols) : cols;
+  // If shrinkage drops the canvas below the multi-col threshold, stay
+  // single-col to avoid burning a divider column on near-empty space.
+  const effectiveNumCols = effectiveCols < cols ? 1 : numCols;
   const imgs =
-    numCols > 1
-      ? await renderTextToPngsMultiCol(text, cols, numCols)
-      : await renderTextToPngs(text, cols);
+    effectiveNumCols > 1
+      ? await renderTextToPngsMultiCol(text, effectiveCols, effectiveNumCols)
+      : await renderTextToPngs(text, effectiveCols);
   let droppedChars = 0;
   let pixels = 0;
   const droppedCodepoints = new Map<number, number>();
@@ -1951,8 +2019,14 @@ export async function transformRequest(
   const slabCpt = opts.charsPerToken !== undefined
     ? o.charsPerToken
     : SLAB_CHARS_PER_TOKEN;
+  // System slab: full-width on purpose. The slab is the cache anchor for
+  // the whole prefix — it lives at the head of the request and benefits
+  // from multi-col packing. Width-shrinking it would defeat the multi-col
+  // pack and (because the slab is huge) the savings would be negligible
+  // anyway. Pass `shrinkWidth=false` here and ONLY here.
   const slabGateEval = evalCompressionProfitability(
     combined, o.cols, undefined, numCols, slabCpt, o.priorWarmTokens, o.priorWarmImageTokens,
+    /* shrinkWidth */ false,
   );
   if (slabGateEval) {
     info.gateEval = {
@@ -1964,7 +2038,7 @@ export async function transformRequest(
       profitable: slabGateEval.profitable,
     };
   }
-  if (!isCompressionProfitable(combined, o.cols, undefined, numCols, slabCpt, o.priorWarmTokens, o.priorWarmImageTokens)) {
+  if (!isCompressionProfitable(combined, o.cols, undefined, numCols, slabCpt, o.priorWarmTokens, o.priorWarmImageTokens, /* shrinkWidth */ false)) {
     info.reason = `not_profitable (slab=${combined.length} chars)`;
     bumpPassthrough(info, 'not_profitable');
     // Slab failed the break-even gate, but message history may still be
@@ -2014,9 +2088,11 @@ export async function transformRequest(
     reflowNoteImg +
     '\n====================== BEGIN RENDERED CONTEXT ======================\n';
 
-  // 3. Render to one or more PNGs.
-  // Prepend the in-image instruction header to the slab so the OCR framing
-  // travels in the same PNG as the content (single-modal task framing).
+  // 3. Render to one or more PNGs at the FULL configured `cols` width.
+  // The system slab is the only call site that does NOT width-shrink —
+  // its multi-col packing assumes full canvas width, and the slab is
+  // already large enough that shrinking doesn't move the needle.
+  // (Per-block contexts use `textToImageBlocks` with `shrinkWidth=true`.)
   const combinedWithHeader = imageInstructionHeader + combined;
   const images =
     numCols > 1

@@ -274,7 +274,36 @@ export function expandTabsInLine(line: string): string {
  *    3. soft-wrap by visual column budget (this loop)
  *  Minify runs first so trailing tabs get stripped before they'd
  *  needlessly expand to arrow + spaces. */
-function wrapLines(text: string, cols: number, markerScale: number = 1): string[] {
+/** Visual width of a single wrapped line in cells. Wide CJK glyphs count as
+ *  2, the enlarged ↵ marker counts as `markerScale` when `markerScale > 1`.
+ *  Iterates codepoints (handles surrogate pairs correctly). */
+export function measureLineCols(line: string, markerScale: number = 1): number {
+  let w = 0;
+  for (const ch of line) w += cellsFor(ch.codePointAt(0)!, markerScale);
+  return w;
+}
+
+/** Shrink the configured `cols` to the actual longest wrapped line in `text`.
+ *  Used by non-system-slab call sites (tool_result, reminder, history per-
+ *  block) to produce the smallest possible canvas: a 16-char "File not found"
+ *  block becomes a ~80 px wide image instead of the full 508 px slab canvas,
+ *  cutting pixel area (and Anthropic's pixel-area billing) by 6×.
+ *
+ *  Returns `min(cols, longestLineWidth)`. Floored at 1 so a degenerate empty
+ *  string still produces a valid canvas. Re-wrap the text at the returned
+ *  cols to get the matching `string[]` for the renderer. */
+export function shrinkColsToContent(text: string, cols: number, markerScale: number = 1): number {
+  const lines = wrapLines(text, cols, markerScale);
+  let maxW = 0;
+  for (const line of lines) {
+    const w = measureLineCols(line, markerScale);
+    if (w > maxW) maxW = w;
+    if (maxW >= cols) return cols; // can't shrink past requested cols
+  }
+  return Math.max(1, maxW);
+}
+
+export function wrapLines(text: string, cols: number, markerScale: number = 1): string[] {
   const out: string[] = [];
   const minified = minifyForRender(text);
   for (const rawWithTabs of minified.split('\n')) {

@@ -41,15 +41,17 @@ describe('symmetric warm-cache burn (anti-flapping)', () => {
   });
 
   it('priorWarmImageTokens symmetrically pins a session in image mode', () => {
-    // Pick text length where the cold gate says NOT profitable (text is
-    // small relative to image fixed cost). Once image mode is warm, the
-    // symmetric burn must flip the verdict to "profitable" so we stay in
-    // image mode rather than re-creating the text cache.
-    const text = 'x'.repeat(2_000);
-    const cold = isCompressionProfitable(text, 100, undefined, 1, 4, 0, 0);
-    const warmImage = isCompressionProfitable(text, 100, undefined, 1, 4, 0, 60_000);
-    // Cold should reject this short text; warm-image must accept it to
-    // avoid the flap-induced cache_create on the text side.
+    // Pick a scenario where the cold gate says NOT profitable: text whose
+    // text-token cost is below the image cost. Under the post-shrink gate
+    // (content-aware image cost) this is rare on natural shapes — but a
+    // pathologically-tight chars-per-token (~50) simulates a session where
+    // the text is unusually token-cheap (think: extremely repetitive
+    // content). Once image mode is warm, the symmetric burn must flip the
+    // verdict to "profitable" so we stay in image mode rather than
+    // re-creating the text cache.
+    const text = 'hello'.repeat(500); // 2500 chars
+    const cold = isCompressionProfitable(text, 100, undefined, 1, 50, 0, 0);
+    const warmImage = isCompressionProfitable(text, 100, undefined, 1, 50, 0, 60_000);
     expect(cold).toBe(false);
     expect(warmImage).toBe(true);
   });
@@ -67,7 +69,7 @@ describe('evalCompressionProfitability observability', () => {
     const samples = [
       { text: 'x'.repeat(50_000), pw: 0, pwi: 0 },
       { text: 'x'.repeat(12_000), pw: 50_000, pwi: 0 },
-      { text: 'x'.repeat(2_000), pw: 0, pwi: 60_000 },
+      { text: 'hello'.repeat(500), pw: 0, pwi: 60_000 },
       { text: 'x'.repeat(12_000), pw: 25_000, pwi: 25_000 },
     ];
     for (const s of samples) {

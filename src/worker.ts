@@ -49,12 +49,13 @@ export default {
       compressReminders: truthy(env.COMPRESS_REMINDERS, true),
       compressToolResults: truthy(env.COMPRESS_TOOL_RESULTS, true),
       minCompressChars: env.MIN_COMPRESS_CHARS ? Number(env.MIN_COMPRESS_CHARS) : 2000,
-      // Raised to 10,000 — per-block break-even point at current renderer
-      // config (Spleen/Unifont 5×8 hybrid, 100 cols). Real gate is
-      // `isCompressionProfitable()` in transform.ts; this is a fast-path
-      // skip for obvious-no cases. Keep in sync with DEFAULTS.
-      minReminderChars: env.MIN_REMINDER_CHARS ? Number(env.MIN_REMINDER_CHARS) : 10000,
-      minToolResultChars: env.MIN_TOOL_RESULT_CHARS ? Number(env.MIN_TOOL_RESULT_CHARS) : 10000,
+      // 500 chars — CPU/latency floor only, not a correctness guard. The
+      // No floors — the content-aware `isCompressionProfitable()` gate
+      // decides per-block based on actual pixel cost vs text cost. Host
+      // can still set a floor via env if they want observability buckets
+      // (e.g. MIN_TOOL_RESULT_CHARS=200 to skip absurdly small dumps).
+      minReminderChars: env.MIN_REMINDER_CHARS ? Number(env.MIN_REMINDER_CHARS) : 0,
+      minToolResultChars: env.MIN_TOOL_RESULT_CHARS ? Number(env.MIN_TOOL_RESULT_CHARS) : 0,
       cols: env.COLS ? Number(env.COLS) : 100,
       // R2 multi-column ON (2 cols) — single-col drops below break-even on
       // real tool-doc slabs. Override via MULTI_COL=1 if OCR misreads layout.

@@ -257,9 +257,14 @@ describe('collapseHistory', () => {
     expect(info.reason).toBe('prefix_too_short');
   });
 
-  it('bails with reason=not_profitable when collapsed text is small', async () => {
+  it('collapses even small histories under the content-aware gate', async () => {
     // 12 tiny turns, all plain prose. Each turn ~30 chars → ~400 chars total
-    // serialised. Well under the 10,000-char break-even.
+    // serialised. Under the OLD width=always-full gate this was "below
+    // break-even" and bailed `not_profitable`. The post-shrink gate measures
+    // the actual rendered image size (small content → small image), so even
+    // tiny histories compress profitably. We assert the NEW physics
+    // explicitly here as a regression guard against re-introducing a fixed
+    // image-cost over-estimation.
     const msgs: Message[] = [];
     for (let i = 0; i < 12; i++) {
       msgs.push(i % 2 === 0 ? usr(`q${i}`) : asst(`a${i}`));
@@ -269,7 +274,9 @@ describe('collapseHistory', () => {
       minCollapsePrefix: 5,
       collapseChunk: 0, // legacy moving boundary — isolate the profitability gate
     });
-    expect(info.reason).toBe('not_profitable');
+    // No reason set ↔ collapsed successfully.
+    expect(info.reason).toBeUndefined();
+    expect(info.collapsedTurns).toBeGreaterThanOrEqual(1);
   });
 
   it('collapses a long all-plain conversation into one prepended user message', async () => {

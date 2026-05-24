@@ -1452,18 +1452,16 @@ function renderToolDoc(t: ToolDef, includeSchema: boolean): string {
   return parts.join('\n');
 }
 
-function makeImageBlock(pngB64: string, ephemeral = false): ImageBlock {
-  const blk: ImageBlock = {
+function makeImageBlock(pngB64: string, _ephemeral = false): ImageBlock {
+  // Per Task #21: pixelpipe NEVER adds its own cache_control marker.
+  // Claude Code already places markers on system+tools, CLAUDE.md, and the
+  // per-turn anchor; we honor those positions byte-identically and add
+  // nothing of our own. The `_ephemeral` parameter is preserved for call-
+  // site compatibility but is now a no-op.
+  return {
     type: 'image',
     source: { type: 'base64', media_type: 'image/png', data: pngB64 },
   };
-  // ttl='1h' is mandatory, not cosmetic. Claude Code marks its own
-  // user-message content with cache_control ttl='1h'; Anthropic enforces
-  // "ttl='1h' must not come after ttl='5m'" in processing order
-  // (tools → system → messages). If we leave ttl unset it defaults to '5m'
-  // and our block lands BEFORE Claude Code's 1h block → 400 at runtime.
-  if (ephemeral) blk.cache_control = { type: 'ephemeral', ttl: '1h' };
-  return blk;
 }
 
 /** Render a long text blob to one or more PNG image blocks. Helper for the

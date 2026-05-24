@@ -1298,7 +1298,11 @@ describe('transform', () => {
     }
   });
 
-  it('puts cache_control on the image only, never on the dynamic tail', async () => {
+  it('never adds its own cache_control marker (Task #21)', async () => {
+    // Per Task #21: pixelpipe must NEVER add cache_control markers of its
+    // own. If the caller sent zero markers, the rewritten request also
+    // carries zero markers — Claude Code's slot budget stays free for its
+    // own anchors.
     const sys =
       'x'.repeat(150000) +
       '<env>\nWorking directory: /tmp/x\n</env>\n' +
@@ -1314,13 +1318,10 @@ describe('transform', () => {
     expect(info.dynamicBlockCount).toBe(2);
 
     const out = JSON.parse(new TextDecoder().decode(outBytes));
-    // cache_control must land on exactly one image block — anywhere in the
-    // request (system field OR user message), never on a text block.
     const sysBlocks = (Array.isArray(out.system) ? out.system : []) as any[];
     const userContent = (out.messages[0].content ?? []) as any[];
     const cached = [...sysBlocks, ...userContent].filter((b: any) => b.cache_control);
-    expect(cached.length).toBe(1);
-    expect(cached[0].type).toBe('image');
+    expect(cached.length).toBe(0);
   });
 
   it('extracts env fields (cwd, platform, today, isGitRepo, branch) into info.env', async () => {
@@ -1504,10 +1505,10 @@ describe('transform', () => {
     expect(out.system).toBe(sys);
   });
 
-  it("uses ttl='1h' on the image cache_control (Anthropic ordering rule)", async () => {
-    // Without ttl='1h' on our cache_control, Claude Code's own ttl='1h'
-    // breakpoint on later user-message content triggers 400: "ttl='1h' must
-    // not come after ttl='5m'" because our default 5m would land first.
+  it('adds no cache_control of its own (Task #21: honor caller markers only)', async () => {
+    // Pixelpipe must never add cache_control markers. The caller's slot
+    // budget (max 4 per Anthropic) belongs entirely to Claude Code. We
+    // rewrite text → image byte-stably and leave marker placement alone.
     const body = new TextEncoder().encode(
       JSON.stringify({
         model: 'claude',
@@ -1522,8 +1523,7 @@ describe('transform', () => {
       ...((out.messages?.[0]?.content ?? []) as any[]),
     ];
     const cached = blocks.filter((b: any) => b.cache_control);
-    expect(cached.length).toBe(1);
-    expect(cached[0].cache_control.ttl).toBe('1h');
+    expect(cached.length).toBe(0);
   });
 
   it('compresses long <system-reminder> blocks in the first user message', async () => {

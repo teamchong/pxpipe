@@ -153,7 +153,9 @@ describe('public library API', () => {
     expect(transformed.reason).toBe('applied');
     expect(transformed.info.compressedChars).toBeGreaterThan(0);
     expect(transformed.info.imageCount).toBeGreaterThan(0);
-    expect(transformed.cache.ownsCacheControl).toBe(true);
-    expect(transformed.cache.markerCount).toBeGreaterThan(0);
+    // Task #21: pixelpipe never adds its own cache_control markers.
+    // The caller sent zero markers, so the rewritten body also has zero.
+    expect(transformed.cache.ownsCacheControl).toBe(false);
+    expect(transformed.cache.markerCount).toBe(0);
   });
 });

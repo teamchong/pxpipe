@@ -150,21 +150,16 @@ export interface RecentRow {
  */
 interface SessionTotals {
   sessionId: string;
-  firstSeen: number; // unix seconds
-  lastSeen: number; // unix seconds
-  requests: number;
   // Dollar-weighted accumulators. baseline/actual are the SAME math as the
-  // global `Totals.allBaselineEquivalentWeighted` / `allActualInputWeighted`
-  // + `allOutputWeighted`, but scoped to a single session.
+  // global `Totals.allBaselineEquivalentWeighted` / `allActualInputWeighted`,
+  // but scoped to a single session. Output is excluded because the proxy
+  // doesn't touch it.
   baselineInputWeighted: number;
   actualInputWeighted: number;
-  outputWeighted: number;
-  // Per-bucket char attribution from ev.info.bucketChars.
-  bucketChars: { [bucket: string]: number };
-  // Passthrough reason histogram from ev.info.passthroughReasons.
-  passthroughReasons: Record<string, number>;
-  passthroughRequests: number; // count of requests where !ev.info.compressed
-  compressedRequests: number;
+  // Honest denominator for the headline: count of requests that contributed
+  // to `baselineInputWeighted` (events that carried a baseline measurement,
+  // matching the global `Totals.baselineMeasuredCount`).
+  baselineMeasuredCount: number;
 }
 
 interface Totals {
@@ -512,59 +507,30 @@ export class DashboardState {
       if (!s) {
         s = {
           sessionId: sid,
-          firstSeen: Date.now() / 1000,
-          lastSeen: Date.now() / 1000,
-          requests: 0,
           baselineInputWeighted: 0,
           actualInputWeighted: 0,
-          outputWeighted: 0,
-          bucketChars: {},
-          passthroughReasons: {},
-          passthroughRequests: 0,
-          compressedRequests: 0,
+          baselineMeasuredCount: 0,
         };
         this.sessions.set(sid, s);
-        // Cap memory — drop the oldest session by lastSeen when over budget.
+        // Cap memory — drop the first (oldest by insertion order) session
+        // when over budget. We no longer track lastSeen privately on the
+        // class — insertion order is a fine proxy because `currentSessionId`
+        // (set above on every update) is what the serve path uses to pick
+        // the most-recent session, not a scan of `this.sessions`.
         if (this.sessions.size > DashboardState.SESSION_CAP) {
-          const oldest = [...this.sessions.values()].sort(
-            (a, b) => a.lastSeen - b.lastSeen,
-          )[0];
-          if (oldest) this.sessions.delete(oldest.sessionId);
+          const firstKey = this.sessions.keys().next().value;
+          if (firstKey !== undefined) this.sessions.delete(firstKey);
         }
       }
-      s.lastSeen = Date.now() / 1000;
-      s.requests += 1;
       // Reuse the same haveUsage / haveBaseline guards + the
-      // baselineInputEff / actualInputEff / outputEquiv locals computed
-      // earlier in update() so the lifetime totals block (above) and the
-      // per-session block (here) read the same values. Re-deriving them
-      // here would duplicate the cache-aware-baseline math and invite drift.
+      // baselineInputEff / actualInputEff locals computed earlier in
+      // update() so the lifetime totals block (above) and the per-session
+      // block (here) read the same values. Re-deriving them here would
+      // duplicate the cache-aware-baseline math and invite drift.
       if (haveBaseline && haveUsage) {
         s.baselineInputWeighted += baselineInputEff;
         s.actualInputWeighted += actualInputEff;
-        s.outputWeighted += outputEquiv;
-      }
-      if (compressed) s.compressedRequests += 1;
-      else s.passthroughRequests += 1;
-      // Per-bucket char attribution from `info.bucketChars` (flat
-      // `Partial<Record<BucketName, number>>` — see src/core/tracker.ts).
-      // Matches the shape the Svelte panel iterates over.
-      const bc = info?.bucketChars;
-      if (bc && typeof bc === 'object') {
-        for (const [key, val] of Object.entries(bc) as [string, unknown][]) {
-          if (typeof val === 'number' && Number.isFinite(val)) {
-            s.bucketChars[key] = (s.bucketChars[key] ?? 0) + val;
-          }
-        }
-      }
-      // Passthrough reason histogram from `info.passthroughReasons`.
-      const pr = info?.passthroughReasons;
-      if (pr && typeof pr === 'object') {
-        for (const [reason, count] of Object.entries(pr as Record<string, unknown>)) {
-          if (typeof count === 'number' && Number.isFinite(count) && count > 0) {
-            s.passthroughReasons[reason] = (s.passthroughReasons[reason] ?? 0) + count;
-          }
-        }
+        s.baselineMeasuredCount += 1;
       }
     }
 
@@ -695,28 +661,16 @@ export class DashboardState {
     if (!s) {
       return jsonResponse({ sessionId: null, message: 'no active session yet' });
     }
-    // Dollar-weighted savings ratio. Same math as the global `saved_pct`
-    // (compressed AND passthrough requests — passthrough has baseline=actual,
-    // so it correctly drags the ratio down when we leak). Honest denominator:
-    // includes both compressed and uncompressed flows that the proxy saw.
-    const baselineUsd = (s.baselineInputWeighted * ASSUMED_INPUT_USD_PER_MTOK) / 1e6;
-    const actualUsd = (s.actualInputWeighted * ASSUMED_INPUT_USD_PER_MTOK) / 1e6;
-    const savedUsd = baselineUsd - actualUsd;
-    const savedPct = baselineUsd > 0 ? (savedUsd / baselineUsd) * 100 : 0;
+    // Minimal headline payload: the same dollar-weighted baseline/actual
+    // input accumulators the global Totals block exposes, plus the honest
+    // denominator (`baselineMeasuredCount` — only requests that carried a
+    // baseline measurement). The Svelte panel does the savings math itself
+    // so we don't round-trip dollar values through the wire.
     return jsonResponse({
       sessionId: s.sessionId,
-      firstSeen: s.firstSeen,
-      lastSeen: s.lastSeen,
-      uptimeSec: Math.max(0, s.lastSeen - s.firstSeen),
-      requests: s.requests,
-      compressedRequests: s.compressedRequests,
-      passthroughRequests: s.passthroughRequests,
-      baselineUsd: round4(baselineUsd),
-      actualUsd: round4(actualUsd),
-      savedUsd: round4(savedUsd),
-      savedPct: round1(savedPct),
-      bucketChars: s.bucketChars,
-      passthroughReasons: s.passthroughReasons,
+      baselineInputWeighted: s.baselineInputWeighted,
+      actualInputWeighted: s.actualInputWeighted,
+      baselineMeasuredCount: s.baselineMeasuredCount,
     });
   }
 

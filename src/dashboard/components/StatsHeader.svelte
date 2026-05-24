@@ -51,17 +51,18 @@
       `<span class="src">source: ${escapeHtml(pa.source || 'docs.anthropic.com pricing')}</span>`
     : '';
 
+  // Diagnostic only — no longer the headline. See `split` math below for
+  // the headline.
   $: pctMath = s && pa
     ? `<div><span class="k">formula:</span> <span class="v">` +
       ` share_of_spend = saved / (all_baseline_equivalent + all_output × ` +
       (pa.output_multiplier ?? 5) +
       `)</span></div>` +
-      `<div><span class="k">why this denominator:</span> <span class="v">` +
-      `the question is "did pixelpipe move my real bill", not "did pixelpipe help on the slice it ran on". ` +
-      `Denominator = what the user WOULD have paid with no pixelpipe — measured rows use their cache-aware ` +
-      `baseline, unmeasured/passthrough rows fall back to actual (pixelpipe didn't run there, so counterfactual = actual). ` +
-      `Dividing by counterfactual bill instead of actual bill keeps the ratio bounded at 100%; saved/actual ` +
-      `is unbounded because pixelpipe shrinks the denominator.</span></div>` +
+      `<div><span class="k">why this is diagnostic, not the headline:</span> <span class="v">` +
+      `this is a counterfactual ("what the user WOULD have paid"). It depends on the count_tokens probe, ` +
+      `the cache-aware baseline split, and an Opus 4.7 input-rate assumption. Useful as a sanity check, ` +
+      `but the operator's real question is "did the compressed path cost less per request than the ` +
+      `passthrough path on real traffic" — that's the headline split above, no counterfactuals.</span></div>` +
       `<div style="height:6px"></div>` +
       row('saved', s.saved_input_tokens, '(measured-rows numerator; cache-aware)') +
       row(
@@ -90,6 +91,43 @@
         '(denominator request count - compressed + passthrough + probe-failed)',
       ) +
       `<span class="src">measured numerator, all-rows counterfactual denominator - bounded at 100%</span>`
+    : '';
+
+  // Headline "compressed vs passthrough" math. Direct observed split — no
+  // counterfactuals, no probe gating. Each bucket is the sum of actual
+  // billed token-equivalents (input + cc×1.25 + cr×0.10 + out×5) for that
+  // path, converted to $ at the assumed input rate.
+  $: splitMath = s && pa
+    ? `<div><span class="k">formula:</span> <span class="v">` +
+      `bucket_$ = (Σ actual_input + Σ output × ` + (pa.output_multiplier ?? 5) +
+      `) × $` + (pa.input_per_mtok ?? 5) + `/Mtok</span></div>` +
+      `<div><span class="k">why:</span> <span class="v">` +
+      `partition the paid-rows set by which path actually ran this turn ` +
+      `(\`info.compressed = true\` for slab/history compression; false for ` +
+      `passthrough or bypassed). Same $/Mtok rate on both sides so the ` +
+      `rate-assumption bias cancels in the delta. Selection bias (the ` +
+      `gate routes each turn) does NOT cancel — interpret with sample ` +
+      `counts.</span></div>` +
+      `<div style="height:6px"></div>` +
+      row(
+        'compressed (n=' + s.compressed_paid_requests + ')',
+        '$' + (s.compressed_actual_usd || 0).toFixed(4),
+        'total · avg $' + (s.compressed_avg_usd_per_request || 0).toFixed(4) + '/req',
+      ) +
+      row(
+        'passthrough (n=' + s.passthrough_paid_requests + ')',
+        '$' + (s.passthrough_actual_usd || 0).toFixed(4),
+        'total · avg $' + (s.passthrough_avg_usd_per_request || 0).toFixed(4) + '/req',
+      ) +
+      row(
+        'compressed − passthrough',
+        '$' + (s.compressed_minus_passthrough_avg_usd || 0).toFixed(4) + '/req',
+        s.split_sufficient_sample
+          ? '(both buckets ≥ ' + s.split_min_sample_per_bucket + ' — delta is meaningful)'
+          : '(small sample: need ≥ ' + s.split_min_sample_per_bucket +
+            ' per bucket; treat delta as noisy)',
+      ) +
+      `<span class="src">no counterfactual, no probe gate — pure observed $/req on each path</span>`
     : '';
 
   $: tokeqMath = s && pa
@@ -179,15 +217,37 @@
     {/if}
   </div>
   <div class="card">
-    <div class="label">share of spend saved</div>
-    <div class="value" class:pos={(s?.saved_pct_of_all_spend ?? 0) >= 0} class:neg={(s?.saved_pct_of_all_spend ?? 0) < 0}>{(s?.saved_pct_of_all_spend ?? 0).toFixed(1)}%</div>
+    <div class="label">compressed $/req</div>
+    <div class="value">$ {(s?.compressed_avg_usd_per_request ?? 0).toFixed(4)}</div>
     <div class="small">
-      ÷ all paid requests ({numFmt(s?.all_usage_requests)} req · compressed + passthrough + probe-failed) · negative = pixelpipe added cost
+      n={numFmt(s?.compressed_paid_requests)} · total $ {(s?.compressed_actual_usd ?? 0).toFixed(4)}
     </div>
+  </div>
+  <div class="card">
+    <div class="label">passthrough $/req</div>
+    <div class="value">$ {(s?.passthrough_avg_usd_per_request ?? 0).toFixed(4)}</div>
+    <div class="small">
+      n={numFmt(s?.passthrough_paid_requests)} · total $ {(s?.passthrough_actual_usd ?? 0).toFixed(4)}
+    </div>
+  </div>
+  <div class="card">
+    <div class="label">compressed − passthrough $/req</div>
+    {#if s?.split_sufficient_sample}
+      <div class="value" class:pos={(s?.compressed_minus_passthrough_avg_usd ?? 0) <= 0} class:neg={(s?.compressed_minus_passthrough_avg_usd ?? 0) > 0}>
+        {((s?.compressed_minus_passthrough_avg_usd ?? 0) >= 0 ? '+$ ' : '-$ ')}{Math.abs(s?.compressed_minus_passthrough_avg_usd ?? 0).toFixed(4)}
+      </div>
+      <div class="small">negative = compressed path cheaper · both buckets ≥ {s?.split_min_sample_per_bucket}</div>
+    {:else}
+      <div class="value small-sample">small sample</div>
+      <div class="small">
+        need ≥ {s?.split_min_sample_per_bucket} requests per bucket · have
+        {numFmt(s?.compressed_paid_requests)} / {numFmt(s?.passthrough_paid_requests)}
+      </div>
+    {/if}
     {#if s && pa}
       <details class="math">
         <summary>show calculation</summary>
-        <div class="formula">{@html pctMath}</div>
+        <div class="formula">{@html splitMath}</div>
       </details>
     {/if}
   </div>
@@ -204,14 +264,32 @@
   </div>
 </div>
 
+{#if s && pa}
+  <details class="diagnostic">
+    <summary>diagnostic: counterfactual "share of spend saved"</summary>
+    <div class="diagnostic-body">
+      <div class="diag-headline">
+        share of spend saved (counterfactual):
+        <span class:pos={(s?.saved_pct_of_all_spend ?? 0) >= 0} class:neg={(s?.saved_pct_of_all_spend ?? 0) < 0}>
+          {(s?.saved_pct_of_all_spend ?? 0).toFixed(1)}%
+        </span>
+        <span class="small">
+          ({numFmt(s?.all_usage_requests)} paid req · compressed + passthrough + probe-failed)
+        </span>
+      </div>
+      <div class="formula">{@html pctMath}</div>
+    </div>
+  </details>
+{/if}
+
 <style>
   .grid {
     display: grid;
-    grid-template-columns: repeat(5, 1fr);
+    grid-template-columns: repeat(6, 1fr);
     gap: 14px;
     margin-bottom: 22px;
   }
-  @media (max-width: 1200px) {
+  @media (max-width: 1400px) {
     .grid {
       grid-template-columns: repeat(3, 1fr);
     }
@@ -245,6 +323,52 @@
   }
   .value.neg {
     color: #f85149;
+  }
+  .value.small-sample {
+    color: #8b949e;
+    font-size: 18px;
+    font-weight: 500;
+  }
+  .diagnostic {
+    margin: 0 0 22px;
+    font-size: 12px;
+    color: #8b949e;
+  }
+  .diagnostic :global(summary) {
+    cursor: pointer;
+    user-select: none;
+    color: #58a6ff;
+    padding: 6px 0;
+  }
+  .diagnostic :global(summary::-webkit-details-marker) {
+    display: none;
+  }
+  .diagnostic :global(summary::before) {
+    content: '▸ ';
+    color: #6e7681;
+    font-size: 9px;
+  }
+  .diagnostic :global([open] summary::before) {
+    content: '▾ ';
+  }
+  .diagnostic-body {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    padding: 12px 14px;
+    margin-top: 6px;
+  }
+  .diag-headline {
+    color: #c9d1d9;
+    margin-bottom: 8px;
+  }
+  .diag-headline .pos {
+    color: #3fb950;
+    font-weight: 600;
+  }
+  .diag-headline .neg {
+    color: #f85149;
+    font-weight: 600;
   }
   .small {
     font-size: 11px;

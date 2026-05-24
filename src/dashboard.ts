@@ -185,6 +185,22 @@ interface Totals {
   /** Count of requests that contributed to allActualInputWeighted (had a
    *  usage block). Lets the UI annotate "N of M paid requests". */
   allUsageRequests: number;
+  /** Direct compressed-vs-passthrough actual-cost split. No counterfactuals,
+   *  no probe gating — just sum what each path actually billed.
+   *
+   *  These accumulate over `haveUsage` rows only (same gate as the all-rows
+   *  counters above) and partition that set by `info.compressed`. The point
+   *  is to answer "did the compressed path actually cost less per request
+   *  than the passthrough path, on real traffic" without inventing a
+   *  counterfactual. Selection bias is real (the gate decides which path
+   *  each turn lands on), so the UI surfaces sample counts so the operator
+   *  can judge sufficiency — the dashboard does not auto-claim significance. */
+  compressedPaidRequests: number;
+  compressedActualInputWeighted: number;
+  compressedOutputWeighted: number;
+  passthroughPaidRequests: number;
+  passthroughActualInputWeighted: number;
+  passthroughOutputWeighted: number;
   /** Sum of ground-truth output character counts from the SSE/JSON scanner
    *  (see `OutputMeasurement` in proxy.ts). These three accumulators are
    *  independent of Anthropic's `usage.output_tokens` — they let the operator
@@ -256,6 +272,12 @@ export class DashboardState {
     allActualInputWeighted: 0,
     allOutputWeighted: 0,
     allUsageRequests: 0,
+    compressedPaidRequests: 0,
+    compressedActualInputWeighted: 0,
+    compressedOutputWeighted: 0,
+    passthroughPaidRequests: 0,
+    passthroughActualInputWeighted: 0,
+    passthroughOutputWeighted: 0,
     textCharsMeasured: 0,
     thinkingCharsMeasured: 0,
     toolUseCharsMeasured: 0,
@@ -421,6 +443,21 @@ export class DashboardState {
       this.totals.allActualInputWeighted += actualInputEff;
       this.totals.allOutputWeighted += outputEquiv;
       this.totals.allUsageRequests += 1;
+      // Direct observed compressed-vs-passthrough split. No counterfactual,
+      // no probe gating — just partition the paid-rows set by which path
+      // actually ran this turn. Headline answers "is the compressed path
+      // cheaper per request on real traffic". Selection bias (the gate
+      // routes each turn) is real; sample counts go to the UI so the
+      // operator can judge sufficiency.
+      if (compressed) {
+        this.totals.compressedPaidRequests += 1;
+        this.totals.compressedActualInputWeighted += actualInputEff;
+        this.totals.compressedOutputWeighted += outputEquiv;
+      } else {
+        this.totals.passthroughPaidRequests += 1;
+        this.totals.passthroughActualInputWeighted += actualInputEff;
+        this.totals.passthroughOutputWeighted += outputEquiv;
+      }
     }
 
     // Measurement totals are independent of usage/baseline gating — they
@@ -568,6 +605,42 @@ export class DashboardState {
     const allCounterfactualBill = allBaselineEquiv + allOutput;
     const pctAllSpend =
       allCounterfactualBill > 0 ? (saved / allCounterfactualBill) * 100 : 0;
+
+    // Direct observed split — actual $ per request, partitioned by which
+    // path ran. Token-equivalent (input × 1.0 + cache_create × 1.25 +
+    // cache_read × 0.10 + output × 5) → $ at the assumed Opus 4.7 input
+    // rate. Same $/Mtok rate is applied to both buckets, so the bias from
+    // the rate assumption cancels in the delta. Selection bias from the
+    // gate is NOT cancelled — the operator interprets that via the
+    // sample-count caveat below.
+    const compressedTokenEquiv =
+      this.totals.compressedActualInputWeighted +
+      this.totals.compressedOutputWeighted;
+    const passthroughTokenEquiv =
+      this.totals.passthroughActualInputWeighted +
+      this.totals.passthroughOutputWeighted;
+    const compressedActualUsd =
+      (compressedTokenEquiv * ASSUMED_INPUT_USD_PER_MTOK) / 1e6;
+    const passthroughActualUsd =
+      (passthroughTokenEquiv * ASSUMED_INPUT_USD_PER_MTOK) / 1e6;
+    const compressedAvgUsd =
+      this.totals.compressedPaidRequests > 0
+        ? compressedActualUsd / this.totals.compressedPaidRequests
+        : 0;
+    const passthroughAvgUsd =
+      this.totals.passthroughPaidRequests > 0
+        ? passthroughActualUsd / this.totals.passthroughPaidRequests
+        : 0;
+    // Sufficient-sample threshold is a soft heuristic. 20 paid requests per
+    // bucket is enough to see a real effect on Opus 4.7 traffic (a single
+    // big cold-miss can dominate at lower n). Below this, the UI shows the
+    // bucket numbers but hides the delta and surfaces "small sample".
+    const SUFFICIENT = 20;
+    const splitSufficient =
+      this.totals.compressedPaidRequests >= SUFFICIENT &&
+      this.totals.passthroughPaidRequests >= SUFFICIENT;
+    const splitDeltaUsd = compressedAvgUsd - passthroughAvgUsd;
+
     const uptimeSec = Date.now() / 1000 - this.totals.startedAt;
     const payload = {
       requests: this.totals.requests,
@@ -590,6 +663,19 @@ export class DashboardState {
       all_actual_input_weighted: Math.round(allActual),
       all_output_weighted: Math.round(allOutput),
       all_usage_requests: this.totals.allUsageRequests,
+      // Direct observed split — replaces "share of spend saved" as the
+      // headline. Total actual $ and average $/req per path, plus a delta
+      // gated on `split_sufficient_sample`. No counterfactual: each
+      // bucket is what each path actually billed.
+      compressed_paid_requests: this.totals.compressedPaidRequests,
+      passthrough_paid_requests: this.totals.passthroughPaidRequests,
+      compressed_actual_usd: round4(compressedActualUsd),
+      passthrough_actual_usd: round4(passthroughActualUsd),
+      compressed_avg_usd_per_request: round4(compressedAvgUsd),
+      passthrough_avg_usd_per_request: round4(passthroughAvgUsd),
+      compressed_minus_passthrough_avg_usd: round4(splitDeltaUsd),
+      split_sufficient_sample: splitSufficient,
+      split_min_sample_per_bucket: SUFFICIENT,
       saved_usd: round4((saved * ASSUMED_INPUT_USD_PER_MTOK) / 1e6),
       output_weighted: Math.round(output),
       baseline_token_equivalent: Math.round(baselineTotal),

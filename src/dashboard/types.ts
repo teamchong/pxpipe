@@ -25,6 +25,20 @@ export interface StatsPayload {
   all_actual_input_weighted: number;
   all_output_weighted: number;
   all_usage_requests: number;
+  /** Direct observed compressed-vs-passthrough split. Headline answers
+   *  "is the compressed path cheaper per request on real traffic" without
+   *  inventing a counterfactual. `split_sufficient_sample` gates the
+   *  per-request delta on a minimum count per bucket (UI hides the delta
+   *  number below the threshold and shows a "small sample" caveat). */
+  compressed_paid_requests: number;
+  passthrough_paid_requests: number;
+  compressed_actual_usd: number;
+  passthrough_actual_usd: number;
+  compressed_avg_usd_per_request: number;
+  passthrough_avg_usd_per_request: number;
+  compressed_minus_passthrough_avg_usd: number;
+  split_sufficient_sample: boolean;
+  split_min_sample_per_bucket: number;
   saved_usd: number;
   output_weighted: number;
   baseline_token_equivalent: number;

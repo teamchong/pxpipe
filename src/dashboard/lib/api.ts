@@ -14,6 +14,7 @@ export const API = {
   latestPng: '/proxy-latest-png',
   sessions: '/api/sessions.json',
   fullStats: '/api/stats.json',
+  currentSession: '/api/current-session.json',
   compressionToggle: '/api/compression',
 } as const;
 

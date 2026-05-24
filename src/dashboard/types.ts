@@ -152,3 +152,28 @@ export interface FullStatsSummary {
 export interface CompressionToggleResponse {
   compression_enabled: boolean;
 }
+
+/** /api/current-session.json payload — per-session aggregates for the most-recently-active Claude Code session. */
+export interface CurrentSessionPayload {
+  sessionId: string | null;
+  message?: string;
+  firstSeen?: number;
+  lastSeen?: number;
+  uptimeSec?: number;
+  requests?: number;
+  compressedRequests?: number;
+  passthroughRequests?: number;
+  baselineUsd?: number;
+  actualUsd?: number;
+  savedUsd?: number;
+  savedPct?: number;
+  bucketChars?: {
+    static_slab: number;
+    reminder: number;
+    tool_result: number;
+    history: number;
+    billing: number;
+    dynamic: number;
+  };
+  passthroughReasons?: Record<string, number>;
+}

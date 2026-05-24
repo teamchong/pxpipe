@@ -142,6 +142,31 @@ export interface RecentRow {
  *  output×5 in input-token-equivalents. The dashboard headline matches it
  *  so a "20% saved" number means weekly-limit consumption dropped by 20%,
  *  not "20% off the slice we touched while the other half stayed full." */
+/**
+ * Per-session aggregate. Same dollar-weighted savings math as the global
+ * `Totals` block, but partitioned by `info.firstUserSha8` so the dashboard
+ * can show "what's happening RIGHT NOW" instead of stale lifetime numbers.
+ * Field names mirror the JSON wire shape served by `serveCurrentSessionJson`.
+ */
+interface SessionTotals {
+  sessionId: string;
+  firstSeen: number; // unix seconds
+  lastSeen: number; // unix seconds
+  requests: number;
+  // Dollar-weighted accumulators. baseline/actual are the SAME math as the
+  // global `Totals.allBaselineEquivalentWeighted` / `allActualInputWeighted`
+  // + `allOutputWeighted`, but scoped to a single session.
+  baselineInputWeighted: number;
+  actualInputWeighted: number;
+  outputWeighted: number;
+  // Per-bucket char attribution from ev.info.bucketChars.
+  bucketChars: { [bucket: string]: number };
+  // Passthrough reason histogram from ev.info.passthroughReasons.
+  passthroughReasons: Record<string, number>;
+  passthroughRequests: number; // count of requests where !ev.info.compressed
+  compressedRequests: number;
+}
+
 interface Totals {
   requests: number;
   compressedRequests: number;
@@ -258,10 +283,24 @@ const OUTPUT_TOKEN_RATE = 5.0;
  *  actual target model; do not trust hardcoded chars-per-token or
  *  tokens-per-image constants on 4.7 without verifying against the
  *  upstream probe. */
-const ASSUMED_INPUT_USD_PER_MTOK = 5.0;
+export const ASSUMED_INPUT_USD_PER_MTOK = 5.0;
 
 export class DashboardState {
   private recent: RecentRow[] = [];
+  /** Per-session dollar-weighted totals, keyed by `info.firstUserSha8`. The
+   *  dashboard surfaces ONLY the most-recently-active session via the
+   *  `serveCurrentSessionJson` endpoint — older sessions linger in the Map
+   *  so a tab refresh during a brief lull still finds the previous session,
+   *  but get evicted at `SESSION_CAP` to bound memory in long-running hosts. */
+  private sessions: Map<string, SessionTotals> = new Map();
+  /** sha8 of the most-recently-active session id. null when no events have
+   *  ever carried a `firstUserSha8` (e.g. a cold start with only passthrough
+   *  hits that the upstream probe never tagged). */
+  private currentSessionId: string | null = null;
+  /** Hard cap on `sessions` Map entries. Keeps memory bounded in
+   *  long-running deployments. 50 sessions × ~13 numeric fields each is
+   *  comfortably under a MB even with fat bucket/passthrough histograms. */
+  private static readonly SESSION_CAP = 50;
   private totals: Totals = {
     requests: 0,
     compressedRequests: 0,
@@ -460,6 +499,75 @@ export class DashboardState {
       }
     }
 
+    // Per-session aggregation. Uses the SAME baseline/actual/output math as
+    // the global accumulators above, partitioned by `info.firstUserSha8`
+    // so the dashboard's "current session" panel can show what's happening
+    // RIGHT NOW instead of stale lifetime numbers. Untagged events (no
+    // firstUserSha8 — cold start, passthrough probe failures) are skipped
+    // rather than bucketed into a synthetic "unknown" session.
+    const sid = info?.firstUserSha8;
+    if (typeof sid === 'string' && sid.length > 0) {
+      this.currentSessionId = sid;
+      let s = this.sessions.get(sid);
+      if (!s) {
+        s = {
+          sessionId: sid,
+          firstSeen: Date.now() / 1000,
+          lastSeen: Date.now() / 1000,
+          requests: 0,
+          baselineInputWeighted: 0,
+          actualInputWeighted: 0,
+          outputWeighted: 0,
+          bucketChars: {},
+          passthroughReasons: {},
+          passthroughRequests: 0,
+          compressedRequests: 0,
+        };
+        this.sessions.set(sid, s);
+        // Cap memory — drop the oldest session by lastSeen when over budget.
+        if (this.sessions.size > DashboardState.SESSION_CAP) {
+          const oldest = [...this.sessions.values()].sort(
+            (a, b) => a.lastSeen - b.lastSeen,
+          )[0];
+          if (oldest) this.sessions.delete(oldest.sessionId);
+        }
+      }
+      s.lastSeen = Date.now() / 1000;
+      s.requests += 1;
+      // Reuse the same haveUsage / haveBaseline guards + the
+      // baselineInputEff / actualInputEff / outputEquiv locals computed
+      // earlier in update() so the lifetime totals block (above) and the
+      // per-session block (here) read the same values. Re-deriving them
+      // here would duplicate the cache-aware-baseline math and invite drift.
+      if (haveBaseline && haveUsage) {
+        s.baselineInputWeighted += baselineInputEff;
+        s.actualInputWeighted += actualInputEff;
+        s.outputWeighted += outputEquiv;
+      }
+      if (compressed) s.compressedRequests += 1;
+      else s.passthroughRequests += 1;
+      // Per-bucket char attribution from `info.bucketChars` (flat
+      // `Partial<Record<BucketName, number>>` — see src/core/tracker.ts).
+      // Matches the shape the Svelte panel iterates over.
+      const bc = info?.bucketChars;
+      if (bc && typeof bc === 'object') {
+        for (const [key, val] of Object.entries(bc) as [string, unknown][]) {
+          if (typeof val === 'number' && Number.isFinite(val)) {
+            s.bucketChars[key] = (s.bucketChars[key] ?? 0) + val;
+          }
+        }
+      }
+      // Passthrough reason histogram from `info.passthroughReasons`.
+      const pr = info?.passthroughReasons;
+      if (pr && typeof pr === 'object') {
+        for (const [reason, count] of Object.entries(pr as Record<string, unknown>)) {
+          if (typeof count === 'number' && Number.isFinite(count) && count > 0) {
+            s.passthroughReasons[reason] = (s.passthroughReasons[reason] ?? 0) + count;
+          }
+        }
+      }
+    }
+
     // Measurement totals are independent of usage/baseline gating — they
     // accumulate whenever the scanner produced numbers. The scanner sets
     // measurement to undefined on 5xx (no body to scan) and on unknown
@@ -560,6 +668,57 @@ export class DashboardState {
   }
 
   // ---- HTTP handlers ------------------------------------------------------
+
+  /**
+   * Per-session "what's happening right now" payload backing the
+   * `SessionSummary` panel. Scopes the dollar-weighted savings ratio + the
+   * per-bucket char attribution + the passthrough-reason histogram to the
+   * most-recently-active session (tracked via `info.firstUserSha8`) so the
+   * top-of-dashboard headline reflects the live session rather than stale
+   * lifetime aggregates from a previous run.
+   *
+   * Returns `{ sessionId: null, message: 'no active session yet' }` when no
+   * events have been received yet (or the first events were all untagged —
+   * cold start, probe failures) — `update()` only sets `currentSessionId`
+   * when a `firstUserSha8`-tagged event lands. The client renders a stale
+   * panel rather than zeroes when a session goes idle (NO `lastSeen >
+   * threshold` check here; see comment in `update()` for the rationale).
+   */
+  serveCurrentSessionJson(): Response {
+    if (!this.currentSessionId) {
+      return jsonResponse({
+        sessionId: null,
+        message: 'no active session yet',
+      });
+    }
+    const s = this.sessions.get(this.currentSessionId);
+    if (!s) {
+      return jsonResponse({ sessionId: null, message: 'no active session yet' });
+    }
+    // Dollar-weighted savings ratio. Same math as the global `saved_pct`
+    // (compressed AND passthrough requests — passthrough has baseline=actual,
+    // so it correctly drags the ratio down when we leak). Honest denominator:
+    // includes both compressed and uncompressed flows that the proxy saw.
+    const baselineUsd = (s.baselineInputWeighted * ASSUMED_INPUT_USD_PER_MTOK) / 1e6;
+    const actualUsd = (s.actualInputWeighted * ASSUMED_INPUT_USD_PER_MTOK) / 1e6;
+    const savedUsd = baselineUsd - actualUsd;
+    const savedPct = baselineUsd > 0 ? (savedUsd / baselineUsd) * 100 : 0;
+    return jsonResponse({
+      sessionId: s.sessionId,
+      firstSeen: s.firstSeen,
+      lastSeen: s.lastSeen,
+      uptimeSec: Math.max(0, s.lastSeen - s.firstSeen),
+      requests: s.requests,
+      compressedRequests: s.compressedRequests,
+      passthroughRequests: s.passthroughRequests,
+      baselineUsd: round4(baselineUsd),
+      actualUsd: round4(actualUsd),
+      savedUsd: round4(savedUsd),
+      savedPct: round1(savedPct),
+      bucketChars: s.bucketChars,
+      passthroughReasons: s.passthroughReasons,
+    });
+  }
 
   serveStats(): Response {
     // Two headline numbers, derived from the same per-event accumulators:
@@ -836,6 +995,7 @@ export type DashboardRoute =
   | { kind: 'png' } // /proxy-latest-png
   | { kind: 'api-sessions' } // /api/sessions.json
   | { kind: 'api-stats' } // /api/stats.json
+  | { kind: 'current-session' } // /api/current-session.json
   | { kind: 'api-compression' }; // /api/compression (POST {enabled}) — runtime kill switch
 
 /** Match dashboard paths (handle query strings on /proxy-latest-png). */
@@ -846,6 +1006,7 @@ export function dashboardPath(pathname: string): DashboardRoute | null {
   if (pathname === '/proxy-latest-png') return { kind: 'png' };
   if (pathname === '/api/sessions.json') return { kind: 'api-sessions' };
   if (pathname === '/api/stats.json') return { kind: 'api-stats' };
+  if (pathname === '/api/current-session.json') return { kind: 'current-session' };
   if (pathname === '/api/compression') return { kind: 'api-compression' };
   return null;
 }

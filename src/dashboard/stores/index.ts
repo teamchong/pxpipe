@@ -11,6 +11,7 @@ import type {
   RecentPayload,
   SessionsPayload,
   FullStatsPayload,
+  CurrentSessionPayload,
 } from '../types.js';
 
 // Live counters + recent table (legacy poll cadence: 2s).
@@ -20,6 +21,7 @@ export const recent = pollJson<RecentPayload>('/proxy-recent', 2000);
 // Slower endpoints (legacy: 5s).
 export const sessions = pollJson<SessionsPayload>('/api/sessions.json', 5000);
 export const fullStats = pollJson<FullStatsPayload>('/api/stats.json', 5000);
+export const currentSession = pollJson<CurrentSessionPayload>('/api/current-session.json', 2000);
 
 // when null the image viewer follows the latest render; when set it pins that image id. ui-only state.
 export const selectedImageId = writable<number | null>(null);

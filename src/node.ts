@@ -202,6 +202,9 @@ async function dispatchDashboard(
     case 'api-stats':
       if (method !== 'GET') return undefined;
       return dashboard.serveApiStats();
+    case 'current-session':
+      if (method !== 'GET') return undefined;
+      return dashboard.serveCurrentSessionJson();
     case 'api-compression': {
       if (method !== 'POST') {
         return new Response(

@@ -10,6 +10,7 @@
   import Sessions from './components/Sessions.svelte';
   import StatsTable from './components/StatsTable.svelte';
   import CompressionToggle from './components/CompressionToggle.svelte';
+  import SessionSummary from './components/SessionSummary.svelte';
   import ToastTray from './components/ToastTray.svelte';
   import { stats } from './stores/index.js';
 
@@ -33,6 +34,8 @@
 <div class="sub">{sub}</div>
 
 <CompressionToggle />
+
+<SessionSummary />
 
 <StatsHeader />
 

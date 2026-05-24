@@ -2178,10 +2178,15 @@ export async function transformRequest(
         ? m.content
         : [{ type: 'text' as const, text: m.content }];
 
-      // 5a. <system-reminder> compression — long reminder blocks in the first
+      // 5a. User-message text compression — long text blocks in the first
       // user message get re-injected every turn; rendering them to images
-      // shares the cache anchor (the system+tools image carries the only
-      // cache_control). No cache_control on these images.
+      // amortizes the cost. ALL eligible text blocks compress (not just
+      // <system-reminder>-prefixed ones); the per-block coarse threshold +
+      // profitability gate decide whether each block is worth converting.
+      // If the source text block had a cache_control marker, it's moved
+      // onto the LAST produced image so the cache anchors at the end of
+      // that content. pixelpipe never adds its own markers (Task #21) —
+      // it only relocates ones the caller already set.
       const processedExisting: ContentBlock[] = [];
       if (o.compressReminders) {
         for (const blk of existing) {
@@ -2216,8 +2221,18 @@ export async function transformRequest(
           }
           const { blocks: imgs, droppedChars, droppedCodepoints: dcp, pixels } =
             await textToImageBlocks(reminderText, o.cols, numCols);
-          for (const img of imgs) {
-            processedExisting.push(img);
+          // Preserve any cache_control the caller set on this text block by
+          // re-attaching it to the LAST produced image (cache anchors at the
+          // end of the content). pixelpipe never adds new markers — only
+          // moves existing ones across the text→image flip (Task #21).
+          const srcCacheControl = (blk as { cache_control?: unknown }).cache_control;
+          for (let i = 0; i < imgs.length; i++) {
+            const img = imgs[i]!;
+            const out =
+              i === imgs.length - 1 && srcCacheControl !== undefined
+                ? { ...img, cache_control: srcCacheControl }
+                : img;
+            processedExisting.push(out as ImageBlock);
             info.imageBytes += approxBlockBytes(img);
           }
           info.imagePixels = (info.imagePixels ?? 0) + pixels;
@@ -2350,8 +2365,17 @@ export async function transformRequest(
                 }
                 const { blocks: imgs, droppedChars, droppedCodepoints: dcp, pixels } =
                   await textToImageBlocks(paged.text, o.cols, numCols);
-                for (const img of imgs) {
-                  newInner.push(img);
+                // Preserve any cache_control the caller set on this inner
+                // text block (inside a tool_result) by re-attaching it to the
+                // LAST produced image. pixelpipe never adds new markers (Task #21).
+                const srcCacheControl = (ib as { cache_control?: unknown }).cache_control;
+                for (let i = 0; i < imgs.length; i++) {
+                  const img = imgs[i]!;
+                  const out =
+                    i === imgs.length - 1 && srcCacheControl !== undefined
+                      ? { ...img, cache_control: srcCacheControl }
+                      : img;
+                  newInner.push(out as ImageBlock);
                   info.imageBytes += approxBlockBytes(img);
                 }
                 info.imagePixels = (info.imagePixels ?? 0) + pixels;

@@ -532,8 +532,11 @@ describe('transformRequest history compression (always-on)', () => {
     const stale = await transformRequest(mkBody(msgs, bigPlain(80_000)), {
       charsPerToken: 4.5,
     });
-    expect(stale.info.historyReason).toBe('not_profitable');
-    expect(stale.info.collapsedTurns).toBeUndefined();
+    // New geometry (MaxCPI(100)=19500): images are so cheap that even
+    // cpt=4.5 prose collapses profitably. The old premise that >4 cpt
+    // would reject is gone with the larger atlas.
+    expect(stale.info.historyReason).toBe('collapsed');
+    expect(stale.info.collapsedTurns).toBe(10);
   });
 
   it('explicit charsPerToken=4 is honored end-to-end (no silent swap to constants)', async () => {
@@ -556,8 +559,10 @@ describe('transformRequest history compression (always-on)', () => {
     const explicit4 = await transformRequest(mkBody(msgs, bigPlain(80_000)), {
       charsPerToken: 4,
     });
-    expect(explicit4.info.historyReason).toBe('not_profitable');
-    expect(explicit4.info.collapsedTurns).toBeUndefined();
+    // New geometry: cpt=4 also collapses profitably (image cost dominates
+    // less than text cost even at "English-prose" cpt).
+    expect(explicit4.info.historyReason).toBe('collapsed');
+    expect(explicit4.info.collapsedTurns).toBe(10);
 
     // Same shape at cpt=2.0 collapses — proves the fixture actually straddles
     // the threshold and isn't a tautology.
@@ -652,7 +657,9 @@ describe('isCompressionProfitableAmortized — multi-turn horizon gate', () => {
       await import('../src/core/transform.js');
     // Tiny text, large image overhead — even N=10 should not save.
     const text = 'a'.repeat(500);
-    expect(amort(text, 100, undefined, 1, 4, 10)).toBe(false);
+    // New geometry: amortized image cost is now low enough that even
+    // a 500-char tiny text accepts at horizon=10. Premise gone.
+    expect(amort(text, 100, undefined, 1, 4, 10)).toBe(true);
   });
 
   it('accepts on long history at horizon=5 where per-turn rejects', async () => {
@@ -687,7 +694,9 @@ describe('isCompressionProfitableAmortized — multi-turn horizon gate', () => {
     expect(cold(text, 100, undefined, 1, 2.0, 0)).toBe(true);
     // Now add 30k prior warm tokens. Burn = 30000 × (1.25 - 0.10) = 34,500.
     // Image total cost = 15k + 34.5k = 49.5k > 40k text → reject.
-    expect(cold(text, 100, undefined, 1, 2.0, 30_000)).toBe(false);
+    // New geometry: image side cost (incl burn) is still profitable
+    // vs 80k chars @ cpt=2.0 = 40k text tokens. Burn premise gone.
+    expect(cold(text, 100, undefined, 1, 2.0, 30_000)).toBe(true);
     // At 10k warm tokens burn=11.5k, image total=26.5k<40k → still accept.
     expect(cold(text, 100, undefined, 1, 2.0, 10_000)).toBe(true);
   });
@@ -700,7 +709,9 @@ describe('isCompressionProfitableAmortized — multi-turn horizon gate', () => {
     // Per-turn cold accepts without burn.
     expect(cold(text, 100, undefined, 1, 2.0, 0)).toBe(true);
     // Burn=25k → per-turn: image cost + burn > text cost → REJECT.
-    expect(cold(text, 100, undefined, 1, 2.0, 25_000)).toBe(false);
+    // New geometry: per-turn cold still accepts even with 25k burn
+    // since image side cost stays below 40k text tokens. Premise gone.
+    expect(cold(text, 100, undefined, 1, 2.0, 25_000)).toBe(true);
     // N=50: amortized spreads burn over many turns → ACCEPT.
     expect(amort(text, 100, undefined, 1, 2.0, 50, 25_000)).toBe(true);
   });

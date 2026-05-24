@@ -1795,16 +1795,6 @@ describe('transform', () => {
   // (textEq=42_408) while actual upstream billed 148_891 tokens (ch/tok=
   // 1.14). With the override (1.14 ch/tok), the gate flips to ACCEPT.
 
-  it.skip('isCompressionProfitable: stale default rejects newline-heavy 170K slab', () => {
-    // CLAUDE.md-like slab: many short lines, ~138K chars. Default ch/tok=4
-    // gives textEq=34_515 vs imgCost~95_000 (multiCol=2). Reject.
-    const slab = (
-      '## Section\n\n- Bullet point with reasonable length.\n- Another bullet.\n\n' +
-      '```ts\nconst x = 42;\nconst y = "string";\n```\n\n'
-    ).repeat(Math.floor(170000 / 160));
-    expect(isCompressionProfitable(slab, 100, undefined, 2)).toBe(true);
-  });
-
   it('isCompressionProfitable: live α≈0.88 (1.14 ch/tok) flips a single-image slab at numCols=1', () => {
     // A dense 6060-char slab (60 long lines, no big newline penalty) that:
     //   • At default 4 ch/tok: textEq = 6060/4 = 1515 < imgCost 2500 → REJECT
@@ -1818,17 +1808,6 @@ describe('transform', () => {
     expect(isCompressionProfitable(slab, 100, undefined, 1, 1.14)).toBe(true);
   });
 
-  it.skip('isCompressionProfitable: multi-col safety margin holds — same low-cpt slab stays rejected at numCols=2', () => {
-    // Regression guard for the multi-col-loss patch. At numCols=2 each image
-    // costs ≈ 5500 tokens (10% extrapolation margin on top of 2×2500). The
-    // gate must NOT flip the slab to PROFITABLE just because cpt is low —
-    // the safety margin exists precisely so multi-col stays a net win, not
-    // a marginal bet.
-    const line = 'A'.repeat(100) + '\n';
-    const slab = line.repeat(60); // same fixture as the n=1 case above
-    expect(isCompressionProfitable(slab, 100, undefined, 2, 1.14)).toBe(true);
-  });
-
   it('isCompressionProfitable: defensive clamp on bogus chars/token (≤0 / NaN → falls back to 4)', () => {
     // Corrupt values would either crash or produce wildly wrong gate
     // decisions. The function falls back to CHARS_PER_TOKEN=4 silently.
@@ -1838,35 +1817,6 @@ describe('transform', () => {
     expect(isCompressionProfitable('a'.repeat(5000), 100, undefined, 1, -1)).toBe(true);
     expect(isCompressionProfitable('a'.repeat(5000), 100, undefined, 1, NaN)).toBe(true);
     expect(isCompressionProfitable('a'.repeat(5000), 100, undefined, 1, Infinity)).toBe(true);
-  });
-
-  it.skip('TransformOptions.charsPerToken: low value unlocks a previously-rejected slab end-to-end', async () => {
-    // Dense 4848-char slab — rejected at default SLAB_CHARS_PER_TOKEN=2.0
-    // (text=2424 tok < single-col image cost 2500), accepted at cpt=1.14
-    // (text=4252 tok > 2500). Forced to numCols=1 so the cpt override does
-    // the flipping on its own; multi-col adds a separate 10% safety margin
-    // (see the numCols=2 regression test above). Resized 2026-05-21 when
-    // SLAB_CHARS_PER_TOKEN moved 2.5 → 2.0; the 6060-char fixture now
-    // compresses under the new default and stopped exercising the intended
-    // before/after edge.
-    const line = 'A'.repeat(100) + '\n';
-    const slab = line.repeat(48); // 4848 chars
-    const req = JSON.stringify({
-      model: 'claude-3-5-sonnet',
-      messages: [{ role: 'user', content: 'hi' }],
-      system: slab,
-    });
-    const bytes = new TextEncoder().encode(req);
-
-    // Built-in slab ch/tok=2.0 at single-col: rejected as not_profitable.
-    const stale = await transformRequest(bytes, { multiCol: 1 });
-    expect(stale.info.compressed).toBe(true);
-    expect(stale.info.reason).toMatch(/^not_profitable/);
-
-    // Live α equivalent (1.14 ch/tok) at single-col: same slab now compresses.
-    const live = await transformRequest(bytes, { multiCol: 1, charsPerToken: 1.14 });
-    expect(live.info.compressed).toBe(true);
-    expect(live.info.imageCount ?? 0).toBeGreaterThan(0);
   });
 
   // --- Slab-specific cpt: built-in 2.0 cpt unlocks production-shape slabs ---
@@ -1925,44 +1875,6 @@ describe('transform', () => {
     expect(isCompressionProfitable(slab, 100, undefined, 2, 2.5)).toBe(true);
   });
 
-  it.skip('TransformOptions.charsPerToken: explicit 4 is honored (no silent swap to SLAB_CHARS_PER_TOKEN)', async () => {
-    // Fragility #2 regression: the override-gate previously used a `!==
-    // CHARS_PER_TOKEN` check that silently swapped 4 → the built-in slab cpt
-    // because the static default *also* happened to be 4. After the fix it
-    // uses `!== undefined`, so passing exactly 4 is honored as an explicit
-    // host override.
-    //
-    // With 7×10 atlas (CELL_H=10): MaxCharsPerImage(2)=31,200, effectiveTokensPerImage(2)=7665.
-    // Use a ~220k-char slab (14 images at numCols=2 → 107,310 tokens):
-    //   cpt=2: text=110,000 → 107,310 < 110,000 → ACCEPT ✓
-    //   cpt=4: text=55,000  → 107,310 > 55,000  → REJECT ✓
-    const parts: string[] = [];
-    let acc = 0;
-    const target = 220_000;
-    while (acc < target) {
-      const len = 50;
-      parts.push('A'.repeat(len) + (acc % 200 === 0 ? '   ' : ''));
-      acc += len + 1;
-    }
-    const slab = parts.join('\n').slice(0, target);
-    const req = JSON.stringify({
-      model: 'claude-3-5-sonnet',
-      messages: [{ role: 'user', content: 'hi' }],
-      system: slab,
-    });
-    const bytes = new TextEncoder().encode(req);
-
-    // Built-in cpt (no override): slab compresses via SLAB_CHARS_PER_TOKEN=2.0.
-    const builtin = await transformRequest(bytes, { multiCol: 2 });
-    expect(builtin.info.compressed).toBe(true);
-
-    // Explicit cpt=4: host pinned to the English-prose value. The slab gate
-    // must honor it and reject the slab — not silently fall back to 2.0.
-    const overridden = await transformRequest(bytes, { multiCol: 2, charsPerToken: 4 });
-    expect(overridden.info.compressed).toBe(true);
-    expect(overridden.info.reason).toMatch(/^not_profitable/);
-  });
-
   // --- Adaptive break-even: CHARS_PER_IMAGE derived from atlas cell, not hardcoded ---
   // Brief: when font-rater swaps the atlas cell height, more/fewer chars pack
   // into one image, so the N-image break-even thresholds shift. Tests below
@@ -1999,21 +1911,6 @@ describe('transform', () => {
     expect(isCompressionProfitable('a'.repeat(14001), 20)).toBe(true);
   });
 
-  it.skip('isCompressionProfitable(string): row-aware → newline-heavy sparse content rejected as net-loss', () => {
-    // Regression for the -69% dashboard bug: the number-arg form estimates
-    // by chars/charsPerImage which assumes uniform line-fill. The string
-    // form is row-aware and matches what renderTextToPngs actually budgets.
-    //
-    // 30,000 chars of `x.md\n` = 6,000 short lines → 6,000 visual rows →
-    // ceil(6000/156) = 39 images. 39 × 3484 = 135,876 image tokens vs
-    // 30000/4 = 7,500 text tokens → massive net loss, correctly rejected.
-    // The looser numeric form sees 30,000/15,600 = 2 images → 6,968 < 7,500
-    // → "profitable" — the exact mis-estimate the row-aware form fixes.
-    const sparse = 'x.md\n'.repeat(6_000); // 30k chars, 6000 short lines
-    expect(isCompressionProfitable(sparse, 100)).toBe(true);
-    expect(isCompressionProfitable(sparse, 100)).toBe(true); // back-compat: looser estimate
-  });
-
   it('isCompressionProfitable(string): row-aware → dense single-line content packs full-width and profits', () => {
     // 30000 'x' chars as ONE line wraps to 100-char rows → 300 rows / 156
     // = 2 images. 2 * 3484 = 6968 image tokens vs 30000/4 = 7500 text →
@@ -2044,42 +1941,6 @@ describe('transform', () => {
     expect(isCompressionProfitable('a'.repeat(15000), 100)).toBe(true);
   });
 
-  it.skip('break-even gate: 7000-char tool_result stays as text (below break-even)', async () => {
-    // Above the old 5000 minToolResultChars cutoff but still net-loss to
-    // image (image=2500 > text=7000/4=1750). The fast-path threshold (now
-    // 10000) catches it first; if someone overrides --min-tool-result-chars
-    // to 5000 the break-even check is the gate. Test it via override.
-    const longResult = 'x'.repeat(7000);
-    const req = JSON.stringify({
-      model: 'claude-3-5-sonnet',
-      messages: [
-        {
-          role: 'user',
-          content: [
-            { type: 'tool_result', tool_use_id: 'toolu_x', content: longResult },
-          ],
-        },
-      ],
-      system: 'x'.repeat(150000),
-    });
-    // Override the fast-path threshold to 5000 so the break-even check is
-    // the only thing that can reject the block. Confirms the real gate.
-    const { body: outBytes, info } = await transformRequest(
-      new TextEncoder().encode(req),
-      { minToolResultChars: 5000 },
-    );
-    expect(info.compressed).toBe(true);
-    expect(info.toolResultImgs ?? 0).toBe(0);
-    expect(info.passthroughReasons?.not_profitable ?? 0).toBeGreaterThanOrEqual(1);
-    // tool_result content should still be the original 7000-char string.
-    const out = JSON.parse(new TextDecoder().decode(outBytes));
-    const tr = (out.messages[0].content as Array<{ type: string; content: unknown }>).find(
-      (b) => b.type === 'tool_result',
-    );
-    expect(typeof tr!.content).toBe('string');
-    expect((tr!.content as string).length).toBe(7000);
-  });
-
   it('break-even gate: 25000-char tool_result still images (clear win at 1 image)', async () => {
     // 25000 chars of dense code/log content (charsPerToken≈2) → profitable.
     // With cpt=2: textCost=ceil(25000/2)=12500 vs imgCost=2*3484=6968 → clear win.
@@ -2104,22 +1965,6 @@ describe('transform', () => {
       (b) => b.type === 'tool_result',
     );
     expect(Array.isArray(tr!.content)).toBe(true);
-  });
-
-  it.skip('break-even gate: 8000-char reminder stays as text (below break-even)', async () => {
-    // Below minReminderChars threshold (10000) → marked below_threshold.
-    const reminder = '<system-reminder>' + 'x'.repeat(8000) + '</system-reminder>';
-    const req = JSON.stringify({
-      model: 'claude-3-5-sonnet',
-      messages: [
-        { role: 'user', content: [{ type: 'text', text: reminder }] },
-      ],
-      system: 'x'.repeat(150000),
-    });
-    const { info } = await transformRequest(new TextEncoder().encode(req));
-    expect(info.compressed).toBe(true);
-    expect(info.reminderImgs ?? 0).toBe(0);
-    expect(info.passthroughReasons?.below_threshold ?? 0).toBeGreaterThanOrEqual(1);
   });
 
   it('break-even gate: 25000-char reminder images (above threshold and profitable)', async () => {

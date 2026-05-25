@@ -24,6 +24,7 @@ import {
 } from '../src/core/transform.js';
 import { toTrackEvent } from '../src/core/tracker.js';
 import type { ProxyEvent } from '../src/core/proxy.js';
+import { DENSE_CONTENT_CHARS_PER_IMAGE } from '../src/core/render.js';
 
 // Default render config: cols=100, 195 lines/img → ~19,500 chars/img if
 // lines fully fill the width. For shorter lines, the budget is dominated
@@ -302,6 +303,22 @@ describe('paging end-to-end (transformRequest)', () => {
     expect((info.toolResultImgs ?? 0)).toBeGreaterThan(0);
     expect(info.truncatedToolResults ?? 0).toBe(0);
     expect(info.omittedChars ?? 0).toBe(0);
+  });
+
+  it('pages dense medium tool_results instead of packing them into one image', async () => {
+    const lockish = Array.from({ length: 200 }, (_, i) =>
+      `  pkg-${i}@npm:1.${i}.0(peer@npm:^${i}.0.0)(typescript@npm:^5.${i % 10}.0): checksum=${'a'.repeat(24)}`,
+    ).join('\n');
+    expect(lockish.length).toBeGreaterThan(18_000);
+    expect(lockish.length).toBeLessThan(24_000);
+
+    const { info } = await transformRequest(makeReq(lockish), { multiCol: 1, charsPerToken: 2 });
+    expect(info.compressed).toBe(true);
+    expect(info.truncatedToolResults ?? 0).toBe(0);
+    expect(info.omittedChars ?? 0).toBe(0);
+    expect(info.toolResultImgs).toBeGreaterThanOrEqual(
+      Math.ceil(lockish.length / DENSE_CONTENT_CHARS_PER_IMAGE),
+    );
   });
 
   it('tool_result over cap fires truncation, lands ≤ 10 images', async () => {

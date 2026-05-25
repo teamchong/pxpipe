@@ -34,6 +34,8 @@ import {
   CELL_W,
   CELL_H,
   READABLE_CHARS_PER_IMAGE,
+  DENSE_CONTENT_CHARS_PER_IMAGE,
+  renderTextToPngsWithCharLimit,
 } from './render.js';
 import { bytesToBase64 } from './png.js';
 import { collapseHistory } from './history.js';
@@ -1535,19 +1537,21 @@ export function estimateImageCount(
   textOrLen: string | number,
   cols: number,
   numCols: number = 1,
+  maxCharsPerImage: number = READABLE_CHARS_PER_IMAGE,
 ): number {
   const n = Math.max(1, numCols | 0);
   const readableLinesPerCol = Math.max(1, Math.floor(READABLE_CHARS_PER_IMAGE / Math.max(1, cols)));
   const linesPerImage = Math.min(LINES_PER_IMAGE, readableLinesPerCol) * n;
+  const charBudget = Math.max(1, maxCharsPerImage * n);
   if (typeof textOrLen === 'number') {
     // Back-compat shim — numeric arg gets the looser chars-based estimate.
-    return Math.max(1, Math.ceil(textOrLen / Math.max(1, READABLE_CHARS_PER_IMAGE * n)));
+    return Math.max(1, Math.ceil(textOrLen / charBudget));
   }
   const rows = countVisualRows(textOrLen, cols);
   return Math.max(
     1,
     Math.ceil(rows / linesPerImage),
-    Math.ceil(textOrLen.length / Math.max(1, READABLE_CHARS_PER_IMAGE * n)),
+    Math.ceil(textOrLen.length / charBudget),
   );
 }
 
@@ -1610,12 +1614,14 @@ export function truncateForBudget(
   maxImages: number,
   cols: number,
   numCols: number = 1,
+  maxCharsPerImage: number = DENSE_CONTENT_CHARS_PER_IMAGE,
 ): { text: string; omittedChars: number; truncated: boolean } {
   const n = Math.max(1, numCols | 0);
-  const estImages = estimateImageCount(text, cols, n);
+  const estImages = estimateImageCount(text, cols, n, maxCharsPerImage);
   if (estImages <= maxImages) return { text, omittedChars: 0, truncated: false };
   const readableLinesPerCol = Math.max(1, Math.floor(READABLE_CHARS_PER_IMAGE / Math.max(1, cols)));
   const totalRowBudget = Math.max(8, maxImages * Math.min(LINES_PER_IMAGE, readableLinesPerCol) * n - 6);
+  const totalCharBudget = Math.max(128, maxImages * maxCharsPerImage * n - 512);
   const shape = classifyContent(text);
   // Reflowed text uses NL_SENTINEL (↵ U+21B5) as line separator instead of \n.
   // Split on whichever delimiter the text uses so we can truncate at logical
@@ -1627,11 +1633,14 @@ export function truncateForBudget(
 
   if (shape === 'structured') {
     let rows = 0;
+    let chars = 0;
     let cut = 0;
     for (let i = 0; i < lines.length; i++) {
       const r = lineRows(lines[i]!, cols);
-      if (rows + r > totalRowBudget) break;
+      const c = lines[i]!.length + (i > 0 ? 1 : 0);
+      if (rows + r > totalRowBudget || chars + c > totalCharBudget) break;
       rows += r;
+      chars += c;
       cut = i + 1;
     }
     if (cut === 0) cut = 1;
@@ -1657,21 +1666,29 @@ export function truncateForBudget(
   // log / other: 60% head, 40% tail.
   const headRowBudget = Math.floor(totalRowBudget * 0.6);
   const tailRowBudget = totalRowBudget - headRowBudget;
+  const headCharBudget = Math.floor(totalCharBudget * 0.6);
+  const tailCharBudget = totalCharBudget - headCharBudget;
   let headRows = 0;
+  let headChars = 0;
   let headCut = 0;
   for (let i = 0; i < lines.length; i++) {
     const r = lineRows(lines[i]!, cols);
-    if (headRows + r > headRowBudget) break;
+    const c = lines[i]!.length + (i > 0 ? 1 : 0);
+    if (headRows + r > headRowBudget || headChars + c > headCharBudget) break;
     headRows += r;
+    headChars += c;
     headCut = i + 1;
   }
   if (headCut === 0) headCut = 1;
   let tailRows = 0;
+  let tailChars = 0;
   let tailStart = lines.length;
   for (let i = lines.length - 1; i >= headCut; i--) {
     const r = lineRows(lines[i]!, cols);
-    if (tailRows + r > tailRowBudget) break;
+    const c = lines[i]!.length + (i < lines.length - 1 ? 1 : 0);
+    if (tailRows + r > tailRowBudget || tailChars + c > tailCharBudget) break;
     tailRows += r;
+    tailChars += c;
     tailStart = i;
   }
   if (tailStart <= headCut || tailStart >= lines.length) {
@@ -1747,7 +1764,7 @@ async function textToImageBlocks(
   const imgs =
     effectiveNumCols > 1
       ? await renderTextToPngsMultiCol(text, effectiveCols, effectiveNumCols)
-      : await renderTextToPngs(text, effectiveCols);
+      : await renderTextToPngsWithCharLimit(text, effectiveCols, DENSE_CONTENT_CHARS_PER_IMAGE);
   let droppedChars = 0;
   let pixels = 0;
   const droppedCodepoints = new Map<number, number>();

@@ -39,6 +39,11 @@ export const MAX_HEIGHT_PX = 1568;
  *  to ~50k to leave headroom for soft-wrap, dropped chars, and the paging
  *  marker. Policy: fill the canvas, one page per 1568×1568 image, max savings. */
 export const READABLE_CHARS_PER_IMAGE = 50000;
+/** Target source chars per image for dense user-visible content (tool output
+ *  and collapsed history). The 50k canvas-max page is token-efficient but too
+ *  dense for OCR on lockfiles/JSON/code. Keep those blocks paged into smaller
+ *  images so the model can read them reliably. */
+export const DENSE_CONTENT_CHARS_PER_IMAGE = 6000;
 /** Default columns per row. 1568 px / 5 px-per-cell = 313 cells. We render
  *  at the full canvas width by default — no shrink-to-content. */
 const DEFAULT_COLS = 313;
@@ -748,9 +753,10 @@ export async function renderTextToPngsReflow(
 }
 
 /** Split `text` into N PNGs, each ≤ MAX_HEIGHT_PX tall. */
-export async function renderTextToPngs(
+export async function renderTextToPngsWithCharLimit(
   text: string,
   cols: number = DEFAULT_COLS,
+  maxCharsPerImage: number = READABLE_CHARS_PER_IMAGE,
   style: RenderStyle = {},
 ): Promise<RenderedImage[]> {
   const markerScale = Math.max(1, Math.floor(style.markerScale ?? 1));
@@ -760,11 +766,19 @@ export async function renderTextToPngs(
   const linesPerImg = Math.min(hardLinesPerImg, readableLinesPerColumn(cols));
 
   const images: RenderedImage[] = [];
-  for (const page of splitWrappedLinesIntoReadablePages(lines, linesPerImg)) {
+  for (const page of splitWrappedLinesIntoReadablePages(lines, linesPerImg, maxCharsPerImage)) {
     const chunk = page.join('\n');
     images.push(await renderChunkToPng(chunk, cols, style));
   }
   return images;
+}
+
+export async function renderTextToPngs(
+  text: string,
+  cols: number = DEFAULT_COLS,
+  style: RenderStyle = {},
+): Promise<RenderedImage[]> {
+  return renderTextToPngsWithCharLimit(text, cols, READABLE_CHARS_PER_IMAGE, style);
 }
 
 // --- R2 multi-column rendering --------------------------------------------

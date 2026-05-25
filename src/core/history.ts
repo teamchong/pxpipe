@@ -37,7 +37,7 @@
  */
 
 import type { ContentBlock, ImageBlock, Message, TextBlock, ToolUseBlock, ToolResultBlock } from './types.js';
-import { renderTextToPngs, shrinkColsToContent } from './render.js';
+import { DENSE_CONTENT_CHARS_PER_IMAGE, renderTextToPngsWithCharLimit, shrinkColsToContent } from './render.js';
 import { bytesToBase64 } from './png.js';
 
 /** Function predicate signature for the break-even gate. Passed in by the
@@ -348,7 +348,7 @@ export async function collapseHistory(
   // history blocks. The gate's `imageTokensCost()` is computed with the
   // same `shrinkColsToContent` so prediction matches reality.
   const effCols = shrinkColsToContent(text, o.cols);
-  const imgs = await renderTextToPngs(text, effCols);
+  const imgs = await renderTextToPngsWithCharLimit(text, effCols, DENSE_CONTENT_CHARS_PER_IMAGE);
   if (imgs.length === 0) {
     info.reason = 'render_empty';
     return { messages, info };

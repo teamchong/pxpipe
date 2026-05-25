@@ -44,6 +44,8 @@ export const READABLE_CHARS_PER_IMAGE = 50000;
  *  dense for OCR on lockfiles/JSON/code. Keep those blocks paged into smaller
  *  images so the model can read them reliably. */
 export const DENSE_CONTENT_CHARS_PER_IMAGE = 6000;
+export const DENSE_CONTENT_COLS = 180;
+export const DENSE_RENDER_STYLE: RenderStyle = { cellWBonus: 2, cellHBonus: 2, aa: true };
 /** Default columns per row. 1568 px / 5 px-per-cell = 313 cells. We render
  *  at the full canvas width by default — no shrink-to-content. */
 const DEFAULT_COLS = 313;

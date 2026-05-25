@@ -35,6 +35,8 @@ import {
   CELL_H,
   READABLE_CHARS_PER_IMAGE,
   DENSE_CONTENT_CHARS_PER_IMAGE,
+  DENSE_CONTENT_COLS,
+  DENSE_RENDER_STYLE,
   renderTextToPngsWithCharLimit,
 } from './render.js';
 import { bytesToBase64 } from './png.js';
@@ -1764,7 +1766,7 @@ async function textToImageBlocks(
   const imgs =
     effectiveNumCols > 1
       ? await renderTextToPngsMultiCol(text, effectiveCols, effectiveNumCols)
-      : await renderTextToPngsWithCharLimit(text, effectiveCols, DENSE_CONTENT_CHARS_PER_IMAGE);
+      : await renderTextToPngsWithCharLimit(text, DENSE_CONTENT_COLS, DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_RENDER_STYLE);
   let droppedChars = 0;
   let pixels = 0;
   const droppedCodepoints = new Map<number, number>();

@@ -24,7 +24,12 @@ import {
 } from '../src/core/transform.js';
 import { toTrackEvent } from '../src/core/tracker.js';
 import type { ProxyEvent } from '../src/core/proxy.js';
-import { DENSE_CONTENT_CHARS_PER_IMAGE } from '../src/core/render.js';
+import {
+  DENSE_CONTENT_CHARS_PER_IMAGE,
+  DENSE_CONTENT_COLS,
+  DENSE_RENDER_STYLE,
+  renderTextToPngsWithCharLimit,
+} from '../src/core/render.js';
 
 // Default render config: cols=100, 195 lines/img → ~19,500 chars/img if
 // lines fully fill the width. For shorter lines, the budget is dominated
@@ -67,6 +72,25 @@ describe('estimateImageCount', () => {
     expect(estimateImageCount(0, COLS)).toBe(1);
     expect(estimateImageCount(50_000, COLS)).toBe(1);
     expect(estimateImageCount(50_001, COLS)).toBe(2);
+  });
+});
+
+describe('dense readable render profile', () => {
+  it('uses larger glyph cells and multiple readable pages for lockfile-shaped text', async () => {
+    const lockish = Array.from({ length: 200 }, (_, i) =>
+      `  pkg-${i}@npm:1.${i}.0(peer@npm:^${i}.0.0)(typescript@npm:^5.${i % 10}.0): checksum=${'a'.repeat(24)}`,
+    ).join('\n');
+
+    const imgs = await renderTextToPngsWithCharLimit(
+      lockish,
+      DENSE_CONTENT_COLS,
+      DENSE_CONTENT_CHARS_PER_IMAGE,
+      DENSE_RENDER_STYLE,
+    );
+
+    expect(imgs.length).toBeGreaterThanOrEqual(3);
+    expect(imgs[0]!.width).toBeGreaterThan(1000);
+    expect(imgs[0]!.width).toBeLessThanOrEqual(1568);
   });
 });
 

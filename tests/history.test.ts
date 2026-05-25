@@ -257,14 +257,14 @@ describe('collapseHistory', () => {
     expect(info.reason).toBe('prefix_too_short');
   });
 
-  it('collapses even small histories under the content-aware gate', async () => {
-    // 12 tiny turns, all plain prose. Each turn ~30 chars → ~400 chars total
-    // serialised. Under the OLD width=always-full gate this was "below
-    // break-even" and bailed `not_profitable`. The post-shrink gate measures
-    // the actual rendered image size (small content → small image), so even
-    // tiny histories compress profitably. We assert the NEW physics
-    // explicitly here as a regression guard against re-introducing a fixed
-    // image-cost over-estimation.
+  it('rejects tiny histories under the full-canvas gate', async () => {
+    // 12 micro-turns (~150 chars serialised). Under the full-canvas render
+    // policy (no shrink-to-content) the cheapest image still spends the full
+    // 1568×88 pixel band, which costs more tokens than 150 chars of text. The
+    // gate correctly refuses unprofitable compressions — pixelpipe must SAVE
+    // tokens, never spend more than the text it replaces. This is a regression
+    // guard against re-introducing shrink-to-content (which traded savings for
+    // a savings illusion on sparse content).
     const msgs: Message[] = [];
     for (let i = 0; i < 12; i++) {
       msgs.push(i % 2 === 0 ? usr(`q${i}`) : asst(`a${i}`));
@@ -272,11 +272,10 @@ describe('collapseHistory', () => {
     const { info } = await collapseHistory(msgs, profitable, {
       keepTail: 0,
       minCollapsePrefix: 5,
-      collapseChunk: 0, // legacy moving boundary — isolate the profitability gate
+      collapseChunk: 0,
     });
-    // No reason set ↔ collapsed successfully.
-    expect(info.reason).toBeUndefined();
-    expect(info.collapsedTurns).toBeGreaterThanOrEqual(1);
+    expect(info.reason).toBe('not_profitable');
+    expect(info.collapsedTurns).toBe(0);
   });
 
   it('collapses a long all-plain conversation into one prepended user message', async () => {

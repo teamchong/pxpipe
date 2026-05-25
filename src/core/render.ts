@@ -34,7 +34,14 @@ import { encodeGrayPng, encodeRgbPng } from './png.js';
  *  image cap. Exported so the break-even gate in transform.ts can derive
  *  CHARS_PER_IMAGE from the same constants the renderer actually uses. */
 export const MAX_HEIGHT_PX = 1568;
-const DEFAULT_COLS = 100;
+/** Target upper bound for source text represented by one PNG page.
+ *  At 313 cols × 196 rows the 1568×1568 canvas holds ~61k chars; we pack
+ *  to ~50k to leave headroom for soft-wrap, dropped chars, and the paging
+ *  marker. Policy: fill the canvas, one page per 1568×1568 image, max savings. */
+export const READABLE_CHARS_PER_IMAGE = 50000;
+/** Default columns per row. 1568 px / 5 px-per-cell = 313 cells. We render
+ *  at the full canvas width by default — no shrink-to-content. */
+const DEFAULT_COLS = 313;
 /** Horizontal padding inside the rendered PNG (left + right each). Exported
  *  so transform.ts can derive image pixel-area for token-cost estimation. */
 export const PAD_X = 4;
@@ -283,24 +290,14 @@ export function measureLineCols(line: string, markerScale: number = 1): number {
   return w;
 }
 
-/** Shrink the configured `cols` to the actual longest wrapped line in `text`.
- *  Used by non-system-slab call sites (tool_result, reminder, history per-
- *  block) to produce the smallest possible canvas: a 16-char "File not found"
- *  block becomes a ~80 px wide image instead of the full 508 px slab canvas,
- *  cutting pixel area (and Anthropic's pixel-area billing) by 6×.
- *
- *  Returns `min(cols, longestLineWidth)`. Floored at 1 so a degenerate empty
- *  string still produces a valid canvas. Re-wrap the text at the returned
- *  cols to get the matching `string[]` for the renderer. */
+/** Policy: always render at full canvas width — no shrink-to-content.
+ *  Maximum chars per page = maximum image-token savings on dense content,
+ *  and the unused canvas tail is just whitespace (cheap to encode). The
+ *  signature is preserved so callers (transform.ts) still compile; the
+ *  function now returns `cols` unchanged. */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 export function shrinkColsToContent(text: string, cols: number, markerScale: number = 1): number {
-  const lines = wrapLines(text, cols, markerScale);
-  let maxW = 0;
-  for (const line of lines) {
-    const w = measureLineCols(line, markerScale);
-    if (w > maxW) maxW = w;
-    if (maxW >= cols) return cols; // can't shrink past requested cols
-  }
-  return Math.max(1, maxW);
+  return Math.max(1, cols | 0);
 }
 
 export function wrapLines(text: string, cols: number, markerScale: number = 1): string[] {
@@ -334,6 +331,38 @@ export function wrapLines(text: string, cols: number, markerScale: number = 1): 
     if (cur.length > 0) out.push(cur);
   }
   return out;
+}
+
+function splitWrappedLinesIntoReadablePages(
+  lines: string[],
+  maxLines: number,
+  maxChars: number = READABLE_CHARS_PER_IMAGE,
+): string[][] {
+  const pages: string[][] = [];
+  let cur: string[] = [];
+  let curChars = 0;
+  const lineLimit = Math.max(1, maxLines | 0);
+  const charLimit = Math.max(1, maxChars | 0);
+
+  for (const line of lines) {
+    const lineChars = line.length + (cur.length > 0 ? 1 : 0);
+    if (
+      cur.length > 0 &&
+      (cur.length >= lineLimit || curChars + lineChars > charLimit)
+    ) {
+      pages.push(cur);
+      cur = [];
+      curChars = 0;
+    }
+    cur.push(line);
+    curChars += line.length + (cur.length > 1 ? 1 : 0);
+  }
+  if (cur.length > 0) pages.push(cur);
+  return pages.length > 0 ? pages : [[]];
+}
+
+function readableLinesPerColumn(cols: number): number {
+  return Math.max(1, Math.floor(READABLE_CHARS_PER_IMAGE / Math.max(1, cols)));
 }
 
 /**
@@ -727,11 +756,12 @@ export async function renderTextToPngs(
   const markerScale = Math.max(1, Math.floor(style.markerScale ?? 1));
   const cellH = ATLAS_CELL_H + Math.max(0, Math.floor(style.cellHBonus ?? DEFAULT_CELL_H_BONUS));
   const lines = wrapLines(text, cols, markerScale);
-  const linesPerImg = Math.max(1, Math.floor((MAX_HEIGHT_PX - 2 * PAD_Y) / cellH));
+  const hardLinesPerImg = Math.max(1, Math.floor((MAX_HEIGHT_PX - 2 * PAD_Y) / cellH));
+  const linesPerImg = Math.min(hardLinesPerImg, readableLinesPerColumn(cols));
 
   const images: RenderedImage[] = [];
-  for (let i = 0; i < lines.length; i += linesPerImg) {
-    const chunk = lines.slice(i, i + linesPerImg).join('\n');
+  for (const page of splitWrappedLinesIntoReadablePages(lines, linesPerImg)) {
+    const chunk = page.join('\n');
     images.push(await renderChunkToPng(chunk, cols, style));
   }
   return images;
@@ -792,12 +822,13 @@ async function renderMultiColChunkFromLines(
   cols: number,
   numCols: number,
   charsCovered: number,
+  linesPerCol: number,
 ): Promise<RenderedImage> {
-  const linesPerImg = Math.max(1, Math.floor((MAX_HEIGHT_PX - 2 * PAD_Y) / CELL_H));
   const width = multiColWidth(cols, numCols);
   // Height tracks the tallest column. With column-major packing column 0 is
   // always at least as tall as later columns, so usedRows = min(lines.length, linesPerImg).
-  const usedRows = Math.min(lines.length, linesPerImg);
+  const rowsPerCol = Math.max(1, linesPerCol | 0);
+  const usedRows = Math.min(lines.length, rowsPerCol);
   const height = 2 * PAD_Y + usedRows * CELL_H;
 
   const fb = new Uint8Array(width * height);
@@ -808,9 +839,9 @@ async function renderMultiColChunkFromLines(
   const colStride = cols * CELL_W + GUTTER_CELLS * CELL_W;
   for (let c = 0; c < numCols; c++) {
     const colBaseX = PAD_X + c * colStride;
-    const colStart = c * linesPerImg;
+    const colStart = c * rowsPerCol;
     if (colStart >= lines.length) break;
-    const colEnd = Math.min(colStart + linesPerImg, lines.length);
+    const colEnd = Math.min(colStart + rowsPerCol, lines.length);
     for (let r = 0; r < colEnd - colStart; r++) {
       const line = lines[colStart + r]!;
       const baseY = PAD_Y + r * CELL_H;
@@ -901,9 +932,9 @@ export async function renderTextToPngsMultiCol(
   }
 
   const lines = wrapLines(text, cols);
-  const linesPerImg = Math.max(1, Math.floor((MAX_HEIGHT_PX - 2 * PAD_Y) / CELL_H));
+  const hardLinesPerImg = Math.max(1, Math.floor((MAX_HEIGHT_PX - 2 * PAD_Y) / CELL_H));
+  const linesPerImg = Math.min(hardLinesPerImg, readableLinesPerColumn(cols));
   const linesPerImage = linesPerImg * numCols;
-  const totalLines = lines.length;
 
   // Total source codepoints — for the last image we can use this directly
   // when every wrapped line fits.
@@ -912,9 +943,14 @@ export async function renderTextToPngsMultiCol(
 
   const images: RenderedImage[] = [];
   let coveredChars = 0;
-  for (let i = 0; i < totalLines; i += linesPerImage) {
-    const slice = lines.slice(i, i + linesPerImage);
-    const isLast = i + linesPerImage >= totalLines;
+  const pages = splitWrappedLinesIntoReadablePages(
+    lines,
+    linesPerImage,
+    READABLE_CHARS_PER_IMAGE * Math.max(1, numCols | 0),
+  );
+  for (let i = 0; i < pages.length; i++) {
+    const slice = pages[i]!;
+    const isLast = i === pages.length - 1;
     let chars: number;
     if (isLast) {
       // Last image: assign whatever source coverage remains so the per-image
@@ -928,7 +964,7 @@ export async function renderTextToPngsMultiCol(
       chars = n;
     }
     coveredChars += chars;
-    images.push(await renderMultiColChunkFromLines(slice, cols, numCols, chars));
+    images.push(await renderMultiColChunkFromLines(slice, cols, numCols, chars, linesPerImg));
   }
   return images;
 }

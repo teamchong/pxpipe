@@ -38,13 +38,13 @@ describe('estimateImageCount', () => {
   });
 
   it('scales linearly with row count for short-line content', () => {
-    // 195 lines of "x" (1 char) = 195 rows = 1 image.
+    // Full-canvas policy: 100 cols × 195 rows = 19,500 chars/page.
     const oneImage = Array.from({ length: ROWS_PER_IMG }, () => 'x').join('\n');
     expect(estimateImageCount(oneImage, COLS)).toBe(1);
-    // 196 lines = 2 images (just over the line).
+    // 196 short lines spill into a second page.
     const justOver = Array.from({ length: ROWS_PER_IMG + 1 }, () => 'x').join('\n');
     expect(estimateImageCount(justOver, COLS)).toBe(2);
-    // 10 × 195 = 1950 lines → 10 images.
+    // 10 × 195 rows → exactly 10 full pages.
     const tenImages = Array.from({ length: ROWS_PER_IMG * 10 }, () => 'x').join('\n');
     expect(estimateImageCount(tenImages, COLS)).toBe(10);
   });
@@ -53,18 +53,19 @@ describe('estimateImageCount', () => {
     // A single 1000-char line wraps to ceil(1000/100) = 10 rows.
     const wrapped = 'x'.repeat(1000);
     expect(estimateImageCount(wrapped, COLS)).toBe(1); // 10 rows, fits in 1 img
-    // 19,500 chars on one line → 195 rows → 1 image.
+    // 19,500 chars on one line wraps to 195 rows → exactly 1 full page.
     const oneImg = 'x'.repeat(19_500);
     expect(estimateImageCount(oneImg, COLS)).toBe(1);
-    // 19,501 chars → 196 rows → 2 images.
+    // 19,501 chars overflows into a second page.
     const twoImgs = 'x'.repeat(19_501);
     expect(estimateImageCount(twoImgs, COLS)).toBe(2);
   });
 
   it('also accepts a numeric length (legacy chars-based estimate)', () => {
+    // Numeric path uses the full READABLE_CHARS_PER_IMAGE (50k) budget per page.
     expect(estimateImageCount(0, COLS)).toBe(1);
-    expect(estimateImageCount(19_500, COLS)).toBe(1);
-    expect(estimateImageCount(19_501, COLS)).toBe(2);
+    expect(estimateImageCount(50_000, COLS)).toBe(1);
+    expect(estimateImageCount(50_001, COLS)).toBe(2);
   });
 });
 

@@ -33,6 +33,7 @@ import {
   PAD_Y,
   CELL_W,
   CELL_H,
+  READABLE_CHARS_PER_IMAGE,
 } from './render.js';
 import { bytesToBase64 } from './png.js';
 import { collapseHistory } from './history.js';
@@ -169,27 +170,25 @@ const DEFAULTS: Required<TransformOptions> = {
   compressReminders: true,
   compressToolResults: true,
   minCompressChars: 2000,
-  // No coarse pre-filter floors on per-block compression. The historical
-  // 14,000-char floors were CORRECTNESS workarounds for a buggy gate that
-  // assumed every image cost ~2,500 tokens (full-canvas billing). With
-  // the gate now computing exact pixel cost via the content-aware path
-  // (width = `shrinkColsToContent`, height = `rows·CELL_H + 2·PAD_Y`,
-  // tokens = `width × height / 750`), the gate correctly rejects blocks
-  // that would actually net-lose and accepts blocks that would actually
-  // net-win, down to single-character inputs. PNG-encode CPU on tiny
-  // blocks is sub-millisecond — not worth a floor. Host can still set a
-  // floor via `TransformOptions.minReminderChars` / `minToolResultChars`
-  // if they want one for non-correctness reasons (e.g. observability).
-  minReminderChars: 0,
-  minToolResultChars: 0,
+  // Keep small tool text as text. Below ~6k chars, the per-image cost
+  // dominates the savings (one PNG ≈ 1300 image tokens, vs ~1500 text
+  // tokens for 6 KB of text — break-even territory). The profitability
+  // gate still runs above this floor. Decoupled from READABLE_CHARS_PER_IMAGE
+  // (now 50k = per-page capacity) since the floor is about round-trip cost,
+  // not per-page packing.
+  minReminderChars: 6000,
+  minToolResultChars: 6000,
   // NOTE: Anthropic's `system` field accepts text blocks only — image blocks
   // there come back as `400 system.N.type: Input should be 'text'`. Images
   // are always attached to the first user message; there's no flag for this
   // because the system-field path is API-rejected. (Removed `placement` +
   // `compressSystem` knobs that gated the dead system-field branch.)
-  cols: 100,
-  // Cap at 10 images per tool_result. With ~19.5k chars/image at the 5×8
-  // production cell, a single-column tool_result can grow to ~195k chars
+  // 313 cells × 5 px = 1565 px ≈ full 1568 px canvas width. We fill the
+  // canvas — no shrink-to-content — so every page packs the maximum chars
+  // per image and the per-image token cost amortizes over more text.
+  cols: 313,
+  // Cap at 10 images per tool_result. With ~50k chars/image at the 5×8
+  // production cell, a single-column tool_result can grow to ~500k chars
   // before paging kicks in. A `find` over a big tree or `grep -r` can easily
   // exceed this; the paging marker tells the model what was elided. Tuneable
   // per session.
@@ -204,12 +203,10 @@ const DEFAULTS: Required<TransformOptions> = {
   historyAmortizationHorizon: 1,
   priorWarmTokens: 0,
   priorWarmImageTokens: 0,
-  // R2 multi-column ON (2 cols) — at single-col the break-even gate
-  // correctly rejects compression on real tool-doc-shaped slabs (~38 chars/
-  // row → ~29 imgs vs 39k text tokens → net loss). Two columns packs ~2×
-  // rows per image, dropping image count to ~15 and crossing break-even.
-  // Set to 1 via `--multi-col 1` if the OCR ordering ever turns out wrong.
-  multiCol: 2,
+  // Multi-column disabled: at 313 cols × 196 rows the single-column page
+  // already holds ~50k chars, so multi-col packing adds OCR-ordering risk
+  // without meaningful savings. Kept in the type for backward compat.
+  multiCol: 1,
   // R3 reflow ON by default — the L1 OCR eval cleared it at the production
   // 5×8 cell with the in-image instruction band (`reflow-inimage`): 98.95 %
   // char accuracy on the 20-block corpus, +1pp over the text-only baseline.
@@ -368,7 +365,9 @@ function imageTokensForRows(
   if (!Number.isFinite(visualRows) || visualRows <= 0) return 0;
   const n = Math.max(1, numCols | 0);
   const widthPx = multiColWidthPx(cols, n);
-  const linesPerImg = Math.max(1, Math.floor((MAX_HEIGHT_PX - 2 * PAD_Y) / CELL_H));
+  const hardLinesPerImg = Math.max(1, Math.floor((MAX_HEIGHT_PX - 2 * PAD_Y) / CELL_H));
+  const readableLinesPerCol = Math.max(1, Math.floor(READABLE_CHARS_PER_IMAGE / Math.max(1, cols)));
+  const linesPerImg = Math.min(hardLinesPerImg, readableLinesPerCol);
   // Multi-col packs n text columns side-by-side, so one image holds
   // n × linesPerImg wrapped lines but its HEIGHT only tracks the tallest
   // column (= min(rowsInChunk, linesPerImg)). See renderMultiColChunkFromLines.
@@ -434,7 +433,7 @@ function imageTokensCost(
 export const LINES_PER_IMAGE = Math.max(1, Math.floor((MAX_HEIGHT_PX - 2 * PAD_Y) / CELL_H));
 
 export function maxCharsPerImage(cols: number): number {
-  return cols * LINES_PER_IMAGE;
+  return Math.min(cols * LINES_PER_IMAGE, READABLE_CHARS_PER_IMAGE);
 }
 
 /** Lossless pre-render slab compactor. Reduces the visual-row count the
@@ -1525,13 +1524,18 @@ export function estimateImageCount(
   numCols: number = 1,
 ): number {
   const n = Math.max(1, numCols | 0);
-  const linesPerImage = LINES_PER_IMAGE * n;
+  const readableLinesPerCol = Math.max(1, Math.floor(READABLE_CHARS_PER_IMAGE / Math.max(1, cols)));
+  const linesPerImage = Math.min(LINES_PER_IMAGE, readableLinesPerCol) * n;
   if (typeof textOrLen === 'number') {
     // Back-compat shim — numeric arg gets the looser chars-based estimate.
-    return Math.max(1, Math.ceil(textOrLen / Math.max(1, maxCharsPerImage(cols) * n)));
+    return Math.max(1, Math.ceil(textOrLen / Math.max(1, READABLE_CHARS_PER_IMAGE * n)));
   }
   const rows = countVisualRows(textOrLen, cols);
-  return Math.max(1, Math.ceil(rows / linesPerImage));
+  return Math.max(
+    1,
+    Math.ceil(rows / linesPerImage),
+    Math.ceil(textOrLen.length / Math.max(1, READABLE_CHARS_PER_IMAGE * n)),
+  );
 }
 
 /** Classify content so we can pick a truncation strategy. Cheap heuristics on
@@ -1597,7 +1601,8 @@ export function truncateForBudget(
   const n = Math.max(1, numCols | 0);
   const estImages = estimateImageCount(text, cols, n);
   if (estImages <= maxImages) return { text, omittedChars: 0, truncated: false };
-  const totalRowBudget = Math.max(8, maxImages * LINES_PER_IMAGE * n - 6);
+  const readableLinesPerCol = Math.max(1, Math.floor(READABLE_CHARS_PER_IMAGE / Math.max(1, cols)));
+  const totalRowBudget = Math.max(8, maxImages * Math.min(LINES_PER_IMAGE, readableLinesPerCol) * n - 6);
   const shape = classifyContent(text);
   // Reflowed text uses NL_SENTINEL (↵ U+21B5) as line separator instead of \n.
   // Split on whichever delimiter the text uses so we can truncate at logical
@@ -1836,7 +1841,19 @@ export async function transformRequest(
   body: Uint8Array,
   opts: TransformOptions = {},
 ): Promise<{ body: Uint8Array; info: TransformInfo }> {
-  const o: Required<TransformOptions> = { ...DEFAULTS, ...opts };
+  // Merge caller opts over DEFAULTS, but treat explicit `undefined` as "not
+  // provided" so it falls through to the default. Without this, a caller that
+  // passes `{ minToolResultChars: undefined }` (common when forwarding partial
+  // options from upstream — e.g. ocproxy's handler) would silently disable the
+  // tool_result text-passthrough gate and route everything through the
+  // renderer.
+  const merged: TransformOptions = { ...DEFAULTS, ...opts };
+  for (const k of Object.keys(merged) as (keyof TransformOptions)[]) {
+    if (merged[k] === undefined) {
+      (merged as Record<string, unknown>)[k] = (DEFAULTS as Record<string, unknown>)[k];
+    }
+  }
+  const o: Required<TransformOptions> = merged as Required<TransformOptions>;
   const info: TransformInfo = {
     compressed: false,
     origChars: 0,

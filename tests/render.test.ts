@@ -136,7 +136,7 @@ describe('renderer', () => {
     // inputs. numCols=1 MUST be a pure passthrough so toggling the flag
     // back to 1 cannot regress cache hit rate.
     const text = ('lorem ipsum dolor sit amet\n'.repeat(8)) + 'final line';
-    const single = await renderTextToPngs(text);
+    const single = await renderTextToPngs(text, 100);
     const passthrough = await renderTextToPngsMultiCol(text, 100, 1);
     expect(passthrough.length).toBe(single.length);
     for (let i = 0; i < single.length; i++) {
@@ -1882,15 +1882,17 @@ describe('transform', () => {
   // responds to `cols` (which scales chars/image linearly the same way a smaller
   // cell-H would).
 
-  it('maxCharsPerImage: matches the 19,500 constant at the 5x8 shipping config', () => {
-    // 5×8 cell, cols=100: floor((1568-8)/8) × 100 = 195 × 100 = 19,500.
-    // If this ever drifts, every break-even test downstream needs re-pinning.
+  it('maxCharsPerImage: fills the canvas (READABLE_CHARS_PER_IMAGE = 50k)', () => {
+    // Policy: maximum chars per page, full 1568×1568 canvas. At cols=100 the
+    // canvas holds 100 × 195 = 19,500 chars per page (height-limited).
     expect(maxCharsPerImage(100)).toBe(19_500);
   });
 
-  it('maxCharsPerImage: scales linearly with cols (same atlas)', () => {
-    expect(maxCharsPerImage(50)).toBe(9_750);
-    expect(maxCharsPerImage(200)).toBe(39_000);
+  it('maxCharsPerImage: scales with cols and caps at the 50k page budget', () => {
+    expect(maxCharsPerImage(20)).toBe(3_900);    // 20 × 195 = 3,900 (height-bound)
+    expect(maxCharsPerImage(50)).toBe(9_750);    // 50 × 195 = 9,750 (height-bound)
+    expect(maxCharsPerImage(200)).toBe(39_000);  // 200 × 195 = 39,000 (height-bound)
+    expect(maxCharsPerImage(313)).toBe(50_000);  // 313 × 195 = 61,035 → capped at READABLE
   });
 
   it('isCompressionProfitable: doubling cols halves the 2-image break-even threshold', () => {
@@ -1920,15 +1922,15 @@ describe('transform', () => {
     expect(isCompressionProfitable(dense, 100)).toBe(true);
   });
 
-  it('isCompressionProfitable(string, cols, cap): truncation cap lets 500KB log become profitable', () => {
+  it('isCompressionProfitable(string, cols, cap): truncation cap lets sparse log become profitable', () => {
     // For tool_result paging — actual image cost is bounded by maxImagesPerToolResult
-    // while the SAVED text is the full pre-truncation length. Without cap we'd
-    // reject (50k rows = 257 images), with cap=10 we accept (10*2500=25000 vs
-    // 500000/4=125000 text → win by 100k).
+    // while the SAVED text is the full pre-truncation length. Sparse content
+    // (10k short lines) wastes canvas at full width, so uncapped it's a loss;
+    // with cap=10 the image side is bounded and we win.
     const lines: string[] = [];
     for (let i = 0; i < 10_000; i++) lines.push(`log entry ${i} payload`);
     const log = lines.join('\n');
-    expect(isCompressionProfitable(log, 100)).toBe(true); // 10k rows × 2500 way over
+    expect(isCompressionProfitable(log, 100)).toBe(false); // sparse → image cost exceeds text
     expect(isCompressionProfitable(log, 100, 10)).toBe(true); // capped, profits
   });
 

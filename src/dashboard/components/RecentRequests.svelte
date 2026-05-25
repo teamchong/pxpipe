@@ -50,9 +50,17 @@
             ? '+' + numFmt(e.session_saved_so_far_delta ?? 0)
             : '-'}
         </td>
-        <td class="num">
-          {#if e.img_id != null}
-            <button class="view-btn" on:click={() => selectedImageId.set(e.img_id ?? null)}>view</button>
+        <td class="img-cell">
+          {#if (e.img_ids && e.img_ids.length > 0) || e.img_id != null}
+            {@const ids = e.img_ids ?? (e.img_id != null ? [e.img_id] : [])}
+            <div class="thumb-strip">
+              {#each ids as id}
+                <button type="button" class="thumb-btn" title="image #{id}"
+                        on:click={() => selectedImageId.set(id)}>
+                  <img class="thumb" src="/proxy-latest-png?id={id}" alt="img {id}" />
+                </button>
+              {/each}
+            </div>
           {:else}
             <span class="muted">-</span>
           {/if}
@@ -108,16 +116,35 @@
   .muted {
     color: #6e7681;
   }
-  .view-btn {
-    font-size: 11px;
-    background: #21262d;
-    color: #58a6ff;
-    border: 1px solid #30363d;
-    border-radius: 4px;
-    padding: 1px 6px;
-    cursor: pointer;
+  .thumb-strip {
+    display: flex;
+    gap: 3px;
+    align-items: center;
+    justify-content: flex-end;
   }
-  .view-btn:hover {
-    background: #30363d;
+  .thumb-btn {
+    padding: 0;
+    border: 1px solid #30363d;
+    border-radius: 3px;
+    background: #fff;
+    cursor: pointer;
+    line-height: 0;
+  }
+  .thumb-btn:hover,
+  .thumb-btn:focus-visible {
+    border-color: #58a6ff;
+    outline: none;
+  }
+  .thumb {
+    height: 28px;
+    width: auto;
+    max-width: 28px;
+    object-fit: cover;
+    object-position: top left;
+    display: block;
+    image-rendering: pixelated;
+  }
+  .img-cell {
+    text-align: right;
   }
 </style>

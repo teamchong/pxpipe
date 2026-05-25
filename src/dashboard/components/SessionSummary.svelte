@@ -28,23 +28,20 @@
   $: err = $currentSession.error;
 
   // backend exposes raw weighted tokens; convert to $ at Opus 4.x rates.
-  // These MUST stay in lockstep with the server-side constants
-  // `ASSUMED_INPUT_USD_PER_MTOK` and `OUTPUT_TOKEN_RATE` in src/dashboard.ts.
+  // These MUST stay in lockstep with the server-side constant
+  // `ASSUMED_INPUT_USD_PER_MTOK` in src/dashboard.ts.
   const INPUT_USD_PER_MTOK = 5.0;
-  const OUTPUT_TOKEN_RATE = 5.0;
   // Numerator: honest savings over the MEASURED slice.
   $: baselineTok = data?.baselineInputWeighted ?? 0;
   $: actualTok = data?.actualInputWeighted ?? 0;
   $: savedTok = Math.max(0, baselineTok - actualTok);
   $: savedUsd = (savedTok * INPUT_USD_PER_MTOK) / 1_000_000;
-  // Denominator: ALL-rows session bill ($) = input + output across every
-  // request the proxy saw this session, measured or not.
-  $: allActualTok = data?.allActualInputWeighted ?? 0;
-  $: allOutputTok = data?.allOutputWeighted ?? 0;
-  $: totalBillUsd =
-    (allActualTok * INPUT_USD_PER_MTOK) / 1_000_000 +
-    (allOutputTok * OUTPUT_TOKEN_RATE) / 1_000_000;
-  $: savedPct = totalBillUsd > 0 ? (savedUsd / totalBillUsd) * 100 : 0;
+  // Denominator: BASELINE input $ over the same MEASURED slice. The proxy
+  // only touches input tokens — output is identical with/without proxy — so
+  // scoping both sides of the ratio to baseline input $ on measured rows
+  // gives an apples-to-apples "what fraction of the baseline did we save".
+  $: baselineUsd = (baselineTok * INPUT_USD_PER_MTOK) / 1_000_000;
+  $: savedPct = baselineUsd > 0 ? (savedUsd / baselineUsd) * 100 : 0;
   $: measuredReqs = data?.baselineMeasuredCount ?? 0;
 
   function fmtUsd(n: number): string {
@@ -58,9 +55,9 @@
   <div class="line">
     <span class="label">THIS SESSION</span>
     — saved <span class="num">{fmtUsd(savedUsd)}</span>
-    of <span class="muted">{fmtUsd(totalBillUsd)}</span> total bill
-    (<span class="num">{savedPct.toFixed(1)}%</span>)
-    · <span class="muted">{measuredReqs} requests</span>
+    (<span class="num">{savedPct.toFixed(1)}%</span> of
+    <span class="muted">{fmtUsd(baselineUsd)}</span> baseline)
+    — <span class="muted">{measuredReqs} requests</span>
   </div>
 {/if}
 

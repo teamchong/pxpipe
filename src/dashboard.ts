@@ -109,6 +109,7 @@ export interface RecentRow {
    *  request rendered no image, or once the image has been evicted from the
    *  ring (the id stays on the row but no longer fetches). */
   img_id?: number;
+  img_ids?: number[];
 }
 
 /** Aggregate over the whole session. Reset on process restart unless
@@ -367,33 +368,42 @@ export class DashboardState {
     this.ccMapFn = ccMapFn ?? (() => claudeCodeMap());
   }
 
-  /** Stash a rendered image into the ring (called from onRequest with the raw
-   *  ProxyEvent before info.firstImagePng is dropped by toTrackEvent).
-   *  Returns the assigned image id, or undefined when there's no image —
-   *  the caller stamps it onto the RecentRow as `img_id`. */
-  captureImage(info: NonNullable<ProxyEvent['info']>): number | undefined {
-    if (!info.firstImagePng) return undefined;
-    const id = this.nextImageId++;
-    const width = info.firstImageWidth ?? 0;
-    const height = info.firstImageHeight ?? 0;
-    const kb = (info.firstImagePng.length / 1024).toFixed(1);
-    const meta =
-      `${width}×${height} · ${kb} KB · ` +
-      `${info.imageCount ?? 0} image${info.imageCount === 1 ? '' : 's'} total`;
-    this.images.push({
-      id,
-      png: info.firstImagePng,
-      meta,
-      width,
-      height,
-      ts: Date.now() / 1000,
-    });
+  /** Stash every rendered image into the ring (called from onRequest with the
+   *  raw ProxyEvent before info.firstImagePng is dropped by toTrackEvent).
+   *  Returns the assigned image ids in render order; empty array when there
+   *  are no images. The caller stamps ids[0] onto the RecentRow as `img_id`
+   *  for back-compat and the full list as `img_ids`. */
+  captureImage(info: NonNullable<ProxyEvent['info']>): number[] {
+    const pngs = info.imagePngs ?? (info.firstImagePng ? [info.firstImagePng] : []);
+    if (pngs.length === 0) return [];
+    const dims =
+      info.imageDims ??
+      (info.firstImagePng
+        ? [{ width: info.firstImageWidth ?? 0, height: info.firstImageHeight ?? 0 }]
+        : []);
+    const ids: number[] = [];
+    for (let i = 0; i < pngs.length; i++) {
+      const id = this.nextImageId++;
+      const width = dims[i]?.width ?? 0;
+      const height = dims[i]?.height ?? 0;
+      const kb = (pngs[i]!.length / 1024).toFixed(1);
+      const meta = `${width}×${height} · ${kb} KB · image ${i + 1}/${pngs.length}`;
+      this.images.push({
+        id,
+        png: pngs[i]!,
+        meta,
+        width,
+        height,
+        ts: Date.now() / 1000,
+      });
+      ids.push(id);
+    }
     // Evict the oldest entries past the cap. splice() keeps insertion order
     // so images[images.length - 1] is always the latest render.
     if (this.images.length > IMAGE_RING_CAP) {
       this.images.splice(0, this.images.length - IMAGE_RING_CAP);
     }
-    return id;
+    return ids;
   }
 
   /** Fold one event into the running totals + ring buffer.
@@ -406,7 +416,8 @@ export class DashboardState {
     // Stash the image bytes before they get GC'd by the request finishing.
     // The returned id (if any) is stamped onto this request's RecentRow so
     // the dashboard can pull the exact image that request rendered.
-    const imgId = ev.info ? this.captureImage(ev.info) : undefined;
+    const imgIds = ev.info ? this.captureImage(ev.info) : [];
+    const imgId = imgIds[0];
 
     const u = ev.usage;
     const info = ev.info;
@@ -580,6 +591,7 @@ export class DashboardState {
       session_saved_so_far_delta:
         haveBaseline && haveUsage ? round1(baselineInputEff - actualInputEff) : undefined,
       img_id: imgId,
+      img_ids: imgIds,
     };
     this.recent.push(row);
     if (this.recent.length > RECENT_CAP) this.recent.splice(0, this.recent.length - RECENT_CAP);

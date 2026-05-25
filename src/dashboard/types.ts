@@ -86,6 +86,7 @@ export interface RecentRow {
   baseline_input?: number;
   session_saved_so_far_delta?: number;
   img_id?: number;
+  img_ids?: number[];
 }
 
 /** /api/sessions.json payload — bulk session aggregate + selection table. */

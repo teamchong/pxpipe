@@ -846,6 +846,11 @@ export interface TransformInfo {
   /** Pixel dimensions of the first image. */
   firstImageWidth?: number;
   firstImageHeight?: number;
+  /** Every rendered PNG for this request, in render order. images[0] === firstImagePng.
+   *  Surfaced separately so the dashboard can pin any image individually. */
+  imagePngs?: Uint8Array[];
+  /** Matching pixel dimensions for each entry in imagePngs. */
+  imageDims?: Array<{ width: number; height: number }>;
   /** Number of images we added by compressing `<system-reminder>` blocks in
    *  the first user message. */
   reminderImgs?: number;
@@ -2141,6 +2146,8 @@ export async function transformRequest(
     info.firstImagePng = images[0]!.png;
     info.firstImageWidth = images[0]!.width;
     info.firstImageHeight = images[0]!.height;
+    info.imagePngs = images.map((i) => i.png);
+    info.imageDims = images.map((i) => ({ width: i.width, height: i.height }));
   }
 
   // 4. Splice images back into the request.

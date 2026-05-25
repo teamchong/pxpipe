@@ -154,12 +154,20 @@ export interface CompressionToggleResponse {
 }
 
 /** /api/current-session.json payload — per-session aggregates for the most-recently-active Claude Code session.
- *  Pruned to only the fields the minimal SessionSummary.svelte headline reads:
- *  dollar-weighted baseline/actual input + the measured-request count. */
+ *  Carries the dollar-weighted baseline/actual input the headline shows PLUS
+ *  the session-wide totals (`allActualInputWeighted` + `allOutputWeighted`)
+ *  needed to compute the honest saved-% ratio against the full session bill
+ *  instead of just the measured slice. */
 export interface CurrentSessionPayload {
   sessionId: string | null;
   message?: string;
   baselineInputWeighted?: number;
   actualInputWeighted?: number;
   baselineMeasuredCount?: number;
+  /** Sum of `actualInputWeighted` across EVERY request in the session
+   *  (measured or not). Pairs with `allOutputWeighted` to form the full
+   *  session bill — the honest denominator for the saved-% ratio. */
+  allActualInputWeighted?: number;
+  /** Sum of `outputWeighted` across EVERY request in the session. */
+  allOutputWeighted?: number;
 }

@@ -2,8 +2,13 @@
   // One-line headline for the current session: dollar-weighted savings ratio.
   //
   // Math (no cherry-pick):
-  //   saved_$ = Σ baseline_$ − Σ actual_$         (over requests where we measured baseline)
-  //   saved_% = saved_$ / Σ baseline_$
+  //   saved_$    = Σ baseline_$ − Σ actual_$        over MEASURED rows only
+  //                (honest numerator — we can only know what we saved on
+  //                 requests where the baseline probe ran)
+  //   totalBill_$ = Σ actual_input_$ + Σ output_$   over ALL session rows
+  //                (measured + unmeasured + passthrough — what Anthropic
+  //                 actually billed for this session)
+  //   saved_%    = saved_$ / totalBill_$ × 100
   //
   // `baseline_$` is the cache-aware bill Anthropic would have charged for the
   // uncompressed body with the SAME cache_control markers Claude Code sent —
@@ -11,17 +16,35 @@
   // requests. Caching savings stay credited to Claude Code; what remains is
   // proxy-attributable savings only.
   //
-  // Unmeasured requests (probe skipped, passthroughs) don't enter either sum.
-  // We only report what we measured.
+  // Why this denominator and not Σ baseline_$? Σ baseline_$ is filtered to
+  // measured rows only, which cherry-picks the wins (the slice where we
+  // proved savings) and ignores the rest of the bill the user actually
+  // paid. Dividing by the full session bill matches the global
+  // `saved_pct_of_all_spend` math and produces a number the user can
+  // reconcile against an invoice.
   import { currentSession } from '../stores/index.js';
 
   $: data = $currentSession.data;
   $: err = $currentSession.error;
 
-  $: baselineUsd = data?.baselineInputWeighted ?? 0;
-  $: actualUsd = data?.actualInputWeighted ?? 0;
-  $: savedUsd = Math.max(0, baselineUsd - actualUsd);
-  $: savedPct = baselineUsd > 0 ? (savedUsd / baselineUsd) * 100 : 0;
+  // backend exposes raw weighted tokens; convert to $ at Opus 4.x rates.
+  // These MUST stay in lockstep with the server-side constants
+  // `ASSUMED_INPUT_USD_PER_MTOK` and `OUTPUT_TOKEN_RATE` in src/dashboard.ts.
+  const INPUT_USD_PER_MTOK = 5.0;
+  const OUTPUT_TOKEN_RATE = 5.0;
+  // Numerator: honest savings over the MEASURED slice.
+  $: baselineTok = data?.baselineInputWeighted ?? 0;
+  $: actualTok = data?.actualInputWeighted ?? 0;
+  $: savedTok = Math.max(0, baselineTok - actualTok);
+  $: savedUsd = (savedTok * INPUT_USD_PER_MTOK) / 1_000_000;
+  // Denominator: ALL-rows session bill ($) = input + output across every
+  // request the proxy saw this session, measured or not.
+  $: allActualTok = data?.allActualInputWeighted ?? 0;
+  $: allOutputTok = data?.allOutputWeighted ?? 0;
+  $: totalBillUsd =
+    (allActualTok * INPUT_USD_PER_MTOK) / 1_000_000 +
+    (allOutputTok * OUTPUT_TOKEN_RATE) / 1_000_000;
+  $: savedPct = totalBillUsd > 0 ? (savedUsd / totalBillUsd) * 100 : 0;
   $: measuredReqs = data?.baselineMeasuredCount ?? 0;
 
   function fmtUsd(n: number): string {
@@ -35,6 +58,7 @@
   <div class="line">
     <span class="label">THIS SESSION</span>
     — saved <span class="num">{fmtUsd(savedUsd)}</span>
+    of <span class="muted">{fmtUsd(totalBillUsd)}</span> total bill
     (<span class="num">{savedPct.toFixed(1)}%</span>)
     · <span class="muted">{measuredReqs} requests</span>
   </div>

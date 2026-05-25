@@ -4,7 +4,6 @@
   // on the same 2s/5s cadences and rebuilt all DOM on every tick; we keep
   // the cadences but let Svelte's reactivity diff at the field level.
 
-  import StatsHeader from './components/StatsHeader.svelte';
   import RecentRequests from './components/RecentRequests.svelte';
   import LatestPng from './components/LatestPng.svelte';
   import Sessions from './components/Sessions.svelte';
@@ -36,8 +35,6 @@
 <CompressionToggle />
 
 <SessionSummary />
-
-<StatsHeader />
 
 <div class="row">
   <div class="panel">

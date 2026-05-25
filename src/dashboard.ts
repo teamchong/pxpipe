@@ -160,6 +160,13 @@ interface SessionTotals {
   // to `baselineInputWeighted` (events that carried a baseline measurement,
   // matching the global `Totals.baselineMeasuredCount`).
   baselineMeasuredCount: number;
+  // ALL-rows session totals (measured + unmeasured + passthrough). These pair
+  // up to form the full session bill in $ — used as the honest denominator
+  // for saved-% so the ratio matches the global `saved_pct_of_all_spend`
+  // math but scoped to a single session. Mirrors the global
+  // `Totals.allActualInputWeighted` / `allOutputWeighted` accumulators.
+  allActualInputWeighted: number;
+  allOutputWeighted: number;
 }
 
 interface Totals {
@@ -510,6 +517,8 @@ export class DashboardState {
           baselineInputWeighted: 0,
           actualInputWeighted: 0,
           baselineMeasuredCount: 0,
+          allActualInputWeighted: 0,
+          allOutputWeighted: 0,
         };
         this.sessions.set(sid, s);
         // Cap memory — drop the first (oldest by insertion order) session
@@ -531,6 +540,14 @@ export class DashboardState {
         s.baselineInputWeighted += baselineInputEff;
         s.actualInputWeighted += actualInputEff;
         s.baselineMeasuredCount += 1;
+      }
+      // ALL-rows session bill — mirrors the global `if (haveUsage)` block
+      // above (allActualInputWeighted / allOutputWeighted). Used as the
+      // honest denominator for the session's saved-% so caching wins on
+      // unmeasured requests still count toward "what you actually paid".
+      if (haveUsage) {
+        s.allActualInputWeighted += actualInputEff;
+        s.allOutputWeighted += outputEquiv;
       }
     }
 
@@ -661,16 +678,22 @@ export class DashboardState {
     if (!s) {
       return jsonResponse({ sessionId: null, message: 'no active session yet' });
     }
-    // Minimal headline payload: the same dollar-weighted baseline/actual
-    // input accumulators the global Totals block exposes, plus the honest
+    // Headline payload: the same dollar-weighted baseline/actual input
+    // accumulators the global Totals block exposes, plus the honest
     // denominator (`baselineMeasuredCount` — only requests that carried a
-    // baseline measurement). The Svelte panel does the savings math itself
-    // so we don't round-trip dollar values through the wire.
+    // baseline measurement). We ALSO ship the ALL-rows session bill
+    // (`allActualInputWeighted` + `allOutputWeighted`) so the Svelte panel
+    // can compute saved-% against the full session bill instead of just
+    // the measured slice — matching the global `saved_pct_of_all_spend`
+    // math but scoped to one session. The Svelte panel does the dollar
+    // conversion itself so we don't round-trip pricing through the wire.
     return jsonResponse({
       sessionId: s.sessionId,
       baselineInputWeighted: s.baselineInputWeighted,
       actualInputWeighted: s.actualInputWeighted,
       baselineMeasuredCount: s.baselineMeasuredCount,
+      allActualInputWeighted: s.allActualInputWeighted,
+      allOutputWeighted: s.allOutputWeighted,
     });
   }
 

@@ -1004,6 +1004,19 @@ function extractSystemText(sys: SystemField | undefined): { text: string; kept: 
   return { text: textParts.join('\n\n'), kept };
 }
 
+function lastStaticSystemCacheControl(sys: SystemField | undefined): TextBlock['cache_control'] | undefined {
+  if (!Array.isArray(sys)) return undefined;
+  let cacheControl: TextBlock['cache_control'] | undefined;
+  for (const block of sys) {
+    if (!block || block.type !== 'text' || block.cache_control === undefined) continue;
+    const { body } = stripBillingLine(block.text);
+    if (splitStaticDynamic(body).staticText.length > 0) {
+      cacheControl = block.cache_control;
+    }
+  }
+  return cacheControl;
+}
+
 /**
  * Claude Code injects a handful of per-turn dynamic blocks into the system
  * prompt (e.g. <env>, <context>, <git_status>, <directoryStructure>,
@@ -1887,6 +1900,7 @@ export async function transformRequest(
   //    - billingLine: Claude Code's per-turn random header (must NOT be cached).
   //    - dynamicText: <env>/<context>/... blocks (per-turn, kept as text).
   //    - staticText: everything else (cacheable, goes into the image).
+  const systemStaticCacheControl = lastStaticSystemCacheControl(req.system);
   const { text: rawSysText, kept: sysRemainder } = extractSystemText(req.system);
   const { kept: billingLine, body: sysBody } = stripBillingLine(rawSysText);
   const {
@@ -2143,8 +2157,12 @@ export async function transformRequest(
     for (const [cp, n] of img.droppedCodepoints) {
       droppedCodepoints.set(cp, (droppedCodepoints.get(cp) ?? 0) + n);
     }
-    // Cache-breakpoint on the last image so the whole block caches as one.
-    imageBlocks.push(makeImageBlock(b64, i === images.length - 1));
+    const imageBlock = makeImageBlock(b64, i === images.length - 1);
+    imageBlocks.push(
+      i === images.length - 1 && systemStaticCacheControl !== undefined
+        ? { ...imageBlock, cache_control: systemStaticCacheControl }
+        : imageBlock,
+    );
   }
   info.imageCount = imageBlocks.length;
   // Static slab made it through the break-even gate and rendered. Credit

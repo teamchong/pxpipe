@@ -1324,6 +1324,36 @@ describe('transform', () => {
     expect(cached.length).toBe(0);
   });
 
+  it('moves caller cache_control from static system text to the last slab image', async () => {
+    const cacheControl = { type: 'ephemeral' as const, ttl: '1h' as const };
+    const body = new TextEncoder().encode(
+      JSON.stringify({
+        model: 'claude',
+        messages: [{ role: 'user', content: 'hi' }],
+        system: [
+          {
+            type: 'text',
+            text: 'Important cached system instruction. '.repeat(2500),
+            cache_control: cacheControl,
+          },
+        ],
+      }),
+    );
+
+    const { body: outBytes, info } = await transformRequest(body);
+    expect(info.compressed).toBe(true);
+
+    const rewritten = JSON.parse(new TextDecoder().decode(outBytes));
+    const rewrittenUserContent = rewritten.messages[0].content as any[];
+    const imageBlocks = rewrittenUserContent.filter((b: any) => b.type === 'image');
+    expect(imageBlocks.length).toBeGreaterThan(0);
+
+    const cachedBlocks = rewrittenUserContent.filter((b: any) => b.cache_control);
+    expect(cachedBlocks).toHaveLength(1);
+    expect(cachedBlocks[0]).toBe(imageBlocks[imageBlocks.length - 1]);
+    expect(cachedBlocks[0].cache_control).toEqual(cacheControl);
+  });
+
   it('extracts env fields (cwd, platform, today, isGitRepo, branch) into info.env', async () => {
     const sys =
       'claude.md\n'.repeat(400) +

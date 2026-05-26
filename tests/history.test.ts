@@ -24,6 +24,7 @@ import {
   HISTORY_DEFAULTS,
 } from '../src/core/history.js';
 import { transformRequest, isCompressionProfitable } from '../src/core/transform.js';
+import { DENSE_CONTENT_CHARS_PER_IMAGE } from '../src/core/render.js';
 import type { Message } from '../src/core/types.js';
 
 // A tiny helper so test fixtures are readable.
@@ -312,23 +313,12 @@ describe('collapseHistory', () => {
     expect(out[2]).toBe(msgs[11]);
   });
 
-  it('preserves git status --short tool output as exact text alongside history images', async () => {
-    const status = [
-      'M  package-lock.json',
-      'M  package.json',
-      'M  packages/capnweb-typecheck/DESIGN.md',
-      'M  packages/capnweb-typecheck/src/index.ts',
-      ' M packages/capnweb-typecheck/src/plugin.ts',
-      'M  tsdown.config.ts',
-      '?? handoff.md',
-      '?? packages/capnweb-typecheck/src/transform/',
-    ].join('\n');
-    const msgs: Message[] = [
-      usr('run git status'),
-      asst([{ type: 'tool_use', id: 'bash-1', name: 'bash', input: { command: 'git status --short' } }]),
-      usr([{ type: 'tool_result', tool_use_id: 'bash-1', content: status }]),
-      asst('noted'),
-    ];
+  it('splits dense collapsed history into readable image pages without plaintext side channels', async () => {
+    const body = Array.from(
+      { length: 180 },
+      (_, i) => `line ${i}: ${'x'.repeat(80)}`,
+    ).join('\n');
+    const msgs: Message[] = [usr(body), asst(body), usr(body)];
 
     const { messages: out, info } = await collapseHistory(msgs, () => true, {
       keepTail: 0,
@@ -337,14 +327,15 @@ describe('collapseHistory', () => {
     });
 
     expect(info.reason).toBe(undefined);
-    const content = out[0]!.content as Array<Record<string, unknown>>;
-    expect(content.some((c) => c.type === 'image')).toBe(true);
-    const exact = content.find(
-      (c) => c.type === 'text' && typeof c.text === 'string' && c.text.includes('source of truth'),
+    expect(info.collapsedImages).toBeGreaterThanOrEqual(
+      Math.ceil(info.collapsedChars / DENSE_CONTENT_CHARS_PER_IMAGE),
     );
-    expect(exact).toBeTruthy();
-    expect((exact!.text as string)).toContain(status);
-    for (const line of status.split('\n')) expect((exact!.text as string)).toContain(line);
+    const content = out[0]!.content as Array<Record<string, unknown>>;
+    expect(content.filter((c) => c.type === 'text')).toEqual([
+      { type: 'text', text: '[Earlier in this conversation:]' },
+      { type: 'text', text: '[End of earlier context.]' },
+    ]);
+    expect(content.filter((c) => c.type === 'image')).toHaveLength(info.collapsedImages);
   });
 
   it('preserves a tool_use sequence that straddles the live-tail boundary', async () => {

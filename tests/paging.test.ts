@@ -92,6 +92,29 @@ describe('dense readable render profile', () => {
     expect(imgs[0]!.width).toBeGreaterThan(1000);
     expect(imgs[0]!.width).toBeLessThanOrEqual(1568);
   });
+
+  it('pages diff-shaped tool output at the dense readable budget', async () => {
+    const diffish = Array.from(
+      { length: 160 },
+      (_, i) => `${i % 2 === 0 ? '+' : '-'}const value${i} = ${i}; // ${'changed '.repeat(8)}`,
+    ).join('\n');
+    expect(diffish.length).toBeGreaterThan(DENSE_CONTENT_CHARS_PER_IMAGE * 2);
+
+    const imgs = await renderTextToPngsWithCharLimit(
+      diffish,
+      DENSE_CONTENT_COLS,
+      DENSE_CONTENT_CHARS_PER_IMAGE,
+      DENSE_RENDER_STYLE,
+    );
+
+    expect(imgs.length).toBeGreaterThanOrEqual(
+      Math.ceil(diffish.length / DENSE_CONTENT_CHARS_PER_IMAGE),
+    );
+    for (const img of imgs) {
+      expect(img.width).toBeLessThanOrEqual(1568);
+      expect(img.height).toBeLessThanOrEqual(1568);
+    }
+  });
 });
 
 describe('classifyContent', () => {

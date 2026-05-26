@@ -15,9 +15,10 @@ ready-to-send PNG buffers.
 
 Experimental. The library ships and runs, but the cost math depends on
 Anthropic's current image-token pricing and on the model you point at it.
-Today, **only Opus 4.7 makes the trade-off worthwhile** in practice — newer
+Today, **only Opus 4.6 and Opus 4.7 are enabled** in practice — newer
 models (Opus 5.x) tighten image tokenization enough that the savings
-disappear or invert. We gate on this at runtime; see *Why option A* below.
+disappear or invert, and non-Opus families have not been validated. We gate
+on this at runtime; see *Why option A* below.
 
 ---
 
@@ -29,7 +30,7 @@ tool_result string  ──►  wrapLines  ──►  renderTextToPngs  ──►
 
 1. **Wrap** the input at a column width that fits 1568 px wide.
 2. **Pack** as many lines as fit into a single readable image
-   (≈ `READABLE_CHARS_PER_IMAGE = 6000` chars per page).
+   (≈ `DENSE_CONTENT_CHARS_PER_IMAGE = 5000` chars per page).
 3. **Render** each page to a PNG via `node-canvas`.
 4. **Return** the array. Callers attach the PNGs to the user message and
    drop the original text.
@@ -38,9 +39,9 @@ tool_result string  ──►  wrapLines  ──►  renderTextToPngs  ──►
 
 A Claude 1568×1568 image costs ≈ 1568 vision tokens (Anthropic, 2026-04-16).
 At ≈ 6 readable characters per square monospace glyph, that page holds
-≈ 6 000 text chars. Same content as plain text: ≈ 1 500 text tokens. So
+≈ 5 000 text chars. Same content as plain text: ≈ 1 250 text tokens. So
 plain text is cheaper *unless* the model treats vision tokens as much
-fatter than text tokens — which Opus 4.7 effectively does on cold-miss
+fatter than text tokens — which Opus 4.6/4.7 effectively do on cold-miss
 cached transcripts.
 
 We measure rather than guess. The runtime estimator
@@ -57,8 +58,8 @@ The current behaviour:
 
 | input size                | output                                  |
 |---------------------------|------------------------------------------|
-| ≤ `MIN_TOO_L_RESULT_CHARS` (~6 000) | not rendered — caller sends as text |
-| moderate (≤ 6 000)        | one 1568×~480 PNG                       |
+| ≤ `minToolResultChars` (~6 000) | not rendered — caller sends as text |
+| moderate (≤ 5 000/page)   | one 1568×~480 PNG                       |
 | long                      | N pages, each 1568×~480, paginated      |
 
 Every page renders at the same font size and column width. Page heights
@@ -179,7 +180,7 @@ once the input clears the profitability gate.
 * `node-canvas` is a native dep on Node and a WASM dep on Workers. The
   Workers build is larger.
 * No streaming. Rendering is per-tool_result.
-* Profitability is model-specific. We currently expect Opus 4.7 callers.
+* Profitability is model-specific. We currently expect Opus 4.6 / 4.7 callers.
 
 ---
 

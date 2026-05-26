@@ -74,7 +74,7 @@ function classifyReason(info: TransformInfo): PixelpipeReason {
 
 /**
  * Library-first wrapper around pixelpipe's Anthropic Messages transformer.
- * It performs the Opus-4.7-only model gate, returns machine-readable reasons,
+ * It performs the Opus-4.6/4.7-only model gate, returns machine-readable reasons,
  * and reports cache_control ownership so hosts such as ocproxy do not stack a
  * second cache injector on top of pixelpipe's image breakpoint.
  */

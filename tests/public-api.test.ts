@@ -10,11 +10,13 @@ const enc = new TextEncoder();
 const dec = new TextDecoder();
 
 describe('public library API', () => {
-  it('recognizes Opus 4.7 and only Opus 4.7 as supported', () => {
+  it('recognizes Opus 4.6 and 4.7, and no other models, as supported', () => {
     expect(isPixelpipeSupportedModel('claude-opus-4-7')).toBe(true);
     expect(isPixelpipeSupportedModel('claude-opus-4-7-high')).toBe(true);
-    expect(isPixelpipeSupportedModel('claude-opus-4-6')).toBe(false);
-    expect(isPixelpipeSupportedModel('claude-sonnet-4-5')).toBe(false);
+    expect(isPixelpipeSupportedModel('claude-opus-4-6')).toBe(true);
+    expect(isPixelpipeSupportedModel('claude-opus-4-6-thinking')).toBe(true);
+    expect(isPixelpipeSupportedModel('claude-opus-4-5')).toBe(false);
+    expect(isPixelpipeSupportedModel('claude-sonnet-4-6')).toBe(false);
     expect(isPixelpipeSupportedModel(null)).toBe(false);
   });
 
@@ -129,17 +131,17 @@ describe('public library API', () => {
 
   it('wraps the transformer with model gating and cache ownership metadata', async () => {
     const unsupported = enc.encode(JSON.stringify({
-      model: 'claude-opus-4-6',
+      model: 'claude-sonnet-4-6',
       system: 'x'.repeat(20_000),
       messages: [{ role: 'user', content: 'hello' }],
     }));
-    const skipped = await transformAnthropicMessages({ body: unsupported, model: 'claude-opus-4-6' });
+    const skipped = await transformAnthropicMessages({ body: unsupported, model: 'claude-sonnet-4-6' });
     expect(skipped.applied).toBe(false);
     expect(skipped.reason).toBe('unsupported_model');
     expect(skipped.body).toBe(unsupported);
 
     const supported = enc.encode(JSON.stringify({
-      model: 'claude-opus-4-7',
+      model: 'claude-opus-4-6',
       system: 'Important system instruction. '.repeat(1200),
       tools: [{
         name: 'read_file',
@@ -148,7 +150,7 @@ describe('public library API', () => {
       }],
       messages: [{ role: 'user', content: 'hello' }],
     }));
-    const transformed = await transformAnthropicMessages({ body: supported, model: 'claude-opus-4-7' });
+    const transformed = await transformAnthropicMessages({ body: supported, model: 'claude-opus-4-6' });
     expect(transformed.applied).toBe(true);
     expect(transformed.reason).toBe('applied');
     expect(transformed.info.compressedChars).toBeGreaterThan(0);

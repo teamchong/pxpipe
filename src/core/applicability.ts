@@ -14,11 +14,11 @@ export interface PixelpipeApplicabilityInput {
   readonly bodyBytes?: number | null;
 }
 
-/** Pixelpipe is a product path for Opus 4.7 only. Suffix aliases such as
- * `claude-opus-4-7-high` are accepted because hosts may check either the
- * client alias or resolved upstream model. */
+/** Pixelpipe is a product path for Opus 4.6 and 4.7 only. Suffix aliases
+ * such as `claude-opus-4-7-high` are accepted because hosts may check either
+ * the client alias or resolved upstream model. */
 export function isPixelpipeSupportedModel(model: string | null | undefined): boolean {
-  return typeof model === 'string' && /^claude-opus-4-7(?:-|$)/.test(model);
+  return typeof model === 'string' && /^claude-opus-4-[67](?:-|$)/.test(model);
 }
 
 export function shouldTransformAnthropicMessages(

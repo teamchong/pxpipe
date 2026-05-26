@@ -312,6 +312,41 @@ describe('collapseHistory', () => {
     expect(out[2]).toBe(msgs[11]);
   });
 
+  it('preserves git status --short tool output as exact text alongside history images', async () => {
+    const status = [
+      'M  package-lock.json',
+      'M  package.json',
+      'M  packages/capnweb-typecheck/DESIGN.md',
+      'M  packages/capnweb-typecheck/src/index.ts',
+      ' M packages/capnweb-typecheck/src/plugin.ts',
+      'M  tsdown.config.ts',
+      '?? handoff.md',
+      '?? packages/capnweb-typecheck/src/transform/',
+    ].join('\n');
+    const msgs: Message[] = [
+      usr('run git status'),
+      asst([{ type: 'tool_use', id: 'bash-1', name: 'bash', input: { command: 'git status --short' } }]),
+      usr([{ type: 'tool_result', tool_use_id: 'bash-1', content: status }]),
+      asst('noted'),
+    ];
+
+    const { messages: out, info } = await collapseHistory(msgs, () => true, {
+      keepTail: 0,
+      minCollapsePrefix: 1,
+      collapseChunk: 0,
+    });
+
+    expect(info.reason).toBe(undefined);
+    const content = out[0]!.content as Array<Record<string, unknown>>;
+    expect(content.some((c) => c.type === 'image')).toBe(true);
+    const exact = content.find(
+      (c) => c.type === 'text' && typeof c.text === 'string' && c.text.includes('source of truth'),
+    );
+    expect(exact).toBeTruthy();
+    expect((exact!.text as string)).toContain(status);
+    for (const line of status.split('\n')) expect((exact!.text as string)).toContain(line);
+  });
+
   it('preserves a tool_use sequence that straddles the live-tail boundary', async () => {
     // 14 turns: 10 closed turns, then an open tool_use at index 10 that closes at index 12.
     // Per-turn body bumped to 4200 chars so the row-aware gate (numCols=1) clears

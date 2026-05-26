@@ -113,6 +113,48 @@ export interface HistoryCollapseInfo {
   droppedCodepoints: Map<number, number>;
 }
 
+const MAX_VERBATIM_GIT_STATUS_CHARS = 8000;
+
+function toolResultTextContent(block: ToolResultBlock): string {
+  const inner = block.content;
+  if (typeof inner === 'string') return inner;
+  if (!Array.isArray(inner)) return '';
+  const parts: string[] = [];
+  for (const sub of inner) {
+    if (sub && (sub as TextBlock).type === 'text') parts.push((sub as TextBlock).text);
+  }
+  return parts.join('\n');
+}
+
+function isGitStatusShortOutput(text: string): boolean {
+  if (!text || text.length > MAX_VERBATIM_GIT_STATUS_CHARS) return false;
+  const lines = text.split(/\r?\n/).filter((line) => line.length > 0);
+  if (lines.length === 0) return false;
+  return lines.every((line) => /^(?:[ MADRCUT?!]{2}|[?!]{2}) .+/.test(line));
+}
+
+function collectVerbatimGitStatusOutputs(
+  messages: Message[],
+  upToExclusive: number,
+): string[] {
+  const out: string[] = [];
+  let used = 0;
+  const limit = Math.min(upToExclusive, messages.length);
+  for (let i = 0; i < limit; i++) {
+    const msg = messages[i]!;
+    if (!Array.isArray(msg.content)) continue;
+    for (const blk of msg.content) {
+      if (!blk || (blk as { type?: string }).type !== 'tool_result') continue;
+      const text = toolResultTextContent(blk as ToolResultBlock);
+      if (!isGitStatusShortOutput(text)) continue;
+      if (used + text.length > MAX_VERBATIM_GIT_STATUS_CHARS) return out;
+      out.push(text);
+      used += text.length;
+    }
+  }
+  return out;
+}
+
 /**
  * Compute the largest index `i*` in `[0..messages.length - keepTail - 1]`
  * such that all `tool_use_id`s issued by assistant turns in `[0..i*]` are
@@ -367,13 +409,26 @@ export async function collapseHistory(
     }
   }
   // Build the synthetic user message.
+  const verbatimGitStatusOutputs = collectVerbatimGitStatusOutputs(messages, collapseLen);
+  const verbatimBlocks: TextBlock[] = verbatimGitStatusOutputs.length > 0
+    ? [{
+        type: 'text',
+        text: [
+          '[Exact git status --short output preserved as text. Use this block as the source of truth over the rendered history image.]',
+          ...verbatimGitStatusOutputs.map((out, i) => `--- git status --short #${i + 1} ---\n${out}`),
+          '[End exact git status --short output.]',
+        ].join('\n\n'),
+      }]
+    : [];
+  const syntheticContent: ContentBlock[] = [
+    { type: 'text', text: '[Earlier in this conversation:]' },
+    ...imageBlocks,
+    ...verbatimBlocks,
+    { type: 'text', text: '[End of earlier context.]' },
+  ];
   const syntheticUser: Message = {
     role: 'user',
-    content: [
-      { type: 'text', text: '[Earlier in this conversation:]' },
-      ...imageBlocks,
-      { type: 'text', text: '[End of earlier context.]' },
-    ],
+    content: syntheticContent,
   };
   const tail = messages.slice(collapseLen);
   info.collapsedTurns = collapseLen;

@@ -46,7 +46,10 @@ cached transcripts.
 
 We measure rather than guess. The runtime estimator
 (`estimateImageCount`) tells the caller how many images a string would
-produce; the caller's gate decides whether that beats sending text.
+produce; the caller's gate decides whether that beats sending text. Built-in
+defaults are model-aware: Opus 4.7 uses `2.0` chars/token for slab/history
+gates, while Opus 4.6 uses the older, more conservative `2.5` chars/token
+default unless the host supplies an empirical override.
 
 ### Why we don't just render one giant image
 

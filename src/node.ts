@@ -189,9 +189,12 @@ async function dispatchDashboard(
     case 'recent':
       if (method !== 'GET') return undefined;
       return dashboard.serveRecent();
-    case 'png':
+    case 'png': {
       if (method !== 'GET') return undefined;
-      return dashboard.servePng();
+      const idRaw = url.searchParams.get('id');
+      const idNum = idRaw != null ? Number(idRaw) : NaN;
+      return dashboard.servePng(Number.isFinite(idNum) ? idNum : undefined);
+    }
     case 'api-sessions': {
       if (method !== 'GET') return undefined;
       return dashboard.serveSessionsJson({

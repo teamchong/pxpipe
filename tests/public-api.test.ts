@@ -17,7 +17,7 @@ describe('public library API', () => {
     expect(isPixelpipeSupportedModel('claude-opus-4-8-thinking')).toBe(true);
     // 4.6 and older were the original measured scope but are no longer enabled:
     // the live re-test ran on 4.8 and the verdict was reversed, so we widened
-    // forward (4.7+) rather than back. See POSTMORTEM correction (2026-05-29).
+    // forward (4.7+) rather than back. See FINDINGS.md correction (2026-05-29).
     expect(isPixelpipeSupportedModel('claude-opus-4-6')).toBe(false);
     expect(isPixelpipeSupportedModel('claude-opus-4-6-thinking')).toBe(false);
     expect(isPixelpipeSupportedModel('claude-opus-4-5')).toBe(false);

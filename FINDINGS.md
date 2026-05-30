@@ -1,4 +1,4 @@
-# POSTMORTEM — pixelpipe (text→PNG token compression)
+# FINDINGS — pixelpipe (text→PNG token compression)
 
 **Status:** ⚠️ **VERDICT REVERSED — see correction below.** Originally ruled "dead"; live measurement shows pixelpipe is a working *lossy gist-compressor* saving ~68% on real (dense) Claude Code traffic, with a known verbatim-recall gap.
 **Date:** 2026-05-28 (original) · 2026-05-29 (correction)
@@ -8,7 +8,7 @@
 
 ---
 
-## CORRECTION (2026-05-29) — verdict reversed: lossy gist-compressor, not dead
+## Verdict (corrected 2026-05-29) — lossy gist-compressor, not dead
 
 The "Dead" verdict below rested on three stacked mistakes. Naming them, because the body of this document is left **intact as the record** rather than rewritten:
 
@@ -27,7 +27,7 @@ The "Dead" verdict below rested on three stacked mistakes. Naming them, because 
 
 ---
 
-## TL;DR
+## Original TL;DR (superseded 2026-05-29 — see verdict above)
 
 pixelpipe rewrites Claude Code tool-result text into compact PNGs before they reach
 the model, betting that vision tokens for a dense image are cheaper than the same

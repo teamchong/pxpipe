@@ -8,6 +8,7 @@
  */
 
 import { transformRequest, type TransformOptions, type TransformInfo } from './transform.js';
+import { isPixelpipeSupportedModel } from './applicability.js';
 import {
   buildBaselineCountTokensBody,
   buildCacheablePrefixCountTokensBody,
@@ -72,6 +73,21 @@ export interface ProxyEvent {
  *  line small while still being big enough to hold Anthropic's full error JSON
  *  (typically a few hundred bytes). */
 const ERROR_BODY_MAX = 2048;
+
+/** Cheap, bounded read of the top-level `model` field from an Anthropic
+ *  /v1/messages body. The field sits near the start of the JSON, so we decode
+ *  only the head rather than JSON-parsing the (potentially multi-MB) full
+ *  conversation just to read one string. Returns null when not found — callers
+ *  treat null as "outside supported scope" (fail-closed). */
+function readModelField(body: Uint8Array): string | null {
+  try {
+    const head = new TextDecoder().decode(body.subarray(0, 8192));
+    const m = /"model"\s*:\s*"([^"]{1,80})"/.exec(head);
+    return m ? m[1]! : null;
+  } catch {
+    return null;
+  }
+}
 
 /** Gzip a byte buffer using the standard `CompressionStream`. Available in
  *  Node 18+ and Cloudflare Workers — no Buffer / no zlib. */
@@ -562,7 +578,18 @@ export function createProxy(config: ProxyConfig = {}) {
       try {
         const transformOpts =
           typeof config.transform === 'function' ? config.transform() : config.transform;
-        const r = await transformRequest(bodyIn, transformOpts);
+        // Model-scope gate (proxy boundary): pixelpipe is validated only for
+        // the models in isPixelpipeSupportedModel (Opus 4.7+). Anything else
+        // passes through untransformed, mirroring the library wrapper's gate.
+        // The pure transformRequest primitive stays model-agnostic — scope is
+        // policy enforced here at the edge. Fail-closed: an unreadable model
+        // means no compression rather than a risky guess.
+        const modelOk = isPixelpipeSupportedModel(readModelField(bodyIn));
+        const r = await transformRequest(
+          bodyIn,
+          modelOk ? transformOpts : { ...transformOpts, compress: false },
+        );
+        if (!modelOk) r.info.reason = 'unsupported_model';
         // Cast: TS narrows Uint8Array<ArrayBufferLike> away from BodyInit, but
         // it's a valid body and we never use SharedArrayBuffer.
         bodyOut = r.body as unknown as BodyInit;

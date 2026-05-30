@@ -10,13 +10,18 @@ const enc = new TextEncoder();
 const dec = new TextDecoder();
 
 describe('public library API', () => {
-  it('recognizes Opus 4.6 and 4.7, and no other models, as supported', () => {
+  it('recognizes Opus 4.7 and newer (4.x), and no older or other models, as supported', () => {
     expect(isPixelpipeSupportedModel('claude-opus-4-7')).toBe(true);
     expect(isPixelpipeSupportedModel('claude-opus-4-7-high')).toBe(true);
-    expect(isPixelpipeSupportedModel('claude-opus-4-6')).toBe(true);
-    expect(isPixelpipeSupportedModel('claude-opus-4-6-thinking')).toBe(true);
+    expect(isPixelpipeSupportedModel('claude-opus-4-8')).toBe(true);
+    expect(isPixelpipeSupportedModel('claude-opus-4-8-thinking')).toBe(true);
+    // 4.6 and older were the original measured scope but are no longer enabled:
+    // the live re-test ran on 4.8 and the verdict was reversed, so we widened
+    // forward (4.7+) rather than back. See POSTMORTEM correction (2026-05-29).
+    expect(isPixelpipeSupportedModel('claude-opus-4-6')).toBe(false);
+    expect(isPixelpipeSupportedModel('claude-opus-4-6-thinking')).toBe(false);
     expect(isPixelpipeSupportedModel('claude-opus-4-5')).toBe(false);
-    expect(isPixelpipeSupportedModel('claude-sonnet-4-6')).toBe(false);
+    expect(isPixelpipeSupportedModel('claude-sonnet-4-7')).toBe(false);
     expect(isPixelpipeSupportedModel(null)).toBe(false);
   });
 
@@ -141,7 +146,7 @@ describe('public library API', () => {
     expect(skipped.body).toBe(unsupported);
 
     const supported = enc.encode(JSON.stringify({
-      model: 'claude-opus-4-6',
+      model: 'claude-opus-4-8',
       system: 'Important system instruction. '.repeat(1200),
       tools: [{
         name: 'read_file',
@@ -150,7 +155,7 @@ describe('public library API', () => {
       }],
       messages: [{ role: 'user', content: 'hello' }],
     }));
-    const transformed = await transformAnthropicMessages({ body: supported, model: 'claude-opus-4-6' });
+    const transformed = await transformAnthropicMessages({ body: supported, model: 'claude-opus-4-8' });
     expect(transformed.applied).toBe(true);
     expect(transformed.reason).toBe('applied');
     expect(transformed.info.compressedChars).toBeGreaterThan(0);

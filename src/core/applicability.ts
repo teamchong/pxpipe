@@ -14,11 +14,14 @@ export interface PixelpipeApplicabilityInput {
   readonly bodyBytes?: number | null;
 }
 
-/** Pixelpipe is a product path for Opus 4.6 and 4.7 only. Suffix aliases
- * such as `claude-opus-4-7-high` are accepted because hosts may check either
- * the client alias or resolved upstream model. */
+/** Pixelpipe's validated production scope: Opus 4.7 and newer in the 4.x line
+ * (4.7, 4.8, …). 4.6 is intentionally excluded; 5.x is excluded pending
+ * validation, because the image tokenizer can change across major versions —
+ * widen the regex once a newer major is measured. Suffix aliases such as
+ * `claude-opus-4-7-high` are accepted because hosts may check either the
+ * client alias or the resolved upstream model. */
 export function isPixelpipeSupportedModel(model: string | null | undefined): boolean {
-  return typeof model === 'string' && /^claude-opus-4-[67](?:-|$)/.test(model);
+  return typeof model === 'string' && /^claude-opus-4-(?:[7-9]|[1-9]\d)(?:-|$)/.test(model);
 }
 
 export function shouldTransformAnthropicMessages(

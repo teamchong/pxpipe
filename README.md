@@ -13,12 +13,29 @@ ready-to-send PNG buffers.
 
 ## Status
 
-Experimental. The library ships and runs, but the cost math depends on
-Anthropic's current image-token pricing and on the model you point at it.
-Today, **only Opus 4.6 and Opus 4.7 are enabled** in practice — newer
-models (Opus 5.x) tighten image tokenization enough that the savings
-disappear or invert, and non-Opus families have not been validated. We gate
-on this at runtime; see *Why option A* below.
+Experimental, and the cost math is **workload-dependent** — read this before
+relying on it.
+
+**What it does.** Rewrites Claude Code tool-result / history text into dense
+PNGs. On a live, multi-session run against real Claude Code traffic it
+measured **~68% fewer input tokens** (856k → 277k over the session), because
+that traffic is token-dense (~1 char/token: JSON, code, tool output, hashes)
+and a dense image packs ~3.1 chars per image-token. On sparse English prose
+(~3.5 chars/token) the same images *lose* money — so the savings depend
+entirely on what you feed it.
+
+**What it is.** A lossy, recency-graded **gist** compressor. Recent turns stay
+text; older bulk history becomes images. A needle-in-haystack eval recovered
+**0/15** exact 12-char hex strings from rendered images across two model
+generations — so imaged content is safe to skim by gist but **cannot be
+relied on for verbatim recall**, and the failure mode is *silent
+confabulation* (it returns a plausible wrong value, not an error). Do not
+image anything you may need back byte-exact (IDs, hashes, secrets, exact
+numbers) until a verbatim-risk guard keeps those blocks as text.
+
+**Model scope.** Opus 4.7 and newer (4.x) only, enforced in both the library
+(`isPixelpipeSupportedModel`) and the proxy. Older Opus (≤ 4.6) and non-Opus
+families are not enabled.
 
 ---
 
@@ -183,7 +200,14 @@ once the input clears the profitability gate.
 * `node-canvas` is a native dep on Node and a WASM dep on Workers. The
   Workers build is larger.
 * No streaming. Rendering is per-tool_result.
-* Profitability is model-specific. We currently expect Opus 4.6 / 4.7 callers.
+* Profitability is **workload-specific**, not just model-specific. It wins on
+  token-dense content (code, JSON, tool output, hashes ~1 char/token) and
+  loses on sparse prose (~3.5 chars/token). Enabled for Opus 4.7+ callers.
+* **Verbatim recall is unreliable.** Exact strings inside imaged content (0/15
+  in eval) can be silently confabulated — a plausible wrong value, not an
+  error. Keep anything you need byte-exact as text; pixelpipe is a lossy gist
+  tier, not a lossless store. A verbatim-risk guard (skip blocks with unique
+  IDs / hashes / exact values) is not yet built.
 
 ---
 

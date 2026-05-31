@@ -339,10 +339,15 @@ export class DashboardState {
   /** Runtime kill switch for compression. When false, the proxy forwards
    *  /v1/messages unchanged to upstream — pure passthrough, no images,
    *  no transforms. Controlled by the dashboard "passthrough" toggle so
-   *  the operator can disable the proxy's transform instantly when
-   *  upstream is unhealthy or when triaging a bad release. In-memory
-   *  only — restart resets to true. */
-  private compressionEnabled = true;
+   *  the operator can toggle the proxy's transform instantly.
+   *
+   *  Defaults to FALSE: compression is OFF on startup and a restart leaves
+   *  it OFF — it will NOT flip back on by itself. The lossy text→image path
+   *  only runs if it is explicitly enabled from the dashboard. Rationale:
+   *  imaging is gist-lossy on exact recall (incl. the system prompt) and the
+   *  savings are largely cache-illusory, so off is the safe default. See
+   *  FINDINGS.md. */
+  private compressionEnabled = false;
   setCompressionEnabled(on: boolean): void {
     this.compressionEnabled = on;
   }

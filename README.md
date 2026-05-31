@@ -39,6 +39,47 @@ families are not enabled.
 
 ---
 
+## Benchmarks (reproducible)
+
+Does imaging preserve answers? We measured it three ways on `claude-opus-4-8`,
+and — unlike a marketing table — we report where it breaks.
+
+**1. Reading fidelity, clean — novel random-number problems (zero memorization possible):**
+
+| test | N | baseline (text) | pixelpipe (image) | delta |
+|---|---:|---:|---:|---:|
+| novel arithmetic, random numbers | 100 | 100% | **93%** | **−7pp** |
+
+This is the honest reading number. With the answer un-memorizable, the model
+reads pixelpipe's render correctly ~93% of the time on short content; the other
+~7% are misreads (`10200`→`9400`, `7873`→`7793`) or come back unreadable.
+
+**2. GSM8K — the standard suite, but it's in training data:**
+
+| benchmark | N | baseline (text) | pixelpipe (image) | tokens/problem |
+|---|---:|---:|---:|---|
+| GSM8K (math) | 100 | 97% | 96% | 61 → 38 (**−38%**) |
+
+GSM8K *looks* near-lossless (−1pp), but that's inflated — the model recognizes
+memorized problems and recalls the answer even when it misreads the image. The
+novel test strips that out: the real reading cost is ~7pp, not ~1.
+
+**3. Where it fails completely — dense / verbatim:**
+
+| test | baseline (text) | pixelpipe (image) |
+|---|---:|---:|
+| verbatim recall — exact 12-char hex from a *dense* render | 15/15 (100%) | **0/15 (0%)** |
+
+So pixelpipe reads **short, readable** content at ~93% (a real ~7% misread tax)
+and **silently fails** on dense walls and exact recall. The number you get depends
+entirely on what you feed it.
+
+Reproduce: [`eval/gsm8k/`](eval/gsm8k/) (GSM8K + the novel reading test) and
+[`eval/needle-haystack/`](eval/needle-haystack/) (the verbatim failure). Full
+analysis: [`FINDINGS.md`](FINDINGS.md).
+
+---
+
 ## How it works
 
 ```

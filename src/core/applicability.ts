@@ -24,6 +24,13 @@ export function isPixelpipeSupportedModel(model: string | null | undefined): boo
   return typeof model === 'string' && /^claude-opus-4-(?:[7-9]|[1-9]\d)(?:-|$)/.test(model);
 }
 
+/** GPT image-tokenization has not been validated across the whole OpenAI
+ *  model matrix. Keep the new OpenAI path scoped to the requested GPT 5.5
+ *  family until production telemetry says it is safe to widen. */
+export function isPixelpipeSupportedGptModel(model: string | null | undefined): boolean {
+  return typeof model === 'string' && /^gpt-5\.5(?:-|$)/.test(model);
+}
+
 export function shouldTransformAnthropicMessages(
   input: PixelpipeApplicabilityInput,
 ): { eligible: boolean; reason: PixelpipeApplicabilityReason } {

@@ -30,6 +30,8 @@ import {
 interface RuntimeConfig {
   port: number;
   upstream: string;
+  openAIUpstream: string;
+  openAIApiKey?: string;
   eventsFile: string;
 }
 
@@ -55,6 +57,8 @@ function parseCli(argv: string[]): RuntimeConfig {
   return {
     port: Number(process.env.PORT ?? 47821),
     upstream: process.env.ANTHROPIC_UPSTREAM ?? 'https://api.anthropic.com',
+    openAIUpstream: process.env.OPENAI_UPSTREAM ?? 'https://api.openai.com',
+    openAIApiKey: process.env.OPENAI_API_KEY,
     eventsFile:
       process.env.PIXELPIPE_LOG ??
       path.join(os.homedir(), '.pixelpipe', 'events.jsonl'),
@@ -81,10 +85,15 @@ Flags:
 Environment (deployment-only):
   PORT                    listen port (default 47821)
   ANTHROPIC_UPSTREAM      upstream API base (default https://api.anthropic.com)
+  OPENAI_UPSTREAM         OpenAI API base (default https://api.openai.com)
+  OPENAI_API_KEY          optional OpenAI key override; otherwise forwarded
   PIXELPIPE_LOG           JSONL events path (default ~/.pixelpipe/events.jsonl)
 
 Use with Claude Code:
   ANTHROPIC_BASE_URL=http://127.0.0.1:47821 claude
+
+Use with OpenAI-compatible GPT clients:
+  OPENAI_BASE_URL=http://127.0.0.1:47821/v1
 `);
 }
 
@@ -416,6 +425,8 @@ async function main(): Promise<void> {
 
   const config: ProxyConfig = {
     upstream: opts.upstream,
+    openAIUpstream: opts.openAIUpstream,
+    openAIApiKey: opts.openAIApiKey,
     // Per-request transform options:
     //   1. Runtime kill switch — when the dashboard "passthrough" toggle
     //      is off, force compress=false so /v1/messages forwards
@@ -516,7 +527,9 @@ async function main(): Promise<void> {
   });
 
   server.listen(opts.port, () => {
-    console.log(`[pixelpipe] listening on http://127.0.0.1:${opts.port} → ${opts.upstream}`);
+    console.log(`[pixelpipe] listening on http://127.0.0.1:${opts.port}`);
+    console.log(`[pixelpipe] anthropic upstream → ${opts.upstream}`);
+    console.log(`[pixelpipe] openai upstream → ${opts.openAIUpstream}`);
     console.log(`[pixelpipe] tracking events → ${opts.eventsFile}`);
     console.log(`[pixelpipe] dashboard → http://127.0.0.1:${opts.port}/`);
   });

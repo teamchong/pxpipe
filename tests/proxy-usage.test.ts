@@ -72,6 +72,71 @@ describe('proxy usage extraction', () => {
     expect(captured!.firstByteMs).toBeTypeOf('number');
   });
 
+  it('routes GPT 5.5 chat completions to OpenAI, transforms once, and normalizes usage', async () => {
+    const upstreamRequests: Request[] = [];
+    const restore = mockUpstream(async (req) => {
+      upstreamRequests.push(req.clone());
+      return new Response(
+        JSON.stringify({
+          id: 'chatcmpl_1',
+          object: 'chat.completion',
+          choices: [{ message: { role: 'assistant', content: 'hello' } }],
+          usage: { prompt_tokens: 55, completion_tokens: 7, total_tokens: 62 },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    });
+
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      openAIUpstream: 'https://api.openai.test',
+      openAIApiKey: 'sk-test',
+      transform: { charsPerToken: 1, minCompressChars: 1 },
+      onRequest: (e) => {
+        captured = e;
+      },
+    });
+
+    const reqBody = JSON.stringify({
+      model: 'gpt-5.5',
+      messages: [
+        { role: 'system', content: 'System instruction. '.repeat(900) },
+        { role: 'user', content: 'hi' },
+      ],
+      tools: [{
+        type: 'function',
+        function: {
+          name: 'search',
+          description: 'Search files. '.repeat(100),
+          parameters: { type: 'object', properties: { query: { type: 'string' } } },
+        },
+      }],
+    });
+
+    const res = await proxy(
+      new Request('http://localhost/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: reqBody,
+      }),
+    );
+    await res.text();
+    await new Promise((r) => setTimeout(r, 20));
+    restore();
+
+    expect(upstreamRequests).toHaveLength(1);
+    expect(upstreamRequests[0]!.url).toBe('https://api.openai.test/v1/chat/completions');
+    expect(upstreamRequests[0]!.headers.get('authorization')).toBe('Bearer sk-test');
+    const sent = JSON.parse(await upstreamRequests[0]!.text()) as any;
+    const firstUser = sent.messages.find((m: any) => m.role === 'user');
+    expect(firstUser.content[0].type).toBe('image_url');
+    expect(firstUser.content[0].image_url.url).toMatch(/^data:image\/png;base64,/);
+    expect(captured).toBeDefined();
+    expect(captured!.usage?.input_tokens).toBe(55);
+    expect(captured!.usage?.output_tokens).toBe(7);
+    expect(captured!.info?.baselineProbeStatus).toBeUndefined();
+  });
+
   it('extracts usage tokens from an SSE stream (message_start event)', async () => {
     const sseBody =
       'event: message_start\n' +

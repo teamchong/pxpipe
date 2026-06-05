@@ -1,8 +1,8 @@
 # pixelpipe
 
-Turn Claude's tool-result text into compact PNGs before it ever reaches the
-model. Anthropic charges per token; vision tokens for a dense 1568×1568 image
-are dramatically cheaper than the same content delivered as transcript text.
+Turn Claude or GPT static context into compact PNGs before it ever reaches the
+model. Text tokens are expensive; vision tokens for a dense 1568×1568 image can
+be dramatically cheaper than the same content delivered as transcript text.
 pixelpipe is the encoder that exploits that gap.
 
 It is a small, focused TypeScript library — no daemon, no MCP wiring, no
@@ -33,9 +33,11 @@ confabulation* (it returns a plausible wrong value, not an error). Do not
 image anything you may need back byte-exact (IDs, hashes, secrets, exact
 numbers) until a verbatim-risk guard keeps those blocks as text.
 
-**Model scope.** Opus 4.7 and newer (4.x) only, enforced in both the library
-(`isPixelpipeSupportedModel`) and the proxy. Older Opus (≤ 4.6) and non-Opus
-families are not enabled.
+**Model scope.** Anthropic `/v1/messages` compression is enabled for Opus 4.7
+and newer (4.x), enforced in both the library (`isPixelpipeSupportedModel`) and
+the proxy. OpenAI `/v1/chat/completions` compression is separately enabled for
+the GPT 5.5 family (`gpt-5.5*`). Older Opus (≤ 4.6), non-Opus Claude families,
+and other GPT families are not enabled.
 
 ---
 
@@ -132,6 +134,34 @@ import { renderTextToPngs } from "pixelpipe";
 const pngs = await renderTextToPngs(toolResultText);
 // pngs: Buffer[]  — attach to the next user turn
 ```
+
+## Proxy Usage
+
+The Node proxy can serve both API families from one port:
+
+```bash
+pixelpipe
+```
+
+Claude Code continues to use the Anthropic route:
+
+```bash
+ANTHROPIC_BASE_URL=http://127.0.0.1:47821 claude
+```
+
+OpenAI-compatible GPT clients use the OpenAI route:
+
+```bash
+OPENAI_BASE_URL=http://127.0.0.1:47821/v1
+```
+
+Environment variables:
+
+| name | default | meaning |
+|---|---|---|
+| `ANTHROPIC_UPSTREAM` | `https://api.anthropic.com` | Upstream for `/v1/messages` |
+| `OPENAI_UPSTREAM` | `https://api.openai.com` | Upstream for `/v1/chat/completions` |
+| `OPENAI_API_KEY` | unset | Optional OpenAI key override; otherwise client `Authorization` is forwarded |
 
 ## Quick start (Cloudflare Workers)
 

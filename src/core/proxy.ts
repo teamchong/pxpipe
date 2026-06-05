@@ -8,7 +8,8 @@
  */
 
 import { transformRequest, type TransformOptions, type TransformInfo } from './transform.js';
-import { isPixelpipeSupportedModel } from './applicability.js';
+import { transformOpenAIChatCompletions } from './openai.js';
+import { isPixelpipeSupportedGptModel, isPixelpipeSupportedModel } from './applicability.js';
 import {
   buildBaselineCountTokensBody,
   buildCacheablePrefixCountTokensBody,
@@ -20,6 +21,10 @@ export interface ProxyConfig {
   upstream?: string;
   /** Override or supply an API key. If unset, we forward whatever the client sent. */
   apiKey?: string;
+  /** OpenAI API base for GPT chat completions, no trailing slash. */
+  openAIUpstream?: string;
+  /** Override or supply an OpenAI API key. If unset, we forward Authorization. */
+  openAIApiKey?: string;
   /** Per-request transform options. Pass a function when the host wants to
    *  inject DYNAMIC values per request (e.g. live empirical `charsPerToken`
    *  from the dashboard's converging fit) — the proxy invokes it once per
@@ -163,9 +168,18 @@ function processSseEvent(
   }
   const obj = j as Record<string, unknown>;
 
+  // OpenAI Chat Completions streaming chunks usually have no `event:` line:
+  // each SSE block is `data: { choices, usage }`, with usage present only
+  // when stream_options.include_usage is enabled. Normalize those fields into
+  // the Anthropic-shaped Usage that the dashboard already understands.
+  const openAIUsage = normalizeUsage((obj as { usage?: unknown }).usage);
+  if (openAIUsage) state.usage = openAIUsage;
+  measureOpenAIChoices(obj, m);
+
   if (event === 'message_start') {
     const msg = obj.message as { usage?: Usage } | undefined;
-    if (msg?.usage) state.usage = { ...msg.usage };
+    const usage = normalizeUsage(msg?.usage);
+    if (usage) state.usage = usage;
   } else if (event === 'content_block_start') {
     const cb = obj.content_block as { type?: string } | undefined;
     if (cb?.type === 'redacted_thinking') m.redactedBlockCount += 1;
@@ -202,11 +216,59 @@ function processSseEvent(
   }
 }
 
+function normalizeUsage(raw: unknown): Usage | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const u = raw as Record<string, unknown>;
+  const out: Usage = {};
+
+  if (typeof u.input_tokens === 'number') out.input_tokens = u.input_tokens;
+  if (typeof u.output_tokens === 'number') out.output_tokens = u.output_tokens;
+  if (typeof u.cache_creation_input_tokens === 'number') {
+    out.cache_creation_input_tokens = u.cache_creation_input_tokens;
+  }
+  if (typeof u.cache_read_input_tokens === 'number') {
+    out.cache_read_input_tokens = u.cache_read_input_tokens;
+  }
+  if (typeof u.cache_creation === 'object' && u.cache_creation !== null) {
+    out.cache_creation = u.cache_creation as Usage['cache_creation'];
+  }
+  if (typeof u.server_tool_use === 'object' && u.server_tool_use !== null) {
+    out.server_tool_use = u.server_tool_use as Usage['server_tool_use'];
+  }
+
+  // OpenAI Chat Completions shape.
+  if (typeof u.prompt_tokens === 'number') out.input_tokens = u.prompt_tokens;
+  if (typeof u.completion_tokens === 'number') out.output_tokens = u.completion_tokens;
+
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function measureOpenAIChoices(obj: Record<string, unknown>, m: OutputMeasurement): void {
+  const choices = obj.choices;
+  if (!Array.isArray(choices)) return;
+  for (const choice of choices) {
+    if (!choice || typeof choice !== 'object') continue;
+    const c = choice as { delta?: unknown; message?: unknown };
+    const payload = (c.delta ?? c.message) as Record<string, unknown> | undefined;
+    if (!payload || typeof payload !== 'object') continue;
+    if (typeof payload.content === 'string') m.textChars += payload.content.length;
+    const toolCalls = payload.tool_calls;
+    if (Array.isArray(toolCalls)) {
+      for (const tc of toolCalls) {
+        const fn = (tc as { function?: unknown } | undefined)?.function;
+        const args = (fn as { arguments?: unknown } | undefined)?.arguments;
+        if (typeof args === 'string') m.toolUseChars += args.length;
+      }
+    }
+  }
+}
+
 /** Measure non-stream `messages.content[]` directly. Same shape as the SSE
  *  accumulator — output_*_chars carry char counts, redactedBlockCount counts
  *  `redacted_thinking` blocks (no chars available). */
 function measureFromMessageJson(j: unknown): OutputMeasurement {
   const m: OutputMeasurement = { textChars: 0, thinkingChars: 0, toolUseChars: 0, redactedBlockCount: 0 };
+  if (j && typeof j === 'object') measureOpenAIChoices(j as Record<string, unknown>, m);
   const content = (j as { content?: unknown })?.content;
   if (!Array.isArray(content)) return m;
   for (const block of content) {
@@ -360,7 +422,7 @@ function teeForUsage(res: Response): {
         try {
           const j = JSON.parse(buf);
           return {
-            usage: j?.usage as Usage | undefined,
+            usage: normalizeUsage(j?.usage),
             measurement: measureFromMessageJson(j),
           };
         } catch {
@@ -395,6 +457,7 @@ function teeForUsage(res: Response): {
 }
 
 const DEFAULT_UPSTREAM = 'https://api.anthropic.com';
+const DEFAULT_OPENAI_UPSTREAM = 'https://api.openai.com';
 
 /** Headers we strip on the way out — they're hop-by-hop or proxy-injected. */
 const STRIP_REQ_HEADERS = new Set([
@@ -453,6 +516,7 @@ async function countTokensUpstream(
 /** Build the proxy fetch handler bound to a config. */
 export function createProxy(config: ProxyConfig = {}) {
   const upstream = (config.upstream ?? DEFAULT_UPSTREAM).replace(/\/+$/, '');
+  const openAIUpstream = (config.openAIUpstream ?? DEFAULT_OPENAI_UPSTREAM).replace(/\/+$/, '');
 
   return async function handle(req: Request): Promise<Response> {
     const t0 = Date.now();
@@ -494,7 +558,7 @@ export function createProxy(config: ProxyConfig = {}) {
         // Each probe is independent: full-body baseline can land even if the
         // cacheable-prefix probe fails (and vice versa). null/missing leaves
         // the field absent; the dashboard's per-event math degrades cleanly.
-        if (info) {
+        if (info && baselineStatusApplies) {
           // Track both halves of the cache-aware baseline so we can honestly
           // report whether a row is fully measured, partially measured, or
           // un-measured. Without this, a missing cacheable-prefix probe was
@@ -552,8 +616,20 @@ export function createProxy(config: ProxyConfig = {}) {
       void finalize();
     };
 
-    // Only intercept /v1/messages POSTs. Everything else passes through.
+    // Only transform known request shapes. Everything else passes through to
+    // the API family implied by its path.
     const isMessages = req.method === 'POST' && url.pathname === '/v1/messages';
+    const isOpenAIChat = req.method === 'POST' && url.pathname === '/v1/chat/completions';
+    const isModelsPath = url.pathname === '/v1/models' || url.pathname.startsWith('/v1/models/');
+    const looksOpenAIAuth =
+      config.openAIApiKey !== undefined
+      || (req.headers.has('authorization') && !req.headers.has('x-api-key'));
+    const isOpenAIPath =
+      url.pathname === '/v1/chat/completions'
+      || url.pathname === '/v1/responses'
+      || url.pathname.startsWith('/v1/responses/')
+      || (isModelsPath && looksOpenAIAuth);
+    const upstreamBase = isOpenAIPath ? openAIUpstream : upstream;
 
     let bodyOut: BodyInit | null = null;
     let info: TransformInfo | undefined;
@@ -572,23 +648,26 @@ export function createProxy(config: ProxyConfig = {}) {
     // host event persists.
     let baselinePromise: Promise<number | null> | undefined;
     let baselineCacheablePromise: Promise<number | null> | undefined;
+    let baselineStatusApplies = false;
 
-    if (isMessages) {
+    if (isMessages || isOpenAIChat) {
       const bodyIn = new Uint8Array(await req.arrayBuffer());
       try {
         const transformOpts =
           typeof config.transform === 'function' ? config.transform() : config.transform;
-        // Model-scope gate (proxy boundary): pixelpipe is validated only for
-        // the models in isPixelpipeSupportedModel (Opus 4.7+). Anything else
-        // passes through untransformed, mirroring the library wrapper's gate.
-        // The pure transformRequest primitive stays model-agnostic — scope is
-        // policy enforced here at the edge. Fail-closed: an unreadable model
-        // means no compression rather than a risky guess.
-        const modelOk = isPixelpipeSupportedModel(readModelField(bodyIn));
-        const r = await transformRequest(
-          bodyIn,
-          modelOk ? transformOpts : { ...transformOpts, compress: false },
-        );
+        const model = readModelField(bodyIn);
+        const modelOk = isMessages
+          ? isPixelpipeSupportedModel(model)
+          : isPixelpipeSupportedGptModel(model);
+        const r = isMessages
+          ? await transformRequest(
+            bodyIn,
+            modelOk ? transformOpts : { ...transformOpts, compress: false },
+          )
+          : await transformOpenAIChatCompletions(
+            bodyIn,
+            modelOk ? transformOpts : { ...transformOpts, compress: false },
+          );
         if (!modelOk) r.info.reason = 'unsupported_model';
         // Cast: TS narrows Uint8Array<ArrayBufferLike> away from BodyInit, but
         // it's a valid body and we never use SharedArrayBuffer.
@@ -599,27 +678,30 @@ export function createProxy(config: ProxyConfig = {}) {
           reqBodySha8 = await sha8Bytes(r.body);
         }
 
-        // Kick off the count_tokens probes on the ORIGINAL body BEFORE the
-        // main forward so all three calls (full probe, cacheable-prefix probe,
-        // main /v1/messages) overlap. Anthropic doesn't bill count_tokens, so
-        // the cost is wall-clock only — typically ~30-80ms, fully hidden by
-        // the main forward latency.
-        const ctBody = buildBaselineCountTokensBody(bodyIn);
-        if (ctBody) {
-          const ctHeaders = filterHeaders(req.headers, STRIP_REQ_HEADERS);
-          ctHeaders.set('content-type', 'application/json');
-          if (config.apiKey) ctHeaders.set('x-api-key', config.apiKey);
-          baselinePromise = countTokensUpstream(upstream, ctBody, ctHeaders);
-          // Second probe: body truncated at the last cache_control marker.
-          // Null body = no markers exist → cacheable=0 by definition, no
-          // probe needed.
-          const ctCacheableBody = buildCacheablePrefixCountTokensBody(bodyIn);
-          if (ctCacheableBody) {
-            baselineCacheablePromise = countTokensUpstream(
-              upstream,
-              ctCacheableBody,
-              new Headers(ctHeaders),
-            );
+        if (isMessages) {
+          baselineStatusApplies = true;
+          // Kick off the count_tokens probes on the ORIGINAL body BEFORE the
+          // main forward so all three calls (full probe, cacheable-prefix probe,
+          // main /v1/messages) overlap. Anthropic doesn't bill count_tokens, so
+          // the cost is wall-clock only — typically ~30-80ms, fully hidden by
+          // the main forward latency.
+          const ctBody = buildBaselineCountTokensBody(bodyIn);
+          if (ctBody) {
+            const ctHeaders = filterHeaders(req.headers, STRIP_REQ_HEADERS);
+            ctHeaders.set('content-type', 'application/json');
+            if (config.apiKey) ctHeaders.set('x-api-key', config.apiKey);
+            baselinePromise = countTokensUpstream(upstream, ctBody, ctHeaders);
+            // Second probe: body truncated at the last cache_control marker.
+            // Null body = no markers exist → cacheable=0 by definition, no
+            // probe needed.
+            const ctCacheableBody = buildCacheablePrefixCountTokensBody(bodyIn);
+            if (ctCacheableBody) {
+              baselineCacheablePromise = countTokensUpstream(
+                upstream,
+                ctCacheableBody,
+                new Headers(ctHeaders),
+              );
+            }
           }
         }
       } catch (e) {
@@ -635,9 +717,13 @@ export function createProxy(config: ProxyConfig = {}) {
     }
 
     const outHeaders = filterHeaders(req.headers, STRIP_REQ_HEADERS);
-    if (config.apiKey) outHeaders.set('x-api-key', config.apiKey);
+    if (isOpenAIPath) {
+      if (config.openAIApiKey) outHeaders.set('authorization', `Bearer ${config.openAIApiKey}`);
+    } else if (config.apiKey) {
+      outHeaders.set('x-api-key', config.apiKey);
+    }
 
-    const upstreamUrl = upstream + path;
+    const upstreamUrl = upstreamBase + path;
     let upstreamRes: Response;
     try {
       upstreamRes = await fetch(upstreamUrl, {

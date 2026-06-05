@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
   buildCountTokensBodies,
+  isPixelpipeSupportedGptModel,
   isPixelpipeSupportedModel,
   shouldTransformAnthropicMessages,
   transformAnthropicMessages,
+  transformOpenAIChatCompletions,
 } from '../src/core/index.js';
 
 const enc = new TextEncoder();
@@ -23,6 +25,15 @@ describe('public library API', () => {
     expect(isPixelpipeSupportedModel('claude-opus-4-5')).toBe(false);
     expect(isPixelpipeSupportedModel('claude-sonnet-4-7')).toBe(false);
     expect(isPixelpipeSupportedModel(null)).toBe(false);
+  });
+
+  it('recognizes only the GPT 5.5 family for OpenAI chat support', () => {
+    expect(isPixelpipeSupportedGptModel('gpt-5.5')).toBe(true);
+    expect(isPixelpipeSupportedGptModel('gpt-5.5-codex')).toBe(true);
+    expect(isPixelpipeSupportedGptModel('gpt-5.5-2026-06-01')).toBe(true);
+    expect(isPixelpipeSupportedGptModel('gpt-5.1')).toBe(false);
+    expect(isPixelpipeSupportedGptModel('claude-opus-4-8')).toBe(false);
+    expect(isPixelpipeSupportedGptModel(null)).toBe(false);
   });
 
   it('reports applicability with route/method/body gates', () => {
@@ -164,5 +175,47 @@ describe('public library API', () => {
     // The caller sent zero markers, so the rewritten body also has zero.
     expect(transformed.cache.ownsCacheControl).toBe(false);
     expect(transformed.cache.markerCount).toBe(0);
+  });
+
+  it('transforms GPT 5.5 chat completions using OpenAI image_url blocks', async () => {
+    const body = enc.encode(JSON.stringify({
+      model: 'gpt-5.5',
+      messages: [
+        { role: 'system', content: 'System instruction. '.repeat(700) },
+        { role: 'developer', content: 'Developer instruction. '.repeat(400) },
+        { role: 'user', content: 'hello' },
+      ],
+      tools: [{
+        type: 'function',
+        function: {
+          name: 'read_file',
+          description: 'Read a file from disk. '.repeat(100),
+          parameters: {
+            type: 'object',
+            description: 'Long root description.',
+            properties: {
+              path: { type: 'string', description: 'Path to read.' },
+            },
+            required: ['path'],
+          },
+        },
+      }],
+    }));
+
+    const transformed = await transformOpenAIChatCompletions(body, {
+      charsPerToken: 1,
+      minCompressChars: 1,
+    });
+    expect(transformed.info.compressed).toBe(true);
+    expect(transformed.info.imageCount).toBeGreaterThan(0);
+    const out = JSON.parse(dec.decode(transformed.body)) as any;
+    const firstUser = out.messages.find((m: any) => m.role === 'user');
+    expect(Array.isArray(firstUser.content)).toBe(true);
+    expect(firstUser.content[0].type).toBe('image_url');
+    expect(firstUser.content[0].image_url.url).toMatch(/^data:image\/png;base64,/);
+    expect(out.messages[0].content).toContain('rendered into image');
+    expect(out.tools[0].function.description).toBe('See rendered tool docs image.');
+    expect(out.tools[0].function.parameters.description).toBeUndefined();
+    expect(out.tools[0].function.parameters.properties.path.description).toBeUndefined();
   });
 });

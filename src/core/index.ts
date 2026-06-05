@@ -1,4 +1,5 @@
 export {
+  isPixelpipeSupportedGptModel,
   isPixelpipeSupportedModel,
   shouldTransformAnthropicMessages,
   type PixelpipeApplicabilityInput,
@@ -23,6 +24,7 @@ export {
   type TransformInfo as PixelpipeTransformInfo,
   type TransformOptions,
 } from './transform.js';
+export { transformOpenAIChatCompletions } from './openai.js';
 export { createProxy, type ProxyConfig, type ProxyEvent } from './proxy.js';
 export {
   computeActualInputEff,

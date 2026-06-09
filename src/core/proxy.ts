@@ -17,6 +17,19 @@ import {
 import type { Usage } from './types.js';
 
 export interface ProxyConfig {
+  /** Provider mode. 'cloudflare-ai-gateway' derives both upstreams from
+   *  `gatewayBaseUrl` (`{base}/anthropic` and `{base}/openai`) and rewrites
+   *  OpenAI paths to the gateway's shape (`/v1/chat/completions` →
+   *  `/chat/completions`). Anthropic paths keep their `/v1/...` shape.
+   *  Unrecognized paths pass through to the family route untouched. */
+  provider?: 'cloudflare-ai-gateway';
+  /** Gateway base URL (account/gateway-scoped). Required when provider is
+   *  set. Comes from env/config only — never hardcoded. Overrides
+   *  `upstream`/`openAIUpstream`. */
+  gatewayBaseUrl?: string;
+  /** Extra headers injected on every upstream request (e.g. gateway auth
+   *  headers). Values come from env/config only. */
+  gatewayHeaders?: Record<string, string>;
   /** Anthropic API base, no trailing slash. Defaults to api.anthropic.com. */
   upstream?: string;
   /** Override or supply an API key. If unset, we forward whatever the client sent. */
@@ -513,10 +526,60 @@ async function countTokensUpstream(
   }
 }
 
+/** Resolved upstream routing for a config. Pure — unit-testable.
+ *  In gateway mode both API families ride one base URL on their own
+ *  provider routes; OpenAI paths drop the `/v1` prefix to match the
+ *  gateway's path shape. No protocol translation anywhere. */
+export function resolveUpstreams(config: ProxyConfig): {
+  anthropic: string;
+  openai: string;
+  stripOpenAIV1: boolean;
+} {
+  if (config.provider === 'cloudflare-ai-gateway') {
+    const base = (config.gatewayBaseUrl ?? '').replace(/\/+$/, '');
+    if (!base) {
+      throw new Error(
+        "provider 'cloudflare-ai-gateway' requires gatewayBaseUrl (PXPIPE_GATEWAY_BASE_URL)",
+      );
+    }
+    return { anthropic: `${base}/anthropic`, openai: `${base}/openai`, stripOpenAIV1: true };
+  }
+  return {
+    anthropic: (config.upstream ?? DEFAULT_UPSTREAM).replace(/\/+$/, ''),
+    openai: (config.openAIUpstream ?? DEFAULT_OPENAI_UPSTREAM).replace(/\/+$/, ''),
+    stripOpenAIV1: false,
+  };
+}
+
+/** Parse `PXPIPE_GATEWAY_HEADERS` — JSON object or `k=v;k2=v2`. */
+export function parseGatewayHeaders(spec: string | undefined): Record<string, string> {
+  if (!spec) return {};
+  const trimmed = spec.trim();
+  if (trimmed.startsWith('{')) {
+    const obj = JSON.parse(trimmed) as Record<string, unknown>;
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(obj)) out[k] = String(v);
+    return out;
+  }
+  const out: Record<string, string> = {};
+  for (const pair of trimmed.split(';')) {
+    const i = pair.indexOf('=');
+    if (i <= 0) continue;
+    out[pair.slice(0, i).trim()] = pair.slice(i + 1).trim();
+  }
+  return out;
+}
+
 /** Build the proxy fetch handler bound to a config. */
 export function createProxy(config: ProxyConfig = {}) {
-  const upstream = (config.upstream ?? DEFAULT_UPSTREAM).replace(/\/+$/, '');
-  const openAIUpstream = (config.openAIUpstream ?? DEFAULT_OPENAI_UPSTREAM).replace(/\/+$/, '');
+  const routes = resolveUpstreams(config);
+  const upstream = routes.anthropic;
+  const openAIUpstream = routes.openai;
+  const gatewayHeaders = config.gatewayHeaders ?? {};
+  const applyGatewayHeaders = (h: Headers): Headers => {
+    for (const [k, v] of Object.entries(gatewayHeaders)) h.set(k, v);
+    return h;
+  };
 
   return async function handle(req: Request): Promise<Response> {
     const t0 = Date.now();
@@ -692,7 +755,7 @@ export function createProxy(config: ProxyConfig = {}) {
           // the main forward latency.
           const ctBody = buildBaselineCountTokensBody(bodyIn);
           if (ctBody) {
-            const ctHeaders = filterHeaders(req.headers, STRIP_REQ_HEADERS);
+            const ctHeaders = applyGatewayHeaders(filterHeaders(req.headers, STRIP_REQ_HEADERS));
             ctHeaders.set('content-type', 'application/json');
             if (config.apiKey) ctHeaders.set('x-api-key', config.apiKey);
             baselinePromise = countTokensUpstream(upstream, ctBody, ctHeaders);
@@ -728,7 +791,13 @@ export function createProxy(config: ProxyConfig = {}) {
       outHeaders.set('x-api-key', config.apiKey);
     }
 
-    const upstreamUrl = upstreamBase + path;
+    applyGatewayHeaders(outHeaders);
+
+    // Gateway OpenAI routes use `/chat/completions` (no `/v1`); Anthropic
+    // routes keep `/v1/messages`. Anything else passes through as-is on the
+    // family route.
+    const outPath = isOpenAIPath && routes.stripOpenAIV1 ? path.replace(/^\/v1(?=\/)/, '') : path;
+    const upstreamUrl = upstreamBase + outPath;
     let upstreamRes: Response;
     try {
       upstreamRes = await fetch(upstreamUrl, {

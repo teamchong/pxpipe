@@ -10,7 +10,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
-import { createProxy, type ProxyConfig } from './core/proxy.js';
+import { createProxy, parseGatewayHeaders, resolveUpstreams, type ProxyConfig } from './core/proxy.js';
 import {
   toTrackEvent,
   TRACK_BODY_INLINE_MAX,
@@ -32,6 +32,9 @@ interface RuntimeConfig {
   upstream: string;
   openAIUpstream: string;
   openAIApiKey?: string;
+  provider?: 'cloudflare-ai-gateway';
+  gatewayBaseUrl?: string;
+  gatewayHeaders?: Record<string, string>;
   eventsFile: string;
 }
 
@@ -59,10 +62,20 @@ function parseCli(argv: string[]): RuntimeConfig {
     upstream: process.env.ANTHROPIC_UPSTREAM ?? 'https://api.anthropic.com',
     openAIUpstream: process.env.OPENAI_UPSTREAM ?? 'https://api.openai.com',
     openAIApiKey: process.env.OPENAI_API_KEY,
+    provider: parseProvider(process.env.PXPIPE_PROVIDER),
+    gatewayBaseUrl: process.env.PXPIPE_GATEWAY_BASE_URL,
+    gatewayHeaders: parseGatewayHeaders(process.env.PXPIPE_GATEWAY_HEADERS),
     eventsFile:
       process.env.PXPIPE_LOG ??
       path.join(os.homedir(), '.pxpipe', 'events.jsonl'),
   };
+}
+
+function parseProvider(v: string | undefined): 'cloudflare-ai-gateway' | undefined {
+  if (v === undefined || v === '') return undefined;
+  if (v === 'cloudflare-ai-gateway') return v;
+  console.error(`[pxpipe] unknown PXPIPE_PROVIDER: ${v}`);
+  process.exit(2);
 }
 
 function printHelp(): void {
@@ -87,6 +100,10 @@ Environment (deployment-only):
   ANTHROPIC_UPSTREAM      upstream API base (default https://api.anthropic.com)
   OPENAI_UPSTREAM         OpenAI API base (default https://api.openai.com)
   OPENAI_API_KEY          optional OpenAI key override; otherwise forwarded
+  PXPIPE_PROVIDER         optional: 'cloudflare-ai-gateway' — route both API
+                          families through one gateway base URL
+  PXPIPE_GATEWAY_BASE_URL gateway base URL (required with PXPIPE_PROVIDER)
+  PXPIPE_GATEWAY_HEADERS  extra upstream headers: JSON object or k=v;k2=v2
   PXPIPE_LOG              JSONL events path (default ~/.pxpipe/events.jsonl)
 
 Use with Claude Code:
@@ -430,6 +447,9 @@ async function main(): Promise<void> {
   await dashboard.replay(opts.eventsFile).catch(() => {});
 
   const config: ProxyConfig = {
+    provider: opts.provider,
+    gatewayBaseUrl: opts.gatewayBaseUrl,
+    gatewayHeaders: opts.gatewayHeaders,
     upstream: opts.upstream,
     openAIUpstream: opts.openAIUpstream,
     openAIApiKey: opts.openAIApiKey,
@@ -534,8 +554,9 @@ async function main(): Promise<void> {
 
   server.listen(opts.port, () => {
     console.log(`[pxpipe] listening on http://127.0.0.1:${opts.port}`);
-    console.log(`[pxpipe] anthropic upstream → ${opts.upstream}`);
-    console.log(`[pxpipe] openai upstream → ${opts.openAIUpstream}`);
+    const routes = resolveUpstreams(config);
+    console.log(`[pxpipe] anthropic upstream → ${routes.anthropic}`);
+    console.log(`[pxpipe] openai upstream → ${routes.openai}`);
     console.log(`[pxpipe] tracking events → ${opts.eventsFile}`);
     console.log(`[pxpipe] dashboard → http://127.0.0.1:${opts.port}/`);
   });

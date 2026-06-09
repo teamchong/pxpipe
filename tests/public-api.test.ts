@@ -12,17 +12,18 @@ const enc = new TextEncoder();
 const dec = new TextDecoder();
 
 describe('public library API', () => {
-  it('recognizes Opus 4.7 and newer (4.x), and no older or other models, as supported', () => {
-    expect(isPixelpipeSupportedModel('claude-opus-4-7')).toBe(true);
-    expect(isPixelpipeSupportedModel('claude-opus-4-7-high')).toBe(true);
-    expect(isPixelpipeSupportedModel('claude-opus-4-8')).toBe(true);
-    expect(isPixelpipeSupportedModel('claude-opus-4-8-thinking')).toBe(true);
-    // 4.6 and older were the original measured scope but are no longer enabled:
-    // the live re-test ran on 4.8 and the verdict was reversed, so we widened
-    // forward (4.7+) rather than back. See FINDINGS.md correction (2026-05-29).
+  it('recognizes Fable 5 (with suffix aliases) and no other models as supported', () => {
+    expect(isPixelpipeSupportedModel('claude-fable-5')).toBe(true);
+    expect(isPixelpipeSupportedModel('claude-fable-5-high')).toBe(true);
+    // Opus was the original measured scope (4.7+) but is disabled 2026-06-09:
+    // Fable 5 reads renders at 100/100 vs Opus 4.8's 93/100 with identical
+    // image billing, so the Opus read tax is no longer worth carrying.
+    expect(isPixelpipeSupportedModel('claude-opus-4-8')).toBe(false);
+    expect(isPixelpipeSupportedModel('claude-opus-4-7')).toBe(false);
     expect(isPixelpipeSupportedModel('claude-opus-4-6')).toBe(false);
-    expect(isPixelpipeSupportedModel('claude-opus-4-6-thinking')).toBe(false);
-    expect(isPixelpipeSupportedModel('claude-opus-4-5')).toBe(false);
+    // Mythos 5 shares the architecture but is unmeasured (no access).
+    expect(isPixelpipeSupportedModel('claude-mythos-5')).toBe(false);
+    expect(isPixelpipeSupportedModel('claude-fable-50')).toBe(false);
     expect(isPixelpipeSupportedModel('claude-sonnet-4-7')).toBe(false);
     expect(isPixelpipeSupportedModel(null)).toBe(false);
   });
@@ -38,19 +39,19 @@ describe('public library API', () => {
 
   it('reports applicability with route/method/body gates', () => {
     expect(shouldTransformAnthropicMessages({
-      model: 'claude-opus-4-7',
+      model: 'claude-fable-5',
       method: 'POST',
       path: '/v1/messages',
       bodyBytes: 10,
     })).toEqual({ eligible: true, reason: 'eligible' });
     expect(shouldTransformAnthropicMessages({
-      model: 'claude-opus-4-7',
+      model: 'claude-fable-5',
       method: 'GET',
       path: '/v1/messages',
       bodyBytes: 10,
     }).reason).toBe('unsupported_method');
     expect(shouldTransformAnthropicMessages({
-      model: 'claude-opus-4-7',
+      model: 'claude-fable-5',
       method: 'POST',
       path: '/v1/messages/count_tokens',
       bodyBytes: 10,
@@ -147,17 +148,17 @@ describe('public library API', () => {
 
   it('wraps the transformer with model gating and cache ownership metadata', async () => {
     const unsupported = enc.encode(JSON.stringify({
-      model: 'claude-sonnet-4-6',
+      model: 'claude-opus-4-8',
       system: 'x'.repeat(20_000),
       messages: [{ role: 'user', content: 'hello' }],
     }));
-    const skipped = await transformAnthropicMessages({ body: unsupported, model: 'claude-sonnet-4-6' });
+    const skipped = await transformAnthropicMessages({ body: unsupported, model: 'claude-opus-4-8' });
     expect(skipped.applied).toBe(false);
     expect(skipped.reason).toBe('unsupported_model');
     expect(skipped.body).toBe(unsupported);
 
     const supported = enc.encode(JSON.stringify({
-      model: 'claude-opus-4-8',
+      model: 'claude-fable-5',
       system: 'Important system instruction. '.repeat(1200),
       tools: [{
         name: 'read_file',
@@ -166,7 +167,7 @@ describe('public library API', () => {
       }],
       messages: [{ role: 'user', content: 'hello' }],
     }));
-    const transformed = await transformAnthropicMessages({ body: supported, model: 'claude-opus-4-8' });
+    const transformed = await transformAnthropicMessages({ body: supported, model: 'claude-fable-5' });
     expect(transformed.applied).toBe(true);
     expect(transformed.reason).toBe('applied');
     expect(transformed.info.compressedChars).toBeGreaterThan(0);

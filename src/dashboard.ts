@@ -341,13 +341,13 @@ export class DashboardState {
    *  no transforms. Controlled by the dashboard "passthrough" toggle so
    *  the operator can toggle the proxy's transform instantly.
    *
-   *  Defaults to FALSE: compression is OFF on startup and a restart leaves
-   *  it OFF — it will NOT flip back on by itself. The lossy text→image path
-   *  only runs if it is explicitly enabled from the dashboard. Rationale:
-   *  imaging is gist-lossy on exact recall (incl. the system prompt) and the
-   *  savings are largely cache-illusory, so off is the safe default. See
-   *  FINDINGS.md. */
-  private compressionEnabled = false;
+   *  Defaults to TRUE since 2026-06-09: scope is Fable 5 only, which reads
+   *  renders at 100/100 (no Opus read tax) with the same image billing, and
+   *  the live proxy record measured ~68% real input-token savings on dense
+   *  traffic — the old off-default rationale ("cache-illusory savings")
+   *  cited the superseded dead verdict. Verbatim recall is still lossy;
+   *  the dashboard toggle remains the kill switch. See FINDINGS.md. */
+  private compressionEnabled = true;
   setCompressionEnabled(on: boolean): void {
     this.compressionEnabled = on;
   }
@@ -945,7 +945,7 @@ export class DashboardState {
 
   /** POST /api/compression — flip the runtime kill switch.
    *  Body: { enabled: boolean }. Returns the new state. In-memory only;
-   *  restart resets to true. */
+   *  restart resets to the default (on). */
   handleCompressionToggle(body: { enabled?: unknown }): Response {
     const on = body.enabled === true;
     this.compressionEnabled = on;

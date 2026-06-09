@@ -14,14 +14,16 @@ export interface PixelpipeApplicabilityInput {
   readonly bodyBytes?: number | null;
 }
 
-/** Pixelpipe's validated production scope: Opus 4.7 and newer in the 4.x line
- * (4.7, 4.8, …). 4.6 is intentionally excluded; 5.x is excluded pending
- * validation, because the image tokenizer can change across major versions —
- * widen the regex once a newer major is measured. Suffix aliases such as
- * `claude-opus-4-7-high` are accepted because hosts may check either the
- * client alias or the resolved upstream model. */
+/** Pixelpipe's validated production scope: Fable 5 only.
+ * Measured 2026-06-09: Fable 5 reads pixelpipe renders at 100/100 on the
+ * novel-arithmetic eval (Opus 4.8: 93/100) and bills the same image tokens
+ * (w·h/750, same tokenizer as Opus 4.7+). Opus is disabled — its ~7% read
+ * tax is the wrong trade now that a tax-free model exists. Mythos 5 is
+ * unmeasured (no access). Suffix aliases such as `claude-fable-5-high` are
+ * accepted because hosts may check either the client alias or the resolved
+ * upstream model. */
 export function isPixelpipeSupportedModel(model: string | null | undefined): boolean {
-  return typeof model === 'string' && /^claude-opus-4-(?:[7-9]|[1-9]\d)(?:-|$)/.test(model);
+  return typeof model === 'string' && /^claude-fable-5(?:-|$)/.test(model);
 }
 
 /** GPT image-tokenization has not been validated across the whole OpenAI

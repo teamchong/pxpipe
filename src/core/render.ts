@@ -45,7 +45,13 @@ export const READABLE_CHARS_PER_IMAGE = 50000;
  *  images so the model can read them reliably. */
 export const DENSE_CONTENT_CHARS_PER_IMAGE = 5000;
 export const DENSE_CONTENT_COLS = 180;
-export const DENSE_RENDER_STYLE: RenderStyle = { cellWBonus: 2, cellHBonus: 2, aa: true };
+/** 2026-06-09: dropped the 7×10 padded cell ({cellWBonus:2, cellHBonus:2})
+ *  to the bare 5×8 atlas cell for the Fable-only scope — A/B on dense JSON
+ *  needles read 4/5 at 5×8 vs 3/5 at 7×10 (n=5, flat) at 42% fewer image
+ *  tokens per page (591 vs 1,028 est. on identical content). Verbatim recall
+ *  is unreliable at every cell size; the verbatim-risk guard is the
+ *  mitigation, not padding. Revert to {2,2} if misread rates rise. */
+export const DENSE_RENDER_STYLE: RenderStyle = { cellWBonus: 0, cellHBonus: 0, aa: true };
 /** Default columns per row. 1568 px / 5 px-per-cell = 313 cells. We render
  *  at the full canvas width by default — no shrink-to-content. */
 const DEFAULT_COLS = 313;

@@ -18,7 +18,9 @@ relying on it.
 
 **What it does.** Rewrites Claude Code tool-result / history text into dense
 PNGs. On a live, multi-session run against real Claude Code traffic it
-measured **~68% fewer input tokens** (856k → 277k over the session), because
+measured **~68% fewer input tokens** (856k → 277k over the session), and the
+cumulative production log now shows **77% saved across 6,691 compressed
+requests** (3.21B baseline tokens → 735M actual, as of 2026-06-09), because
 that traffic is token-dense (~1 char/token: JSON, code, tool output, hashes)
 and a dense image packs ~3.1 chars per image-token. On sparse English prose
 (~3.5 chars/token) the same images *lose* money — so the savings depend
@@ -33,35 +35,42 @@ confabulation* (it returns a plausible wrong value, not an error). Do not
 image anything you may need back byte-exact (IDs, hashes, secrets, exact
 numbers) until a verbatim-risk guard keeps those blocks as text.
 
-**Model scope.** Anthropic `/v1/messages` compression is enabled for Opus 4.7
-and newer (4.x), enforced in both the library (`isPixelpipeSupportedModel`) and
-the proxy. OpenAI `/v1/chat/completions` compression is separately enabled for
-the GPT 5.5 family (`gpt-5.5*`). Older Opus (≤ 4.6), non-Opus Claude families,
-and other GPT families are not enabled.
+**Model scope.** Fable 5 (`claude-fable-5`) only on the Anthropic route,
+enforced in both the library (`isPixelpipeSupportedModel`) and the proxy.
+Opus (4.7/4.8, the original measured scope) was disabled 2026-06-09: Fable 5
+reads renders at 100/100 on the novel-arithmetic eval vs Opus 4.8's 93/100,
+with identical image billing (same Opus 4.7-line tokenizer, verified by direct
+measurement) — so the ~7% Opus read tax is no longer worth carrying. An OpenAI
+`/v1/chat/completions` route exists for GPT 5.5 (`gpt-5.5*`) but is not the
+focus and is unmeasured beyond smoke tests. Mythos 5 is unmeasured (no access).
 
 ---
 
 ## Benchmarks (reproducible)
 
-**One number: on short, readable content the model reads pixelpipe's render
-~93% of the time, at ~38% fewer tokens.** Measured clean — with novel
-random-number problems it cannot have memorized, on `claude-opus-4-8`:
+**One number: on short, readable content Fable 5 reads pixelpipe's render
+100% of the time, at ~38% fewer tokens.** Measured clean — with novel
+random-number problems it cannot have memorized:
 
 | test | N | text | pixelpipe (image) | tokens |
 |---|---:|---:|---:|---|
-| novel arithmetic (un-memorizable) | 100 | 100% | **93%** | **−38%** |
+| novel arithmetic, `claude-fable-5` (2026-06-09) | 100 | 100% | **100%** | **−38%** |
+| novel arithmetic, `claude-opus-4-8` | 100 | 100% | 93% | −38% |
 
-The ~7% gap is real misreads (`10200`→`9400`, `7873`→`7793`), not noise — imaging
-is lossy even where it mostly works.
+The Opus ~7% gap was real misreads (`10200`→`9400`, `7873`→`7793`) — that read
+tax is why Opus is now disabled and the gate is Fable-only.
 
-**The boundary** — push to dense, exact-recall content and it collapses:
+**The boundary** — push to dense, exact-recall content and it degrades:
 
 | test | text | pixelpipe (image) |
 |---|---:|---:|
-| verbatim recall — 12-char hex from a *dense* render | 15/15 | **0/15** |
+| verbatim recall — 12-char hex from a *dense* render, Opus | 15/15 | **0/15** |
+| verbatim recall — 12-char hex, dense JSON render, Fable 5 (n=4, smaller page) | — | **3/4** |
 
-~93% on short / readable, **0%** on dense / exact-recall. There is no free lunch —
-full analysis in [`FINDINGS.md`](FINDINGS.md).
+Fable 5 dramatically improves verbatim recall but still produces single-glyph
+silent misreads (`125f9e6e1c77`→`125f9e6a1c77`, `cc33ae67`→`cc33a867`), so the
+rule stands: do not image anything you need back byte-exact. Full analysis in
+[`FINDINGS.md`](FINDINGS.md).
 
 <sub>We also ran the standard **GSM8K** suite: 96% imaged. But GSM8K is in training
 data, so the model recalls memorized answers through its own misreads — inflating
@@ -89,15 +98,15 @@ A Claude 1568×1568 image costs ≈ 1568 vision tokens (Anthropic, 2026-04-16).
 At ≈ 6 readable characters per square monospace glyph, that page holds
 ≈ 5 000 text chars. Same content as plain text: ≈ 1 250 text tokens. So
 plain text is cheaper *unless* the model treats vision tokens as much
-fatter than text tokens — which Opus 4.6/4.7 effectively do on cold-miss
+fatter than text tokens — which they effectively do on cold-miss
 cached transcripts.
 
 We measure rather than guess. The runtime estimator
 (`estimateImageCount`) tells the caller how many images a string would
-produce; the caller's gate decides whether that beats sending text. Built-in
-defaults are model-aware: Opus 4.7 uses `2.0` chars/token for slab/history
-gates, while Opus 4.6 uses the older, more conservative `2.5` chars/token
-default unless the host supplies an empirical override.
+produce; the caller's gate decides whether that beats sending text. The
+built-in gate constant is `2.0` chars/token, calibrated against N=391
+production rows (observed 1.91), unless the host supplies an empirical
+override via `opts.charsPerToken`.
 
 ### Why we don't just render one giant image
 
@@ -261,7 +270,7 @@ once the input clears the profitability gate.
 * No streaming. Rendering is per-tool_result.
 * Profitability is **workload-specific**, not just model-specific. It wins on
   token-dense content (code, JSON, tool output, hashes ~1 char/token) and
-  loses on sparse prose (~3.5 chars/token). Enabled for Opus 4.7+ callers.
+  loses on sparse prose (~3.5 chars/token). Enabled for Fable 5 callers.
 * **Verbatim recall is unreliable.** Exact strings inside imaged content (0/15
   in eval) can be silently confabulated — a plausible wrong value, not an
   error. Keep anything you need byte-exact as text; pixelpipe is a lossy gist

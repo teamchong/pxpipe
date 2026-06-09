@@ -277,10 +277,11 @@ baseline = effective + extra_text_baseline * baseline_rate
 saved    = baseline - effective
 ```
 
-The dashboard's "tokens saved" and "$ saved (opus 4.7)" cards (and
+The dashboard's "tokens saved" and "$ saved" cards (and
 `pixelpipe stats` for the offline aggregate) both surface these numbers.
-The $ figure assumes Opus 4.7 input rates ($15/M input tokens, hence the
-`saved * 15 / 1e6` in `src/dashboard.ts:237`).
+The $ figure in `src/dashboard.ts` uses a fixed per-Mtok input rate — note
+Fable 5 (the current supported model) bills $10/M input, so re-check the
+constant if you care about the dollar card.
 
 **Important framing**: do not quote 65–73% as a benchmark. That number is
 the architectural ceiling — the steady-state savings on a long session over

@@ -655,6 +655,11 @@ export function createProxy(config: ProxyConfig = {}) {
       try {
         const transformOpts =
           typeof config.transform === 'function' ? config.transform() : config.transform;
+        // Model-scope gate (proxy boundary): pixelpipe is validated only for
+        // the models in isPixelpipeSupportedModel (Fable 5) on the Anthropic
+        // route; the OpenAI route has its own gate. Anything else passes
+        // through untransformed. Fail-closed: an unreadable model means no
+        // compression rather than a risky guess.
         const model = readModelField(bodyIn);
         const modelOk = isMessages
           ? isPixelpipeSupportedModel(model)

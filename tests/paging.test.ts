@@ -76,7 +76,7 @@ describe('estimateImageCount', () => {
 });
 
 describe('dense readable render profile', () => {
-  it('uses larger glyph cells and multiple readable pages for lockfile-shaped text', async () => {
+  it('uses the bare 5×8 cell and multiple readable pages for lockfile-shaped text', async () => {
     const lockish = Array.from({ length: 200 }, (_, i) =>
       `  pkg-${i}@npm:1.${i}.0(peer@npm:^${i}.0.0)(typescript@npm:^5.${i % 10}.0): checksum=${'a'.repeat(24)}`,
     ).join('\n');
@@ -89,7 +89,9 @@ describe('dense readable render profile', () => {
     );
 
     expect(imgs.length).toBeGreaterThanOrEqual(3);
-    expect(imgs[0]!.width).toBeGreaterThan(1000);
+    // 180 cols × 5 px bare cell + padding — 2026-06-09 switched DENSE_RENDER_STYLE
+    // from the padded 7×10 cell (width ~1268) to 5×8 (width ~908) for Fable.
+    expect(imgs[0]!.width).toBeGreaterThan(890);
     expect(imgs[0]!.width).toBeLessThanOrEqual(1568);
   });
 

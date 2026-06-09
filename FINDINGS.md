@@ -1,10 +1,49 @@
 # FINDINGS — pixelpipe (text→PNG token compression)
 
 **Status:** ⚠️ **VERDICT REVERSED — see correction below.** Originally ruled "dead"; live measurement shows pixelpipe is a working *lossy gist-compressor* saving ~68% on real (dense) Claude Code traffic, with a known verbatim-recall gap.
-**Date:** 2026-05-28 (original) · 2026-05-29 (correction)
-**Models tested:** `claude-opus-4-5` (original run), `claude-opus-4-8` (re-test after a model bump)
-**Model scope (current):** Opus 4.7+ only, enforced in library + proxy.
+**Date:** 2026-05-28 (original) · 2026-05-29 (correction) · 2026-06-09 (Fable 5 update)
+**Models tested:** `claude-opus-4-5` (original run), `claude-opus-4-8` (re-test after a model bump), `claude-fable-5` (2026-06-09)
+**Model scope (current):** Fable 5 only, enforced in library + proxy (Opus disabled 2026-06-09 — see update below).
 **Harness:** `eval/needle-haystack/` (receipts preserved from `/tmp/needle_eval`)
+
+---
+
+## Update (2026-06-09) — Fable 5: read tax gone, scope narrowed to fable-only
+
+Fable 5 launched today; ran the clean evals against it the same day and
+narrowed the production gate from Opus 4.7+ to `claude-fable-5` only.
+
+**1. Reading (novel arithmetic, N=100, `eval/gsm8k/` harness, same images):**
+
+| arm | opus-4-8 | fable-5 |
+|---|---:|---:|
+| text baseline | 100/100 | 100/100 |
+| pixelpipe image | 93/100 | **100/100** |
+
+The ~7% Opus read tax — the main per-read cost of imaging — is gone on Fable.
+
+**2. Image billing parity (tokenizer check).** Same 1573×488 dense-JSON page
+(est. 1,023 tokens by w·h/750), measured per-API-call through the CLI:
+fable-5 ~1,104 tokens, opus-4-8 ~1,162 (deltas include tool_result overhead).
+Fable ships the Opus 4.7-line tokenizer, so the compression ratio carries over
+unchanged. The 5.x-tokenizer-might-change fear that kept the gate at 4.x is
+resolved by measurement.
+
+**3. Verbatim recall improves but is NOT fixed.** 12-char hex ids from a dense
+JSON render (n=4 needles, single ~5.8k-char page — smaller and easier than the
+original 0/15 haystack, not apples-to-apples): **3/4 exact**. The miss is the
+documented failure mode, a single-glyph silent misread (`125f9e6e1c77` →
+`125f9e6a1c77`); one passing trial also misread an adjacent field
+(`cc33ae67` → `cc33a867`). The verbatim-risk guard remains required.
+
+**4. Economics.** Fable is $10/$50 per MTok (2× Opus 4.8). Token-for-token
+savings are identical (same tokenizer), so every saved token is worth 2× the
+dollars — pixelpipe is more valuable on Fable in absolute terms.
+
+**Decision:** support Fable 5 only. Opus 4.7/4.8 disabled — with a tax-free
+reader available, shipping a known 7% misread rate is the wrong default.
+Mythos 5 (`claude-mythos-5`) is the same base model but Project Glasswing
+restricted; unmeasured, not enabled.
 
 ---
 

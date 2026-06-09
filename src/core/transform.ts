@@ -310,21 +310,10 @@ export const SLAB_CHARS_PER_TOKEN = 2.0;
  *  see it in the dashboard before any net-loss compression. */
 export const HISTORY_CHARS_PER_TOKEN = 2.0;
 
-/** Opus 4.6 uses the older tokenizer profile. Keep its default gate more
- * conservative than Opus 4.7 unless the host supplies an empirical override. */
-const OPUS_4_6_CHARS_PER_TOKEN = 2.5;
-
-function isOpus46(model: string | null | undefined): boolean {
-  return typeof model === 'string' && /^claude-opus-4-6(?:-|$)/.test(model);
-}
-
-function defaultSlabCharsPerTokenForModel(model: string | null | undefined): number {
-  return isOpus46(model) ? OPUS_4_6_CHARS_PER_TOKEN : SLAB_CHARS_PER_TOKEN;
-}
-
-function defaultHistoryCharsPerTokenForModel(model: string | null | undefined): number {
-  return isOpus46(model) ? OPUS_4_6_CHARS_PER_TOKEN : HISTORY_CHARS_PER_TOKEN;
-}
+// Model-specific cpt forks removed 2026-06-09 with the fable-5-only scope:
+// Fable 5 ships the Opus 4.7 tokenizer (verified by direct measurement —
+// identical image billing for the same PNG), so the 2.0 telemetry fit
+// applies unchanged and the Opus 4.6 carve-out (2.5) is dead.
 
 /** Anthropic's documented image-billing formula: `tokens ≈ width × height / 750`.
  *  https://docs.anthropic.com/en/docs/build-with-claude/vision#image-tokens
@@ -1836,7 +1825,7 @@ async function runHistoryCollapseAndFinalize(
   if (Array.isArray(req.messages) && req.messages.length > 0) {
     const historyCpt = opts.charsPerToken !== undefined
       ? o.charsPerToken
-      : defaultHistoryCharsPerTokenForModel(req.model);
+      : HISTORY_CHARS_PER_TOKEN;
     const horizon = Math.max(1, Math.floor(o.historyAmortizationHorizon));
     // Pass the symmetric warm-cache burn through to the history-collapse
     // gate as well. The slab gate alone got the symmetric treatment, which
@@ -2078,14 +2067,13 @@ export async function transformRequest(
     Math.max(1, (o.multiCol | 0) || 1),
     Math.max(1, maxFittingCols(o.cols)),
   );
-  // Slab cpt is model-specific. Opus 4.7 uses the 2.0 telemetry fit;
-  // Opus 4.6 keeps the older conservative 2.5 default unless the host
-  // supplies an empirical override via `opts.charsPerToken`.
+  // Slab cpt: the 2.0 telemetry fit (Opus 4.7 tokenizer, which Fable 5
+  // shares) unless the host supplies an empirical override.
   // Discriminate on the *raw* `opts` so a host that genuinely wants the
   // English-prose `4` can pin to it without colliding with the merged default.
   const slabCpt = opts.charsPerToken !== undefined
     ? o.charsPerToken
-    : defaultSlabCharsPerTokenForModel(req.model);
+    : SLAB_CHARS_PER_TOKEN;
   // System slab: width-shrink like every other block. Earlier versions of
   // this code path fixed the slab at the full configured `cols` on the
   // theory that (a) the slab is huge so any shrink savings would be
@@ -2508,15 +2496,14 @@ export async function transformRequest(
     // the renderer will use. History is single-col; pinning numCols=1
     // here makes the gate decision identical to the renderer's image
     // count after wrapping.
-    // History cpt is model-specific. Opus 4.7 uses the 2.0 telemetry fit;
-    // Opus 4.6 keeps the older conservative 2.5 default unless the host
-    // supplies an empirical override via `opts.charsPerToken`.
+    // History cpt: the 2.0 telemetry fit (Opus 4.7 tokenizer, which Fable 5
+    // shares) unless the host supplies an empirical override.
     // Same discriminator as the slab path: check the *raw* `opts` so a host
     // that genuinely wants `4` can pin to it without colliding with the merged
     // default.
     const historyCpt = opts.charsPerToken !== undefined
       ? o.charsPerToken
-      : defaultHistoryCharsPerTokenForModel(req.model);
+      : HISTORY_CHARS_PER_TOKEN;
     const horizon = Math.max(1, Math.floor(o.historyAmortizationHorizon));
     // Pass the symmetric warm-cache burn through to the history-collapse
     // gate as well. The slab gate alone got the symmetric treatment, which

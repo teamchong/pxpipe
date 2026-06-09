@@ -204,6 +204,12 @@ async function dispatchDashboard(
       const idNum = idRaw != null ? Number(idRaw) : NaN;
       return dashboard.servePng(Number.isFinite(idNum) ? idNum : undefined);
     }
+    case 'api-image-source': {
+      if (method !== 'GET') return undefined;
+      const idRaw = url.searchParams.get('id');
+      const idNum = idRaw != null ? Number(idRaw) : NaN;
+      return dashboard.serveImageSource(Number.isFinite(idNum) ? idNum : undefined);
+    }
     case 'api-sessions': {
       if (method !== 'GET') return undefined;
       return dashboard.serveSessionsJson({

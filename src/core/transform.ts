@@ -859,6 +859,12 @@ export interface TransformInfo {
   imagePngs?: Uint8Array[];
   /** Matching pixel dimensions for each entry in imagePngs. */
   imageDims?: Array<{ width: number; height: number }>;
+  /** The source text that was rendered into `imagePngs` (the combined
+   *  slab text, header included). Lets the dashboard show the before/after
+   *  pair so an operator can see exactly what JSON/tool-result text became
+   *  the image. Capped at 64 KiB to bound memory; NOT persisted to JSONL
+   *  (toTrackEvent drops it alongside the PNG bytes). */
+  imageSourceText?: string;
   /** Number of images we added by compressing `<system-reminder>` blocks in
    *  the first user message. */
   reminderImgs?: number;
@@ -2204,6 +2210,7 @@ export async function transformRequest(
     info.firstImageHeight = images[0]!.height;
     info.imagePngs = images.map((i) => i.png);
     info.imageDims = images.map((i) => ({ width: i.width, height: i.height }));
+    info.imageSourceText = combinedWithHeader.slice(0, 65_536);
   }
 
   // 4. Splice images back into the request.

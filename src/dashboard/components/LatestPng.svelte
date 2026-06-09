@@ -23,6 +23,43 @@
   $: caption = pinned != null
     ? `image #${pinned}`
     : (meta ? meta + ' - showing top-left at native resolution' : '');
+
+  // --- source-text viewer ---------------------------------------------
+  // Fetches /api/image-source so the operator can see the JSON/tool-result
+  // text that was rendered into the PNG, side by side with the image.
+  let showSource = false;
+  let sourceText: string | null = null;
+  let sourceErr: string | null = null;
+  let sourceForKey = '';
+
+  // key identifying the currently displayed image (pin id or latest meta)
+  $: sourceKey = pinned != null ? `id:${pinned}` : `latest:${meta}`;
+
+  async function loadSource() {
+    sourceForKey = sourceKey;
+    sourceText = null;
+    sourceErr = null;
+    try {
+      const url = pinned != null ? `/api/image-source?id=${pinned}` : '/api/image-source';
+      const res = await fetch(url);
+      if (!res.ok) {
+        sourceErr = 'source text not captured for this image';
+        return;
+      }
+      const body = await res.json();
+      sourceText = body.source_text ?? '';
+    } catch {
+      sourceErr = 'failed to fetch source text';
+    }
+  }
+
+  function toggleSource() {
+    showSource = !showSource;
+    if (showSource) void loadSource();
+  }
+
+  // refetch when the displayed image changes while the panel is open
+  $: if (showSource && sourceKey !== sourceForKey) void loadSource();
 </script>
 
 <div class="wrap">
@@ -45,7 +82,21 @@
     <div class="sub">(none yet)</div>
   {/if}
 </div>
-<div class="small">{caption}</div>
+<div class="small">
+  {caption}
+  {#if pinned != null ? !pinnedEvicted : hasPreview}
+    <button class="src-btn" on:click={toggleSource}>{showSource ? 'hide source text' : 'view source text'}</button>
+  {/if}
+</div>
+{#if showSource}
+  {#if sourceErr}
+    <div class="evicted">{sourceErr}</div>
+  {:else if sourceText == null}
+    <div class="evicted">loading…</div>
+  {:else}
+    <pre class="src-pane">{sourceText}</pre>
+  {/if}
+{/if}
 
 <style>
   .wrap {
@@ -95,6 +146,33 @@
   }
   .back-btn:hover {
     background: #30363d;
+  }
+  .src-btn {
+    font-size: 11px;
+    background: #21262d;
+    color: #58a6ff;
+    border: 1px solid #30363d;
+    border-radius: 4px;
+    padding: 1px 6px;
+    margin-left: 8px;
+    cursor: pointer;
+  }
+  .src-btn:hover {
+    background: #30363d;
+  }
+  .src-pane {
+    margin-top: 8px;
+    max-height: 400px;
+    overflow: auto;
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 4px;
+    padding: 8px;
+    font-size: 11px;
+    line-height: 1.4;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: #c9d1d9;
   }
   .evicted {
     font-size: 11px;

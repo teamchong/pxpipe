@@ -70,6 +70,10 @@ interface ImageEntry {
   width: number;
   height: number;
   ts: number;
+  /** The source text this PNG was rendered from (shared across all pages of
+   *  one render; capped upstream at 64 KiB). Lets the dashboard show the
+   *  text → image pair so the operator can see what got converted. */
+  sourceText?: string;
 }
 
 /** One row in the dashboard's "recent requests" table. Compact on purpose —
@@ -400,6 +404,7 @@ export class DashboardState {
         width,
         height,
         ts: Date.now() / 1000,
+        sourceText: info.imageSourceText,
       });
       ids.push(id);
     }
@@ -896,6 +901,26 @@ export class DashboardState {
     });
   }
 
+  /** GET /api/image-source[?id=N] — the source text the PNG was rendered
+   *  from, so the operator can see the text → image conversion side by side.
+   *  Falls back to the latest image; 404 if evicted or text wasn't captured. */
+  serveImageSource(id?: number): Response {
+    const entry =
+      id !== undefined
+        ? this.images.find((im) => im.id === id)
+        : this.images[this.images.length - 1];
+    if (!entry || entry.sourceText === undefined) {
+      return new Response(JSON.stringify({ error: 'no source text' }), {
+        status: 404,
+        headers: { 'content-type': 'application/json', 'access-control-allow-origin': '*' },
+      });
+    }
+    return new Response(
+      JSON.stringify({ id: entry.id, meta: entry.meta, source_text: entry.sourceText }),
+      { headers: { 'content-type': 'application/json', 'access-control-allow-origin': '*' } },
+    );
+  }
+
   serveHtml(port: number): Response {
     return new Response(DASHBOARD_HTML.replace(/__PORT__/g, String(port)), {
       headers: { 'content-type': 'text/html; charset=utf-8' },
@@ -990,7 +1015,8 @@ export type DashboardRoute =
   | { kind: 'api-sessions' } // /api/sessions.json
   | { kind: 'api-stats' } // /api/stats.json
   | { kind: 'current-session' } // /api/current-session.json
-  | { kind: 'api-compression' }; // /api/compression (POST {enabled}) — runtime kill switch
+  | { kind: 'api-compression' } // /api/compression (POST {enabled}) — runtime kill switch
+  | { kind: 'api-image-source' }; // /api/image-source[?id=N] — source text behind a rendered PNG
 
 /** Match dashboard paths (handle query strings on /proxy-latest-png). */
 export function dashboardPath(pathname: string): DashboardRoute | null {
@@ -1002,6 +1028,7 @@ export function dashboardPath(pathname: string): DashboardRoute | null {
   if (pathname === '/api/stats.json') return { kind: 'api-stats' };
   if (pathname === '/api/current-session.json') return { kind: 'current-session' };
   if (pathname === '/api/compression') return { kind: 'api-compression' };
+  if (pathname === '/api/image-source') return { kind: 'api-image-source' };
   return null;
 }
 

@@ -1,4 +1,4 @@
-# GSM8K: text baseline vs pixelpipe-rendered-image, both solved by `claude -p`.
+# GSM8K: text baseline vs pxpipe-rendered-image, both solved by `claude -p`.
 # The image arm gets ONLY the PNG (problem text not in the prompt), so it must
 # read the image to answer. Exact-match on the final integer.
 import json, subprocess, re, os
@@ -46,7 +46,7 @@ with ThreadPoolExecutor(max_workers=6) as ex:
 bc = sum(1 for r in res if r[0]); ic = sum(1 for r in res if r[1])
 print(f"N={N} (offset {OFF}, model {MODEL})")
 print(f"  baseline (text)   = {bc}/{N} = {100*bc/N:.1f}%")
-print(f"  pixelpipe (image) = {ic}/{N} = {100*ic/N:.1f}%")
+print(f"  pxpipe (image) = {ic}/{N} = {100*ic/N:.1f}%")
 print(f"  delta             = {100*(ic-bc)/N:+.1f} pp")
 for i, (bok, iok, g, b, im) in enumerate(res):
     if bok and not iok:

@@ -112,7 +112,7 @@ const BASELINE_PROMPT = 'Transcribe this text verbatim.';
 const REFLOW_PROMPT   = 'Transcribe this text verbatim, replacing ↵ with line breaks.';
 
 // In-image instruction header — same encoder pass as the content. The user's
-// hypothesis: pixelpipe production already renders the system prompt as part
+// hypothesis: pxpipe production already renders the system prompt as part
 // of the image, so the model is calibrated to read instructions and content
 // in the same modality. Having the instruction next to the dense text in the
 // same downsample pass may anchor the encoder's reading mode more reliably
@@ -212,7 +212,7 @@ const VARIANTS = [
   // Instruction-in-image: prepend the OCR instructions INTO the rendered PNG
   // (same density as the content). API `system` is minimal. Tests whether
   // putting instructions in the same encoder pass as the dense text helps the
-  // model lock into reading mode — matching pixelpipe's production flow, where
+  // model lock into reading mode — matching pxpipe's production flow, where
   // the host system prompt is already rendered as image content.
   {
     name:   'reflow-inimage',

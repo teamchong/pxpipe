@@ -1,7 +1,7 @@
 /**
  * eval/lib/render-bridge.mjs
  *
- * Thin bridge that imports the compiled pixelpipe render functions from
+ * Thin bridge that imports the compiled pxpipe render functions from
  * dist/core/render.js and exposes them to the eval scripts.
  *
  * Why dist/ and not src/?

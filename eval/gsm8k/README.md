@@ -1,6 +1,6 @@
-# reading-fidelity eval — does the model actually *read* pixelpipe's image?
+# reading-fidelity eval — does the model actually *read* pxpipe's image?
 
-Solve a math problem given as **text** vs. as a **pixelpipe-rendered PNG**
+Solve a math problem given as **text** vs. as a **pxpipe-rendered PNG**
 (its real `renderTextToPngs`), exact-match the final number. The image arm gets
 *only* the image, so it must read it. `claude-opus-4-8`.
 
@@ -15,18 +15,18 @@ so any wrong answer is a **misread**.
 | arm | accuracy |
 |---|---|
 | baseline (text) | **100%** |
-| pixelpipe (image) | **93%** |
+| pxpipe (image) | **93%** |
 | delta | **−7pp** (real reading tax) |
 
 Misses are genuine misreads (`10200`→`9400`, `7873`→`7793`) or unreadable. So the
-model *does* read pixelpipe's render on short content — but at a real ~7% cost.
+model *does* read pxpipe's render on short content — but at a real ~7% cost.
 
 ## GSM8K (standard suite — contaminated, shown for comparison)
 
 | arm | accuracy |
 |---|---|
 | baseline (text) | 97% |
-| pixelpipe (image) | 96% |
+| pxpipe (image) | 96% |
 
 GSM8K *looks* near-lossless (−1pp) but that's memory inflating the image arm by
 ~3pp vs. the clean novel number. Don't trust it alone.

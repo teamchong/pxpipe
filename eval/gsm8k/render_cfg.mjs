@@ -1,4 +1,4 @@
-// Render any {question} jsonl with pixelpipe's real renderTextToPngs.
+// Render any {question} jsonl with pxpipe's real renderTextToPngs.
 // Usage: node render_cfg.mjs <data.jsonl> <outdir> [N] [OFFSET]
 import { renderTextToPngs } from '../../dist/core/render.js';
 import { writeFileSync, mkdirSync, readFileSync } from 'node:fs';

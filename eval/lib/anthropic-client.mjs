@@ -15,7 +15,7 @@
  *
  * Proxy bypass:
  *   The interactive `claude` shell alias points ANTHROPIC_BASE_URL at the
- *   local pixelpipe proxy. The eval MUST NOT go through pixelpipe — that would
+ *   local pxpipe proxy. The eval MUST NOT go through pxpipe — that would
  *   transform/compress the very images we are trying to measure. So every call
  *   here (a) invokes the real binary at ~/.claude/local/claude rather than the
  *   alias, and (b) strips ANTHROPIC_BASE_URL from the child environment. The

@@ -1,5 +1,5 @@
-// Render GSM8K problems with pixelpipe's REAL renderTextToPngs (default settings),
-// so the benchmark tests pixelpipe itself, not an approximation.
+// Render GSM8K problems with pxpipe's REAL renderTextToPngs (default settings),
+// so the benchmark tests pxpipe itself, not an approximation.
 // Usage: node render_all.mjs [N] [OFFSET]   → writes ./imgs/q*.png
 import { renderTextToPngs } from '../../dist/core/render.js';
 import { writeFileSync, mkdirSync, readFileSync } from 'node:fs';

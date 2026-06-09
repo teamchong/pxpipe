@@ -374,7 +374,7 @@ rare in real conversation text (measured: 0 collisions in 1M tokens).
 `.trim();
 
   const SAMPLE_CONVO = `
-I need to debug why the pixelpipe proxy is adding extra blank lines to the
+I need to debug why the pxpipe proxy is adding extra blank lines to the
 rendered output. Here is the test case that reproduces it:
 
   const text = "line one\\n\\nline two\\n\\n\\nline three";
@@ -410,7 +410,7 @@ The function seems correct. Let me look at the test more carefully.
 
 function syntheticSessions() {
   const historyText = `[USER]
-Can you explain how the reflow renderer works in pixelpipe?
+Can you explain how the reflow renderer works in pxpipe?
 
 ---
 

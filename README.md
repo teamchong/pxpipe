@@ -173,23 +173,6 @@ and not the focus; Fable 5 via the Anthropic route is.
 | `OPENAI_UPSTREAM` | `https://api.openai.com` | Upstream for `/v1/chat/completions` |
 | `OPENAI_API_KEY` | unset | Optional OpenAI key override; otherwise client `Authorization` is forwarded |
 
-## Quick start (Cloudflare Workers)
-
-`renderTextToPngs` works in Workers via the WASM build of `node-canvas`
-shipped under `dist/wasm/`. Set `nodejs_compat` in `wrangler.toml`.
-
-```ts
-import { renderTextToPngs } from "pxpipe";
-
-export default {
-  async fetch(req: Request) {
-    const text = await req.text();
-    const pngs = await renderTextToPngs(text);
-    return new Response(pngs[0], { headers: { "content-type": "image/png" } });
-  },
-};
-```
-
 ---
 
 ## Library API

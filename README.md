@@ -159,27 +159,13 @@ const pngs = await renderTextToPngs(toolResultText);
 // pngs: Buffer[]  — attach to the next user turn
 ```
 
-## Proxy Usage
+## Proxy environment variables
 
-The Node proxy can serve both API families from one port:
+An OpenAI-compatible route (`/v1/chat/completions`, GPT 5.5 only) also exists
+on the same port — we tried it, it works in smoke tests, but it is unmeasured
+and not the focus; Fable 5 via the Anthropic route is.
 
-```bash
-npx pxpipe
-```
 
-Claude Code continues to use the Anthropic route:
-
-```bash
-ANTHROPIC_BASE_URL=http://127.0.0.1:47821 claude
-```
-
-OpenAI-compatible GPT clients use the OpenAI route:
-
-```bash
-OPENAI_BASE_URL=http://127.0.0.1:47821/v1
-```
-
-Environment variables:
 
 | name | default | meaning |
 |---|---|---|
@@ -232,7 +218,7 @@ wrapLines(text: string, cols: number, markerScale?: number): string[]
 
 ## Configuration
 
-There is none in the library itself. Callers (e.g. ocproxy) decide:
+There is none in the library itself. Callers (e.g. the bundled proxy) decide:
 
 * whether to render this particular tool_result at all
 * what `cols` to pass (often `DEFAULT_COLS` is fine)
@@ -260,7 +246,7 @@ are tools used during development and for the demo dashboard.
 ```bash
 pnpm install
 pnpm run typecheck
-pnpm test                # 320 tests
+pnpm test                # 323 tests
 pnpm run build           # regenerates dist/
 ```
 

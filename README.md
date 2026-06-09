@@ -1,4 +1,4 @@
-# pixelpipe
+# pixelpipe (npm: `pxpipe`)
 
 Turn Claude or GPT static context into compact PNGs before it ever reaches the
 model. Text tokens are expensive; vision tokens for a dense 1568×1568 image can
@@ -142,8 +142,7 @@ It transparently compresses eligible `/v1/messages` bodies and passes
 everything else through untouched.
 
 ```bash
-pnpm install && pnpm run build
-node bin/cli.js                          # listens on http://127.0.0.1:47821
+npx pxpipe                               # listens on http://127.0.0.1:47821
 ANTHROPIC_BASE_URL=http://localhost:47821 claude
 ```
 
@@ -154,7 +153,7 @@ are logged to `~/.pixelpipe/events.jsonl`.
 ## Quick start (Node)
 
 ```ts
-import { renderTextToPngs } from "pixelpipe";
+import { renderTextToPngs } from "pxpipe";
 
 const pngs = await renderTextToPngs(toolResultText);
 // pngs: Buffer[]  — attach to the next user turn
@@ -165,7 +164,7 @@ const pngs = await renderTextToPngs(toolResultText);
 The Node proxy can serve both API families from one port:
 
 ```bash
-pixelpipe
+npx pxpipe
 ```
 
 Claude Code continues to use the Anthropic route:
@@ -194,7 +193,7 @@ Environment variables:
 shipped under `dist/wasm/`. Set `nodejs_compat` in `wrangler.toml`.
 
 ```ts
-import { renderTextToPngs } from "pixelpipe";
+import { renderTextToPngs } from "pxpipe";
 
 export default {
   async fetch(req: Request) {

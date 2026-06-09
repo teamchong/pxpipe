@@ -1,4 +1,4 @@
-# pxpipe (npm: `pxpipe`)
+# pxpipe
 
 Turn Claude or GPT static context into compact PNGs before it ever reaches the
 model. Text tokens are expensive; vision tokens for a dense 1568×1568 image can

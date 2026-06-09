@@ -135,6 +135,22 @@ both faithfulness *and* savings.
 
 ---
 
+## Quick start (CLI proxy — Claude Code)
+
+The fastest way to try it: run the local proxy and point Claude Code at it.
+It transparently compresses eligible `/v1/messages` bodies and passes
+everything else through untouched.
+
+```bash
+pnpm install && pnpm run build
+node bin/cli.js                          # listens on http://127.0.0.1:47821
+ANTHROPIC_BASE_URL=http://localhost:47821 claude
+```
+
+A live dashboard (tokens saved, per-session stats, compression kill switch)
+is served at the same address: <http://127.0.0.1:47821/>. Per-request events
+are logged to `~/.pixelpipe/events.jsonl`.
+
 ## Quick start (Node)
 
 ```ts
@@ -205,14 +221,13 @@ wrapLines(text: string, cols: number, markerScale?: number): string[]
 
 ### Constants
 
-| name                       | value | meaning                                      |
-|----------------------------|-------|----------------------------------------------|
-| `READABLE_CHARS_PER_IMAGE` | 6 000 | upper bound on chars packed into one page    |
-| `MIN_TOO_L_RESULT_CHARS`   | 6 000 | inputs below this should not be rendered     |
-| `MIN_REMINDER_CHARS`       | 6 000 | gate for adding "(see image)" reminder text  |
-| `DEFAULT_COLS`             | 100   | column width when caller doesn't override     |
-| `MAX_HEIGHT_PX`            | 1 568 | page height ceiling                          |
-| `MAX_WIDTH_PX`             | 1 568 | page width                                   |
+| name                            | value  | meaning                                        |
+|---------------------------------|--------|------------------------------------------------|
+| `READABLE_CHARS_PER_IMAGE`      | 50 000 | hard ceiling on chars packed into one page     |
+| `DENSE_CONTENT_CHARS_PER_IMAGE` | 5 000  | target chars/page for dense tool-result pages  |
+| `DENSE_CONTENT_COLS`            | 180    | column width for dense pages                   |
+| `DEFAULT_COLS`                  | 313    | column width when caller doesn't override      |
+| `MAX_HEIGHT_PX`                 | 1 568  | page height ceiling                            |
 
 ---
 
@@ -245,8 +260,8 @@ are tools used during development and for the demo dashboard.
 
 ```bash
 pnpm install
-pnpm run typecheck      # 315 tests pass
-pnpm test
+pnpm run typecheck
+pnpm test                # 320 tests
 pnpm run build           # regenerates dist/
 ```
 

@@ -1,9 +1,9 @@
 export {
-  isPixelpipeSupportedGptModel,
-  isPixelpipeSupportedModel,
+  isPxpipeSupportedGptModel,
+  isPxpipeSupportedModel,
   shouldTransformAnthropicMessages,
-  type PixelpipeApplicabilityInput,
-  type PixelpipeApplicabilityReason,
+  type PxpipeApplicabilityInput,
+  type PxpipeApplicabilityReason,
 } from './applicability.js';
 export {
   buildCountTokensBodies,
@@ -14,14 +14,14 @@ export {
 } from './measurement.js';
 export {
   transformAnthropicMessages,
-  type PixelpipeOptions,
-  type PixelpipeReason,
-  type PixelpipeTransformInput,
-  type PixelpipeTransformResult,
+  type PxpipeOptions,
+  type PxpipeReason,
+  type PxpipeTransformInput,
+  type PxpipeTransformResult,
 } from './library.js';
 export {
   transformRequest,
-  type TransformInfo as PixelpipeTransformInfo,
+  type TransformInfo as PxpipeTransformInfo,
   type TransformOptions,
 } from './transform.js';
 export { transformOpenAIChatCompletions } from './openai.js';

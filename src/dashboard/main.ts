@@ -14,5 +14,5 @@ if (target) {
   // Should never happen - the HTML template always emits #app. But if a
   // stale cached page is served alongside a new bundle, fail loud rather
   // than silent so the operator notices.
-  document.body.textContent = 'pixelpipe dashboard: mount target #app missing';
+  document.body.textContent = 'pxpipe dashboard: mount target #app missing';
 }

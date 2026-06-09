@@ -1,10 +1,10 @@
 /**
- * Runtime-agnostic event sink for pixelpipe.
+ * Runtime-agnostic event sink for pxpipe.
  *
  * The proxy core emits a `ProxyEvent` per request. A Tracker is the host's
  * decision about *where* those events go — local JSONL file on Node, console
  * (= Workers Logs) on Cloudflare. The shape of the persisted record is the
- * same on both sides so analysis tooling (`pixelpipe stats`, downstream
+ * same on both sides so analysis tooling (`pxpipe stats`, downstream
  * aggregation) doesn't care which runtime produced it.
  *
  * Privacy: we never emit raw user text or the system prompt. Only sizes,
@@ -380,5 +380,5 @@ export class JsonLogTracker implements Tracker {
   }
 }
 
-/** Tracker that drops everything. Used when PIXELPIPE_TRACK=0. */
+/** Tracker that drops everything. Used when PXPIPE_TRACK=0. */
 export const noopTracker: Tracker = { emit() {} };

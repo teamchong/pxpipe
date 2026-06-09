@@ -262,7 +262,7 @@ describe('collapseHistory', () => {
     // 12 micro-turns (~150 chars serialised). Under the full-canvas render
     // policy (no shrink-to-content) the cheapest image still spends the full
     // 1568×88 pixel band, which costs more tokens than 150 chars of text. The
-    // gate correctly refuses unprofitable compressions — pixelpipe must SAVE
+    // gate correctly refuses unprofitable compressions — pxpipe must SAVE
     // tokens, never spend more than the text it replaces. This is a regression
     // guard against re-introducing shrink-to-content (which traded savings for
     // a savings illusion on sparse content).

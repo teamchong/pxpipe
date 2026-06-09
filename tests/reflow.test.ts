@@ -611,10 +611,10 @@ describe('reflow L0 contract – real corpus', () => {
     expect(violations, 'L0 violations found in real corpus (see logs above)').toHaveLength(0);
   }, 30_000);
 
-  it('L0 contract holds for ~/.pixelpipe/4xx-bodies/ if present', () => {
-    const dir4xx = resolve(homedir(), '.pixelpipe', '4xx-bodies');
+  it('L0 contract holds for ~/.pxpipe/4xx-bodies/ if present', () => {
+    const dir4xx = resolve(homedir(), '.pxpipe', '4xx-bodies');
     if (!existsSync(dir4xx)) {
-      console.log('[4xx-bodies] ~/.pixelpipe/4xx-bodies not found — skipping');
+      console.log('[4xx-bodies] ~/.pxpipe/4xx-bodies not found — skipping');
       return;
     }
 

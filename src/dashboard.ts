@@ -1,7 +1,7 @@
 /**
  * Live dashboard for the Node host. Serves the main HTML page and JSON
  * polling endpoints. All "/api/*.json" endpoints recompute from disk on
- * every request — pixelpipe doesn't have a query layer, but a 1.5 MB JSONL
+ * every request — pxpipe doesn't have a query layer, but a 1.5 MB JSONL
  * streams in well under 100 ms.
  *
  * Legacy live-poll endpoints (left in place, the existing tick() loop uses
@@ -15,7 +15,7 @@
  * Session endpoints (read-only telemetry — no destructive operations):
  *
  *   GET  /api/sessions.json          → grouped sessions (sha8 + project + counts)
- *   GET  /api/stats.json             → full-history aggregate (formerly `pixelpipe stats`)
+ *   GET  /api/stats.json             → full-history aggregate (formerly `pxpipe stats`)
  *
  * Metric formulas and HTML shell originally ported from the Python reference
  * implementation (deleted after live cache-rate validation hit 98.7% by tokens).
@@ -195,14 +195,14 @@ interface Totals {
    *  with a usage block. For measured rows: cache-aware baseline (what the
    *  unproxied path would have billed). For unmeasured/probe-failed rows:
    *  actual_input_eff (best available estimate — these rows didn't run
-   *  pixelpipe or we can't measure what it would have cost, so the
+   *  pxpipe or we can't measure what it would have cost, so the
    *  counterfactual ≈ actual).
    *
    *  This is the right denominator for "share of bill saved": dividing
    *  by what-you-would-have-paid is bounded at 100% (you can't save more
    *  than you would have spent). Dividing by what-you-DID-pay is not
    *  bounded — a single big cold-miss compressed request can make
-   *  saved/actual exceed 100% because pixelpipe shrunk the actual to
+   *  saved/actual exceed 100% because pxpipe shrunk the actual to
    *  near zero. */
   allBaselineEquivalentWeighted: number;
   /** Sum of weighted ACTUAL input tokens across the same all-rows set.
@@ -492,10 +492,10 @@ export class DashboardState {
       this.totals.outputWeighted += outputEquiv;
     }
     // All-rows COUNTERFACTUAL spend, ungated on the probe — the honest
-    // denominator for "did pixelpipe move my real bill". Measured rows
+    // denominator for "did pxpipe move my real bill". Measured rows
     // contribute their cache-aware baseline (what the unproxied path
     // would have billed); unmeasured/probe-failed/passthrough rows
-    // contribute their actual input (pixelpipe either didn't run or we
+    // contribute their actual input (pxpipe either didn't run or we
     // can't measure the counterfactual, so actual ≈ baseline). This
     // keeps the ratio bounded at 100% — you can't save more than you
     // would have paid.
@@ -751,13 +751,13 @@ export class DashboardState {
     // estimation), but the denominator MUST include every request the user
     // actually paid for — including passthrough rows, probe-failed rows,
     // and untransformed turns the gate said no to. Otherwise the headline
-    // answers "did pixelpipe help on the rows where it ran" instead of
-    // "did pixelpipe move my real bill". The first is a cherry-pick.
+    // answers "did pxpipe help on the rows where it ran" instead of
+    // "did pxpipe move my real bill". The first is a cherry-pick.
     const allBaselineEquiv = this.totals.allBaselineEquivalentWeighted;
     const allActual = this.totals.allActualInputWeighted;
     const allOutput = this.totals.allOutputWeighted;
     // Denominator = counterfactual all-rows bill: what the user would have
-    // paid with no pixelpipe. Bounded ratio at 100%; a single cold-miss
+    // paid with no pxpipe. Bounded ratio at 100%; a single cold-miss
     // compressed request on an otherwise empty session shows ~99% saved,
     // not 280%.
     const allCounterfactualBill = allBaselineEquiv + allOutput;
@@ -814,7 +814,7 @@ export class DashboardState {
       // Honest "share of total bill saved" — measured-rows numerator over
       // ALL paid requests in the denominator (compressed + passthrough +
       // probe-failed). This is the number users actually want when they
-      // ask "is pixelpipe helping". Negative when flap-pollution from
+      // ask "is pxpipe helping". Negative when flap-pollution from
       // passthrough turns exceeds the collapse win on measured turns.
       saved_pct_of_all_spend: round1(pctAllSpend),
       all_baseline_equivalent_weighted: Math.round(allBaselineEquiv),
@@ -951,7 +951,7 @@ export class DashboardState {
   }
 
   /** GET /api/stats.json — full-history aggregate. Migrated from the
-   *  former `pixelpipe stats` CLI. */
+   *  former `pxpipe stats` CLI. */
   async serveApiStats(): Promise<Response> {
     if (!this.paths) return notConfigured('stats');
     const result = await aggregateEventsFile(this.paths.eventsFile);
@@ -1038,14 +1038,14 @@ const DASHBOARD_HTML = `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>pixelpipe – Live dashboard</title>
+<title>pxpipe – Live dashboard</title>
 <style>
   /* Pre-mount body styling so the loading flash matches the Svelte UI. The
      real stylesheet is injected by Svelte components on mount. */
   * { box-sizing: border-box; }
   body { margin: 0; padding: 0; background: #0d1117; color: #c9d1d9;
          font: 14px/1.45 -apple-system,BlinkMacSystemFont,"SF Mono",Menlo,monospace; }
-  #app:empty::before { content: 'pixelpipe dashboard loading…';
+  #app:empty::before { content: 'pxpipe dashboard loading…';
                        display: block; padding: 24px; color: #6e7681; }
 </style>
 </head>

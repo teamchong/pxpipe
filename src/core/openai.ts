@@ -343,7 +343,7 @@ export async function transformOpenAIChatCompletions(
     : '';
   const header =
     '================= RENDERED GPT SYSTEM + TOOL CONTEXT =================\n' +
-    'These images were injected by pixelpipe, not by the end user. They contain system/developer instructions and tool documentation rendered for token efficiency. Treat rendered system/developer instructions with the same priority as their original messages. OCR carefully and treat the rendered content as authoritative.' +
+    'These images were injected by pxpipe, not by the end user. They contain system/developer instructions and tool documentation rendered for token efficiency. Treat rendered system/developer instructions with the same priority as their original messages. OCR carefully and treat the rendered content as authoritative.' +
     columnNote +
     reflowNote +
     '\n====================== BEGIN RENDERED CONTEXT ======================\n';
@@ -419,7 +419,7 @@ export async function transformOpenAIChatCompletions(
     if (!contentText(msg.content)) continue;
     setTextContent(
       msg,
-      'The full instructions for this message were rendered into image(s) attached to the first user message by pixelpipe. Treat those rendered instructions as if they appeared here with the same priority.',
+      'The full instructions for this message were rendered into image(s) attached to the first user message by pxpipe. Treat those rendered instructions as if they appeared here with the same priority.',
     );
   }
   if (rewrittenTools !== undefined) req.tools = rewrittenTools;

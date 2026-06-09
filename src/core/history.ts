@@ -20,7 +20,7 @@
  *
  * The synthesized user message uses `role: 'user'` because Anthropic
  * **forbids `image` blocks inside `role: 'assistant'`** (see
- * `/tmp/pixelpipe-history-compression.md` line 14 and `types.ts:58`
+ * `/tmp/pxpipe-history-compression.md` line 14 and `types.ts:58`
  * comments). Self-attribution ("I previously said X") is the price.
  *
  * `thinking` blocks inside the collapsed range are dropped from the
@@ -29,10 +29,10 @@
  * and that turn is in the live tail by construction.
  *
  * **Cache-control**: caller controls whether the history-image carries
- * pixelpipe's ephemeral breakpoint. This module returns the image blocks
+ * pxpipe's ephemeral breakpoint. This module returns the image blocks
  * unmarked; the caller in `transform.ts` decides placement.
  *
- * Spec source: `/tmp/pixelpipe-history-compression.md` Variant C section
+ * Spec source: `/tmp/pxpipe-history-compression.md` Variant C section
  * (round 3, lines 346-364 + check-3 cache-control discussion).
  */
 

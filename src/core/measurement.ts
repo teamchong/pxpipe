@@ -3,7 +3,7 @@
  *
  * These are pure body-shaping utilities: no fetch, no auth, no Node APIs.
  * Hosts such as ocproxy can use them to run shadow /v1/messages/count_tokens
- * probes with their own transport/auth while pixelpipe transforms the real
+ * probes with their own transport/auth while pxpipe transforms the real
  * request body.
  */
 

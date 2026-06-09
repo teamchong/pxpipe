@@ -1,9 +1,9 @@
-# pixelpipe (npm: `pxpipe`)
+# pxpipe (npm: `pxpipe`)
 
 Turn Claude or GPT static context into compact PNGs before it ever reaches the
 model. Text tokens are expensive; vision tokens for a dense 1568×1568 image can
 be dramatically cheaper than the same content delivered as transcript text.
-pixelpipe is the encoder that exploits that gap.
+pxpipe is the encoder that exploits that gap.
 
 It is a small, focused TypeScript library — no daemon, no MCP wiring, no
 opinions about transport. You hand it a string, it hands you one or more
@@ -36,7 +36,7 @@ image anything you may need back byte-exact (IDs, hashes, secrets, exact
 numbers) until a verbatim-risk guard keeps those blocks as text.
 
 **Model scope.** Fable 5 (`claude-fable-5`) only on the Anthropic route,
-enforced in both the library (`isPixelpipeSupportedModel`) and the proxy.
+enforced in both the library (`isPxpipeSupportedModel`) and the proxy.
 Opus (4.7/4.8, the original measured scope) was disabled 2026-06-09: Fable 5
 reads renders at 100/100 on the novel-arithmetic eval vs Opus 4.8's 93/100,
 with identical image billing (same Opus 4.7-line tokenizer, verified by direct
@@ -48,11 +48,11 @@ focus and is unmeasured beyond smoke tests. Mythos 5 is unmeasured (no access).
 
 ## Benchmarks (reproducible)
 
-**One number: on short, readable content Fable 5 reads pixelpipe's render
+**One number: on short, readable content Fable 5 reads pxpipe's render
 100% of the time, at ~38% fewer tokens.** Measured clean — with novel
 random-number problems it cannot have memorized:
 
-| test | N | text | pixelpipe (image) | tokens |
+| test | N | text | pxpipe (image) | tokens |
 |---|---:|---:|---:|---|
 | novel arithmetic, `claude-fable-5` (2026-06-09) | 100 | 100% | **100%** | **−38%** |
 | novel arithmetic, `claude-opus-4-8` | 100 | 100% | 93% | −38% |
@@ -62,7 +62,7 @@ tax is why Opus is now disabled and the gate is Fable-only.
 
 **The boundary** — push to dense, exact-recall content and it degrades:
 
-| test | text | pixelpipe (image) |
+| test | text | pxpipe (image) |
 |---|---:|---:|
 | verbatim recall — 12-char hex from a *dense* render, Opus | 15/15 | **0/15** |
 | verbatim recall — 12-char hex, dense JSON render, Fable 5 (n=4, smaller page) | — | **3/4** |
@@ -148,7 +148,7 @@ ANTHROPIC_BASE_URL=http://localhost:47821 claude
 
 A live dashboard (tokens saved, per-session stats, compression kill switch)
 is served at the same address: <http://127.0.0.1:47821/>. Per-request events
-are logged to `~/.pixelpipe/events.jsonl`.
+are logged to `~/.pxpipe/events.jsonl`.
 
 ## Quick start (Node)
 
@@ -287,7 +287,7 @@ once the input clears the profitability gate.
   loses on sparse prose (~3.5 chars/token). Enabled for Fable 5 callers.
 * **Verbatim recall is unreliable.** Exact strings inside imaged content (0/15
   in eval) can be silently confabulated — a plausible wrong value, not an
-  error. Keep anything you need byte-exact as text; pixelpipe is a lossy gist
+  error. Keep anything you need byte-exact as text; pxpipe is a lossy gist
   tier, not a lossless store. A verbatim-risk guard (skip blocks with unique
   IDs / hashes / exact values) is not yet built.
 

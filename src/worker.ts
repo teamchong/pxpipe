@@ -37,7 +37,7 @@ export interface Env {
   /** When "0" / "false", disable per-request event JSON logs. Default-on.
    *  Cloudflare ingests console.log as Workers Logs; pipe via Logpush to
    *  R2/S3 for the same JSONL shape Node writes to disk. */
-  PIXELPIPE_TRACK?: string;
+  PXPIPE_TRACK?: string;
 }
 
 const truthy = (v: string | undefined, fallback: boolean): boolean =>
@@ -64,7 +64,7 @@ export default {
       // real tool-doc slabs. Override via MULTI_COL=1 if OCR misreads layout.
       multiCol: env.MULTI_COL ? Math.max(1, Number(env.MULTI_COL) | 0) : 2,
     };
-    const trackingOn = truthy(env.PIXELPIPE_TRACK, true);
+    const trackingOn = truthy(env.PXPIPE_TRACK, true);
     // Workers Logs ingests stdout as separate log lines. Emit one JSON line
     // per event so downstream (Logpush → R2/S3) reads the same JSONL shape
     // the Node host writes to disk.
@@ -87,7 +87,7 @@ export default {
 
         if (e.info?.unknownStaticTags && e.info.unknownStaticTags.length > 0) {
           console.warn(
-            `[pixelpipe warn] unknown tag(s) in static slab: ${e.info.unknownStaticTags.join(', ')}`,
+            `[pxpipe warn] unknown tag(s) in static slab: ${e.info.unknownStaticTags.join(', ')}`,
           );
         }
 

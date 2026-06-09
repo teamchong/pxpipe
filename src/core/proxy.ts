@@ -1,5 +1,5 @@
 /**
- * The pixelpipe proxy as a single Web-standard fetch handler.
+ * The pxpipe proxy as a single Web-standard fetch handler.
  *
  * Both `src/node.ts` and `src/worker.ts` adapt this to their respective
  * runtimes (node:http server vs CF Worker `fetch` export). The handler
@@ -9,7 +9,7 @@
 
 import { transformRequest, type TransformOptions, type TransformInfo } from './transform.js';
 import { transformOpenAIChatCompletions } from './openai.js';
-import { isPixelpipeSupportedGptModel, isPixelpipeSupportedModel } from './applicability.js';
+import { isPxpipeSupportedGptModel, isPxpipeSupportedModel } from './applicability.js';
 import {
   buildBaselineCountTokensBody,
   buildCacheablePrefixCountTokensBody,
@@ -655,15 +655,15 @@ export function createProxy(config: ProxyConfig = {}) {
       try {
         const transformOpts =
           typeof config.transform === 'function' ? config.transform() : config.transform;
-        // Model-scope gate (proxy boundary): pixelpipe is validated only for
-        // the models in isPixelpipeSupportedModel (Fable 5) on the Anthropic
+        // Model-scope gate (proxy boundary): pxpipe is validated only for
+        // the models in isPxpipeSupportedModel (Fable 5) on the Anthropic
         // route; the OpenAI route has its own gate. Anything else passes
         // through untransformed. Fail-closed: an unreadable model means no
         // compression rather than a risky guess.
         const model = readModelField(bodyIn);
         const modelOk = isMessages
-          ? isPixelpipeSupportedModel(model)
-          : isPixelpipeSupportedGptModel(model);
+          ? isPxpipeSupportedModel(model)
+          : isPxpipeSupportedGptModel(model);
         const r = isMessages
           ? await transformRequest(
             bodyIn,
@@ -711,7 +711,7 @@ export function createProxy(config: ProxyConfig = {}) {
         }
       } catch (e) {
         fire(502, undefined, `transform_error: ${(e as Error).message}`);
-        return new Response(JSON.stringify({ error: 'pixelpipe transform failed' }), {
+        return new Response(JSON.stringify({ error: 'pxpipe transform failed' }), {
           status: 502,
           headers: { 'content-type': 'application/json' },
         });
@@ -740,7 +740,7 @@ export function createProxy(config: ProxyConfig = {}) {
       } as RequestInit);
     } catch (e) {
       fire(502, info, `upstream_error: ${(e as Error).message}`);
-      return new Response(JSON.stringify({ error: 'pixelpipe upstream unreachable' }), {
+      return new Response(JSON.stringify({ error: 'pxpipe upstream unreachable' }), {
         status: 502,
         headers: { 'content-type': 'application/json' },
       });

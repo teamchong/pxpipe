@@ -1,23 +1,23 @@
-import { isPixelpipeSupportedModel } from './applicability.js';
+import { isPxpipeSupportedModel } from './applicability.js';
 import { countCacheControlMarkers } from './measurement.js';
 import { transformRequest, type TransformInfo, type TransformOptions } from './transform.js';
 
 export type BytesLike = Uint8Array | ArrayBuffer | ArrayBufferView;
 
-export interface PixelpipeOptions extends Pick<TransformOptions, 'charsPerToken' | 'historyAmortizationHorizon'> {
+export interface PxpipeOptions extends Pick<TransformOptions, 'charsPerToken' | 'historyAmortizationHorizon'> {
   /** Test/debug-only bypass. Product hosts should prefer their dashboard setting. */
   readonly compress?: boolean;
 }
 
-export interface PixelpipeTransformInput {
+export interface PxpipeTransformInput {
   readonly body: BytesLike;
   /** Resolved upstream model when available; aliases are accepted for applicability checks. */
   readonly model?: string | null;
   readonly requestId?: string;
-  readonly options?: PixelpipeOptions;
+  readonly options?: PxpipeOptions;
 }
 
-export type PixelpipeReason =
+export type PxpipeReason =
   | 'applied'
   | 'unsupported_model'
   | 'parse_error'
@@ -28,10 +28,10 @@ export type PixelpipeReason =
   | 'transform_error'
   | 'passthrough';
 
-export interface PixelpipeTransformResult {
+export interface PxpipeTransformResult {
   readonly body: Uint8Array;
   readonly applied: boolean;
-  readonly reason: PixelpipeReason;
+  readonly reason: PxpipeReason;
   readonly detail?: string;
   readonly info: TransformInfo;
   readonly cache: {
@@ -61,7 +61,7 @@ function emptyInfo(reason: string): TransformInfo {
   };
 }
 
-function classifyReason(info: TransformInfo): PixelpipeReason {
+function classifyReason(info: TransformInfo): PxpipeReason {
   if (info.compressed) return 'applied';
   const r = info.reason ?? '';
   if (r.startsWith('parse_error')) return 'parse_error';
@@ -73,16 +73,16 @@ function classifyReason(info: TransformInfo): PixelpipeReason {
 }
 
 /**
- * Library-first wrapper around pixelpipe's Anthropic Messages transformer.
+ * Library-first wrapper around pxpipe's Anthropic Messages transformer.
  * It performs the Opus-4.6/4.7-only model gate, returns machine-readable reasons,
  * and reports cache_control ownership so hosts such as ocproxy do not stack a
- * second cache injector on top of pixelpipe's image breakpoint.
+ * second cache injector on top of pxpipe's image breakpoint.
  */
 export async function transformAnthropicMessages(
-  input: PixelpipeTransformInput,
-): Promise<PixelpipeTransformResult> {
+  input: PxpipeTransformInput,
+): Promise<PxpipeTransformResult> {
   const original = toUint8Array(input.body);
-  if (!isPixelpipeSupportedModel(input.model)) {
+  if (!isPxpipeSupportedModel(input.model)) {
     return {
       body: original,
       applied: false,

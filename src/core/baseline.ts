@@ -2,7 +2,7 @@
  * Cache-aware baseline math for the unproxied counterfactual.
  *
  * The whole point of the parallel count_tokens probe is to answer:
- *   "If the user had sent the ORIGINAL request (no pixelpipe) on this turn,
+ *   "If the user had sent the ORIGINAL request (no pxpipe) on this turn,
  *    against an unproxied cache that's been built up turn-by-turn the same
  *    way, what would Anthropic have billed?"
  *

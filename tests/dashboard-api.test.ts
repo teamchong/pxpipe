@@ -15,7 +15,7 @@ import type { SessionsPaths } from '../src/sessions.js';
 import type { TrackEvent } from '../src/core/tracker.js';
 
 function makeTmp(): SessionsPaths {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pixelpipe-dashapi-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pxpipe-dashapi-'));
   return {
     eventsFile: path.join(dir, 'events.jsonl'),
     sidecarDir: path.join(dir, '4xx-bodies'),
@@ -108,10 +108,10 @@ describe('serveSessionsJson', () => {
 
   it('respects ?project filtering', async () => {
     writeEvents(tmp, [
-      ev({ first_user_sha8: 'aaaaaaaa', cwd: '/Users/me/code/pixelpipe' }),
+      ev({ first_user_sha8: 'aaaaaaaa', cwd: '/Users/me/code/pxpipe' }),
       ev({ first_user_sha8: 'bbbbbbbb', cwd: '/Users/me/code/other' }),
     ]);
-    const res = await dash.serveSessionsJson({ project: 'pixelpipe' });
+    const res = await dash.serveSessionsJson({ project: 'pxpipe' });
     const body = await res.json();
     expect(body.count).toBe(1);
     expect(body.sessions[0].id).toBe('aaaaaaaa');

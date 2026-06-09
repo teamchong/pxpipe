@@ -107,7 +107,7 @@ export interface TransformOptions {
    *  always-collapse (rejected), cache-bust-driven (rejected). */
   historyAmortizationHorizon?: number;
   /** Tokens that the *un-rewritten* request would have hit Anthropic's cache
-   *  on (cache_read at 0.10×). When pixelpipe rewrites the cacheable prefix
+   *  on (cache_read at 0.10×). When pxpipe rewrites the cacheable prefix
    *  (slab compression, image substitution, history collapse), the new
    *  prefix has a different cache key — Anthropic charges cache_create
    *  (1.25×) on the new prefix's first turn, destroying the prior warm
@@ -129,7 +129,7 @@ export interface TransformOptions {
   /** Symmetric counterpart of `priorWarmTokens` for the IMAGE-mode side.
    *
    *  When the prior turn rendered the static prefix as image blocks
-   *  (pixelpipe applied), Anthropic's prompt cache holds the IMAGE prefix,
+   *  (pxpipe applied), Anthropic's prompt cache holds the IMAGE prefix,
    *  not the text prefix. Declining compression on this turn — sending
    *  plain text — invalidates the image-prefix cache key and forces a
    *  fresh `cache_create` on the un-rewritten text prefix. Symmetric to
@@ -292,8 +292,8 @@ export const SLAB_CHARS_PER_TOKEN = 2.0;
  *  so the 2.5 → 2.0 move here is doubly conservative.
  *
  *  Diagnostic that drove this change: 283/391 = 72% of measured Opus 4.7
- *  pixelpipe rows in the last 7 days carried
- *  pixelpipe_history_reason='not_profitable'. The break-even gate was
+ *  pxpipe rows in the last 7 days carried
+ *  pxpipe_history_reason='not_profitable'. The break-even gate was
  *  rejecting most history-collapse opportunities because it was
  *  comparing real image costs against a 30%-under-counted text cost.
  *
@@ -603,7 +603,7 @@ export function isCompressionProfitable(
    *  TEXT side — the cost of forcing a fresh cache_create on the
    *  un-rewritten text prefix when the rewritten image prefix was warm.
    *  Default 0 (back-compat; existing single-arg callers behave unchanged).
-   *  See PixelpipeOptions.priorWarmImageTokens for the foundational rationale. */
+   *  See PxpipeOptions.priorWarmImageTokens for the foundational rationale. */
   priorWarmImageTokens: number = 0,
   /** Shrink the rendered canvas width to the longest actual wrapped line.
    *  Default `true` (per-block content: tool_result, reminder, history).
@@ -1485,7 +1485,7 @@ function renderToolDoc(t: ToolDef, includeSchema: boolean): string {
 }
 
 function makeImageBlock(pngB64: string, _ephemeral = false): ImageBlock {
-  // Per Task #21: pixelpipe NEVER adds its own cache_control marker.
+  // Per Task #21: pxpipe NEVER adds its own cache_control marker.
   // Claude Code already places markers on system+tools, CLAUDE.md, and the
   // per-turn anchor; we honor those positions byte-identically and add
   // nothing of our own. The `_ephemeral` parameter is preserved for call-
@@ -1608,7 +1608,7 @@ function buildPagingMarker(args: {
       ? ` Showing first ${args.shownHeadLines} lines and last ${args.shownTailLines} lines.`
       : ` Showing first ${args.shownHeadLines} lines (tail elided).`;
   return (
-    `\n\n[ pixelpipe paging: omitted ${args.omittedLines.toLocaleString('en-US')} lines ` +
+    `\n\n[ pxpipe paging: omitted ${args.omittedLines.toLocaleString('en-US')} lines ` +
     `(${args.omittedChars.toLocaleString('en-US')} chars) of content here. ` +
     `Original length: ${args.originalChars.toLocaleString('en-US')} chars ` +
     `(${args.originalLines.toLocaleString('en-US')} lines, ~${args.originalEstImages} images).` +
@@ -2255,7 +2255,7 @@ export async function transformRequest(
       // profitability gate decide whether each block is worth converting.
       // If the source text block had a cache_control marker, it's moved
       // onto the LAST produced image so the cache anchors at the end of
-      // that content. pixelpipe never adds its own markers (Task #21) —
+      // that content. pxpipe never adds its own markers (Task #21) —
       // it only relocates ones the caller already set.
       const processedExisting: ContentBlock[] = [];
       if (o.compressReminders) {
@@ -2293,7 +2293,7 @@ export async function transformRequest(
             await textToImageBlocks(reminderText, o.cols, numCols);
           // Preserve any cache_control the caller set on this text block by
           // re-attaching it to the LAST produced image (cache anchors at the
-          // end of the content). pixelpipe never adds new markers — only
+          // end of the content). pxpipe never adds new markers — only
           // moves existing ones across the text→image flip (Task #21).
           const srcCacheControl = (blk as { cache_control?: unknown }).cache_control;
           for (let i = 0; i < imgs.length; i++) {
@@ -2437,7 +2437,7 @@ export async function transformRequest(
                   await textToImageBlocks(paged.text, o.cols, numCols);
                 // Preserve any cache_control the caller set on this inner
                 // text block (inside a tool_result) by re-attaching it to the
-                // LAST produced image. pixelpipe never adds new markers (Task #21).
+                // LAST produced image. pxpipe never adds new markers (Task #21).
                 const srcCacheControl = (ib as { cache_control?: unknown }).cache_control;
                 for (let i = 0; i < imgs.length; i++) {
                   const img = imgs[i]!;
@@ -2489,7 +2489,7 @@ export async function transformRequest(
   // the largest closed-prefix run into one prepended synthetic user
   // message. Live tail (HISTORY_DEFAULTS.keepTail turns + anything in an
   // open tool sequence) stays as text. History image carries NO
-  // cache_control — the static-slab breakpoint remains pixelpipe's sole
+  // cache_control — the static-slab breakpoint remains pxpipe's sole
   // breakpoint.
   //
   // The per-block break-even gate (`isCompressionProfitable`) is passed

@@ -1,7 +1,7 @@
 /**
  * Anonymized event shapes extracted from production `events.jsonl`.
  *
- * Source: a real Claude Code session against pixelpipe, 2026-05-19 → 2026-05-20.
+ * Source: a real Claude Code session against pxpipe, 2026-05-19 → 2026-05-20.
  * Each fixture captures the *shape* of an event (orig_chars, image_count,
  * baseline_tokens, gate decision) without any user content. Tests rebuild
  * synthetic text that matches the density (chars/row, lines-per-image) and

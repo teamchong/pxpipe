@@ -37,7 +37,7 @@ interface RuntimeConfig {
 
 function parseCli(argv: string[]): RuntimeConfig {
   // Only flags accepted are --help and --version. Anything else is an
-  // error — there is exactly ONE way to run pixelpipe and the dashboard
+  // error — there is exactly ONE way to run pxpipe and the dashboard
   // exposes every metric the operator might want to inspect.
   for (const a of argv) {
     if (a === '-h' || a === '--help') {
@@ -49,8 +49,8 @@ function parseCli(argv: string[]): RuntimeConfig {
       process.exit(0);
     }
     if (a.startsWith('-')) {
-      console.error(`[pixelpipe] unknown option: ${a}`);
-      console.error(`[pixelpipe] this build accepts no flags; run \`pixelpipe --help\` for env vars`);
+      console.error(`[pxpipe] unknown option: ${a}`);
+      console.error(`[pxpipe] this build accepts no flags; run \`pxpipe --help\` for env vars`);
       process.exit(2);
     }
   }
@@ -60,16 +60,16 @@ function parseCli(argv: string[]): RuntimeConfig {
     openAIUpstream: process.env.OPENAI_UPSTREAM ?? 'https://api.openai.com',
     openAIApiKey: process.env.OPENAI_API_KEY,
     eventsFile:
-      process.env.PIXELPIPE_LOG ??
-      path.join(os.homedir(), '.pixelpipe', 'events.jsonl'),
+      process.env.PXPIPE_LOG ??
+      path.join(os.homedir(), '.pxpipe', 'events.jsonl'),
   };
 }
 
 function printHelp(): void {
-  console.log(`pixelpipe — token-saving proxy for Claude Code
+  console.log(`pxpipe — token-saving proxy for Claude Code
 
 Usage:
-  pixelpipe                run the proxy (no flags)
+  pxpipe                run the proxy (no flags)
 
 The proxy always compresses tools, schemas, reminders, tool_results,
 and history; always tracks events to disk; and always measures real
@@ -87,7 +87,7 @@ Environment (deployment-only):
   ANTHROPIC_UPSTREAM      upstream API base (default https://api.anthropic.com)
   OPENAI_UPSTREAM         OpenAI API base (default https://api.openai.com)
   OPENAI_API_KEY          optional OpenAI key override; otherwise forwarded
-  PIXELPIPE_LOG           JSONL events path (default ~/.pixelpipe/events.jsonl)
+  PXPIPE_LOG              JSONL events path (default ~/.pxpipe/events.jsonl)
 
 Use with Claude Code:
   ANTHROPIC_BASE_URL=http://127.0.0.1:47821 claude
@@ -288,7 +288,7 @@ class FileTracker implements Tracker {
     } catch (err) {
       if (!this.brokenLogged) {
         console.error(
-          `[pixelpipe] FileTracker disabled — cannot open ${this.filePath}: ${(err as Error).message}`,
+          `[pxpipe] FileTracker disabled — cannot open ${this.filePath}: ${(err as Error).message}`,
         );
         this.brokenLogged = true;
       }
@@ -325,7 +325,7 @@ class FileTracker implements Tracker {
     } catch (err) {
       if (!this.brokenLogged) {
         console.error(
-          `[pixelpipe] FileTracker write failed: ${(err as Error).message}`,
+          `[pxpipe] FileTracker write failed: ${(err as Error).message}`,
         );
         this.brokenLogged = true;
       }
@@ -399,7 +399,7 @@ async function maybeWriteBodySidecar(
 // ---- main ----------------------------------------------------------------
 
 async function main(): Promise<void> {
-  // No subcommands — pixelpipe is just the proxy. Stats / sessions / cleanup
+  // No subcommands — pxpipe is just the proxy. Stats / sessions / cleanup
   // tools live in the dashboard (see http://127.0.0.1:${port}/).
   const argv = process.argv.slice(2);
   const opts = parseCli(argv);
@@ -472,14 +472,14 @@ async function main(): Promise<void> {
         const trimmed = e.errorBody.length > 400
           ? e.errorBody.slice(0, 400) + '…'
           : e.errorBody;
-        console.warn(`[pixelpipe ${e.status}] upstream body: ${trimmed}`);
+        console.warn(`[pxpipe ${e.status}] upstream body: ${trimmed}`);
       }
 
       // Canary: surface unknown tag-shaped blocks so a Claude Code release
       // that adds a new dynamic tag is caught within hours.
       if (e.info?.unknownStaticTags && e.info.unknownStaticTags.length > 0) {
         console.warn(
-          `[pixelpipe warn] unknown tag(s) in static slab: ${e.info.unknownStaticTags.join(', ')}  ` +
+          `[pxpipe warn] unknown tag(s) in static slab: ${e.info.unknownStaticTags.join(', ')}  ` +
             `— may need to add to DYNAMIC_BLOCK_TAGS (per-turn) or KNOWN_STATIC_TAGS (static) in src/core/transform.ts`,
         );
       }
@@ -501,7 +501,7 @@ async function main(): Promise<void> {
         // it (still too big to inline). We never lose the sha8 / error_body.
       }
 
-      // Persistent JSONL event for offline analysis (pixelpipe stats etc.).
+      // Persistent JSONL event for offline analysis (pxpipe stats etc.).
       tracker.emit(toTrackEvent(e));
     },
   };
@@ -526,22 +526,22 @@ async function main(): Promise<void> {
         await writeWebResponse(webRes, res);
       })
       .catch((err) => {
-        console.error('[pixelpipe] handler error:', err);
+        console.error('[pxpipe] handler error:', err);
         if (!res.headersSent) res.statusCode = 500;
         res.end();
       });
   });
 
   server.listen(opts.port, () => {
-    console.log(`[pixelpipe] listening on http://127.0.0.1:${opts.port}`);
-    console.log(`[pixelpipe] anthropic upstream → ${opts.upstream}`);
-    console.log(`[pixelpipe] openai upstream → ${opts.openAIUpstream}`);
-    console.log(`[pixelpipe] tracking events → ${opts.eventsFile}`);
-    console.log(`[pixelpipe] dashboard → http://127.0.0.1:${opts.port}/`);
+    console.log(`[pxpipe] listening on http://127.0.0.1:${opts.port}`);
+    console.log(`[pxpipe] anthropic upstream → ${opts.upstream}`);
+    console.log(`[pxpipe] openai upstream → ${opts.openAIUpstream}`);
+    console.log(`[pxpipe] tracking events → ${opts.eventsFile}`);
+    console.log(`[pxpipe] dashboard → http://127.0.0.1:${opts.port}/`);
   });
 
   const shutdown = (sig: string) => {
-    console.log(`[pixelpipe] ${sig} — shutting down`);
+    console.log(`[pxpipe] ${sig} — shutting down`);
     // Flush+close the tracker so we don't drop the last few events on exit.
     if (tracker instanceof FileTracker) tracker.close();
     server.close(() => process.exit(0));
@@ -551,6 +551,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  console.error('[pixelpipe] fatal:', err);
+  console.error('[pxpipe] fatal:', err);
   process.exit(1);
 });

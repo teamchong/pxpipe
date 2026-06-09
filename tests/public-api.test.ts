@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
   buildCountTokensBodies,
-  isPixelpipeSupportedGptModel,
-  isPixelpipeSupportedModel,
+  isPxpipeSupportedGptModel,
+  isPxpipeSupportedModel,
   shouldTransformAnthropicMessages,
   transformAnthropicMessages,
   transformOpenAIChatCompletions,
@@ -13,28 +13,28 @@ const dec = new TextDecoder();
 
 describe('public library API', () => {
   it('recognizes Fable 5 (with suffix aliases) and no other models as supported', () => {
-    expect(isPixelpipeSupportedModel('claude-fable-5')).toBe(true);
-    expect(isPixelpipeSupportedModel('claude-fable-5-high')).toBe(true);
+    expect(isPxpipeSupportedModel('claude-fable-5')).toBe(true);
+    expect(isPxpipeSupportedModel('claude-fable-5-high')).toBe(true);
     // Opus was the original measured scope (4.7+) but is disabled 2026-06-09:
     // Fable 5 reads renders at 100/100 vs Opus 4.8's 93/100 with identical
     // image billing, so the Opus read tax is no longer worth carrying.
-    expect(isPixelpipeSupportedModel('claude-opus-4-8')).toBe(false);
-    expect(isPixelpipeSupportedModel('claude-opus-4-7')).toBe(false);
-    expect(isPixelpipeSupportedModel('claude-opus-4-6')).toBe(false);
+    expect(isPxpipeSupportedModel('claude-opus-4-8')).toBe(false);
+    expect(isPxpipeSupportedModel('claude-opus-4-7')).toBe(false);
+    expect(isPxpipeSupportedModel('claude-opus-4-6')).toBe(false);
     // Mythos 5 shares the architecture but is unmeasured (no access).
-    expect(isPixelpipeSupportedModel('claude-mythos-5')).toBe(false);
-    expect(isPixelpipeSupportedModel('claude-fable-50')).toBe(false);
-    expect(isPixelpipeSupportedModel('claude-sonnet-4-7')).toBe(false);
-    expect(isPixelpipeSupportedModel(null)).toBe(false);
+    expect(isPxpipeSupportedModel('claude-mythos-5')).toBe(false);
+    expect(isPxpipeSupportedModel('claude-fable-50')).toBe(false);
+    expect(isPxpipeSupportedModel('claude-sonnet-4-7')).toBe(false);
+    expect(isPxpipeSupportedModel(null)).toBe(false);
   });
 
   it('recognizes only the GPT 5.5 family for OpenAI chat support', () => {
-    expect(isPixelpipeSupportedGptModel('gpt-5.5')).toBe(true);
-    expect(isPixelpipeSupportedGptModel('gpt-5.5-codex')).toBe(true);
-    expect(isPixelpipeSupportedGptModel('gpt-5.5-2026-06-01')).toBe(true);
-    expect(isPixelpipeSupportedGptModel('gpt-5.1')).toBe(false);
-    expect(isPixelpipeSupportedGptModel('claude-opus-4-8')).toBe(false);
-    expect(isPixelpipeSupportedGptModel(null)).toBe(false);
+    expect(isPxpipeSupportedGptModel('gpt-5.5')).toBe(true);
+    expect(isPxpipeSupportedGptModel('gpt-5.5-codex')).toBe(true);
+    expect(isPxpipeSupportedGptModel('gpt-5.5-2026-06-01')).toBe(true);
+    expect(isPxpipeSupportedGptModel('gpt-5.1')).toBe(false);
+    expect(isPxpipeSupportedGptModel('claude-opus-4-8')).toBe(false);
+    expect(isPxpipeSupportedGptModel(null)).toBe(false);
   });
 
   it('reports applicability with route/method/body gates', () => {
@@ -172,7 +172,7 @@ describe('public library API', () => {
     expect(transformed.reason).toBe('applied');
     expect(transformed.info.compressedChars).toBeGreaterThan(0);
     expect(transformed.info.imageCount).toBeGreaterThan(0);
-    // Task #21: pixelpipe never adds its own cache_control markers.
+    // Task #21: pxpipe never adds its own cache_control markers.
     // The caller sent zero markers, so the rewritten body also has zero.
     expect(transformed.cache.ownsCacheControl).toBe(false);
     expect(transformed.cache.markerCount).toBe(0);

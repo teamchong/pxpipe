@@ -29,7 +29,7 @@
   }
 </script>
 
-<h1><span class="dot"></span>pixelpipe</h1>
+<h1><span class="dot"></span>pxpipe</h1>
 <div class="sub">{sub}</div>
 
 <CompressionToggle />

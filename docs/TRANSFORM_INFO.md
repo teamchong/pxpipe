@@ -1,4 +1,4 @@
-# How pixelpipe compresses Claude Code requests
+# How pxpipe compresses Claude Code requests
 
 This doc explains what the proxy actually does on the wire, why each piece is
 shaped the way it is, and which invariants future contributors must not break.
@@ -12,7 +12,7 @@ CLAUDE.md project rules, the agent / subagent definitions, the tool catalogue
 with full input schemas, and a long list of internal "skill" reminders. On
 Opus-class models that prefix runs ~68K input tokens. The model never *needs*
 to re-read that text in token form — Anthropic prompt-caches it, and image
-blocks OCR cleanly at small font sizes. So pixelpipe pulls the static prefix
+blocks OCR cleanly at small font sizes. So pxpipe pulls the static prefix
 out of the JSON body, renders it as one or more grayscale PNG image blocks,
 and pins a single `cache_control` breakpoint on the last image. Anthropic
 charges roughly `ceil(W*H/750)` tokens per image; our renderer caps each image
@@ -189,13 +189,13 @@ anything on the render path, that test must continue to pass.
 The transform also emits three SHA-256-prefixed (first 8 hex chars, 32 bits —
 collision-safe for the request volume a single proxy instance sees)
 fingerprints. They live on the `TransformInfo` struct and get persisted to the
-JSONL event log so `pixelpipe stats` can analyze them:
+JSONL event log so `pxpipe stats` can analyze them:
 
 - **`systemSha8`** — hash of the exact text that goes into the image (static
   slab + folded tool docs, joined with `\n\n`). If this value repeats across
   turns, the cache_control breakpoint *should* be hitting upstream.
   Mismatched `systemSha8` between turns is the signal that prompt drift is
-  killing your cache hit rate; check `pixelpipe stats` for the
+  killing your cache hit rate; check `pxpipe stats` for the
   `system_sha8 reuse rate` line.
 - **`claudeMdSha8`** — hash of just the CLAUDE.md section, if detectable by
   the heuristic in `extractClaudeMdSlab` (`src/core/transform.ts:231`). Lets
@@ -221,7 +221,7 @@ splitting, it sweeps the *static* slab for any other tag-shaped opening
 (`<foo>...</foo>` with `foo` under 64 chars, alphanumeric / dot / dash /
 underscore) and emits the tag names on `info.unknownStaticTags`. Both the
 Node host (`src/node.ts:367`) and the Worker (`src/worker.ts:74`) log a
-warning to stderr / Workers Logs when this array is non-empty. `pixelpipe
+warning to stderr / Workers Logs when this array is non-empty. `pxpipe
 stats` also tallies these tag names across the JSONL log.
 
 `<types>` is a *static* tag used inside Claude Code's built-in tool docs
@@ -278,7 +278,7 @@ saved    = baseline - effective
 ```
 
 The dashboard's "tokens saved" and "$ saved" cards (and
-`pixelpipe stats` for the offline aggregate) both surface these numbers.
+`pxpipe stats` for the offline aggregate) both surface these numbers.
 The $ figure in `src/dashboard.ts` uses a fixed per-Mtok input rate — note
 Fable 5 (the current supported model) bills $10/M input, so re-check the
 constant if you care about the dollar card.
@@ -289,7 +289,7 @@ the same codebase where the image cache is warm and the cumulative
 tool_result history is large. A short session with no warm cache may save
 much less. The first turn always pays cache-creation cost; cache-read
 amortization kicks in from turn 2 onwards. Cite the per-session number that
-`pixelpipe stats` reports, not the headline.
+`pxpipe stats` reports, not the headline.
 
 ## 9. What deliberately did NOT get built
 
@@ -330,6 +330,6 @@ same proxy logic, `JsonLogTracker` writes to Workers Logs via `console.log`
 strips heavy fields (the `firstImagePng` byte buffer) before persistence.
 `src/dashboard.ts` aggregates events in memory for the Node live view (capped
 ring buffer, ~50 most recent calls). `src/stats.ts` is the offline aggregator
-that powers `pixelpipe stats`; it streams the JSONL file line-by-line so
+that powers `pxpipe stats`; it streams the JSONL file line-by-line so
 100 MB logs don't blow the heap. Tests live in `tests/` and pin the
 invariants — byte-output determinism most of all (see section 6).

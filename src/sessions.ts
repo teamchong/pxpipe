@@ -8,7 +8,7 @@
  * sha256 prefix of the conversation's first user message. Within a single
  * Claude Code session that hash is stable across every turn; across two
  * different sessions it is virtually never the same. That makes it a
- * better-than-good-enough session key without coupling pixelpipe to Claude
+ * better-than-good-enough session key without coupling pxpipe to Claude
  * Code's internal file layout for *correctness*.
  *
  * We *do* read `~/.claude/projects/` opportunistically (see `claudeCodeMap`)
@@ -18,8 +18,8 @@
  *
  * ## File layout we manage
  *
- * - `~/.pixelpipe/events.jsonl` — append-only JSONL written by FileTracker
- * - `~/.pixelpipe/4xx-bodies/${iso-ts}-${sha8}.json.gz` — gzipped failure
+ * - `~/.pxpipe/events.jsonl` — append-only JSONL written by FileTracker
+ * - `~/.pxpipe/4xx-bodies/${iso-ts}-${sha8}.json.gz` — gzipped failure
  *   bodies referenced from JSONL rows via `req_body_sample_path`
  */
 
@@ -83,7 +83,7 @@ export interface SessionsPaths {
 export function defaultPaths(): SessionsPaths {
   const home = os.homedir();
   const eventsFile =
-    process.env.PIXELPIPE_LOG ?? path.join(home, '.pixelpipe', 'events.jsonl');
+    process.env.PXPIPE_LOG ?? path.join(home, '.pxpipe', 'events.jsonl');
   // The sidecar directory is `4xx-bodies` next to the events file, matching
   // what src/node.ts writes.
   const sidecarDir = path.join(path.dirname(eventsFile), '4xx-bodies');
@@ -94,7 +94,7 @@ export function defaultPaths(): SessionsPaths {
 
 /** Lazily stream events.jsonl line by line. Yields parsed TrackEvents plus
  *  the raw line (we need byte length for jsonlBytes accounting). Malformed
- *  lines are silently dropped — matches `pixelpipe stats` behavior. */
+ *  lines are silently dropped — matches `pxpipe stats` behavior. */
 export async function* readEvents(
   eventsFile: string,
 ): AsyncGenerator<{ ev: TrackEvent; rawBytes: number }> {
@@ -569,7 +569,7 @@ export function decodeClaudeProjectDir(name: string): string {
 /**
  * Best-effort scan of `~/.claude/projects/*.jsonl`. Returns a map keyed by
  * the same `first_user_sha8` the proxy emits. If `~/.claude/projects/` is
- * missing, returns an empty map without throwing — pixelpipe must keep
+ * missing, returns an empty map without throwing — pxpipe must keep
  * working for non-Claude-Code clients.
  *
  * This is O(number_of_sessions) file opens. On a heavy user's machine

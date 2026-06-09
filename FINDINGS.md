@@ -1,6 +1,6 @@
-# FINDINGS — pixelpipe (text→PNG token compression)
+# FINDINGS — pxpipe (text→PNG token compression)
 
-**Status:** ⚠️ **VERDICT REVERSED — see correction below.** Originally ruled "dead"; live measurement shows pixelpipe is a working *lossy gist-compressor* saving ~68% on real (dense) Claude Code traffic, with a known verbatim-recall gap.
+**Status:** ⚠️ **VERDICT REVERSED — see correction below.** Originally ruled "dead"; live measurement shows pxpipe is a working *lossy gist-compressor* saving ~68% on real (dense) Claude Code traffic, with a known verbatim-recall gap.
 **Date:** 2026-05-28 (original) · 2026-05-29 (correction) · 2026-06-09 (Fable 5 update)
 **Models tested:** `claude-opus-4-5` (original run), `claude-opus-4-8` (re-test after a model bump), `claude-fable-5` (2026-06-09)
 **Model scope (current):** Fable 5 only, enforced in library + proxy (Opus disabled 2026-06-09 — see update below).
@@ -18,7 +18,7 @@ narrowed the production gate from Opus 4.7+ to `claude-fable-5` only.
 | arm | opus-4-8 | fable-5 |
 |---|---:|---:|
 | text baseline | 100/100 | 100/100 |
-| pixelpipe image | 93/100 | **100/100** |
+| pxpipe image | 93/100 | **100/100** |
 
 The ~7% Opus read tax — the main per-read cost of imaging — is gone on Fable.
 
@@ -38,7 +38,7 @@ documented failure mode, a single-glyph silent misread (`125f9e6e1c77` →
 
 **4. Economics.** Fable is $10/$50 per MTok (2× Opus 4.8). Token-for-token
 savings are identical (same tokenizer), so every saved token is worth 2× the
-dollars — pixelpipe is more valuable on Fable in absolute terms.
+dollars — pxpipe is more valuable on Fable in absolute terms.
 
 **Decision:** support Fable 5 only. Opus 4.7/4.8 disabled — with a tax-free
 reader available, shipping a known 7% misread rate is the wrong default.
@@ -53,22 +53,22 @@ The "Dead" verdict below rested on three stacked mistakes. Naming them, because 
 
 1. **Wrong cost model.** The economics were computed on English prose (~3.5 chars/token), where images lose. Real Claude Code traffic is token-*dense* — JSON, code, tool output, hashes at ~1 char/token (this repo's own `MEMORY.md` recorded a 1.17 char/token median and warned against the prose default; I pasted that warning in as a caveat and then used prose anyway). On a live, multi-session run the proxy measured **856k → 277k input tokens (~68% fewer)**, at **3.1 chars per image-token vs ~1.0 as text** — images win ~3× on the real workload.
 
-2. **Generalized the worst case to the whole product.** The 0/15 needle eval is the single hardest thing you can ask a lossy gist compressor: exact recovery of a random 12-char hex. That is not pixelpipe's job — its job is letting the model skim bulk history by gist. The worst-case sub-task failing was a real finding; calling the *product* dead from it was not.
+2. **Generalized the worst case to the whole product.** The 0/15 needle eval is the single hardest thing you can ask a lossy gist compressor: exact recovery of a random 12-char hex. That is not pxpipe's job — its job is letting the model skim bulk history by gist. The worst-case sub-task failing was a real finding; calling the *product* dead from it was not.
 
 3. **Never checked it was actually running.** The investigation theorized "if you sent this to Opus…" while a successful, transparent A/B was running underneath the whole time (`ANTHROPIC_BASE_URL=127.0.0.1:47821`; event log showing `compressed:true, 152 images/request`). I asserted the interactive session bypassed the proxy without looking. It didn't.
 
 **What still stands (unchanged, and the important caveat):** verbatim retrieval is **0/15** on both model generations, and the failure mode is **silent confabulation** — imaged content returns a plausible *wrong* value, not an error. Therefore:
 
-* pixelpipe is a **lossy, recency-graded gist tier**: recent turns stay text, older bulk history becomes images. Safe to navigate by gist; **unsafe as the sole copy of anything needed byte-exact** (IDs, hashes, secrets, exact numbers).
+* pxpipe is a **lossy, recency-graded gist tier**: recent turns stay text, older bulk history becomes images. Safe to navigate by gist; **unsafe as the sole copy of anything needed byte-exact** (IDs, hashes, secrets, exact numbers).
 * the one **open item** before this is production-ready is a **verbatim-risk guard** in the gate — never image blocks carrying unique IDs / hashes / exact values. Not yet built.
 
-**Corrected one-liner:** the encoder limit kills *verbatim*; it does **not** kill the product. On dense traffic pixelpipe is a real ~68% gist compressor with one fixable silent-confabulation gap — measured live, apples-to-apples, on Opus 4.8. Everything below this line is the original (superseded) "dead" writeup, preserved.
+**Corrected one-liner:** the encoder limit kills *verbatim*; it does **not** kill the product. On dense traffic pxpipe is a real ~68% gist compressor with one fixable silent-confabulation gap — measured live, apples-to-apples, on Opus 4.8. Everything below this line is the original (superseded) "dead" writeup, preserved.
 
 ---
 
 ## Original TL;DR (superseded 2026-05-29 — see verdict above)
 
-pixelpipe rewrites Claude Code tool-result text into compact PNGs before they reach
+pxpipe rewrites Claude Code tool-result text into compact PNGs before they reach
 the model, betting that vision tokens for a dense image are cheaper than the same
 content delivered as transcript text. **The tokens are cheaper. The model cannot
 read the content back.** That is the whole story.
@@ -84,7 +84,7 @@ round numbers (two-proportion test across the model bump: z≈0.76, **p≈0.45**
 its failure mode is **silent confabulation** — which is worse than an error,
 because the caller can't tell.
 
-pixelpipe is theater. The image *is* sent and the model *acknowledges seeing it*,
+pxpipe is theater. The image *is* sent and the model *acknowledges seeing it*,
 but it cannot extract either verbatim strings or specific facts from it. The token
 "savings" come from Opus quietly throwing the content away.
 
@@ -118,7 +118,7 @@ is decorative and the savings are fake.
   - **verbatim** — a random 12-char hex needle (`VARIABLE x IS ASSIGNED THE VALUE
     <hex>`), asked back exactly. This is the OCR-hard case.
   - **semantic** — a specific fact stated in the rendered tool-reference doc (e.g.
-    "what is the default timeout for `net.fetch`?"). This is pixelpipe's *actual*
+    "what is the default timeout for `net.fetch`?"). This is pxpipe's *actual*
     sales pitch: "comprehension over bulky docs."
 
 **Controlled:** identical needle/haystack across ON and OFF; image is 1568×1276
@@ -166,7 +166,7 @@ image at all. Verbatim stayed at a hard zero across both versions.
 
 Before writing the tombstone we isolated **encoder incapability** from a
 **rendering/density** problem by feeding Opus custom images directly (same vision
-path, bypassing pixelpipe's specific renderer; `eval/needle-haystack/crux.py`).
+path, bypassing pxpipe's specific renderer; `eval/needle-haystack/crux.py`).
 
 | tier | rendering | result |
 |---|---|---|
@@ -175,12 +175,12 @@ path, bypassing pixelpipe's specific renderer; `eval/needle-haystack/crux.py`).
 
 **The encoder is not fundamentally hex-blind.** When glyphs are large and isolated
 it nails them. So the 0/15 was never an encoder wall — it is a
-**density / resolution-per-character** problem. pixelpipe's ~8pt wall-to-wall
+**density / resolution-per-character** problem. pxpipe's ~8pt wall-to-wall
 filler was simply below the glyph-resolution floor.
 
 ### Phase 4 — Density sweep: where does it break, and is the readable zone economical?
 
-We swept font size **down** from "clean" at fixed pixelpipe dimensions
+We swept font size **down** from "clean" at fixed pxpipe dimensions
 (`eval/needle-haystack/sweep.py`, ~2,668 image tokens throughout):
 
 | font | retrieval | chars/image | failure mode |
@@ -266,7 +266,7 @@ outstanding for semantic."
 ## What this proves / doesn't prove
 
 **Proven:**
-- pixelpipe **as built** does not work. Verbatim retrieval is zero across two model
+- pxpipe **as built** does not work. Verbatim retrieval is zero across two model
   versions; prose-density compression loses money in the readable zone.
 - The failure is architectural (encoder is a summarizer, not an OCR; image cost is a
   fixed token canvas), not a tuning parameter. Font size, resolution, and "try
@@ -329,7 +329,7 @@ Preserved under `eval/needle-haystack/` (copied from the volatile `/tmp/needle_e
 | `crux.py` | direct-to-Opus billboard/clean encoder test (Phase 3) |
 | `sweep.py` | fixed-dimension font-size density sweep (Phase 4) |
 
-Run: start the pixelpipe proxy (`127.0.0.1:47821`), then
+Run: start the pxpipe proxy (`127.0.0.1:47821`), then
 `cd eval/needle-haystack && ./run3.sh`. Requires a `claude` CLI on a MAX plan
 (no API key needed) and PIL + a monospace TTF for the Python tiers.
 
@@ -340,7 +340,7 @@ rows. The `4-8` raw rows are in `results2.tsv` and Appendix B.
 ## Appendix B — Raw `opus-4-8` data (Phase 2)
 
 **verbatim / ON:** 15/15 returned **empty** — not garbled, not a near-miss. The
-encoder never resolved character-level glyphs at pixelpipe's density; it saw "a
+encoder never resolved character-level glyphs at pxpipe's density; it saw "a
 block of code-like texture" and gave up.
 
 **semantic / ON — the confabulations** (expected → got; the dangerous part is these

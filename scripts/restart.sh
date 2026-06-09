@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Restart the local pixelpipe proxy.
+# Restart the local pxpipe proxy.
 #
 # What this does, in order:
-#   1. Discover every running pixelpipe proxy via `pgrep -f "node.*bin/cli.js"`
+#   1. Discover every running pxpipe proxy via `pgrep -f "node.*bin/cli.js"`
 #      and list them. If multiple are running (orphans from a prior crashed
 #      session), kill all of them — there's no "right" oldest in a graceful
 #      restart, we want a clean slate.
@@ -29,7 +29,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-# --- Parse our own flags out of "$@". --no-build only — pixelpipe takes none. ----
+# --- Parse our own flags out of "$@". --no-build only — pxpipe takes none. ----
 DO_BUILD=1
 for arg in "$@"; do
   case "$arg" in
@@ -38,7 +38,7 @@ for arg in "$@"; do
       ;;
     *)
       echo "[restart] unknown argument: $arg" >&2
-      echo "[restart] this script only accepts --no-build (pixelpipe takes no flags)" >&2
+      echo "[restart] this script only accepts --no-build (pxpipe takes no flags)" >&2
       exit 2
       ;;
   esac
@@ -53,7 +53,7 @@ PIDS_RAW=$(pgrep -f 'node.*bin/[c]li\.js' 2>/dev/null || true)
 if [ -n "$PIDS_RAW" ]; then
   # Convert to space-separated list, sorted numerically for stable output.
   PIDS=$(echo "$PIDS_RAW" | tr '\n' ' ' | xargs -n1 | sort -n | tr '\n' ' ')
-  echo "[restart] found running pixelpipe proxy PID(s): $PIDS"
+  echo "[restart] found running pxpipe proxy PID(s): $PIDS"
 
   # --- 2. SIGTERM all of them ---
   for pid in $PIDS; do
@@ -104,7 +104,7 @@ if command -v lsof >/dev/null 2>&1; then
     HOLDER_CMD=$(ps -o command= -p "$HOLDER" 2>/dev/null || echo "?")
     echo "[restart] ERROR: port $TARGET_PORT is still held by PID $HOLDER:" >&2
     echo "    $HOLDER_CMD" >&2
-    echo "  Hint: if that's a pixelpipe proxy our SIGTERM should have cleared," >&2
+    echo "  Hint: if that's a pxpipe proxy our SIGTERM should have cleared," >&2
     echo "  it may have been started outside this repo. Free the port and rerun." >&2
     exit 1
   fi

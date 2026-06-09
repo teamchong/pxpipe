@@ -13,7 +13,7 @@ import type { TrackEvent } from '../src/core/tracker.js';
 
 /** Build a tmpdir with a fresh events.jsonl and 4xx-bodies/ for each test. */
 function makeTmp(): SessionsPaths {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pixelpipe-sessions-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pxpipe-sessions-'));
   const eventsFile = path.join(dir, 'events.jsonl');
   const sidecarDir = path.join(dir, '4xx-bodies');
   return { eventsFile, sidecarDir };
@@ -207,11 +207,11 @@ describe('aggregateSessions', () => {
 describe('filterSessions', () => {
   it('filters by project (substring match)', async () => {
     writeEvents(tmp, [
-      ev({ first_user_sha8: 'aaaaaaaa', cwd: '/Users/me/code/pixelpipe' }),
+      ev({ first_user_sha8: 'aaaaaaaa', cwd: '/Users/me/code/pxpipe' }),
       ev({ first_user_sha8: 'bbbbbbbb', cwd: '/Users/me/code/other' }),
     ]);
     const { sessions } = await aggregateSessions(tmp);
-    expect(filterSessions(sessions, { project: 'pixelpipe' }).map((s) => s.id)).toEqual([
+    expect(filterSessions(sessions, { project: 'pxpipe' }).map((s) => s.id)).toEqual([
       'aaaaaaaa',
     ]);
     expect(filterSessions(sessions, { project: 'other' }).map((s) => s.id)).toEqual([
@@ -254,7 +254,7 @@ describe('Claude Code session map', () => {
   /** Build a synthetic `~/.claude/projects/<proj>/<session>.jsonl` tree under
    *  a tmpdir and return the root path. */
   function makeCCRoot(): string {
-    return fs.mkdtempSync(path.join(os.tmpdir(), 'pixelpipe-ccmap-'));
+    return fs.mkdtempSync(path.join(os.tmpdir(), 'pxpipe-ccmap-'));
   }
 
   it('returns an empty map when the directory does not exist', async () => {
@@ -264,7 +264,7 @@ describe('Claude Code session map', () => {
 
   it('fingerprints the first user message and maps to the session id', async () => {
     const root = makeCCRoot();
-    const proj = path.join(root, '-Users-me-code-pixelpipe');
+    const proj = path.join(root, '-Users-me-code-pxpipe');
     fs.mkdirSync(proj, { recursive: true });
     const firstUser = 'hello, this is the start of a conversation';
     const sessionFile = path.join(proj, 'abc-123.jsonl');
@@ -282,7 +282,7 @@ describe('Claude Code session map', () => {
     const ref = m.get(expectedSha);
     expect(ref).toBeDefined();
     expect(ref!.sessionId).toBe('abc-123');
-    expect(ref!.projectPath).toBe('/Users/me/code/pixelpipe');
+    expect(ref!.projectPath).toBe('/Users/me/code/pxpipe');
     expect(ref!.firstUserPreview).toContain('hello');
   });
 

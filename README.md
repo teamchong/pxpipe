@@ -26,7 +26,7 @@ eval (see benchmarks).*
 ## Try it (30 seconds)
 
 ```bash
-npx pxpipe                                        # proxy on 127.0.0.1:47821
+npx pxpipe-proxy                                  # proxy on 127.0.0.1:47821
 ANTHROPIC_BASE_URL=http://localhost:47821 claude  # point Claude Code at it
 ```
 

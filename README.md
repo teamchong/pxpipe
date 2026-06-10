@@ -14,7 +14,7 @@ actual). Single sessions measure ~68%.
 
 This is what the model sees instead of text:
 
-![example: 5,000 chars of TypeScript rendered as one 908×880 PNG](docs/assets/example-render.png)
+![example: ~17k chars of tool-result JSON + prose rendered as one dense 1573×1280 page (what the dashboard shows)](docs/assets/example-render.png)
 
 *5,000 characters of source code — ≈1,250 text tokens as a transcript, ≈530
 image tokens as this PNG. The model reads it at 100/100 on a clean eval (see

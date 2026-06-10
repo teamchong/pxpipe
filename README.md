@@ -8,9 +8,12 @@ image-token vs ~1 char per text-token on real Claude Code traffic. pxpipe is a
 local proxy that exploits that gap: it rewrites the bulky middle of your
 conversation into compact PNGs before the request leaves your machine.
 
-Running against real Claude Code sessions, the production log shows
-**77% input tokens saved across 6,691 requests** (3.21B baseline → 735M
-actual). Single sessions measure ~68%.
+Running against real Claude Code sessions, the production log (13,709
+requests) shows: a **$100 total bill becomes ~$41** — full dollar math, input
++ cache writes at 1.25× + cache reads at 0.1× + output at 5×, including the
+~6k small requests pxpipe correctly leaves untouched. On the large requests it
+actually compresses (7,756 of them), $100 of spend becomes ~$28. Quote the
+59%; the 72% only applies to touched requests.
 
 This is what the model sees instead of text:
 

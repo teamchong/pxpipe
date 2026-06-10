@@ -290,7 +290,11 @@ const OUTPUT_TOKEN_RATE = 5.0;
  *  actual target model; do not trust hardcoded chars-per-token or
  *  tokens-per-image constants on 4.7 without verifying against the
  *  upstream probe. */
-export const ASSUMED_INPUT_USD_PER_MTOK = 5.0;
+// 2026-06-09: gate is Fable-5-only and Fable 5 bills $10/MTok input,
+// so the dashboard dollar figure uses that rate. Output tokens are
+// excluded entirely (the proxy can't move them), so this still
+// understates the real bill - treat it as "input-side $ saved".
+export const ASSUMED_INPUT_USD_PER_MTOK = 10.0;
 
 export class DashboardState {
   private recent: RecentRow[] = [];

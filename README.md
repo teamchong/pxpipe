@@ -14,7 +14,7 @@ actual). Single sessions measure ~68%.
 
 This is what the model sees instead of text:
 
-![example: a real `transformRequest` output — system prompt + tool docs reflowed into one dense 1573×1248 page, instruction banner on top, ↵ marking original newlines](docs/assets/example-render.png)
+![example: a real `transformRequest` output — system prompt + tool docs reflowed into one dense 1573×1248 page, instruction banner on top, ↵ marking original newlines](https://raw.githubusercontent.com/teamchong/pxpipe/main/docs/assets/example-render.png)
 
 *~48k characters of system prompt + tool docs (this repo's own README,
 FINDINGS, and source) — ≈25k tokens as text, ≈2.7k image tokens as this page.

@@ -16,9 +16,10 @@ This is what the model sees instead of text:
 
 ![example: ~17k chars of tool-result JSON + prose rendered as one dense 1573×1280 page (what the dashboard shows)](docs/assets/example-render.png)
 
-*5,000 characters of source code — ≈1,250 text tokens as a transcript, ≈530
-image tokens as this PNG. The model reads it at 100/100 on a clean eval (see
-benchmarks).*
+*~17k characters of tool-result JSON and prose — ≈9k text tokens as a
+transcript, ≈2.7k image tokens as this page. Synthetic content with the same
+shape as real traffic; the model reads renders like this at 100/100 on a clean
+eval (see benchmarks).*
 
 ## Try it (30 seconds)
 

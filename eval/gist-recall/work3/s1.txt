@@ -1,0 +1,1004 @@
+=== session s1 transcript ===
+[tool_use Read]
+{"file_path":"src/core/proxy.ts"}
+[tool_result]
+
+        : imageBlock,
+    );
+  }
+  info.imageCount = imageBlocks.length;
+  // Static slab made it through the break-even gate and rendered. Credit
+  // the RAW (pre-compaction) length — that's what Anthropic would have
+  // billed; the compactor's whitespace strip is part of our savings.
+  info.compressedChars += combinedRaw.length;
+  // Phase 1 (Task #18): per-bucket char attribution. Credit the same RAW
+  // length to the `static_slab` bucket so the rolling cpt regression can
+  // bucket-fit chars/token by call site instead of relying on one global
+  // constant. Mirrors the `compressedChars` accounting exactly.
+  bumpBucket(info, 'static_slab', combinedRaw.length);
+  // Stash the first image's raw bytes + dimensions for the dashboard preview.
+  // Stripped before persisting to JSONL by toTrackEvent. Memory cost is bounded
+  // (we only ever keep ONE — the latest — via the dashboard's replace-on-update).
+  if (images.length > 0) {
+    info.firstImagePng = images[0]!.png;
+    info.firstImageWidth = images[0]!.width;
+    info.firstImageHeight = images[0]!.height;
+    info.imagePngs = images.map((i) => i.png);
+    info.imageDims = images.map((i) => ({ width: i.width, height: i.height }));
+    info.imageSourceText = combinedWithHeader.slice(0, 65_536);
+  }
+
+  // 4. Splice images back into the request.
+  // Cache-friendly layout:
+  //   [intro text]                 ← static (helps OCR framing)
+  //   [image block(s)]             ← static; LAST one carries cache_control
+  //   ─── cache breakpoint ───
+  //   [end-marker + dynamic + billing]  ← per-turn, NO cache_control
+  //   [sysRemainder]               ← any non-text blocks the caller had
+  // OCR framing (instruction header + column/reflow notes) is now baked into
+  // the image itself — see `imageInstructionHeader` above. No standalone
+  // TextBlock is emitted before the image. The tail closer below still sits
+  // as plain text after the image so the model knows where rendered context
+  // ends and per-turn dynamic content begins.
+  const tailParts: string[] = ['[End of rendered context.]'];
+  if (dynamicText) tailParts.push(dynamicText);
+  if (billingLine) tailParts.push(billingLine);
+  const tailText = tailParts.join('\n\n');
+
+  // Image blocks ALWAYS go into the first user message — Anthropic's `system`
+  // field rejects images with `400 system.N.type: Input should be 'text'`.
+  // The system field stays as cheap text (billing line + dynamic blocks +
+  // sysRemainder) so the model still sees env / context info.
+  {
+    const sysTail: SystemField = [];
+    if (billingLine) sysTail.push({ type: 'text', text: billingLine });
+    if (dynamicText) sysTail.push({ type: 'text', text: dynamicText });
+    if (Array.isArray(sysRemainder)) sysTail.push(...sysRemainder);
+    req.system = sysTail.length > 0 ? sysTail : undefined;
+
+    const firstUserIdx = (req.messages ?? []).findIndex((m) => m.role === 'user');
+    if (firstUserIdx >= 0) {
+      const m = req.messages![firstUserIdx]!;
+      const existing = Array.isArray(m.content)
+        ? m.content
+        : [{ type: 'text' as const, text: m.content }];
+
+      // 5a. User-message text compression — long text blocks in the first
+      // user message get re-injected every turn; rendering them to images
+      // amortizes the cost. ALL eligible text blocks compress (not just
+      // <system-reminder>-prefixed ones); the per-block coarse threshold +
+      // profitability gate decide whether each block is worth converting.
+      // If the source text block had a cache_control marker, it's moved
+      // onto the LAST produced image so the cache anchors at the end of
+      // that content. pxpipe never adds its own markers (Task #21) —
+      // it only relocates ones the caller already set.
+      const processedExisting: ContentBlock[] = [];
+      if (o.compressReminders) {
+        for (const blk of existing) {
+          const isReminderText =
+            blk &&
+            (blk as TextBlock).type === 'text' &&
+            typeof (blk as TextBlock).text === 'string' &&
+            (blk as TextBlock).text.trimStart().startsWith('<system-reminder>');
+          if (!isReminderText) {
+            processedExisting.push(blk);
+            continue;
+          }
+          const textLen = (blk as TextBlock).text.length;
+          if (textLen < o.minReminderChars) {
+            // Below coarse threshold; can't possibly be profitable. Skip.
+            bumpPassthrough(info, 'below_threshold');
+            processedExisting.push(bl
+[assistant]
+Reviewed src/core/proxy.ts.
+[user]
+set BATCH_WINDOW_MS to 5400 to start.
+[assistant]
+BATCH_WINDOW_MS=5400 committed.
+[tool_use Read]
+{"file_path":"src/core/proxy.ts"}
+[tool_result]
+    compressed: false,
+    origChars: 0,
+    compressedChars: 0,
+    imageCount: 0,
+    imageBytes: 0,
+    staticChars: 0,
+    dynamicChars: 0,
+    dynamicBlockCount: 0,
+    droppedChars: 0,
+  };
+  // Per-request codepoint drop histogram. Merged from every render call
+  // (static slab + reminder + tool_result compressions). Serialized to
+  // `info.droppedCodepointsTop` at the end of transformRequest IF non-empty.
+  const droppedCodepoints = new Map<number, number>();
+
+  if (!o.compress) {
+    info.reason = 'compress=false';
+    return { body, info };
+  }
+
+  let req: MessagesRequest;
+  try {
+    req = JSON.parse(new TextDecoder().decode(body));
+  } catch (e) {
+    info.reason = `parse_error: ${(e as Error).message}`;
+    return { body, info };
+  }
+
+  // 1. Pull system text out. Split into:
+  //    - billingLine: Claude Code's per-turn random header (must NOT be cached).
+  //    - dynamicText: <env>/<context>/... blocks (per-turn, kept as text).
+  //    - staticText: everything else (cacheable, goes into the image).
+  const systemStaticCacheControl = lastStaticSystemCacheControl(req.system);
+  const { text: rawSysText, kept: sysRemainder } = extractSystemText(req.system);
+  const { kept: billingLine, body: sysBody } = stripBillingLine(rawSysText);
+  const {
+    staticText,
+    dynamicText,
+    blockCount: dynBlocks,
+    unknownTags,
+  } = splitStaticDynamic(sysBody);
+  info.staticChars = staticText.length;
+  info.dynamicChars = dynamicText.length;
+  info.dynamicBlockCount = dynBlocks;
+  if (unknownTags.length > 0) info.unknownStaticTags = unknownTags;
+  // Parse env fields out of the dynamic slab — telemetry only, never mutates.
+  const env = extractEnvFields(dynamicText);
+  if (Object.keys(env).length > 0) info.env = env;
+
+  // Privacy-safe fingerprints that don't depend on tool docs (computed
+  // here so they're available even if we below_min_chars out below).
+  // systemSha8 is set later, after we know the combined image-bound text.
+  const claudeMdSlab = extractClaudeMdSlab(staticText);
+  const firstUser = firstUserText(req);
+  const [claudeMdSha, firstUserSha] = await Promise.all([
+    claudeMdSlab ? sha8(claudeMdSlab) : Promise.resolve(undefined),
+    firstUser ? sha8(firstUser) : Promise.resolve(undefined),
+  ]);
+  if (claudeMdSha) info.claudeMdSha8 = claudeMdSha;
+  if (firstUserSha) info.firstUserSha8 = firstUserSha;
+
+  // 2. Optionally fold tool docs into the same image, stubbing originals.
+  let toolDocsText = '';
+  let toolsRewritten: ToolDef[] | undefined;
+  if (o.compressTools && Array.isArray(req.tools) && req.tools.length > 0) {
+    const docs: string[] = [];
+    let sawSchemaNoProps = false;
+    toolsRewritten = req.tools.map((t) => {
+      docs.push(renderToolDoc(t, o.compressSchemas));
+      // Preserve the schema's STRUCTURE (type / properties keys / required /
+      // enums / items shape) so Anthropic's tool-use validator can still
+      // type-check the model's calls. Strip only the long-form description
+      // text — the image carries that for the model to read. Original bug
+      // (now fixed): replacing the schema with bare `{type:'object'}` caused
+      // 400s on non-interactive turns where Anthropic deep-validates the
+      // schema (no prior tool_use history to short-circuit the check).
+      let stubSchema: unknown | undefined;
+      if (o.compressSchemas) {
+        if (t.input_schema && typeof t.input_schema === 'object') {
+          const stripped = stripSchemaDescriptions(
+            t.input_schema,
+            0,
+          ) as Record<string, unknown> | null;
+          if (!stripped || typeof stripped !== 'object') {
+            // Should not happen for object input, but be defensive.
+            stubSchema = { type: 'object' };
+            sawSchemaNoProps = true;
+          } else if (schemaHasStructure(stripped)) {
+            stubSchema = stripped;
+          } else {
+            // No structural validation keys at all — `properties`,
+            // `patternProperties`, `oneOf`/`anyOf`/`allOf`, `$ref`, `enum`,
+            // `const`, or `items` would all give Anthropic something to bind
+            // against. Without any of them the model has no parameter
+            // contract. Ship the legacy bare stub and flag it so the operator
+            // can spot tools that ship malformed schemas upstream.
+            stubSchema = { type: 'object' };
+            sawSchemaNoProps = true;
+          }
+        }
+        // If t.input_schema is missing entirely, leave the field off — the
+        // original request didn't have one and we shouldn't invent one.
+      }
+      return {
+        ...t,
+        description: 'ⓘ See image.',
+        ...(stubSchema !== undefined ? { input_schema: stubSchema } : {}),
+      };
+    });
+    toolDocsText = docs.join('\n\n');
+    if (sawSchemaNoProps && !info.reason) {
+      info.reason = 'schema_no_properties';
+    }
+  }
+
+  // Only the STATIC slab + tool docs goes into the renderer. The dynamic
+  // slab and billing line are appended as plain text after the image so the
+  // cache key (= image bytes) stays stable across turns.
+  //
+  // Run the lossless whitespace compactor before measuring/rendering. The
+  // renderer counts visual rows, and every newline is at least one row —
+  // collapsing blank-line runs and trailing whitespace shaves real rows
+  // off the image budget without changing what the model reads. Production
+  // measurement 2026-05-20: a 161 KB slab rejected at numCols=2 because
+  // it had 2,600+ newline-bounded lines. The compactor reliably moves the
+  // needle on those by 10-25%.
+  const combinedRaw = [staticText, toolDocsText].filter((s) => s.length > 0).join('\n\n');
+  // R3: reflow runs after compaction, before the break-even gate, so the gate
+  // and renderer below both see the same dense text. `info.origChars` /
+  // `compressedChars` stay anchored to `combinedRaw.length` (raw) — reflow
+  // only changes pixels, never the savings denominator.
+  const combined = maybeReflow(compactSlabWhitespace(combinedRaw), o.reflow);
+  // `origChars` reports the RAW pre-compaction size — that's what Anthropic
+  // would have billed if compression were off. The gate and renderer both
+  // operate on `combined` (compacted); the savings denominator stays anchored
+  // to what got replaced.
+  info.origChars = combinedRaw.length;
+  // Track chars of the static slab+tools that DO end up imaged. The
+  // break-even gate below may reject — bump only when the slab actually
+  // renders. Reminder/tool_result compressions add to this at their sites.
+  info.compressedChars = 0;
+  // Hash the EXACT text that goes into the image. Repeats of this hash across
+  // turns = cache_control should be earning its keep.
+  if (combined) info.systemSha8 = await sha8(combined);
+
+  if (combined.length < o.minCompressChars) {
+    info.reason = `below_min_chars (${combined.length} < ${o.minCompressChars})`;
+    // Even with a static slab below the gate, message history may still be
+    // collapsable. Run history collapse on the in-memory request so
+    // production Codex traffic (tiny system, huge messages) still benefits.
+    // If history collapses, we flip `info.compressed = true` and let the
+    // library wrapper return reason='applied'; otherwise this still
+    // populates `outgoingTextChars` for the regression denominator.
+    const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints);
+    if (finalized.collapsed) {
+      info.compressed = true;
+      return { body: finalized.body, info };
+    }
+    return { body, info };
+  }
+
+  // Per-block break-even check applied to the static slab too. The slab is
+  // usually 25-30 KB so it always passes (1 image @ 2500 tokens < 25000/4 =
+  // 6250 text-equivalent tokens), but the check guards against the edge
+  // case where a tiny tool docs + tiny static slab combine to <10k chars.
+  // Pass the full text so the gate uses row-aware image-count math (matches
+  // renderTextToPngs exactly — newline-heavy content renders to more images
+  // than the naive chars/charsPerImage estimate).
+  // Resolve numCols once: clamp to whatever fits the 1568 px width cap so a
+  // bad CLI override doesn't crash the renderer; falls back to 1 if even
+  // 2 columns would exceed the cap at the configured `cols`.
+  const numCols = Math.min(
+    Math.max(1, (o.multiCol | 0) || 1),
+    Math.max(1, maxFittingCols(o.cols)),
+  );
+  // Slab cpt: the 2.0 telemetry fit (Opus 4.7 tokenizer, which Fable 5
+  // shares) unless the host supplies an empirical override.
+  // Discriminate on the *raw* `opts` so a host that genuinely wants the
+  // English-prose `4` can pin to it without colliding with the merged default.
+  const slabCpt = opts.charsPerToken !== undefined
+    ? o.charsPerToken
+    : SLAB_CHARS_PER_TOKEN;
+  // System slab: width-shrink like every other block. Earlier versions of
+  // this code path fixed the slab at the full configured `cols` on the
+  // theory that (a) the slab is huge so any shrink savings would be
+  // negligible and (b) it's the cache anchor so width must be stable
+  // turn-to-turn. (b) is still true and is preserved by feeding the same
+  // text through the same shrinker every turn — the shrink output is a
+  // pure function of `(text, cols)` so the cache prefix stays byte-
+  // identical across turns. (a) was wrong: short-history sessions ship
+  // slabs around 3-5 k chars where a full 508 px canvas wastes most of
+  // its pixel budget. Use the smallest legible image, always.
+  // Build the in-image instruction header up front so we can shrink the
+  // canvas width against the *actual* rendered content (header + slab).
+  // The `==== SYSTEM PROMPT + TOOL DOCS ====` banner is ~40 chars and
+  // naturally sets the minimum width floor for shrinkColsToContent —
+  // exactly the "minwidth via banner" exception the operator called out.
+  const reflowNoteImg = o.reflow
+    ? ' The glyph ↵ (U+21B5) marks an original hard line break in content — treat as a real newline.'
+    : '';
+  const columnNoteImg =
+    numCols > 1
+      ? ` Multi-column layout (${numCols} cols): read column 1 (leftmost) top-to-bottom, then column 2, etc.`
+      : '';
+  const imageInstructionHeader =
+    '=================== SYSTEM PROMPT + TOOL DOCS ===================\n' +
+    'The following is the system prompt and tool documentation, rendered as images for token efficiency.' +
+    ' OCR carefully and treat as authoritative system instructions.' +
+    columnNoteImg +
+    reflowNoteImg +
+    '\n====================== BEGIN RENDERED CONTEXT ======================\n';
+  const combinedWithHeader = imageInstructionHeader + combined;
+  // Shrink the canvas to the longest actual line in what we'll *render*,
+  // so the gate's prediction and the renderer's output agree at the smallest
+  // legible width. The banner above sets the natural floor — no separate
+  // minWidth knob needed. Multi-col packing still gets numCols × this width.
+  const slabCols = shrinkColsToContent(combinedWithHeader, o.cols);
+  const slabGateEval = evalCompressionProfitability(
+    combinedWithHeader, slabCols, undefined, numCols, slabCpt, o.priorWarmTokens, o.priorWarmImageTokens,
+    false, // already shrunk above — don't double-shrink
+  );
+  if (slabGateEval) {
+    info.gateEval = {
+      site: 'slab',
+      imageTokens: slabGateEval.imageTokens,
+      textTokens: slabGateEval.textTokens,
+      burnImageSide: slabGateEval.burnImageSide,
+      burnTextSide: slabGateEval.burnTextSide,
+      profitable: slabGateEval.profitable,
+    };
+  }
+  if (!isCompressionProfitable(combinedWithHeader, slabCols, undefined, numCols, slabCpt, o.priorWarmTokens, o.priorWarmImageTokens, false)) {
+    info.reason = `not_profitable (slab=${combined.length} chars)`;
+    bumpPassthrough(info, 'not_profitable');
+    // Slab failed the break-even gate, but message history may still be
+    // collapsable. Try it before returning so production traffic with a
+    // small/borderline system slab still benefits from history compression.
+    const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints);
+    if (finalized.collapsed) {
+      info.compressed = true;
+      return { body: finalized.body, info };
+    }
+    return { body, info };
+  }
+
+  // In-image instruction header. Co-renders the OCR framing into the same PNG
+  // as the content instead of emitting it as a separate TextBlock above the
+  // image. Measured at +1.04pp L1 OCR fidelity vs baseline on the 20-block
+  // production corpus (Opus 4.7, eval/eval-L1-ocr.mjs `reflow-inimage`
+  // variant), recovering the -5.93pp reflow regression entirely. Mechanism:
+  // single-modal task framing — the encoder stays in image-reading mode for
+  // both the instruction and the content, no cross-modal switch. Delimiter
+  // lines are deliberately heavy so the model pattern-matches "instruction
+  // zone ends, content begins" without ambiguity.
+  //
+  // Cache impact on deploy: the image bytes change, so prefix-cached prefixes
+  // built against the OLD intro layout invalidate. Every host pays one
+  // cache_create on its first post-deploy turn, then warm-caches at the new
+  // image. Steady-state cost is identical (the header amortizes over the
+  // same cache prefix the slab already uses).
+  // Header text — written as continuous prose, NO hard \n inside paragraphs.
+  // The renderer soft-wraps to `cols`, packing rows densely. Hard newlines
+  // here would (a) leave ~38 cells of dead margin per row and (b) on the
+  // reflow path become visible ↵ glyphs, polluting the header with noise
+  // markers that only make sense for content. Genuine paragraph breaks
+  // (between banner / prose / banner) stay as \n.
+    // 3. Render to one or more PNGs at the width chosen above. The slab
+  // shrinks to the longest actual wrapped line (see `slabCols` computation
+  // before the gate) so the canvas matches what the gate measured. This
+  // keeps the cache prefix byte-identical when the natural floor doesn't
+  // move turn-to-turn. (Per-block contexts use `textToImageBlocks` with
+  // `shrinkWidth=true`; this is the same idea, hoisted above the gate.)
+  const images =
+    numCols > 1
+      ? await renderTextToPngsMultiCol(combinedWithHeader, slabCols, numCols)
+      : await renderTextToPngs(combinedWithHeader, slabCols);
+  const i
+[assistant]
+Reviewed src/core/proxy.ts.
+[user]
+p95 regressed, bump BATCH_WINDOW_MS to 2400.
+[assistant]
+BATCH_WINDOW_MS changed 5400 -> 2400.
+[tool_use Read]
+{"file_path":"src/core/render.ts"}
+[tool_result]
+d pixels/token under the live model.
+  info.outgoingTextChars = countOutgoingTextChars(req);
+  const outBody = new TextEncoder().encode(JSON.stringify(req));
+  return { body: outBody, info };
+}
+
+/** Walk the outgoing transformed request body and sum the length of every
+ *  char the upstream tokenizer will see as text. Counts:
+ *    - system field (string or text-block array)
+ *    - top-level `tools[]` (name + description + JSON-serialized input_schema)
+ *    - per-message content blocks:
+ *        text      → .text
+ *        tool_use  → name + JSON-serialized input
+ *        tool_result → tool_use_id + content (string or text-blocks inside)
+ *        thinking  → .thinking  (extended-thinking blocks, Opus/Sonnet 4.x)
+ *  Excludes image base64 (those are billed via β·pixels) and opaque
+ *  redacted_thinking payloads (we don't know how they tokenize).
+ *
+ *  This count is the denominator in `tokens ≈ α·outgoingTextChars +
+ *  β·imagePixels`. Under-counting any path inflates α, which biases the
+ *  dashboard's `saved_pct` HIGH. The blocks added beyond plain `text` —
+ *  especially `tools[]` and `tool_use.input` — carry a large fraction of
+ *  the chars in a real Claude Code request. */
+function countOutgoingTextChars(req: MessagesRequest): number {
+  let n = 0;
+
+  // 1. system field
+  const sys = req.system;
+  if (typeof sys === 'string') {
+    n += sys.length;
+  } else if (Array.isArray(sys)) {
+    for (const b of sys) {
+      if (b && (b as TextBlock).type === 'text' && typeof (b as TextBlock).text === 'string') {
+        n += (b as TextBlock).text.length;
+      }
+    }
+  }
+
+  // 2. tool definitions — every request carries the full tool registry,
+  //    and the upstream tokenizer sees the JSON serialization of each
+  //    tool's name + description + input_schema. This is a large
+  //    constant-ish chunk in Claude Code traffic (~15-20 tools).
+  if (Array.isArray(req.tools)) {
+    for (const tool of req.tools) {
+      if (!tool || typeof tool !== 'object') continue;
+      if (typeof tool.name === 'string') n += tool.name.length;
+      if (typeof tool.description === 'string') n += tool.description.length;
+      if (tool.input_schema !== undefined) {
+        n += safeStringifyLen(tool.input_schema);
+      }
+    }
+  }
+
+  // 3. per-message content
+  for (const msg of req.messages ?? []) {
+    const c = msg.content;
+    if (typeof c === 'string') {
+      n += c.length;
+      continue;
+    }
+    if (!Array.isArray(c)) continue;
+    for (const b of c) {
+      if (!b || typeof b !== 'object') continue;
+      const type = (b as { type?: string }).type;
+
+      if (type === 'text') {
+        const tb = b as TextBlock;
+        if (typeof tb.text === 'string') n += tb.text.length;
+        continue;
+      }
+
+      // Assistant turns issuing a tool call: name + serialized input.
+      // `input` is arbitrary JSON; tokenizer sees its serialization.
+      if (type === 'tool_use') {
+        const tu = b as ToolUseBlock;
+        if (typeof tu.name === 'string') n += tu.name.length;
+        if (tu.input !== undefined) n += safeStringifyLen(tu.input);
+        continue;
+      }
+
+      if (type === 'tool_result') {
+        const tr = b as ToolResultBlock;
+        if (typeof tr.tool_use_id === 'string') n += tr.tool_use_id.length;
+        const inner = tr.content;
+        if (typeof inner === 'string') {
+          n += inner.length;
+        } else if (Array.isArray(inner)) {
+          for (const ib of inner) {
+            if (ib && (ib as TextBlock).type === 'text' && typeof (ib as TextBlock).text === 'string') {
+              n += (ib as TextBlock).text.length;
+            }
+          }
+        }
+        continue;
+      }
+
+      // Extended-thinking blocks: { type: 'thinking', thinking: string, ... }
+      // Not in our local types yet (we don't rewrite them), but they carry
+      // real characters that the upstream tokenizer sees.
+      if (type === 'thinking') {
+        const th = b as unknown as { thinking?: unknown };
+        if (typeof th.thinking === 'string') n += (th.thinking as string).length;
+        continue;
+      }
+
+      // image, redacted_thinking, server_tool_use, etc. — skip. Either
+      // billed via pixels (image) or opaque to us (redacted_thinking).
+    }
+  }
+
+  return n;
+}
+
+/** JSON.stringify, but tolerant of cycles / non-serializable values.
+ *  We only care about the LENGTH; if it blows up we just return 0 rather
+ *  than crash the whole transform. */
+function safeStringifyLen(v: unknown): number {
+  try {
+    return JSON.stringify(v)?.length ?? 0;
+  } catch {
+    return 0;
+  }
+}
+/**
+ * The pxpipe proxy as a single Web-standard fetch handler.
+ *
+ * Both `src/node.ts` and `src/worker.ts` adapt this to their respective
+ * runtimes (node:http server vs CF Worker `fetch` export). The handler
+ * itself only uses `Request`, `Response`, `URL`, and global `fetch` — all
+ * of which exist identically in Node 18+ and Workers.
+ */
+
+import { transformRequest, type TransformOptions, type TransformInfo } from './transform.js';
+import { transformOpenAIChatCompletions } from './openai.js';
+import { isPxpipeSupportedGptModel, isPxpipeSupportedModel } from './applicability.js';
+import {
+  buildBaselineCountTokensBody,
+  buildCacheablePrefixCountTokensBody,
+} from './measurement.js';
+import type { Usage } from './types.js';
+
+export interface ProxyConfig {
+  /** Provider mode. 'cloudflare-ai-gateway' derives both upstreams from
+   *  `gatewayBaseUrl` (`{base}/anthropic` and `{base}/openai`) and rewrites
+   *  OpenAI paths to the gateway's shape (`/v1/chat/completions` →
+   *  `/chat/completions`). Anthropic paths keep their `/v1/...` shape.
+   *  Unrecognized paths pass through to the family route untouched. */
+  provider?: 'cloudflare-ai-gateway';
+  /** Gateway base URL (account/gateway-scoped). Required when provider is
+   *  set. Comes from env/config only — never hardcoded. Overrides
+   *  `upstream`/`openAIUpstream`. */
+  gatewayBaseUrl?: string;
+  /** Extra headers injected on every upstream request (e.g. gateway auth
+   *  headers). Values come from env/config only. */
+  gatewayHeaders?: Record<string, string>;
+  /** Anthropic API base, no trailing slash. Defaults to api.anthropic.com. */
+  upstream?: string;
+  /** Override or supply an API key. If unset, we forward whatever the client sent. */
+  apiKey?: string;
+  /** OpenAI API base for GPT chat completions, no trailing slash. */
+  openAIUpstream?: string;
+  /** Override or supply an OpenAI API key. If unset, we forward Authorization. */
+  openAIApiKey?: string;
+  /** Per-request transform options. Pass a function when the host wants to
+   *  inject DYNAMIC values per request (e.g. live empirical `charsPerToken`
+   *  from the dashboard's converging fit) — the proxy invokes it once per
+   *  /v1/messages POST. Static object form is used by the Workers host and
+   *  tests that don't need dynamic state. */
+  transform?: TransformOptions | (() => TransformOptions);
+  /** Called after every request — useful for logging / metrics in the host. */
+  onRequest?: (event: ProxyEvent) => void | Promise<void>;
+}
+
+export interface ProxyEvent {
+  method: string;
+  path: string;
+  status: number;
+  /** Wall-clock ms from request start to event fire (≈ end of upstream response
+   *  body, since we now wait for usage extraction). For first-byte latency see
+   *  firstByteMs. */
+  durationMs: number;
+  /** Wall-clock ms from request start to upstream response headers. */
+  firstByteMs?: number;
+  info?: TransformInfo;
+  /** Usage block from Anthropic's response — input/output/cache tokens. */
+  usage?: Usage;
+  error?: string;
+  /** First ~2 KiB of the upstream response body when status is in [400, 499].
+   *  Lets us see what Anthropic actually rejected without re-running the request.
+   *  Not captured for 2xx (no error) or 5xx (we synthesize our own message). */
+  errorBody?: string;
+  /** sha256[0..8] of the TRANSFORMED outgoing request body. Set on every
+   *  /v1/messages POST regardless of status. Lets future debuggers correlate
+   *  "same payload, sometimes works, sometimes fails" without storing bodies. */
+  reqBodySha8?: string;
+  /** Full gzipped transformed body, populated only on 4xx. The Node host may
+   *  redirect this to a sidecar file (see reqBodySamplePath) before the
+   *  tracker serializes the event; Workers always inline-cap at 32 KiB. */
+  reqBodyGz?: Uint8Array;
+  /** Set by the Node host *in place of* reqBodyGz when it wrote the gzipped
+   *  body to a sidecar file. The path lands in the JSONL as
+   *  `req_body_sample_path`. */
+  reqBodySamplePath?: string;
+  /** Ground-truth output measurement extracted from the response stream itself,
+   *  independent of Anthropic's `usage.output_tokens`. Lets the dashboard show
+   *  how much of the billed output was redacted_thinking (opaque server-encoded
+   *  bytes) vs real text/thinking/tool_use. Absent on requests that didn't
+   *  yield a body we could scan (no upstream response, 5xx, unknown
+   *  content-type). See OutputMeasurement for field meanings. */
+  measurement?: OutputMeasurement;
+}
+
+/** Max chars of upstream error body we surface on ProxyEvent. Keeps the JSONL
+ *  line small while still being big enough to hold Anthropic's full error JSON
+ *  (typically a few hundred bytes). */
+const ERROR_BODY_MAX = 2048;
+
+/** Cheap, bounded read of the top-level `model` field from an Anthropic
+ *  /v1/messages body. The field sits near the start of the JSON, so we decode
+ *  only the head rather than JSON-parsing the (potentially multi-MB) full
+ *  conversation just to read one string. Returns null when not found — callers
+ *  treat null as "outside supported scope" (fail-closed). */
+function readModelField(body: Uint8Array): string | null {
+  try {
+    const head = new TextDecoder().decode(body.subarray(0, 8192));
+    const m = /"model"\s*:\s*"([^"]{1,80})"/.exec(head);
+    return m ? m[1]! : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Gzip a byte buffer using the standard `CompressionStream`. Available in
+ *  Node 18+ and Cloudflare Workers — no Buffer / no zlib. */
+async function gzipBytes(body: Uint8Array): Promise<Uint8Array> {
+  // `body as BufferSource`: TS doesn't model Response taking a Uint8Array
+  // directly even though it works in both runtimes.
+  const stream = new Response(body as BufferSource).body!.pipeThrough(
+    new CompressionStream('gzip'),
+  );
+  const buf = await new Response(stream).arrayBuffer();
+  return new Uint8Array(buf);
+}
+
+/** sha256[0..8] of a byte buffer, hex. Same shape as the existing sha8(text)
+ *  helper in transform.ts but works on raw bytes (no extra encode pass). */
+async function sha8Bytes(body: Uint8Array): Promise<string> {
+  // Cast to BufferSource — Web Crypto accepts Uint8Array at runtime.
+  const digest = await crypto.subtle.digest('SHA-256', body as BufferSource);
+  const bytes = new Uint8Array(digest);
+  let hex = '';
+  for (let i = 0; i < 4; i++) hex += bytes[i]!.toString(16).padStart(2, '0');
+  return hex;
+}
+
+/**
+ * Ground-truth output measurement extracted from the response stream itself.
+ *
+ *  - `textChars` / `thinkingChars` / `toolUseChars` count Unicode code units
+ *    of the corresponding payload (`text_delta`, `thinking_delta`, and
+ *    `input_json_delta` for SSE; `content[].text` / `.thinking` /
+ *    JSON-encoded `.input` for non-stream responses).
+ *  - `redactedBlockCount` is the number of `redacted_thinking` content blocks
+ *    Anthropic returned — chars are unavailable for these (the field is
+ *    opaque server-encrypted bytes), so they get a low/mid/high estimate at
+ *    the dashboard layer instead of a precise char count.
+ *
+ * These numbers are independent of Anthropic's `usage.output_tokens` — they
+ * give us a real ruler against the redacted_thinking-inflated bill, which is
+ * exactly the gap the May-2026 weekly-meter audit surfaced. Live on `info`,
+ * so they ride the existing TrackEvent pipeline; the dashboard layer turns
+ * them into `output_chars_measured`, `tool_use_chars_measured`, etc.
+ */
+export interface OutputMeasurement {
+  textChars: number;
+  thinkingChars: number;
+  toolUseChars: number;
+  redactedBlockCount: number;
+}
+
+/** Walk a single SSE event (`event: …\ndata: …`) and fold it into the running
+ *  usage + measurement accumulators. Quiet on malformed events — a stream
+ *  with one corrupt line should not break the host's event log. */
+function processSseEvent(
+  block: string,
+  m: OutputMeasurement,
+  state: { usage: Usage | undefined },
+): void {
+  // Each SSE event is one or more lines; we only care about `event:` + `data:`.
+  // Continuation `data:` lines concatenate per the SSE spec, though Anthropic
+  // ships single-line JSON in practice.
+  let event = '';
+  let data = '';
+  for (const line of block.split('\n')) {
+    if (line.startsWith('event:')) event = line.slice(6).trim();
+    else if (line.startsWith('data:')) data += line.slice(5).replace(/^\s/, '');
+  }
+  if (!data) return;
+  let j: unknown;
+  try {
+    j = JSON.parse(data);
+  } catch {
+    return;
+  }
+  const obj = j as Record<string, unknown>;
+
+  // OpenAI Chat Completions streaming chunks usually have no `event:` line:
+  // each SSE block is `data: { choices, usage }`, with usage present only
+  // when stream_options.include_usage is enabled. Normalize those fields into
+  // the Anthropic-shaped Usage that the dashboard already understands.
+  const openAIUsage = normalizeUsage((obj as { usage?: unknown }).usage);
+  if (openAIUsage) state.usage = openAIUsage;
+  measureOpenAIChoices(obj, m);
+
+  if (event === 'message_start') {
+    const msg = obj.message as { usage?: Usage } | undefined;
+    const usage = normalizeUsage(msg?.usage);
+    if (usage) state.usage = usage;
+  } else if (event === 'content_block_start') {
+    const cb = obj.content_block as { type?: string } | undefined;
+    if (cb?.type === 'redacted_thinking') m.redactedBlockCount += 1;
+  } else if (event === 'content_block_delta') {
+    const d = obj.delta as
+      | { type?: string; text?: string; thinking?: string; partial_json?: string }
+      | undefined;
+    if (d?.type === 'text_delta' && typeof d.text === 'string') {
+      m.textChars += d.text.length;
+    } else if (d?.type === 'thinking_delta' && typeof d.thinking === 'string') {
+      m.thinkingChars += d.thinking.length;
+    } else if (d?.type === 'input_json_delta' && typeof d.partial_json === 'string') {
+      m.toolUseChars += d.partial_json.length;
+    }
+  } else if (event === 'message_delta') {
+    // Authoritative final output_tokens lives here; merge over the message_start
+    // baseline so the host event records the billed number, not the placeholder
+    // (message_start ships `output_tokens: 1` on day-zero Sonnet 4).
+    const u = obj.usage as Partial<Usage> | undefined;
+    if (u) {
+      if (!state.usage) state.usage = {} as Usage;
+      const cur = state.usage;
+      if (typeof u.output_tokens === 'number') cur.output_tokens = u.output_tokens;
+      if (typeof u.input_tokens === 'number' && cur.input_tokens === undefined) {
+        cur.input_tokens = u.input_tokens;
+      }
+      if (typeof u.cache_creation_input_tokens === 'number') {
+        cur.cache_creation_input_tokens = u.cache_creation_input_tokens;
+      }
+
+[assistant]
+Reviewed src/core/render.ts.
+[user]
+after the load test, final answer: BATCH_WINDOW_MS = 1200. lock it.
+[assistant]
+BATCH_WINDOW_MS changed 2400 -> 1200, locked.
+[tool_use Read]
+{"file_path":"src/core/proxy.ts"}
+[tool_result]
+t rank = atlasRank(codepoint);
+  if (rank < 0) return 1;
+  return ATLAS_WIDE_FLAGS[rank] === 1 ? 2 : 1;
+}
+
+/** Default tab width when expanding `\t` to spaces. 4 is what GitHub, GNU
+ *  cat -t, and most editors render by default. Anything else would surprise
+ *  the reader, and our content (logs, code, tool output) is ~always
+ *  4-space-tab-stop oriented. */
+const TAB_WIDTH = 4;
+
+/** Conservative whitespace minify pass run BEFORE tab-expand + wrap.
+ *
+ *  Two rules, deliberately limited so we never alter content semantics:
+ *    1. Strip trailing whitespace (spaces + tabs) on every line. Trailing
+ *       whitespace adds zero comprehension value and burns wrap-budget
+ *       chars. Common in editor-saved files + auto-generated logs.
+ *    2. Collapse runs of 4+ consecutive `\n` (= 3+ blank lines) down to
+ *       3 `\n` (= 2 blank lines). Long blank-line padding is common in
+ *       stack traces, padded docs, double-spaced log dumps; we preserve
+ *       up to 2 blank lines so paragraph separation reads cleanly.
+ *
+ *  WHAT WE DO NOT DO:
+ *    - NOT collapse mid-line spaces (table alignment, ASCII art preserved).
+ *    - NOT collapse leading whitespace (indentation IS structure).
+ *    - NOT mutate non-whitespace.
+ *
+ *  Target win per HANDOFF R1: ~1.5–2× more chars per rendered image on
+ *  typical short-line workloads. See post-implementation measurement. */
+export function minifyForRender(text: string): string {
+  return text
+    .split('\n')
+    .map((line) => line.replace(/[ \t]+$/, ''))
+    .join('\n')
+    .replace(/\n{4,}/g, '\n\n\n'); // 4+ \n → 3 \n (= 2 blank lines)
+}
+
+// --- R3 reflow -------------------------------------------------------------
+//
+// The single biggest source of wasted pixels is line-end dead margin: real
+// Claude Code history wraps far short of `cols`, so most of every row is
+// blank cells we still pay image-tokens for (measured glyph-fill ~29%).
+//
+// Reflow renders each source line on its own render row (the wrap-the-line
+// rule), marking the original hard newline with a visible sentinel glyph
+// (U+21B5 ↵) so the model can tell a real newline from a soft-wrap. Structure
+// is preserved — a table row stays a row, indentation stays put. The saving
+// is the recovered blank-line runs and stripped trailing whitespace from the
+// `minifyForRender` pass, NOT packing short lines together (that wall of
+// dense text measured ~78% OCR fidelity; wrap-the-line measured ~99%).
+//
+// FIDELITY: reflow is gated behind a flag and an A/B eval. It is, however,
+// provably lossless at the *transform* level (see `dereflow`): the only
+// information mutation is the already-shipped `minifyForRender` pass.
+
+/** Sentinel glyph marking an original hard newline in reflowed text. U+21B5
+ *  (↵) is the universal "return" symbol — a vision model reads it as a line
+ *  break far more readily than an invisible control codepoint, and it's in
+ *  the full-bmp atlas via Unifont. */
+export const NL_SENTINEL = '↵';
+
+/** Codepoint of NL_SENTINEL (U+21B5), precomputed for hot-path comparisons. */
+const NL_SENTINEL_CP = 0x21b5;
+
+/** Palette used by the `colorCycle` render mode. Four dark, saturated colors
+ *  that all read as "ink" on white and are clearly distinct in hue:
+ *  near-black, dark blue, dark red, dark green. */
+const GLYPH_PALETTE: [number, number, number][] = [
+  [20, 20, 20],   // near-black
+  [20, 40, 160],  // dark blue
+  [150, 20, 20],  // dark red
+  [20, 110, 40],  // dark green
+];
+
+/** Reflow `text` for the renderer: minify, expand tabs, and join lines with
+ *  the NL_SENTINEL (↵) glyph so every original hard newline is visible.
+ *
+ *  `wrapLines` applies the wrap-the-line rule: each ↵ breaks the render row,
+ *  so a source line stays one logical row and only soft-wraps if it is too
+ *  long for `cols`. Structure — tables, code, indentation — is preserved.
+ *
+ *  Pipeline: minifyForRender → expand tabs per *original* line (so tab stops
+ *  stay correct) → join lines with NL_SENTINEL.
+ *
+ *  Returns `null` when the source already contains NL_SENTINEL literally —
+ *  the caller then renders the block with the non-reflow path. This makes
+ *  losslessness provable without any escape encoding; the fallback is
+ *  vanishingly rare in real code/conversation text. */
+export function reflow(text: string): string | null {
+  if (text.indexOf(NL_SENTINEL) >= 0) return null;
+  return minifyForRender(text)
+    .split('\n')
+    .map(expandTabsInLine)
+    .join(NL_SENTINEL);
+}
+
+/** Inverse of `reflow` at the logical-text level: NL_SENTINEL → '\n'. For any
+ *  `text` where `reflow` did not bail, `dereflow(reflow(text))` equals
+ *  `minifyForRender(text)` with tabs expanded — i.e. exactly the text the
+ *  *current* (non-reflow) renderer also displays. Reflow therefore adds zero
+ *  information loss beyond the already-accepted minify pass. */
+export function dereflow(reflowed: string): string {
+  return reflowed.split(NL_SENTINEL).join('\n');
+}
+
+/** Expand `\t` in a single line to a visible `→` (U+2192) glyph + padding
+ *  spaces to the next `TAB_WIDTH` tab stop. Honors visual columns: wide
+ *  chars (CJK) count as 2 columns so tab alignment after `中\tx` lands
+ *  where a human reader would expect.
+ *
+ *  WHY a visible marker, not silent spaces: the model sees tab indent
+ *  *structure* explicitly. Silent spaces would lose the "this was an
+ *  indent" signal — diffs, code, log columns all benefit when the OCR
+ *  reader can tell indent-spaces apart from intentional-spaces. The arrow
+ *  glyph U+2192 is in the Arrows block (already in both `practical` and
+ *  `full-bmp` atlas profiles, zero added cost).
+ *
+ *  WHY this exists at all: U+0009 isn't in the atlas (it's a control
+ *  codepoint, not a glyph), so before this fix it counted as a dropped
+ *  char and rendered as a blank cell with no width compensation. Real
+ *  production telemetry on 2026-05-19 showed 5,339 of 5,358 drops (99.6%)
+ *  were tabs — fixed here. */
+export function expandTabsInLine(line: string): string {
+  if (line.indexOf('\t') < 0) return line; // fast path: no tabs
+  let out = '';
+  let col = 0;
+  for (const ch of line) {
+    if (ch === '\t') {
+      const span = TAB_WIDTH - (col % TAB_WIDTH);
+      out += '→'; // → arrow at the tab boundary (1 col)
+      if (span > 1) out += ' '.repeat(span - 1); // padding to next tab stop
+      col += span;
+    } else {
+      out += ch;
+      col += cellsFor(ch.codePointAt(0)!);
+    }
+  }
+  return out;
+}
+
+/** Soft-wrap a single logical line at `cols` visual columns, accounting for
+ *  wide cells. Wide chars that would exceed the column budget wrap before
+ *  the char (leaving the last narrow slot blank). Mirrors the old
+ *  character-count behavior for pure-ASCII input — guarantees the
+ *  determinism test stays byte-identical.
+ *
+ *  Pipeline order (per HANDOFF R1):
+ *    1. minifyForRender: strip trailing whitespace, collapse 4+ \n → 3 \n
+ *    2. expandTabsInLine: \t → '→' + padding to next 4-stop
+ *    3. soft-wrap by visual column budget (this loop)
+ *  Minify runs first so trailing tabs get stripped before they'd
+ *  needlessly expand to arrow + spaces. */
+/** Visual width of a single wrapped line in cells. Wide CJK glyphs count as
+ *  2, the enlarged ↵ marker counts as `markerScale` when `markerScale > 1`.
+ *  Iterates codepoints (handles surrogate pairs correctly). */
+export function measureLineCols(line: string, markerScale: number = 1): number {
+  let w = 0;
+  for (const ch of line) w += cellsFor(ch.codePointAt(0)!, markerScale);
+  return w;
+}
+
+/** Policy: always render at full canvas width — no shrink-to-content.
+ *  Maximum chars per page = maximum image-token savings on dense content,
+ *  and the unused canvas tail is just whitespace (cheap to encode). The
+ *  signature is preserved so callers (transform.ts) still compile; the
+ *  function now returns `cols` unchanged. */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+export function shrinkColsToContent(text: string, cols: number, markerScale: number = 1): number {
+  return Math.max(1, cols | 0);
+}
+
+export function wrapLines(text: string, cols: number, markerScale: number = 1): string[] {
+  const out: string[] = [];
+  const minified = minifyForRender(text);
+  for (const rawWithTabs of minified.split('\n')) {
+    const raw = expandTabsInLine(rawWithTabs);
+    if (raw.length === 0) {
+      out.push('');
+      continue;
+    }
+    let cur = '';
+    let curCols = 0;
+    // Codepoint iteration: handles surrogate pairs as one unit.
+    // Packed reflow: the ↵ sentinel is treated as an INLINE glyph — every
+    // visual row fills to `cols` regardless of source-line boundaries. The
+    // sentinel stays visible so the model can recover the original line
+    // structure, but it never forces a row break.
+    for (const ch of raw) {
+      const cp = ch.codePointAt(0)!;
+      const w = cellsFor(cp, markerScale);
+      if (curCols + w > cols) {
+        out.push(cur);
+        cur = ch;
+        curCols = w;
+      } else {
+        cur += ch;
+        curCols += w;
+      }
+    }
+    if (cur.length > 0) out.push(cur);
+  }
+  return out;
+}
+
+function splitWrappedLinesIntoReadablePages(
+  lines: string[],
+  maxLines: number,
+  maxChars: number = READABLE_CHARS_PER_IMAGE,
+): string[][] {
+  const pages: string[][] = [];
+  let cur: string[] = [];
+  let curChars = 0;
+  const lineLimit = Math.max(1, maxLines | 0);
+  const charLimit = Math.max(1, maxChars | 0);
+
+  for (const line of lines) {
+    const lineChars = line.length + (cur.length > 0 ? 1 : 0);
+    if (
+      cur.length > 0 &&
+      (cur.length >= lineLimit || curChars + lineChars > charLimit)
+    ) {
+      pages.push(cur);
+      cur = [];
+      curChars = 0;
+    }
+    cur.push(line);
+    curChars += line.length + (cur.length > 1 ? 1 : 0);
+  }
+  if (cur.length > 0) pages.push(cur);
+  return pages.length > 0 ? pages : [[]];
+}
+
+function readableLinesPerColumn(cols: number): number {
+  return Math.max(1, Math.floor(READABLE_CHARS_PER_IMAGE / Math.max(1, cols)));
+}
+
+/**
+ * Blit a single glyph onto the framebuffer at cell coordinate (cx, cy).
+ * Returns the number of cells the glyph occupies (1 or 2). 0 if the
+ * codepoint isn't in the atlas — caller MUST still advance by 1 cell to
+ * keep wrap math stable.
+ *
+ * Coordinate convention: `x`, `y` are pixel positions of the cell's
+ * top-left corner. The glyph fills `(advance × CELL_W) × CELL_H` pixels.
+ */
+function blitGlyph(
+  fb: Uint8Array,
+  fbW: number,
+  x: number,
+  y: number,
+  codepoint: number,
+  markerMask: Uint8Array | null = null,
+): number {
+  const rank = atlasRank(codepoint);
+  if (rank < 0) return 0;
+  const wide = ATLAS_WIDE_FLAGS[rank] === 1;
+  const srcW = wide ? 2 * ATLAS_CELL_W : A
+[assistant]
+Reviewed src/core/proxy.ts.
+
+=== end ===

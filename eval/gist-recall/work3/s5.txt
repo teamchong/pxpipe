@@ -1,0 +1,955 @@
+=== session s5 transcript ===
+[tool_use Read]
+{"file_path":"src/core/render.ts"}
+[tool_result]
+e image carries that for the model to read. Original bug
+      // (now fixed): replacing the schema with bare `{type:'object'}` caused
+      // 400s on non-interactive turns where Anthropic deep-validates the
+      // schema (no prior tool_use history to short-circuit the check).
+      let stubSchema: unknown | undefined;
+      if (o.compressSchemas) {
+        if (t.input_schema && typeof t.input_schema === 'object') {
+          const stripped = stripSchemaDescriptions(
+            t.input_schema,
+            0,
+          ) as Record<string, unknown> | null;
+          if (!stripped || typeof stripped !== 'object') {
+            // Should not happen for object input, but be defensive.
+            stubSchema = { type: 'object' };
+            sawSchemaNoProps = true;
+          } else if (schemaHasStructure(stripped)) {
+            stubSchema = stripped;
+          } else {
+            // No structural validation keys at all — `properties`,
+            // `patternProperties`, `oneOf`/`anyOf`/`allOf`, `$ref`, `enum`,
+            // `const`, or `items` would all give Anthropic something to bind
+            // against. Without any of them the model has no parameter
+            // contract. Ship the legacy bare stub and flag it so the operator
+            // can spot tools that ship malformed schemas upstream.
+            stubSchema = { type: 'object' };
+            sawSchemaNoProps = true;
+          }
+        }
+        // If t.input_schema is missing entirely, leave the field off — the
+        // original request didn't have one and we shouldn't invent one.
+      }
+      return {
+        ...t,
+        description: 'ⓘ See image.',
+        ...(stubSchema !== undefined ? { input_schema: stubSchema } : {}),
+      };
+    });
+    toolDocsText = docs.join('\n\n');
+    if (sawSchemaNoProps && !info.reason) {
+      info.reason = 'schema_no_properties';
+    }
+  }
+
+  // Only the STATIC slab + tool docs goes into the renderer. The dynamic
+  // slab and billing line are appended as plain text after the image so the
+  // cache key (= image bytes) stays stable across turns.
+  //
+  // Run the lossless whitespace compactor before measuring/rendering. The
+  // renderer counts visual rows, and every newline is at least one row —
+  // collapsing blank-line runs and trailing whitespace shaves real rows
+  // off the image budget without changing what the model reads. Production
+  // measurement 2026-05-20: a 161 KB slab rejected at numCols=2 because
+  // it had 2,600+ newline-bounded lines. The compactor reliably moves the
+  // needle on those by 10-25%.
+  const combinedRaw = [staticText, toolDocsText].filter((s) => s.length > 0).join('\n\n');
+  // R3: reflow runs after compaction, before the break-even gate, so the gate
+  // and renderer below both see the same dense text. `info.origChars` /
+  // `compressedChars` stay anchored to `combinedRaw.length` (raw) — reflow
+  // only changes pixels, never the savings denominator.
+  const combined = maybeReflow(compactSlabWhitespace(combinedRaw), o.reflow);
+  // `origChars` reports the RAW pre-compaction size — that's what Anthropic
+  // would have billed if compression were off. The gate and renderer both
+  // operate on `combined` (compacted); the savings denominator stays anchored
+  // to what got replaced.
+  info.origChars = combinedRaw.length;
+  // Track chars of the static slab+tools that DO end up imaged. The
+  // break-even gate below may reject — bump only when the slab actually
+  // renders. Reminder/tool_result compressions add to this at their sites.
+  info.compressedChars = 0;
+  // Hash the EXACT text that goes into the image. Repeats of this hash across
+  // turns = cache_control should be earning its keep.
+  if (combined) info.systemSha8 = await sha8(combined);
+
+  if (combined.length < o.minCompressChars) {
+    info.reason = `below_min_chars (${combined.length} < ${o.minCompressChars})`;
+    // Even with a static slab below the gate, message history may still be
+    // collapsable. Run history collapse on the in-memory request so
+    // production Codex traffic (tiny system, huge messages) still benefits.
+    // If history collapses, we flip `info.compressed = true` and let the
+    // library wrapper return reason='applied'; otherwise this still
+    // populates `outgoingTextChars` for the regression denominator.
+    const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints);
+    if (finalized.collapsed) {
+      info.compressed = true;
+      return { body:
+[assistant]
+Reviewed src/core/render.ts.
+[user]
+set BATCH_WINDOW_MS to 3600 to start.
+[assistant]
+BATCH_WINDOW_MS=3600 committed.
+[tool_use Read]
+{"file_path":"src/core/proxy.ts"}
+[tool_result]
+string,
+  cols: number = DEFAULT_COLS,
+  numCols: number = 2,
+): Promise<RenderedImage[]> {
+  const packed = reflow(text);
+  return renderTextToPngsMultiCol(packed ?? text, cols, numCols);
+}
+/**
+ * Request-body transformer. Takes an Anthropic Messages API request body,
+ * extracts the large static parts (system prompt + tool definitions),
+ * renders them as PNG image blocks, and rewrites the body to reference
+ * those images instead — saving 65-73% input tokens on Opus 4.7 while
+ * preserving 100% reasoning quality.
+ *
+ * Originally ported from a Python reference implementation; the Python
+ * has since been removed (live cache-rate validation passed at 98.7% by
+ * tokens). Byte-output determinism is now verified by tests alone.
+ */
+
+import type {
+  ContentBlock,
+  ImageBlock,
+  Message,
+  MessagesRequest,
+  SystemField,
+  TextBlock,
+  ToolDef,
+  ToolResultBlock,
+  ToolUseBlock,
+} from './types.js';
+import {
+  renderTextToPngs,
+  renderTextToPngsMultiCol,
+  reflow,
+  maxFittingCols,
+  shrinkColsToContent,
+  MAX_HEIGHT_PX,
+  NL_SENTINEL,
+  PAD_X,
+  PAD_Y,
+  CELL_W,
+  CELL_H,
+  READABLE_CHARS_PER_IMAGE,
+  DENSE_CONTENT_CHARS_PER_IMAGE,
+  DENSE_CONTENT_COLS,
+  DENSE_RENDER_STYLE,
+  renderTextToPngsWithCharLimit,
+} from './render.js';
+import { bytesToBase64 } from './png.js';
+import { collapseHistory } from './history.js';
+import { CACHE_CREATE_RATE, CACHE_READ_RATE } from './baseline.js';
+
+export interface TransformOptions {
+  /** Master switch — false makes this a no-op pass-through. */
+  compress?: boolean;
+  /** Move tool descriptions into the same image (and stub the originals). */
+  compressTools?: boolean;
+  /** Include full input_schema JSON for each tool. Adds tokens but maximizes parity. */
+  compressSchemas?: boolean;
+  /** Compress large `<system-reminder>` text blocks in the first user message.
+   *  Claude Code re-injects these every turn; rendering them to images shares
+   *  the cache anchor with the system+tools render. */
+  compressReminders?: boolean;
+  /** Compress large tool_result text content across all user messages. Tool
+   *  output is static once produced and accumulates across the conversation,
+   *  so image-rendering it compounds savings as the session grows. */
+  compressToolResults?: boolean;
+  /** Don't compress if total compressible chars below this. */
+  minCompressChars?: number;
+  /** Per-block threshold for compressReminders (chars). */
+  minReminderChars?: number;
+  /** Per-block threshold for compressToolResults (chars). */
+  minToolResultChars?: number;
+  /** Soft-wrap column count. */
+  cols?: number;
+  /** Hard upper bound on images emitted per single tool_result. Above this,
+   *  the source text is truncated (head + paging marker + tail) BEFORE
+   *  rendering so the request stays under Anthropic's 100-image-per-request
+   *  cap even when a single tool dumps a huge log. Default 10. */
+  maxImagesPerToolResult?: number;
+  /** R2 multi-column rendering: pack N text columns side-by-side per image
+   *  so each image covers `N×LINES_PER_IMAGE` wrapped lines instead of one.
+   *  Default 1 (single column = current behavior). 2 roughly halves image
+   *  count on real Claude Code workloads at the cost of OCR ordering risk
+   *  — the model must read column 1 fully top-to-bottom before column 2.
+   *  Modern vision LLMs handle this well on newspaper layouts; keep this
+   *  off until a smoke test against the real slab confirms ordering.
+   *  Auto-clamped if the resulting canvas would exceed 1568 px wide. */
+  multiCol?: number;
+  /** Chars-per-token assumption used by `isCompressionProfitable()`. Default
+   *  4 (Anthropic's published English-text average). Host may override per
+   *  request if it has a better number for the specific deployment. */
+  charsPerToken?: number;
+  /** Multi-turn amortization horizon for the **history-collapse** break-even
+   *  gate. The per-turn gate that asks "is the image cheaper than the text
+   *  on this single request, cold?" gets the wrong answer when Anthropic has
+   *  already cached the text-based prefix — text-at-10% beats image-at-100%
+   *  on warm turns. But the text prefix's cache *will* eventually expire (5-
+   *  min idle or 4-breakpoint cliff), and on that cold turn the giant text
+   *  pays full freight while an image prefix pays once and rides
+   *  `cache_read` for the rest of the session.
+   *
+   *  Setting this to N ≥ 2 evaluates the gate as if N future turns will
+   *  share the same prefix, weighting both sides by
+   *  `(cache_create_rate × 1 + cache_read_rate × (N-1))`. Honest expected-
+   *  lifetime-cost framing, no session state required. Mirrors the JIT
+   *  tiered-compilation analogue: assume the hot path runs N more times,
+   *  decide once, eat the loss if the session ended early.
+   *
+   *  Default 1 (= per-turn gate, current behaviour). Hosts opt in by
+   *  passing a value ≥ 2 (e.g. ocproxy passes 5 for Codex traffic). See
+   *  README's "The unsolved part: multi-turn amortization" section for the
+   *  full design space — try-then-decide (this), session-state (rejected),
+   *  always-collapse (rejected), cache-bust-driven (rejected). */
+  historyAmortizationHorizon?: number;
+  /** Tokens that the *un-rewritten* request would have hit Anthropic's cache
+   *  on (cache_read at 0.10×). When pxpipe rewrites the cacheable prefix
+   *  (slab compression, image substitution, history collapse), the new
+   *  prefix has a different cache key — Anthropic charges cache_create
+   *  (1.25×) on the new prefix's first turn, destroying the prior warm
+   *  cache. The break-even gate accounts for this burn cost as a one-time
+   *  penalty amortized over `historyAmortizationHorizon` turns:
+   *
+   *    burn = priorWarmTokens × (CACHE_CREATE_RATE − CACHE_READ_RATE) / N
+   *
+   *  Set by the host from a recent `count_tokens` cacheable-prefix probe
+   *  on the un-rewritten body, or from a session-keyed LRU populated by
+   *  prior responses. Default 0 (no burn — current behavior, correct for
+   *  the first turn of a fresh conversation). Hosts that already populate
+   *  `historyAmortizationHorizon` should populate this too; mismatched
+   *  values bias the gate toward over-compression on short conversations.
+   *
+   *  Cold-start safe: 0 disables the burn term entirely. Negative or
+   *  non-finite values are clamped to 0. */
+  priorWarmTokens?: number;
+  /** Symmetric counterpart of `priorWarmTokens` for the IMAGE-mode side.
+   *
+   *  When the prior turn rendered the static prefix as image blocks
+   *  (pxpipe applied), Anthropic's prompt cache holds the IMAGE prefix,
+   *  not the text prefix. Declining compression on this turn — sending
+   *  plain text — invalidates the image-prefix cache key and forces a
+   *  fresh `cache_create` on the un-rewritten text prefix. Symmetric to
+   *  `priorWarmTokens`, the burn cost is
+   *
+   *    burn = priorWarmImageTokens × (CACHE_CREATE_RATE − CACHE_READ_RATE)
+   *
+   *  and is added to the TEXT side of the break-even comparison so the
+   *  gate stays in image mode when the image cache is already warm. This
+   *  is the foundational fix for gate flapping: without it the gate
+   *  re-decides every turn purely on per-turn cost and ping-pongs between
+   *  modes, paying cache_create on both sides.
+   *
+   *  Set by the host from a session-keyed LRU that remembers the prior
+   *  turn's chosen mode AND the upstream-observed cacheable prefix size
+   *  on that turn. Hosts populating `priorWarmTokens` SHOULD also
+   *  populate this; supplying one without the other biases the gate
+   *  toward whichever side has the asymmetric burn term.
+   *
+   *  Cold-start safe: 0 disables the burn term entirely. Negative or
+   *  non-finite values are clamped to 0. */
+  priorWarmImageTokens?: number;
+  /** R3 reflow: re-pack each image-bound text block into a continuous
+   *  sentinel-delimited stream so rendered rows fill `cols` instead of
+   *  leaving line-end dead margin (measured glyph-fill ~29% → ~75-80%).
+   *  Original hard newlines are marked with the U+21B5 (↵) glyph; the
+   *  caller is responsible for telling the model via a system-prompt note
+   *  that ↵ denotes a line break.
+   *
+   *  ON by default: the L1 OCR eval cleared it at the production 5×8 cell
+   *  with the in-image instruction band (`reflow-inimage` variant) at 98.95 %
+   *  char accuracy, +1pp over the text-only baseline. The ↵ marker is
+   *  comprehended. Hosts can still force it off per request (e.g. for an
+   *  A/B). */
+  reflow?: boolean;
+}
+
+const DEFAULTS: Required<TransformOptions> = {
+  compress: true,
+  compressTools: true,
+  compressSchemas: true,
+  compressReminders: true,
+  compressToolResults: true,
+  minCompressChars: 2000,
+  // Keep small tool text as text. Below ~6k chars, the per-image cost
+  // dominates the savings (one PNG ≈ 1300 image tokens, vs ~1500 text
+  // tokens for 6 KB of text — break-even territory). The profitability
+  // gate still runs above this floor. Decoupled from READABLE_CHARS_PER_IMAGE
+  // (now 50k = per-page capacity) since the floor is about round-trip cost,
+  // not per-page packing.
+  minReminderChars: 6000,
+  minToolResultChars: 6000,
+  // NOTE: Anthropic's `system` field accepts text blocks only — image blocks
+  // there come back as `400 system.N.type: Input should be 'text'`. Images
+  // are always attached to the first user message; there's no flag for this
+  // because the system-field path is API-rejected. (Removed `placement` +
+  // `compressSystem` knobs that gated the dead system-field branch.)
+  // 313 cells × 5 px = 1565 px ≈ full 1568 px canvas width. We fill the
+  // canvas — no shrink-to-content — so every page packs the maximum chars
+  // per image and the per-image token cost amortizes over more text.
+  cols: 313,
+  // Cap at 10 images per tool_result. With ~50k chars/image at the 5×8
+  // production cell, a single-column tool_result can grow to ~500k chars
+  // before paging kicks in. A `find` over a big tree or `grep -r` can easily
+  // exceed this; the paging marker tells the model what was elided. Tuneable
+  // per session.
+  maxImagesPerToolResult: 10,
+  // English ~4 chars/tok default (= the CHARS_PER_TOKEN constant declared
+  // later in this file — kept as a literal here to avoid forward-reference).
+  // Host overrides per-request when the dashboard's live fit has converged.
+  charsPerToken: 4,
+  // Per-turn break-even gate by default (= horizon 1). Hosts that want
+  // multi-turn amortization (e.g. ocproxy's Codex integration) pass an
+  // integer ≥ 2 via `historyAmortizationHorizon`. See option jsdoc.
+  historyAmortizationHorizon: 1,
+  priorWarmTokens: 0,
+  priorWarmImageTokens: 0,
+  // Multi-column disabled: at 313 cols × 196 rows the single-column page
+  // already holds ~50k chars, so multi-col packing adds OCR-ordering risk
+  // without meaningful savings. Kept in the type for backward compat.
+  multiCol: 1,
+  // R3 reflow ON by default — the L1 OCR eval cleared it at the production
+  // 5×8 cell with the in-image instruction band (`reflow-inimage`): 98.95 %
+  // char accuracy on the 20-block corpus, +1pp over the text-only baseline.
+  // The ↵ newline marker is comprehended. See eval/.
+  reflow: true,
+};
+
+// --- per-block break-even check ---
+//
+// Anthropic's real per-image cost is ~2,500 tokens for a single-col PNG at
+// the OLD 5×8 atlas cell — a 508×1559 canvas (history-researcher's round-3
+// N=33 measurement on cold-miss events 2026-05-18). The published
+// theoretical formula `(w × h) / 750` underpredicts actual Anthropic
+// billing by ~2.4×, so we anchor on the empirical number. Billing is ∝
+// pixel area, so we scale that anchor on two axes: by canvas WIDTH for the
+// cell-size change (the production 5×8 cell keeps the cols=100 canvas at
+// 508 px — see TOKENS_PER_IMAGE_SINGLE_COL) and LINEARLY by numCols for
+// multi-col packing (N text columns side-by-side multiplies pixel area).
+//
+// Safety: the gate's job is to compress a block only when doing so saves
+// tokens. The constants below bias CONSERVATIVE — every uncertainty
+// resolves in favor of pass-through, so a misprediction at worst leaves
+// money on the table; it never burns money on a net-loss image:
+//   • CHARS_PER_TOKEN = 4 over-estimates tokens-per-char for typical
+//     tool_result code/JSON (real cpt ≈ 3-3.5), which UNDER-estimates
+//     text savings → bias toward pass-through.
+//   • numCols=1 cost is empirical (2500). numCols≥2 cost is linearly
+//     extrapolated + 10% margin since we don't yet have empirical
+//     measurements at wider canvases. Over-stating image cost ALSO
+//     biases toward pass-through.
+//
+// Production bug context (2026-05-19): a request with orig_chars=169k spread
+// across 88 small blocks each cost ~2,500 tokens as images = 220k tokens
+// when the text would have been only 42k tokens. The flat per-block-min
+// threshold (5k) was wide of the break-even point (10k) and let net-loss
+// compressions through.
+//
+// Multi-col safety hole (closed 2026-05-19): production runs multiCol=2
+// by default. The OLD flat `TOKENS_PER_IMAGE = 2500` applied at all
+// numCols, so the gate believed multi-col images were ~2× cheaper than
+// they actually are and would compress slabs that net-lost in reality.
+// The scaled cost below fixes that — at multiCol≥2, image cost reflects
+// the wider canvas.
+
+/** English ~4 chars per token average. Holds well enough for code + prose
+ *  mix; tool_result content is typically code-shaped. */
+const CHARS_PER_TOKEN = 4;
+
+/** Empirical chars-per-token for the *image-slab* path.
+ *
+ *  Updated 2026-05-21 from 2.5 → 2.0 on the basis of N=391 production
+ *  rows on Opus 4.7 (last 7 days, baseline_probe_status='ok'):
+ *
+ *      avg_outgoing_text_chars = 231,925
+ *      avg_real_input_tokens   = 115,893    (input + cache_created + cache_read)
+ *      => observed cpt         = 1.91
+ *
+ *  Opus 4.7 ships a new tokenizer; the older 2.5 value was calibrated on
+ *  Opus 4.5/4.6 text and now systematically OVER-estimates chars-per-token
+ *  by ~30%, which UNDER-estimates the real text-token cost the gate is
+ *  comparing image cost against. The result: the gate rejects compressions
+ *  that would actually be net wins. 2.0 brings the gate's text-token
+ *  estimate close to reality while still rounding slightly conservative
+ *  versus the observed mean (1.91), 
+[assistant]
+Reviewed src/core/proxy.ts.
+[user]
+p95 regressed, bump BATCH_WINDOW_MS to 1200.
+[assistant]
+BATCH_WINDOW_MS changed 3600 -> 1200.
+[tool_use Read]
+{"file_path":"src/core/render.ts"}
+[tool_result]
+tals.requests += 1;
+    if (compressed) this.totals.compressedRequests += 1;
+
+    if (haveBaseline && haveUsage) {
+      this.totals.baselineInputWeighted += baselineInputEff;
+      this.totals.actualInputWeighted += actualInputEff;
+      this.totals.outputWeighted += outputEquiv;
+    }
+    // All-rows COUNTERFACTUAL spend, ungated on the probe — the honest
+    // denominator for "did pxpipe move my real bill". Measured rows
+    // contribute their cache-aware baseline (what the unproxied path
+    // would have billed); unmeasured/probe-failed/passthrough rows
+    // contribute their actual input (pxpipe either didn't run or we
+    // can't measure the counterfactual, so actual ≈ baseline). This
+    // keeps the ratio bounded at 100% — you can't save more than you
+    // would have paid.
+    if (haveUsage) {
+      this.totals.allBaselineEquivalentWeighted +=
+        haveBaseline ? baselineInputEff : actualInputEff;
+      this.totals.allActualInputWeighted += actualInputEff;
+      this.totals.allOutputWeighted += outputEquiv;
+      this.totals.allUsageRequests += 1;
+      // Direct observed compressed-vs-passthrough split. No counterfactual,
+      // no probe gating — just partition the paid-rows set by which path
+      // actually ran this turn. Headline answers "is the compressed path
+      // cheaper per request on real traffic". Selection bias (the gate
+      // routes each turn) is real; sample counts go to the UI so the
+      // operator can judge sufficiency.
+      if (compressed) {
+        this.totals.compressedPaidRequests += 1;
+        this.totals.compressedActualInputWeighted += actualInputEff;
+        this.totals.compressedOutputWeighted += outputEquiv;
+      } else {
+        this.totals.passthroughPaidRequests += 1;
+        this.totals.passthroughActualInputWeighted += actualInputEff;
+        this.totals.passthroughOutputWeighted += outputEquiv;
+      }
+    }
+
+    // Per-session aggregation. Uses the SAME baseline/actual/output math as
+    // the global accumulators above, partitioned by `info.firstUserSha8`
+    // so the dashboard's "current session" panel can show what's happening
+    // RIGHT NOW instead of stale lifetime numbers. Untagged events (no
+    // firstUserSha8 — cold start, passthrough probe failures) are skipped
+    // rather than bucketed into a synthetic "unknown" session.
+    const sid = info?.firstUserSha8;
+    if (typeof sid === 'string' && sid.length > 0) {
+      this.currentSessionId = sid;
+      let s = this.sessions.get(sid);
+      if (!s) {
+        s = {
+          sessionId: sid,
+          baselineInputWeighted: 0,
+          actualInputWeighted: 0,
+          baselineMeasuredCount: 0,
+          allActualInputWeighted: 0,
+          allOutputWeighted: 0,
+        };
+        this.sessions.set(sid, s);
+        // Cap memory — drop the first (oldest by insertion order) session
+        // when over budget. We no longer track lastSeen privately on the
+        // class — insertion order is a fine proxy because `currentSessionId`
+        // (set above on every update) is what the serve path uses to pick
+        // the most-recent session, not a scan of `this.sessions`.
+        if (this.sessions.size > DashboardState.SESSION_CAP) {
+          const firstKey = this.sessions.keys().next().value;
+          if (firstKey !== undefined) this.sessions.delete(firstKey);
+        }
+      }
+      // Reuse the same haveUsage / haveBaseline guards + the
+      // baselineInputEff / actualInputEff locals computed earlier in
+      // update() so the lifetime totals block (above) and the per-session
+      // block (here) read the same values. Re-deriving them here would
+      // duplicate the cache-aware-baseline math and invite drift.
+      if (haveBaseline && haveUsage) {
+        s.baselineInputWeighted += baselineInputEff;
+        s.actualInputWeighted += actualInputEff;
+        s.baselineMeasuredCount += 1;
+      }
+      // ALL-rows session bill — mirrors the global `if (haveUsage)` block
+      // above (allActualInputWeighted / allOutputWeighted). Used as the
+      // honest denominator for the session's saved-% so caching wins on
+      // unmeasured requests still count toward "what you actually paid".
+      if (haveUsage) {
+        s.allActualInputWeighted += actualInputEff;
+        s.allOutputWeighted += outputEquiv;
+      }
+    }
+
+    // Measurement totals are independent of usage/baseline gating — they
+    // accumulate whenever the scanner produced numbers. The scanner sets
+    // measurement to undefined on 5xx (no body to scan) and on unknown
+    // content-types; we count an event as "measured" when it has any.
+    const m = ev.measurement;
+    if (m) {
+      this.totals.textCharsMeasured += m.textChars;
+      this.totals.thinkingCharsMeasured += m.thinkingChars;
+      this.totals.toolUseCharsMeasured += m.toolUseChars;
+      this.totals.redactedBlockCountMeasured += m.redactedBlockCount;
+      this.totals.eventsWithMeasurement += 1;
+    }
+
+    const row: RecentRow = {
+      ts: Date.now() / 1000,
+      method: ev.method,
+      path: ev.path,
+      status: ev.status,
+      compressed,
+      cc_added: compressed ? 1 : undefined,
+      input_tokens: haveUsage ? inp : undefined,
+      output_tokens: haveUsage ? out : undefined,
+      cache_create: haveUsage ? cc : undefined,
+      cache_read: haveUsage ? cr : undefined,
+      actual_input: haveUsage ? round1(actualInputEff) : undefined,
+      baseline_input: haveBaseline && haveUsage ? round1(baselineInputEff) : undefined,
+      session_saved_so_far_delta:
+        haveBaseline && haveUsage ? round1(baselineInputEff - actualInputEff) : undefined,
+      img_id: imgId,
+      img_ids: imgIds,
+    };
+    this.recent.push(row);
+    if (this.recent.length > RECENT_CAP) this.recent.splice(0, this.recent.length - RECENT_CAP);
+  }
+
+
+  /** On startup, fold the last N entries from the JSONL events file back
+   *  into the ring buffer so a process restart doesn't show an empty table.
+   *  Cumulative totals are *not* restored (the file may have rotated, and
+   *  double-counting is worse than starting fresh). */
+  async replay(filePath: string): Promise<void> {
+    try {
+      await fs.promises.access(filePath, fs.constants.R_OK);
+    } catch {
+      return; // no file yet, nothing to replay
+    }
+    const stream = fs.createReadStream(filePath, { encoding: 'utf8' });
+    const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+    const tail: TrackEvent[] = [];
+    for await (const line of rl) {
+      if (!line) continue;
+      try {
+        const ev = JSON.parse(line) as TrackEvent;
+        tail.push(ev);
+        if (tail.length > RECENT_CAP) tail.shift();
+      } catch {
+        /* skip malformed line */
+      }
+    }
+    for (const t of tail) {
+      const inp = t.input_tokens ?? 0;
+      const out = t.output_tokens ?? 0;
+      const cc = t.cache_create_tokens ?? 0;
+      const cr = t.cache_read_tokens ?? 0;
+      const haveUsage = inp > 0 || out > 0 || cc > 0 || cr > 0;
+      const baseline = (t as { baseline_tokens?: number }).baseline_tokens;
+      const cacheable = (t as { baseline_cacheable_tokens?: number })
+        .baseline_cacheable_tokens ?? 0;
+      const probeStatus = (t as { baseline_probe_status?: string }).baseline_probe_status;
+      // Same gating rule as update(): require an explicit 'ok' status when
+      // present; fall back to "have a baseline number" for legacy JSONL.
+      const probeOk = probeStatus === 'ok'
+        || (probeStatus === undefined && typeof baseline === 'number' && baseline > 0);
+      const haveBaseline = typeof baseline === 'number' && baseline > 0 && probeOk;
+      const actualInputEff = haveUsage ? computeActualInputEff(inp, cc, cr) : 0;
+      const baselineInputEff =
+        haveBaseline && haveUsage
+          ? computeBaselineInputEff(baseline as number, cacheable, cc, cr)
+          : 0;
+      // Output tokens land in the row for the table; totals are not
+      // restored on replay (see header comment on cumulative totals).
+      const row: RecentRow = {
+        ts: Date.parse(t.ts) / 1000,
+        method: t.method,
+        path: t.path,
+        status: t.status,
+        compressed: t.compressed === true,
+        cc_added: t.compressed === true ? 1 : undefined,
+        input_tokens: t.input_tokens,
+        output_tokens: t.output_tokens,
+        cache_create: t.cache_create_tokens,
+        cache_read: t.cache_read_tokens,
+        actual_input: haveUsage ? round1(actualInputEff) : undefined,
+        baseline_input:
+          haveBaseline && haveUsage ? round1(baselineInputEff) : undefined,
+      };
+      this.recent.push(row);
+    }
+  }
+
+  // ---- HTTP handlers ------------------------------------------------------
+
+  /**
+   * Per-session "what's happening right now" payload backing the
+   * `SessionSummary` panel. Scopes the dollar-weighted savings ratio + the
+   * per-bucket char attribution + the passthrough-reason histogram to the
+   * most-recently-active session (tracked via `info.firstUserSha8`) so the
+   * top-of-dashboard headline reflects the live session rather than stale
+   * lifetime aggregates from a previous run.
+   *
+   * Returns `{ sessionId: null, message: 'no active session yet' }` when no
+   * events have been received yet (or the first events were all untagged —
+   * cold start, probe failures) — `update()` only sets `currentSessionId`
+   * when a `firstUserSha8`-tagged event lands. The client renders a stale
+   * panel rather than zeroes when a session goes idle (NO `lastSeen >
+   * threshold` check here; see comment in `update()` for the rationale).
+   */
+  serveCurrentSessionJson(): Response {
+    if (!this.currentSessionId) {
+      return jsonResponse({
+        sessionId: null,
+        message: 'no active session yet',
+      });
+    }
+    const s = this.sessions.get(this.currentSessionId);
+    if (!s) {
+      return jsonResponse({ sessionId: null, message: 'no active session yet' });
+    }
+    // Headline payload: the same dollar-weighted baseline/actual input
+    // accumulators the global Totals block exposes, plus the honest
+    // denominator (`baselineMeasuredCount` — only requests that carried a
+    // baseline measurement). We ALSO ship the ALL-rows session bill
+    // (`allActualInputWeighted` + `allOutputWeighted`) so the Svelte panel
+    // can compute saved-% against the full session bill instead of just
+    // the measured slice — matching the global `saved_pct_of_all_spend`
+    // math but scoped to one session. The Svelte panel does the dollar
+    // conversion itself so we don't round-trip pricing through the wire.
+    return jsonResponse({
+      sessionId: s.sessionId,
+      baselineInputWeighted: s.baselineInputWeighted,
+      actualInputWeighted: s.actualInputWeighted,
+      baselineMeasuredCount: s.baselineMeasuredCount,
+      allActualInputWeighted: s.allActualInputWeighted,
+      allOutputWeighted: s.allOutputWeighted,
+    });
+  }
+
+  serveStats(): Response {
+    // Two headline numbers, derived from the same per-event accumulators:
+    //
+    //   saved_pct_input_only = Σ saved / Σ baseline_input_eff × 100
+    //     What the proxy actually saved on the slice it can move (input).
+    //     Numerator = input tokens we didn't pay for (cache-aware).
+    //     Denominator = input tokens we WOULD have paid (cache-aware).
+    //     Output is excluded because the proxy doesn't touch it.
+    //
+    //   saved_pct_of_total_bill = Σ saved / Σ (baseline_input + output × 5) × 100
+    //     What share of the TOTAL bill the proxy saved. Honest counter to the
+    //     input-only number: on output-heavy sessions (long thinking blocks,
+    //     big edits) the percentage shrinks because output dominates.
+    //
+    //   token_equivalent_total = Σ (actual_input + output × 5)
+    //     What Anthropic's weekly limit actually meters — input × 1.0 +
+    //     output × 5.0 (the same ratio as the per-MTok price card). This is
+    //     the number that moves your "%% used this week" indicator.
+    const baseline = this.totals.baselineInputWeighted;
+    const actual = this.totals.actualInputWeighted;
+    const output = this.totals.outputWeighted; // already × OUTPUT_TOKEN_RATE
+    const saved = baseline - actual;
+    const pctInput = baseline > 0 ? (saved / baseline) * 100 : 0;
+    const baselineTotal = baseline + output;
+    const actualTotal = actual + output;
+    const pctTotal = baselineTotal > 0 ? (saved / baselineTotal) * 100 : 0;
+
+    // Share-of-all-spend: honest denominator. The numerator can only credit
+    // savings against rows where we have a probe baseline (otherwise it's
+    // estimation), but the denominator MUST include every request the user
+    // actually paid for — including passthrough rows, probe-failed rows,
+    // and untransformed turns the gate said no to. Otherwise the headline
+    // answers "did pxpipe help on the rows where it ran" instead of
+    // "did pxpipe move my real bill". The first is a cherry-pick.
+    const allBaselineEquiv = this.totals.allBaselineEquivalentWeighted;
+    const allActual = this.totals.allActualInputWeighted;
+    const allOutput = this.totals.allOutputWeighted;
+    // Denominator = counterfactual all-rows bill: what the user would have
+    // paid with no pxpipe. Bounded ratio at 100%; a single cold-miss
+    // compressed request on an otherwise empty session shows ~99% saved,
+    // not 280%.
+    const allCounterfactualBill = allBaselineEquiv + allOutput;
+    const pctAllSpend =
+      allCounterfactualBill > 0 ? (saved / allCounterfactualBill) * 100 : 0;
+
+    // Direct observed split — actual $ per request, partitioned by which
+    // path ran. Token-equivalent (input × 1.0 + cache_create × 1.25 +
+    // cache_read × 0.10 + output × 5) → $ at the assumed Opus 4.7 input
+    // rate. Same $/Mtok rate is applied to both buckets, so the bias from
+    // the rate assumption cancels in the delta. Selection bias from the
+    // gate is NOT cancelled — the operator interprets that via the
+    // sample-count caveat below.
+    const compressedTokenEquiv =
+      this.totals.compressedActualInputWeighted +
+      this.totals.compressedOutputWeighted;
+    const passthroughTokenEquiv =
+      this.totals.passthroughActualInputWeighted +
+      this.totals.passthroughOutputWeighted;
+    const compressedActualUsd =
+      (compressedTokenEquiv * ASSUMED_INPUT_USD_PER_MTOK) / 1e6;
+    const passthroughActualUsd =
+      (passthroughTokenEquiv * ASSUMED_INPUT_USD_PER_MTOK) / 1e6;
+    const compressedAvgUsd =
+      this.totals.compressedPaidRequests > 0
+        ? compressedActualUsd / this.totals.compressedPaidRequests
+        : 0;
+    const passthroughAvgUsd =
+      this.totals.passthroughPaidRequests > 0
+        ? passthroughActualUsd / this.totals.passthroughPaidRequests
+        : 0;
+    // Sufficient-sample threshold is a soft heuristic. 20 paid requests per
+    // bucket is enough to see a real effect on Opus 4.7 traffic (a single
+    // big cold-miss can dominate at lower n). Below this, the UI shows the
+    // bucket numbers but hides the delta and surfaces "small sample".
+    const SUFFICIENT = 20;
+    const splitSufficient =
+      this.totals.compressedPaidRequests >= SUFFICIENT &&
+      this.totals.passth
+[assistant]
+Reviewed src/core/render.ts.
+[user]
+after the load test, final answer: BATCH_WINDOW_MS = 8400. lock it.
+[assistant]
+BATCH_WINDOW_MS changed 1200 -> 8400, locked.
+[tool_use Read]
+{"file_path":"src/core/transform.ts"}
+[tool_result]
+t: string,
+  cols: number,
+  numCols: number = 1,
+  /** Shrink the rendered canvas width to the longest actual wrapped line.
+   *  Default `true` (matches the `isCompressionProfitable` default and is
+   *  correct for per-block content: tool_result, reminder, history). Set
+   *  `false` for the system slab path, which fills the full configured
+   *  `cols` deliberately for multi-col packing. */
+  shrinkWidth: boolean = true,
+): Promise<{
+  blocks: ImageBlock[];
+  droppedChars: number;
+  droppedCodepoints: Map<number, number>;
+  /** Total pixel area across the rendered images (`Σ width × height`).
+   *  Lets the caller accumulate `info.imagePixels` for the empirical
+   *  px/token regression. */
+  pixels: number;
+}> {
+  // Width-shrink at the renderer entry so the renderer's canvas matches
+  // the gate's prediction (gate also uses `shrinkColsToContent` when its
+  // own `shrinkWidth=true`). Multi-col packing only kicks in when the
+  // configured `cols` is wide enough to need it, so we shrink BEFORE the
+  // numCols branch — for narrow content, single-col is the right call
+  // even if numCols>1 was configured.
+  const effectiveCols = shrinkWidth ? shrinkColsToContent(text, cols) : cols;
+  // If shrinkage drops the canvas below the multi-col threshold, stay
+  // single-col to avoid burning a divider column on near-empty space.
+  const effectiveNumCols = effectiveCols < cols ? 1 : numCols;
+  const imgs =
+    effectiveNumCols > 1
+      ? await renderTextToPngsMultiCol(text, effectiveCols, effectiveNumCols)
+      : await renderTextToPngsWithCharLimit(text, DENSE_CONTENT_COLS, DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_RENDER_STYLE);
+  let droppedChars = 0;
+  let pixels = 0;
+  const droppedCodepoints = new Map<number, number>();
+  const blocks: ImageBlock[] = [];
+  for (const img of imgs) {
+    blocks.push(makeImageBlock(bytesToBase64(img.png), false));
+    droppedChars += img.droppedChars;
+    pixels += img.width * img.height;
+    for (const [cp, n] of img.droppedCodepoints) {
+      droppedCodepoints.set(cp, (droppedCodepoints.get(cp) ?? 0) + n);
+    }
+  }
+  return { blocks, droppedChars, droppedCodepoints, pixels };
+}
+
+/** Best-effort byte-count of an image block's PNG payload (decoded from b64).
+ *  Used only for the imageBytes telemetry; an exact value isn't worth a
+ *  second base64 round-trip. */
+function approxBlockBytes(blk: ImageBlock): number {
+  const b64 = blk.source.data;
+  // base64 → bytes: every 4 chars decode to 3 bytes, minus padding.
+  const pad = b64.endsWith('==') ? 2 : b64.endsWith('=') ? 1 : 0;
+  return Math.floor((b64.length * 3) / 4) - pad;
+}
+
+// --- main transform --------------------------------------------------------
+
+
+/**
+ * Run history-image compression on `req.messages` and finalize the
+ * outgoing body. Called from BOTH the main success path AND the
+ * early-exit paths (below_min_chars, not_profitable slab) so message
+ * history is collapsed regardless of whether the static slab compresses.
+ *
+ * Real Codex traffic has tiny system slabs but huge `messages[]`. Without
+ * this, history collapse never runs on real production requests — the
+ * early-exits fire first and return the original bytes.
+ *
+ * The fn is intentionally tolerant to a missing or short messages array
+ * (collapseHistory itself short-circuits with reason='no_history' /
+ * 'prefix_too_short') so it's always safe to call.
+ */
+async function runHistoryCollapseAndFinalize(
+  req: MessagesRequest,
+  info: TransformInfo,
+  o: Required<TransformOptions>,
+  opts: TransformOptions,
+  droppedCodepoints: Map<number, number>,
+): Promise<{ body: Uint8Array; info: TransformInfo; collapsed: boolean }> {
+  let collapsedFlag = false;
+  if (Array.isArray(req.messages) && req.messages.length > 0) {
+    const historyCpt = opts.charsPerToken !== undefined
+      ? o.charsPerToken
+      : HISTORY_CHARS_PER_TOKEN;
+    const horizon = Math.max(1, Math.floor(o.historyAmortizationHorizon));
+    // Pass the symmetric warm-cache burn through to the history-collapse
+    // gate as well. The slab gate alone got the symmetric treatment, which
+    // let the history gate flip a session out of image mode even when
+    // symmetric burn would have kept the slab gate in. Production data
+    // 2026-05-23 showed three-turn sessions paying cache_create every
+    // turn because the history gate ignored priorWarmImageTokens.
+    const historyProfitable = (text: string, cols: number): boolean =>
+      isCompressionProfitableAmortized(
+        text, cols, undefined, 1, historyCpt, horizon,
+        o.priorWarmTokens, o.priorWarmImageTokens,
+      );
+    const { messages: newMessages, info: histInfo } = await collapseHistory(
+      req.messages,
+      historyProfitable,
+      { cols: o.cols },
+    );
+    if (histInfo.collapsedTurns > 0) {
+      req.messages = newMessages;
+      info.collapsedTurns = histInfo.collapsedTurns;
+      info.collapsedChars = histInfo.collapsedChars;
+      info.collapsedImages = histInfo.collapsedImages;
+      info.imageCount += histInfo.collapsedImages;
+      info.imageBytes += histInfo.collapsedImageBytes;
+      info.imagePixels = (info.imagePixels ?? 0) + histInfo.collapsedImagePixels;
+      info.droppedChars = (info.droppedChars ?? 0) + histInfo.droppedChars;
+      for (const [cp, n] of histInfo.droppedCodepoints) {
+        droppedCodepoints.set(cp, (droppedCodepoints.get(cp) ?? 0) + n);
+      }
+      info.historyReason = 'collapsed';
+      info.historyTextChars = histInfo.collapsedChars;
+      info.historyImageSha = await historyImageSha8(newMessages);
+      bumpBucket(info, 'history', histInfo.collapsedChars);
+      collapsedFlag = true;
+    } else if (histInfo.reason) {
+      info.historyReason = histInfo.reason;
+    }
+  }
+  info.outgoingTextChars = countOutgoingTextChars(req);
+  const outBody = new TextEncoder().encode(JSON.stringify(req));
+  return { body: outBody, info, collapsed: collapsedFlag };
+}
+
+/**
+ * Rewrite a Messages API request body. Returns the new body (still JSON
+ * bytes) plus diagnostic info. On any error, returns the original bytes
+ * unchanged.
+ */
+export async function transformRequest(
+  body: Uint8Array,
+  opts: TransformOptions = {},
+): Promise<{ body: Uint8Array; info: TransformInfo }> {
+  // Merge caller opts over DEFAULTS, but treat explicit `undefined` as "not
+  // provided" so it falls through to the default. Without this, a caller that
+  // passes `{ minToolResultChars: undefined }` (common when forwarding partial
+  // options from upstream — e.g. ocproxy's handler) would silently disable the
+  // tool_result text-passthrough gate and route everything through the
+  // renderer.
+  const merged: TransformOptions = { ...DEFAULTS, ...opts };
+  for (const k of Object.keys(merged) as (keyof TransformOptions)[]) {
+    if (merged[k] === undefined) {
+      (merged as Record<string, unknown>)[k] = (DEFAULTS as Record<string, unknown>)[k];
+    }
+  }
+  const o: Required<TransformOptions> = merged as Required<TransformOptions>;
+  const info: TransformInfo = {
+    compressed: false,
+    origChars: 0,
+    compressedChars: 0,
+    imageCount: 0,
+    imageBytes: 0,
+    staticChars: 0,
+    dynamicChars: 0,
+    dynamicBlockCount: 0,
+    droppedChars: 0,
+  };
+  // Per-request codepoint drop histogram. Merged from every render call
+  // (static slab + reminder + tool_result compressions). Serialized to
+  // `info.droppedCodepointsTop` at the end of transformRequest IF non-empty.
+  const droppedCodepoints = new Map<number, number>();
+
+  if (!o.compress) {
+    info.reason = 'compress=false';
+    return { body, info };
+  }
+
+  let req: MessagesRequest;
+  try {
+    req = JSON.parse(new TextDecoder().decode(body));
+  } catch (e) {
+    info.reason = `parse_error: ${(e as Error).message}`;
+    return { body, info };
+  }
+
+  // 1. Pull system text out. Split into:
+  //    - billingLine: Claude Code's per-turn random header (must NOT be cached).
+  //    - dynamicText: <env>/<context>/... blocks (per-turn, kept as text).
+  //    - staticText: everything else (cacheable, goes into the image).
+  const systemStaticCacheControl = lastStaticSystemCacheControl(req.system);
+  const { text: rawSysText, kept: sysRemainder } = extractSystemText(req.system);
+  const { kept: billingLine, body: sysBody } = stripBillingLine(rawSysText);
+  const {
+    staticText,
+    dynamicText,
+    blockCount: dynBlocks,
+    unknownTags,
+  } = splitStaticDynamic(sysBody);
+  info.staticChars = staticText.length;
+  info.dynamicChars = dynamicText.length;
+  info.dynamicBlockCount = dynBlocks;
+  if (unknownTags.length > 0) info.unknownStaticTags = unknownTags;
+  // Parse env fields out of the dynamic slab — telemetry only, never mutates.
+  const env = extractEnvFields(dynamicText);
+  if (Object.keys(env).length > 0) info.env = env;
+
+  // Privacy-safe fingerprints that don't depend on tool docs (computed
+  // here so they're available even if we below_min_chars out below).
+  // systemSha8 is set later, after we know the combined image-bound text.
+  const claudeMdSlab = extractClaudeMdSlab(staticText);
+  const firstUser = firstUserText(req);
+  const [claudeMdSha, firstUserSha] = await Promise.all([
+    claudeMdSlab ? sha8(claudeMdSlab) : Promise.resolve(undefined),
+    firstUser ? sha8(firstUser) : Promise.resolve(undefined),
+  ]);
+  if (claudeMdSha) info.claudeMdSha8 = claudeMdSha;
+  if (firstUserSha) info.firstUserSha8 = firstUserSha;
+
+  // 2. Optionally fold tool docs into the same image, stubbing originals.
+  let toolDocsText = '';
+  let toolsRewritten: ToolDef[] | undefined;
+  if (o.compressTools && Array.isArray(req.tools) && req.tools.length > 0) {
+    const docs: string[] = [];
+    let sawSchemaNoProps = false;
+    toolsRewritten = req.tools.map((t) => {
+      docs.push(renderToolDoc(t, o.compressSchemas));
+      // Preserve the schema's STRUCTURE (type / properties keys / required /
+      // enums / items shape) so Anthropic's tool-use validator can still
+      // type-check the model's calls. Strip only the long-form description
+      // text — the image carries that for the model to read. Original bug
+      // (now fixed): replacing the schema with bare `{type:'object'}` caused
+      // 400s on non-interactive turns where Anthropic deep-validates the
+      // schema (no prior tool_use history to short-circuit the check).
+      let stubSchema: unknown | undefined;
+      if (o.compressSchemas) {
+        if (t.input_schema && typeof t.input_schema === 'object') {
+          const stripped = stripSchemaDescriptions(
+            t.input_schema,
+            0,
+          ) as Record<string, unknown> | null;
+          if (!stripped || typeof stripped !== 'object') {
+            // Should not happen for object input, but b
+[assistant]
+Reviewed src/core/transform.ts.
+
+=== end ===

@@ -64,6 +64,9 @@ Measured with novel random-number problems the model cannot have memorized:
 |---|---:|---:|---:|---|
 | novel arithmetic, `claude-fable-5` | 100 | 100% | **100%** | **−38%** |
 | novel arithmetic, `claude-opus-4-8` | 100 | 100% | 93% | −38% |
+| gist recall A/B (decisions, values, paths, names, negations; with distractors; 15k-45k char sessions), Fable 5 | 98/arm | 98/98 | **98/98** | - |
+| state tracking (value mutated 3x, final/first/count), Fable 5 | 18/arm | 18/18 | **18/18** | - |
+| confabulation on never-stated facts (lower is better), Fable 5 | 16/arm | 0/16 | **0/16** | - |
 | verbatim 12-char hex recall, dense render, Opus | 15 | 15/15 | **0/15** | - |
 | verbatim 12-char hex recall, dense render, Fable 5 | 4 | - | 3/4 | - |
 
@@ -71,6 +74,7 @@ Measured with novel random-number problems the model cannot have memorized:
 recalls memorized answers through its own misreads, inflating the score, so we
 lead with the clean novel-number eval instead. Reproduce:
 [`eval/gsm8k/`](eval/gsm8k/) · [`eval/needle-haystack/`](eval/needle-haystack/) ·
+[`eval/gist-recall/`](eval/gist-recall/) ·
 full analysis in [`FINDINGS.md`](FINDINGS.md).</sub>
 
 ## How it works

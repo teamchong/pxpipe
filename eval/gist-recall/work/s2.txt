@@ -1,0 +1,381 @@
+=== session s2: earlier coding session transcript ===
+[tool_use Read]
+{"file_path":"src/core/render.ts"}
+[tool_result]
+e 0. The L1 OCR
+ *  sweep originally landed at 7×10 (96 % char accuracy vs ~82 % at naïve 5×8
+ *  on dense text), but the later combination of packed reflow + grayscale
+ *  atlas + the in-image instruction band (`reflow-inimage`) brought 5×8 back
+ *  to 98.95 % on Opus 4.7 — slightly above the text-only baseline — so the
+ *  production default reverted to the dense cell. RenderStyle.cellWBonus /
+ *  cellHBonus override these (eval use only); with no style the renderer
+ *  produces 5×8 cells. */
+export const DEFAULT_CELL_W_BONUS = 0;
+export const DEFAULT_CELL_H_BONUS = 0;
+/** Effective production render-cell pixel dimensions (atlas glyph + default
+ *  padding). transform.ts derives its image-budget and break-even math from
+ *  these so the gate always tracks the renderer's real geometry. */
+export const CELL_W = ATLAS_CELL_W + DEFAULT_CELL_W_BONUS;
+export const CELL_H = ATLAS_CELL_H + DEFAULT_CELL_H_BONUS;
+
+export interface RenderedImage {
+  /** Raw PNG bytes. */
+  png: Uint8Array;
+  /** Pixel width. */
+  width: number;
+  /** Pixel height. */
+  height: number;
+  /** How many input *codepoints* were rendered into this image (covers wide
+   *  chars correctly: 中 counts as 1, not 2). */
+  charsRendered: number;
+  /** Codepoints encountered that aren't in the atlas. They were rendered as
+   *  blank cells; the caller may want to surface this as telemetry so a
+   *  spike of drops triggers a profile review. */
+  droppedChars: number;
+  /** Histogram of dropped codepoints: codepoint
+[assistant]
+Looked at src/core/render.ts; continuing with the change.
+[user]
+ops note: the upstream gateway hard-times-out at 10s, so set our retry budget to exactly 9110ms and do not change it without a ticket.
+[assistant]
+Set the retry budget constant to 9110ms.
+[tool_use Read]
+{"file_path":"src/core/transform.ts"}
+[tool_result]
+xel is still background (0). Defensive against
+        // a glyph-overrun scenario where a wide char could in principle have
+        // landed in the gutter — though our wrap math caps col < cols above,
+        // so this is belt-and-braces.
+        if (fb[idx] === 0) fb[idx] = GUTTER_DIVIDER_INK;
+      }
+    }
+  }
+
+  // Invert: black-on-white (matches single-col convention).
+  for (let i = 0; i < fb.length; i++) fb[i] = 255 - fb[i]!;
+
+  const png = await encodeGrayPng(fb, width, height);
+  return {
+    png,
+    width,
+    height,
+    charsRendered: charsCovered,
+    droppedChars,
+    droppedCodepoints,
+  };
+}
+
+/** Split `text` into N multi-column PNGs.
+ *
+ *  When `numCols <= 1`, delegates to `renderTextToPngs` to guarantee
+ *  byte-identical output (so the determinism / cache_control story stays
+ *  intact when the flag is off).
+ *
+ *  Column-major layout: column 0 fills top-to-bottom with the first
+ *  `linesPerImg` wrapped lines, column 1 with the next `linesPerImg`, etc.
+ *  One image holds `numCols × linesPerImg` wrapped lines total.
+ *
+ *  `charsRendered` for each image is the codepoint count of source text
+ *  whose wrapped lines landed in that image, with a +1 separator between
+ *  adjacent kept lines — same convention as `renderChunkToPng`. */
+export async function renderTextToPngsMultiCol(
+  text: string,
+  cols: number = DEFAULT_COLS,
+  numCols: number = 2,
+): Promise<RenderedImage[]> {
+  if (numCols <= 1) return renderTextToPngs(text, cols);
+  if (multiColWidth(cols, numCols) > MAX_WIDTH_PX) {
+    // Clamp rather than throw — keeps the proxy serving traffic even if 
+[assistant]
+Looked at src/core/transform.ts; continuing with the change.
+[assistant]
+Found it: the double-flush race lives in src/cursor/io.ts, the lock is released before the journal write lands.
+[user]
+ok fix it there, nowhere else.
+[tool_use Read]
+{"file_path":"src/core/proxy.ts"}
+[tool_result]
+The glyph fills `(advance × CELL_W) × CELL_H` pixels.
+ */
+function blitGlyph(
+  fb: Uint8Array,
+  fbW: number,
+  x: number,
+  y: number,
+  codepoint: number,
+  markerMask: Uint8Array | null = null,
+): number {
+  const rank = atlasRank(codepoint);
+  if (rank < 0) return 0;
+  const wide = ATLAS_WIDE_FLAGS[rank] === 1;
+  const srcW = wide ? 2 * ATLAS_CELL_W : ATLAS_CELL_W;
+  // ATLAS_OFFSETS is a BIT offset since the bit-pack slice. To read pixel
+  // (gx, gy) of this glyph: bitIdx = srcOff + gy*srcW + gx, then extract
+  // the MSB-first bit at byte (bitIdx >>> 3), position 7 - (bitIdx & 7).
+  // Output pixel = 0 (background) or 255 (full ink).
+  const srcOff = ATLAS_OFFSETS[rank]!;
+  for (let gy = 0; gy < ATLAS_CELL_H; gy++) {
+    const dstRow = (y + gy) * fbW + x;
+    const bitRowStart = srcOff + gy * srcW;
+    for (let gx = 0; gx < srcW; gx++) {
+      const bitIdx = bitRowStart + gx;
+      const byte = ATLAS_PIXELS[bitIdx >>> 3]!;
+      const bit = (byte >>> (7 - (bitIdx & 7))) & 1;
+      if (bit) {
+        // 1-bit pixel: full ink. No max() blending needed since glyphs
+        // never overlap in our grid layout — set unconditionally.
+        fb[dstRow + gx] = 255;
+        if (markerMask) markerMask[dstRow + gx] = 1;
+      }
+    }
+  }
+  return wide ? 2 : 1;
+}
+
+/**
+ * Blit a single glyph from the grayscale atlas (atlas-gray.ts) onto the
+ * framebuffer at pixel position (x, y). Reads coverage bytes and writes
+ * `fb[idx] = Math.max(fb[idx], coverage)` so glyph ink accumulates without
+ * overwriting already-inked pixels (max blending, same convention as the
+ * 1-bit path which just sets 255).
+ *
+ * EVAL-ONLY: called only when style.aa is set. The 1-bit blitGlyph path
+ * is unchanged and remains byte-identical to before.
+ *
+ * Returns the number of cells the gl
+[assistant]
+Looked at src/core/proxy.ts; continuing with the change.
+[user]
+fyi the on-call reviewer for this change is Nadia Costa, route the PR to them.
+[assistant]
+Will request review from Nadia Costa.
+[tool_use Read]
+{"file_path":"src/core/history.ts"}
+[tool_result]
+seAA = style.aa === true;
+  const atlasH = useAA ? ATLAS_GRAY_CELL_H : ATLAS_CELL_H;
+  const atlasW = useAA ? ATLAS_GRAY_CELL_W : ATLAS_CELL_W;
+  const markerScale = Math.max(1, Math.floor(style.markerScale ?? 1));
+  const cellH = atlasH + Math.max(0, Math.floor(style.cellHBonus ?? DEFAULT_CELL_H_BONUS));
+  const cellW = Math.max(1, atlasW + Math.floor(style.cellWBonus ?? DEFAULT_CELL_W_BONUS));
+  const lines = wrapLines(text, cols, markerScale);
+
+  // Vertical budget: cap by MAX_HEIGHT_PX, then take that many lines.
+  const maxLines = Math.max(1, Math.floor((MAX_HEIGHT_PX - 2 * PAD_Y) / cellH));
+  const fitLines = lines.slice(0, maxLines);
+
+  // charsRendered = how many *input* codepoints this image covers. If we fit
+  // the whole input, that's just the codepoint count of `text`. If we had to
+  // drop overflow lines, we count only the chars in the lines we kept,
+  // including the input newlines BETWEEN them but excluding synthetic
+  // newlines that `wrapLines` introduced for soft-wrap.
+  let charsRendered: number;
+  if (fitLines.length === lines.length) {
+    // Full coverage: count input codepoints exactly. `for..of` iterates by
+    // codepoint, so surrogate pairs above U+FFFF count as 1.
+    let n = 0;
+    for (const _ of text) n++;
+    charsRendered = n;
+  } else {
+    // Partial coverage: sum codepoints in the lines we kept, plus one for
+    // each line break (since the input separator was either a real '\n' or a
+    // soft-wrap point — both represent one input position we covered).
+    let n = 0;
+    for (let i = 0; i < fitLines.length; i++) {
+      for (const _ of fitLines[i]!) n++;
+    }
+    // Each pair of adjacent fitLines was separated by either an input '\n'
+    // or a soft-wrap point; we cover (fitLines.length - 1) such separators.
+    n += Math.max(0, fitLines.l
+[assistant]
+Looked at src/core/history.ts; continuing with the change.
+[user]
+important: we did NOT enable ENABLE_SHARDING in prod, it only looked enabled because of the stale config cache. coverage stayed at 87%.
+[assistant]
+Understood: ENABLE_SHARDING is OFF in prod, the dashboard was lying; coverage 87%.
+[tool_use Read]
+{"file_path":"src/core/history.ts"}
+[tool_result]
+a char-attribution event lands in. One bucket per
+ *  gate-call neighborhood in `transformRequest`:
+ *    - `static_slab`        — the combined CLAUDE.md + tool docs slab
+ *    - `reminder`           — `<system-reminder>` blocks in the first user message
+ *    - `tool_result_json`   — tool_result content classified `structured`
+ *    - `tool_result_log`    — tool_result content classified `log`
+ *    - `tool_result_prose`  — tool_result content classified `other` (prose)
+ *    - `history`            — text folded into the Variant C history image
+ *  Used by the rolling-cpt regression (Task #18) to derive a per-bucket
+ *  marginal cpt so the gate can stop using one global text-cpt for content
+ *  with very different real cpts (JSON-dense tool_results vs prose). */
+export type BucketName =
+  | 'static_slab'
+  | 'reminder'
+  | 'tool_result_json'
+  | 'tool_result_log'
+  | 'tool_result_prose'
+  | 'history';
+
+/** Per-bucket sum of TEXT chars that flowed through each gate-call site this
+ *  request. Pre-compaction lengths — values stay comparable to `origChars`
+ *  and the chars that would have been billed if compression were off, and
+ *  give the regression a clean denominator. Absent when no bucket fired. */
+export type BucketChars = Partial<Record<BucketName, number>>;
+
+/** Attribute `chars` of TEXT to a logical compression bucket. Lazily allocates
+ *  `info.bucketChars` so happy-path events stay lean. Called at every gate
+ *  call site regardless of whether the gate accepted or rejected — we want
+ *  the denominator to reflect everything the gate saw, not just the wins. */
+function bumpBucket(info: TransformInfo, bucket: BucketName, chars: number): void {
+  if (chars <= 0) return;
+  if (!info.bucketChars) info.bucketChars = {};
+  info.bucketChars[bucket] = (info.bucketChars[bucket] ?? 0) + chars;
+}
+
+/** Map a `classifyContent` shape to a tool_result bucket name. Keeps the
+ *  per-call-site code free of repeated string checks. */
+function toolResultBucket(shape: 'structured' | 'log' | 'other'): BucketName {
+  if (shape === 'structured') return 'tool_result_json';
+  if (shape === 'log') return 'tool_result_log';
+  return 'tool_result_prose';
+}
+
+/** Parsed contents of Claude Code's <env> + git status blocks. All optional —
+ *  fields are only populated if the corresponding line is present. */
+export interface EnvFields {
+  /** Working directory at the time `claude` was launched. */
+  cwd?: string;
+  isGitRepo?: boolean;
+  /** Current git branch, parsed from <git_status> or a "Branch:" line. */
+  gitBranch?: string;
+  platform?: string;
+  osVersion?: string;
+  /** "Today's date" as Claude Code reported it (YYYY-MM-DD). */
+  today?: string;
+}
+
+export interface TransformInfo {
+  compressed: boolean;
+  reason?: string;
+  origChars: number;
+  /** Total chars of source text that were image-encoded across ALL blocks
+   *  this request (static slab + reminders + tool_results). Pairs with
+   *  `imageCount` for honest savings math:
+   *     textTokens  = compressedChars / 4
+   *     imageTokens = imageCount × 2500
+   *     savings     = textTokens − imageTokens
+   *  Unlike `origChars` (which is just static slab + tool docs),
+   *  `compressedChars` reflects what `imageCount` actually replaced. */
+  compressedChars: number;
+  imageCount: number;
+  imageBytes: number;
+  /** Total pixel area summed across all rendered images this request
+   *  (`Σ width × height`). Pairs with `cache_create_tokens` on cold-miss
+   *  events to derive empirical pixels-per-token under the current model —
+   *  the dashboard's `OPUS_IMAGE_TOKEN_COST` and the gate's `TOKENS_PER_IMAGE`
+   *  are both stale empirical constants from a d
+[assistant]
+Looked at src/core/history.ts; continuing with the change.
+[user]
+team sync outcome: we are going with immer for the store layer, valtio was rejected because the bundle delta was too big.
+[assistant]
+Noted, immer it is for the store layer; I will not add valtio.
+[tool_use Read]
+{"file_path":"src/core/transform.ts"}
+[tool_result]
+line in the *center* of the
+  // gutter region between columns c and c+1, with a small top/bottom inset
+  // so it doesn't visually bleed into the padding rows.
+  //
+  // Cost: ~1568 px × 1 byte = 1568 bytes of identical mid-gray. After DEFLATE
+  // this is ~3-5 bytes; per-pixel token cost is β·1568 ≈ 2 tokens for the
+  // entire divider at the current measured β. Trivial vs the OCR-clarity win.
+  if (numCols >= 2) {
+    const gutterPxPerSide = GUTTER_CELLS * CELL_W;
+    const yStart = GUTTER_DIVIDER_INSET_PX;
+    const yEnd = height - GUTTER_DIVIDER_INSET_PX;
+    for (let c = 0; c < numCols - 1; c++) {
+      // X coord: end of column c's text area + half the gutter.
+      const colEndX = PAD_X + c * colStride + cols * CELL_W;
+      const dividerX = colEndX + Math.floor(gutterPxPerSide / 2);
+      for (let y = yStart; y < yEnd; y++) {
+        const idx = y * width + dividerX;
+        // Only paint if the pixel is still background (0). Defensive against
+        // a glyph-overrun scenario where a wide char could in principle have
+        // landed in the gutter — though our wrap math caps col < cols above,
+        // so this is belt-and-braces.
+        if (fb[idx] === 0) fb[idx] = GUTTER_DIVIDER_INK;
+      }
+    }
+  }
+
+  // Invert: black-on-white (matches single-col convention).
+  for (let i = 0; i < fb.length; i++) fb[i] = 255 - fb[i]!;
+
+  const png = await encodeGrayPng(fb, width, height);
+  return {
+    png,
+    width,
+    height,
+    charsRendered: charsCovered,
+    droppedChars,
+    droppedCodepoints,
+  };
+}
+
+/** Split `text` into N multi-column PNGs.
+ *
+ *  When `numCols <= 1`, delegates to `renderTextToPngs` to guarantee
+ *  byte-identical output (so the determinism / cache_control story stays
+ *  intact when the flag is off).
+ *
+ *  Column-major layout: column 0 fills top-to-bottom with the first
+ *  `linesPerImg` wrapped lines, column 1 with the next `linesPerImg`, etc.
+ *  One image holds `numCols × linesPerImg` wrapped lines total.
+ *
+ *  `charsRendered` for each image is the codepoint count of source text
+ *  whose wrapped lines landed in that image, with a +1 separator between
+ *  adjacent kept lines — same convention as `renderChunkToPng`. */
+export async function renderTextToPngsMultiCol(
+  text: string,
+  cols: number = DEFAULT_COLS,
+  numCols: number = 2,
+): Promise<RenderedImage[]> {
+  if (numCols <= 1) return renderTextToPngs(text, cols);
+  if (multiColWidth(cols, numCols) > MAX_WIDTH_PX) {
+    // Clamp rather than throw — keeps the proxy serving traffic even if a
+    // bad CLI flag slipped through. Falls back to the widest fitting count.
+    numCols = maxFittingCols(cols);
+    if (numCols <= 1) return renderTextToPngs(text, cols);
+  }
+
+  const lines = wrapLines(text, cols);
+  const hardLinesPerImg = Math.max(1, Math.floor((MAX_HEIGHT_PX - 2 * PAD_Y) / CELL_H));
+  const linesPerImg = Math.min(hardLinesPerImg, readableLinesPerColumn(cols));
+  const linesPerImage = linesPerImg * numCols;
+
+  // Total source codepoints — for the last image we can use this directly
+  // when every wrapped line fits.
+  let totalChars = 0;
+  for (const _ of text) totalChars++;
+
+  const images: RenderedImage[] = [];
+  let coveredChars = 0;
+  const pages = splitWrappedLinesIntoReadablePages(
+    lines,
+    linesPerImage,
+    READABLE_CHARS_PER_IMAGE * Math.max(1, numCols | 0),
+  );
+  for (let i = 0; i < pages.length; i++) {
+    const slice = pages[i]!;
+    const isLast = i === pages.length - 1;
+    let chars: number;
+    if (isLast) {
+      // Last image: assign whatever source coverage remains so the per-image
+      // counts sum to the total input codepoint count.
+      chars = Math.max(0, totalChars - coveredChars);
+    } else {
+   
+[assistant]
+Looked at src/core/transform.ts; continuing with the change.
+
+=== end of transcript ===

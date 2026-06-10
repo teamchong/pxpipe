@@ -1,0 +1,1038 @@
+=== session s4 transcript ===
+[tool_use Read]
+{"file_path":"src/core/transform.ts"}
+[tool_result]
+, content: [
+ *     { type: 'text', text: '[Earlier in this conversation:]' },
+ *     { type: 'image', source: {...} },           // (1..N images)
+ *     { type: 'text', text: '[End of earlier context.]' },
+ *   ]}
+ *
+ * Live tail (the last `keepTail` turns + anything inside an open tool
+ * sequence) stays as text. The most-recent assistant turn — the one
+ * carrying Opus 4.7's `thinking` signature — is always in the live tail
+ * by construction (it's at index `messages.length - 1` when present).
+ *
+ * The synthesized user message uses `role: 'user'` because Anthropic
+ * **forbids `image` blocks inside `role: 'assistant'`** (see
+ * `/tmp/pxpipe-history-compression.md` line 14 and `types.ts:58`
+ * comments). Self-attribution ("I previously said X") is the price.
+ *
+ * `thinking` blocks inside the collapsed range are dropped from the
+ * rendered text — per the spec's Check 2, only the most-recent
+ * assistant-with-tool_use's thinking content must round-trip bit-perfect,
+ * and that turn is in the live tail by construction.
+ *
+ * **Cache-control**: caller controls whether the history-image carries
+ * pxpipe's ephemeral breakpoint. This module returns the image blocks
+ * unmarked; the caller in `transform.ts` decides placement.
+ *
+ * Spec source: `/tmp/pxpipe-history-compression.md` Variant C section
+ * (round 3, lines 346-364 + check-3 cache-control discussion).
+ */
+
+import type { ContentBlock, ImageBlock, Message, TextBlock, ToolUseBlock, ToolResultBlock } from './types.js';
+import { DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_CONTENT_COLS, DENSE_RENDER_STYLE, renderTextToPngsWithCharLimit } from './render.js';
+import { bytesToBase64 } from './png.js';
+
+/** Function predicate signature for the break-even gate. Passed in by the
+ *  caller (transform.ts) rather than imported here to keep `src/core/history.ts`
+ *  free of a cycle with `src/core/transform.ts`. transform.ts already imports
+ *  history.ts to invoke `collapseHistory`; importing back the other way would
+ *  create an evaluation-order trap.
+ *
+ *  IMPORTANT — takes the full `text`, NOT `text.length`. The downstream
+ *  `isCompressionProfitable` has two paths: a row-aware path for strings
+ *  (matches renderTextToPngs() image budgeting exactly) and a looser
+ *  chars-only fallback for numbers (assumes dense lines, no newlines).
+ *  History text is *newline-heavy* — `--- role ---` headers, JSON args,
+ *  `[tool_use]` / `[tool_result]` labels — so the chars-only estimate
+ *  under-predicts image count by ~5-10× and used to let net-losers
+ *  through. The 2026-05-19 production -250% savings measurement traces
+ *  back to that asymmetry. Always pass the string. */
+export type ProfitableFn = (text: string, cols: number) => boolean;
+
+/** Configuration for history collapse. */
+export interface HistoryCollapseOptions {
+  /** Number of turns at the tail (most recent) to KEEP as text. Default 4. */
+  keepTail: number;
+  /** Minimum number of turns in the collapsable prefix before we attempt
+   *  the rolling-window re-roll. Below this, leaving them as text costs
+   *  almost nothing and the cache-amortization math doesn't work. Default 10. */
+  minCollapsePrefix: number;
+  /** Soft-wrap column count for the renderer. Should match the host's
+   *  configured `cols` so the history image visually matches the system
+   *  image. Default 100. */
+  cols: number;
+  /** Quantize the collapse boundary onto a fixed grid of this many
+   *  messages. The collapsed prefix only advances in `collapseChunk`-sized
+   *  steps, so the rendered history image stays byte-identical between
+   *  steps and keeps hitting Anthropic's prompt cache instead of forcing a
+   *  fresh `cache_create` (1.25x) of the whole prefix on every single turn.
+   *  Set to 0 for the legacy per-turn moving boundary. Default 50. */
+  collapseChunk: number;
+}
+
+export const HISTORY_DEFAULTS: HistoryCollapseOptions = {
+  keepTail: 4,
+  minCollapsePrefix: 10,
+  cols: 100,
+  collapseChunk: 50,
+};
+
+/** Per-request telemetry surfaced back to TransformInfo. */
+export interface HistoryCollapseInfo {
+  /** Number of turns collapsed into the history image. */
+  collapsedTurns: number;
+  /** Total chars of text that went into the history image. */
+  collapsedChars: number;
+  /** Number of PNG image blocks emitted for the history (≥1 if collapsed). */
+  collapsedImages: number;
+  /** Total PNG bytes emitted. */
+  collapsedImageBytes: number;
+  /** Total pixel area emitted (`Σ width × height`). Pairs with cold-miss
+   *  cache_create to
+[assistant]
+Reviewed src/core/transform.ts.
+[user]
+set BATCH_WINDOW_MS to 7200 to start.
+[assistant]
+BATCH_WINDOW_MS=7200 committed.
+[tool_use Read]
+{"file_path":"src/core/render.ts"}
+[tool_result]
+ew Uint8Array(buf);
+}
+
+/** sha256[0..8] of a byte buffer, hex. Same shape as the existing sha8(text)
+ *  helper in transform.ts but works on raw bytes (no extra encode pass). */
+async function sha8Bytes(body: Uint8Array): Promise<string> {
+  // Cast to BufferSource — Web Crypto accepts Uint8Array at runtime.
+  const digest = await crypto.subtle.digest('SHA-256', body as BufferSource);
+  const bytes = new Uint8Array(digest);
+  let hex = '';
+  for (let i = 0; i < 4; i++) hex += bytes[i]!.toString(16).padStart(2, '0');
+  return hex;
+}
+
+/**
+ * Ground-truth output measurement extracted from the response stream itself.
+ *
+ *  - `textChars` / `thinkingChars` / `toolUseChars` count Unicode code units
+ *    of the corresponding payload (`text_delta`, `thinking_delta`, and
+ *    `input_json_delta` for SSE; `content[].text` / `.thinking` /
+ *    JSON-encoded `.input` for non-stream responses).
+ *  - `redactedBlockCount` is the number of `redacted_thinking` content blocks
+ *    Anthropic returned — chars are unavailable for these (the field is
+ *    opaque server-encrypted bytes), so they get a low/mid/high estimate at
+ *    the dashboard layer instead of a precise char count.
+ *
+ * These numbers are independent of Anthropic's `usage.output_tokens` — they
+ * give us a real ruler against the redacted_thinking-inflated bill, which is
+ * exactly the gap the May-2026 weekly-meter audit surfaced. Live on `info`,
+ * so they ride the existing TrackEvent pipeline; the dashboard layer turns
+ * them into `output_chars_measured`, `tool_use_chars_measured`, etc.
+ */
+export interface OutputMeasurement {
+  textChars: number;
+  thinkingChars: number;
+  toolUseChars: number;
+  redactedBlockCount: number;
+}
+
+/** Walk a single SSE event (`event: …\ndata: …`) and fold it into the running
+ *  usage + measurement accumulators. Quiet on malformed events — a stream
+ *  with one corrupt line should not break the host's event log. */
+function processSseEvent(
+  block: string,
+  m: OutputMeasurement,
+  state: { usage: Usage | undefined },
+): void {
+  // Each SSE event is one or more lines; we only care about `event:` + `data:`.
+  // Continuation `data:` lines concatenate per the SSE spec, though Anthropic
+  // ships single-line JSON in practice.
+  let event = '';
+  let data = '';
+  for (const line of block.split('\n')) {
+    if (line.startsWith('event:')) event = line.slice(6).trim();
+    else if (line.startsWith('data:')) data += line.slice(5).replace(/^\s/, '');
+  }
+  if (!data) return;
+  let j: unknown;
+  try {
+    j = JSON.parse(data);
+  } catch {
+    return;
+  }
+  const obj = j as Record<string, unknown>;
+
+  // OpenAI Chat Completions streaming chunks usually have no `event:` line:
+  // each SSE block is `data: { choices, usage }`, with usage present only
+  // when stream_options.include_usage is enabled. Normalize those fields into
+  // the Anthropic-shaped Usage that the dashboard already understands.
+  const openAIUsage = normalizeUsage((obj as { usage?: unknown }).usage);
+  if (openAIUsage) state.usage = openAIUsage;
+  measureOpenAIChoices(obj, m);
+
+  if (event === 'message_start') {
+    const msg = obj.message as { usage?: Usage } | undefined;
+    const usage = normalizeUsage(msg?.usage);
+    if (usage) state.usage = usage;
+  } else if (event === 'content_block_start') {
+    const cb = obj.content_block as { type?: string } | undefined;
+    if (cb?.type === 'redacted_thinking') m.redactedBlockCount += 1;
+  } else if (event === 'content_block_delta') {
+    const d = obj.delta as
+      | { type?: string; text?: string; thinking?: string; partial_json?: string }
+      | undefined;
+    if (d?.type === 'text_delta' && typeof d.text === 'string') {
+      m.textChars += d.text.length;
+    } else if (d?.type === 'thinking_delta' && typeof d.thinking === 'string') {
+      m.thinkingChars += d.thinking.length;
+    } else if (d?.type === 'input_json_delta' && typeof d.partial_json === 'string') {
+      m.toolUseChars += d.partial_json.length;
+    }
+  } else if (event === 'message_delta') {
+    // Authoritative final output_tokens lives here; merge over the message_start
+    // baseline so the host event records the billed number, not the placeholder
+    // (message_start ships `output_tokens: 1` on day-zero Sonnet 4).
+    const u = obj.usage as Partial<Usage> | undefined;
+    if (u) {
+      if (!state.usage) state.usage = {} as Usage;
+      const cur = state.usage;
+      if (typeof u.output_tokens === 'number') cur.output_tokens = u.output_tokens;
+      if (typeof u.input_tokens === 'number' && cur.input_tokens === undefined) {
+        cur.input_tokens = u.input_tokens;
+      }
+      if (typeof u.cache_creation_input_tokens === 'number') {
+        cur.cache_creation_input_tokens = u.cache_creation_input_tokens;
+      }
+      if (typeof u.cache_read_input_tokens === 'number') {
+        cur.cache_read_input_tokens = u.cache_read_input_tokens;
+      }
+    }
+  }
+}
+
+function normalizeUsage(raw: unknown): Usage | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const u = raw as Record<string, unknown>;
+  const out: Usage = {};
+
+  if (typeof u.input_tokens === 'number') out.input_tokens = u.input_tokens;
+  if (typeof u.output_tokens === 'number') out.output_tokens = u.output_tokens;
+  if (typeof u.cache_creation_input_tokens === 'number') {
+    out.cache_creation_input_tokens = u.cache_creation_input_tokens;
+  }
+  if (typeof u.cache_read_input_tokens === 'number') {
+    out.cache_read_input_tokens = u.cache_read_input_tokens;
+  }
+  if (typeof u.cache_creation === 'object' && u.cache_creation !== null) {
+    out.cache_creation = u.cache_creation as Usage['cache_creation'];
+  }
+  if (typeof u.server_tool_use === 'object' && u.server_tool_use !== null) {
+    out.server_tool_use = u.server_tool_use as Usage['server_tool_use'];
+  }
+
+  // OpenAI Chat Completions shape.
+  if (typeof u.prompt_tokens === 'number') out.input_tokens = u.prompt_tokens;
+  if (typeof u.completion_tokens === 'number') out.output_tokens = u.completion_tokens;
+
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function measureOpenAIChoices(obj: Record<string, unknown>, m: OutputMeasurement): void {
+  const choices = obj.choices;
+  if (!Array.isArray(choices)) return;
+  for (const choice of choices) {
+    if (!choice || typeof choice !== 'object') continue;
+    const c = choice as { delta?: unknown; message?: unknown };
+    const payload = (c.delta ?? c.message) as Record<string, unknown> | undefined;
+    if (!payload || typeof payload !== 'object') continue;
+    if (typeof payload.content === 'string') m.textChars += payload.content.length;
+    const toolCalls = payload.tool_calls;
+    if (Array.isArray(toolCalls)) {
+      for (const tc of toolCalls) {
+        const fn = (tc as { function?: unknown } | undefined)?.function;
+        const args = (fn as { arguments?: unknown } | undefined)?.arguments;
+        if (typeof args === 'string') m.toolUseChars += args.length;
+      }
+    }
+  }
+}
+
+/** Measure non-stream `messages.content[]` directly. Same shape as the SSE
+ *  accumulator — output_*_chars carry char counts, redactedBlockCount counts
+ *  `redacted_thinking` blocks (no chars available). */
+function measureFromMessageJson(j: unknown): OutputMeasurement {
+  const m: OutputMeasurement = { textChars: 0, thinkingChars: 0, toolUseChars: 0, redactedBlockCount: 0 };
+  if (j && typeof j === 'object') measureOpenAIChoices(j as Record<string, unknown>, m);
+  const content = (j as { content?: unknown })?.content;
+  if (!Array.isArray(content)) return m;
+  for (const block of content) {
+    const b = block as { type?: string; text?: unknown; thinking?: unknown; input?: unknown };
+    if (b?.type === 'text' && typeof b.text === 'string') {
+      m.textChars += b.text.length;
+    } else if (b?.type === 'thinking' && typeof b.thinking === 'string') {
+      m.thinkingChars += b.thinking.length;
+    } else if (b?.type === 'redacted_thinking') {
+      m.redactedBlockCount += 1;
+    } else if (b?.type === 'tool_use') {
+      try {
+        m.toolUseChars += JSON.stringify(b.input ?? {}).length;
+      } catch {
+        /* circular / unserialisable input — leave the counter as-is */
+      }
+    }
+  }
+  return m;
+}
+
+/**
+ * Tee the response body so we can scan for the usage block AND the per-event
+ * char counts for honest output measurement. Returns the un-touched response
+ * to forward to the client + a Promise that resolves to the parsed Usage and
+ * a Promise that resolves to the measurement (both `undefined` when we can't
+ * extract them — e.g. unknown content-type, 5xx, no body).
+ *
+ * Streaming responses are scanned to EOF (not the old 64 KiB cap) because the
+ * final `output_tokens` lives in the `message_delta` at the end of the stream
+ * and `redacted_thinking` blocks can appear anywhere. The scanner is cheap
+ * (regex-free incremental SSE parser) and the tee back-pressure is no worse
+ * than the previous "drain to /dev/null in the background" path.
+ *
+ * For upstream 4xx responses, we tee the body to capture up to `ERROR_BODY_MAX`
+ * chars so the host can log what Anthropic actually rejected. 5xx still bails.
+ */
+function teeForUsage(res: Response): {
+  response: Response;
+  usagePromise: Promise<Usage | undefined>;
+  errorBodyPromise: Promise<string | undefined>;
+  measurementPromise: Promise<OutputMeasurement | undefined>;
+} {
+  // No body at all: nothing to extract on either path.
+  if (!res.body) {
+    return {
+      response: res,
+      usagePromise: Promise.resolve(undefined),
+      errorBodyPromise: Promise.resolve(undefined),
+      measurementPromise: Promise.resolve(undefined),
+    };
+  }
+  // 4xx: tee for the error body but skip usage scanning entirely.
+  if (res.status >= 400 && res.status < 500) {
+    const [forClient, forUs] = res.body.tee();
+    const errorBodyPromise = (async (): Promise<string | undefined> => {
+      const reader = forUs.getReader();
+      const decoder = new TextDecoder();
+      let out = '';
+      try {
+        while (out.length < ERROR_BODY_MAX) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          out += decoder.decode(value, { stream: true });
+        }
+        out += decoder.decode();
+        // Drain the rest so the tee buffer doesn't hold the stream open.
+        while (true) {
+          const { done } = await reader.read();
+          if (done) break;
+        }
+      } catch {
+        /* client may have aborted; whatever we got is fine */
+      }
+      return out.length > ERROR_BODY_MAX ? out.slice(0, ERROR_BODY_MAX) : out;
+    })();
+    return {
+      response: new Response(forClient, {
+        status: res.status,
+        statusText: res.statusText,
+        headers: res.headers,
+      }),
+      usagePromise: Promise.resolve(undefined),
+      errorBodyPromise,
+      measurementPromise: Promise.resolve(undefined),
+    };
+  }
+  // 5xx: skip both (the host already synthesizes an error message).
+  if (res.status >= 500) {
+    return {
+      response: res,
+      usagePromise: Promise.resolve(undefined),
+      errorBodyPromise: Promise.resolve(undefined),
+      measurementPromise: Promise.resolve(undefined),
+    };
+  }
+  const ct = (res.headers.get('content-type') ?? '').toLowerCase();
+  const [forClient, forUs] = res.body.tee();
+
+  // Single scan resolves both usage and measurement together. We expose them
+  // as separate promises (resolved from the same shared payload) so callers
+  // can stay readable; both wait on the same underlying read loop.
+  const scanResult = (async (): Promise<{
+    usage: Usage | undefined;
+    measurement: OutputMeasurement | undefined;
+  }> => {
+    const reader = forUs.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+
+    try {
+      if (ct.includes('text/event-stream')) {
+        // SSE: walk every event to EOF. Final output_tokens is in message_delta
+        // (last event before message_stop); redacted_thinking blocks can appear
+        // anywhere. Tee back-pressure is bounded by the slower-reader's buffer,
+        // which here is whichever of the proxy/scanner falls behind — both run
+        // at network speed in practice.
+        const m: OutputMeasurement = {
+          textChars: 0,
+          thinkingChars: 0,
+          toolUseChars: 0,
+          redactedBlockCount: 0,
+        };
+        const state: { usage: Usage | undefined } = { usage: undefined };
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          // Drain every complete event (terminated by a blank line per SSE spec).
+          let evEnd: number;
+          while ((evEnd = buf.indexOf('\n\n')) >= 0) {
+            const block = buf.slice(0, evEnd);
+            buf = buf.slice(evEnd + 2);
+            processSseEvent(block, m, state);
+          }
+        }
+        buf += decoder.decode();
+        // Trailing partial event (no blank line) — try once for robustness.
+        if (buf.trim().length > 0) processSseEvent(buf, m, state);
+        return { usage: state.usage, measurement: m };
+      }
+
+      if (ct.includes('application/json')) {
+        // Non-stream: buffer fully (capped at 4 MiB).
+        const MAX = 4 * 1024 * 1024;
+        while (buf.length < MAX) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+        }
+        try {
+          const j = JSON.parse(buf);
+          return {
+            usage: normalizeUsage(j?.usage),
+            measurement: measureFromMessageJson(j),
+          };
+        } catch {
+          return { usage: undefined, measurement: undefined };
+        }
+      }
+    } catch {
+      /* tee may be released early if the client aborts — ignore */
+    }
+    // Unknown content-type: drain so the tee buffer doesn't hold the stream open.
+    try {
+      while (true) {
+        const { done } = await reader.read();
+        if (done) break;
+      }
+    } catch {
+      /* ignore */
+    }
+    return { usage: undefined, measurement: undefined };
+  })();
+
+  return {
+    response: new Response(forClient, {
+      status: res.status,
+      statusText: res.statusText,
+      headers: res.headers,
+    }),
+    usagePromise: scanResult.then((s) => s.usage),
+    errorBodyPromise: Promise.res
+[assistant]
+Reviewed src/core/render.ts.
+[user]
+p95 regressed, bump BATCH_WINDOW_MS to 1800.
+[assistant]
+BATCH_WINDOW_MS changed 7200 -> 1800.
+[tool_use Read]
+{"file_path":"src/core/render.ts"}
+[tool_result]
+rt),
+        omittedChars: omitted,
+      }) +
+      tailText,
+    omittedChars: omitted,
+    truncated: true,
+  };
+}
+
+async function textToImageBlocks(
+  text: string,
+  cols: number,
+  numCols: number = 1,
+  /** Shrink the rendered canvas width to the longest actual wrapped line.
+   *  Default `true` (matches the `isCompressionProfitable` default and is
+   *  correct for per-block content: tool_result, reminder, history). Set
+   *  `false` for the system slab path, which fills the full configured
+   *  `cols` deliberately for multi-col packing. */
+  shrinkWidth: boolean = true,
+): Promise<{
+  blocks: ImageBlock[];
+  droppedChars: number;
+  droppedCodepoints: Map<number, number>;
+  /** Total pixel area across the rendered images (`Σ width × height`).
+   *  Lets the caller accumulate `info.imagePixels` for the empirical
+   *  px/token regression. */
+  pixels: number;
+}> {
+  // Width-shrink at the renderer entry so the renderer's canvas matches
+  // the gate's prediction (gate also uses `shrinkColsToContent` when its
+  // own `shrinkWidth=true`). Multi-col packing only kicks in when the
+  // configured `cols` is wide enough to need it, so we shrink BEFORE the
+  // numCols branch — for narrow content, single-col is the right call
+  // even if numCols>1 was configured.
+  const effectiveCols = shrinkWidth ? shrinkColsToContent(text, cols) : cols;
+  // If shrinkage drops the canvas below the multi-col threshold, stay
+  // single-col to avoid burning a divider column on near-empty space.
+  const effectiveNumCols = effectiveCols < cols ? 1 : numCols;
+  const imgs =
+    effectiveNumCols > 1
+      ? await renderTextToPngsMultiCol(text, effectiveCols, effectiveNumCols)
+      : await renderTextToPngsWithCharLimit(text, DENSE_CONTENT_COLS, DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_RENDER_STYLE);
+  let droppedChars = 0;
+  let pixels = 0;
+  const droppedCodepoints = new Map<number, number>();
+  const blocks: ImageBlock[] = [];
+  for (const img of imgs) {
+    blocks.push(makeImageBlock(bytesToBase64(img.png), false));
+    droppedChars += img.droppedChars;
+    pixels += img.width * img.height;
+    for (const [cp, n] of img.droppedCodepoints) {
+      droppedCodepoints.set(cp, (droppedCodepoints.get(cp) ?? 0) + n);
+    }
+  }
+  return { blocks, droppedChars, droppedCodepoints, pixels };
+}
+
+/** Best-effort byte-count of an image block's PNG payload (decoded from b64).
+ *  Used only for the imageBytes telemetry; an exact value isn't worth a
+ *  second base64 round-trip. */
+function approxBlockBytes(blk: ImageBlock): number {
+  const b64 = blk.source.data;
+  // base64 → bytes: every 4 chars decode to 3 bytes, minus padding.
+  const pad = b64.endsWith('==') ? 2 : b64.endsWith('=') ? 1 : 0;
+  return Math.floor((b64.length * 3) / 4) - pad;
+}
+
+// --- main transform --------------------------------------------------------
+
+
+/**
+ * Run history-image compression on `req.messages` and finalize the
+ * outgoing body. Called from BOTH the main success path AND the
+ * early-exit paths (below_min_chars, not_profitable slab) so message
+ * history is collapsed regardless of whether the static slab compresses.
+ *
+ * Real Codex traffic has tiny system slabs but huge `messages[]`. Without
+ * this, history collapse never runs on real production requests — the
+ * early-exits fire first and return the original bytes.
+ *
+ * The fn is intentionally tolerant to a missing or short messages array
+ * (collapseHistory itself short-circuits with reason='no_history' /
+ * 'prefix_too_short') so it's always safe to call.
+ */
+async function runHistoryCollapseAndFinalize(
+  req: MessagesRequest,
+  info: TransformInfo,
+  o: Required<TransformOptions>,
+  opts: TransformOptions,
+  droppedCodepoints: Map<number, number>,
+): Promise<{ body: Uint8Array; info: TransformInfo; collapsed: boolean }> {
+  let collapsedFlag = false;
+  if (Array.isArray(req.messages) && req.messages.length > 0) {
+    const historyCpt = opts.charsPerToken !== undefined
+      ? o.charsPerToken
+      : HISTORY_CHARS_PER_TOKEN;
+    const horizon = Math.max(1, Math.floor(o.historyAmortizationHorizon));
+    // Pass the symmetric warm-cache burn through to the history-collapse
+    // gate as well. The slab gate alone got the symmetric treatment, which
+    // let the history gate flip a session out of image mode even when
+    // symmetric burn would have kept the slab gate in. Production data
+    // 2026-05-23 showed three-turn sessions paying cache_create every
+    // turn because the history gate ignored priorWarmImageTokens.
+    const historyProfitable = (text: string, cols: number): boolean =>
+      isCompressionProfitableAmortized(
+        text, cols, undefined, 1, historyCpt, horizon,
+        o.priorWarmTokens, o.priorWarmImageTokens,
+      );
+    const { messages: newMessages, info: histInfo } = await collapseHistory(
+      req.messages,
+      historyProfitable,
+      { cols: o.cols },
+    );
+    if (histInfo.collapsedTurns > 0) {
+      req.messages = newMessages;
+      info.collapsedTurns = histInfo.collapsedTurns;
+      info.collapsedChars = histInfo.collapsedChars;
+      info.collapsedImages = histInfo.collapsedImages;
+      info.imageCount += histInfo.collapsedImages;
+      info.imageBytes += histInfo.collapsedImageBytes;
+      info.imagePixels = (info.imagePixels ?? 0) + histInfo.collapsedImagePixels;
+      info.droppedChars = (info.droppedChars ?? 0) + histInfo.droppedChars;
+      for (const [cp, n] of histInfo.droppedCodepoints) {
+        droppedCodepoints.set(cp, (droppedCodepoints.get(cp) ?? 0) + n);
+      }
+      info.historyReason = 'collapsed';
+      info.historyTextChars = histInfo.collapsedChars;
+      info.historyImageSha = await historyImageSha8(newMessages);
+      bumpBucket(info, 'history', histInfo.collapsedChars);
+      collapsedFlag = true;
+    } else if (histInfo.reason) {
+      info.historyReason = histInfo.reason;
+    }
+  }
+  info.outgoingTextChars = countOutgoingTextChars(req);
+  const outBody = new TextEncoder().encode(JSON.stringify(req));
+  return { body: outBody, info, collapsed: collapsedFlag };
+}
+
+/**
+ * Rewrite a Messages API request body. Returns the new body (still JSON
+ * bytes) plus diagnostic info. On any error, returns the original bytes
+ * unchanged.
+ */
+export async function transformRequest(
+  body: Uint8Array,
+  opts: TransformOptions = {},
+): Promise<{ body: Uint8Array; info: TransformInfo }> {
+  // Merge caller opts over DEFAULTS, but treat explicit `undefined` as "not
+  // provided" so it falls through to the default. Without this, a caller that
+  // passes `{ minToolResultChars: undefined }` (common when forwarding partial
+  // options from upstream — e.g. ocproxy's handler) would silently disable the
+  // tool_result text-passthrough gate and route everything through the
+  // renderer.
+  const merged: TransformOptions = { ...DEFAULTS, ...opts };
+  for (const k of Object.keys(merged) as (keyof TransformOptions)[]) {
+    if (merged[k] === undefined) {
+      (merged as Record<string, unknown>)[k] = (DEFAULTS as Record<string, unknown>)[k];
+    }
+  }
+  const o: Required<TransformOptions> = merged as Required<TransformOptions>;
+  const info: TransformInfo = {
+    compressed: false,
+    origChars: 0,
+    compressedChars: 0,
+    imageCount: 0,
+    imageBytes: 0,
+    staticChars: 0,
+    dynamicChars: 0,
+    dynamicBlockCount: 0,
+    droppedChars: 0,
+  };
+  // Per-request codepoint drop histogram. Merged from every render call
+  // (static slab + reminder + tool_result compressions). Serialized to
+  // `info.droppedCodepointsTop` at the end of transformRequest IF non-empty.
+  const droppedCodepoints = new Map<number, number>();
+
+  if (!o.compress) {
+    info.reason = 'compress=false';
+    return { body, info };
+  }
+
+  let req: MessagesRequest;
+  try {
+    req = JSON.parse(new TextDecoder().decode(body));
+  } catch (e) {
+    info.reason = `parse_error: ${(e as Error).message}`;
+    return { body, info };
+  }
+
+  // 1. Pull system text out. Split into:
+  //    - billingLine: Claude Code's per-turn random header (must NOT be cached).
+  //    - dynamicText: <env>/<context>/... blocks (per-turn, kept as text).
+  //    - staticText: everything else (cacheable, goes into the image).
+  const systemStaticCacheControl = lastStaticSystemCacheControl(req.system);
+  const { text: rawSysText, kept: sysRemainder } = extractSystemText(req.system);
+  const { kept: billingLine, body: sysBody } = stripBillingLine(rawSysText);
+  const {
+    staticText,
+    dynamicText,
+    blockCount: dynBlocks,
+    unknownTags,
+  } = splitStaticDynamic(sysBody);
+  info.staticChars = staticText.length;
+  info.dynamicChars = dynamicText.length;
+  info.dynamicBlockCount = dynBlocks;
+  if (unknownTags.length > 0) info.unknownStaticTags = unknownTags;
+  // Parse env fields out of the dynamic slab — telemetry only, never mutates.
+  const env = extractEnvFields(dynamicText);
+  if (Object.keys(env).length > 0) info.env = env;
+
+  // Privacy-safe fingerprints that don't depend on tool docs (computed
+  // here so they're available even if we below_min_chars out below).
+  // systemSha8 is set later, after we know the combined image-bound text.
+  const claudeMdSlab = extractClaudeMdSlab(staticText);
+  const firstUser = firstUserText(req);
+  const [claudeMdSha, firstUserSha] = await Promise.all([
+    claudeMdSlab ? sha8(claudeMdSlab) : Promise.resolve(undefined),
+    firstUser ? sha8(firstUser) : Promise.resolve(undefined),
+  ]);
+  if (claudeMdSha) info.claudeMdSha8 = claudeMdSha;
+  if (firstUserSha) info.firstUserSha8 = firstUserSha;
+
+  // 2. Optionally fold tool docs into the same image, stubbing originals.
+  let toolDocsText = '';
+  let toolsRewritten: ToolDef[] | undefined;
+  if (o.compressTools && Array.isArray(req.tools) && req.tools.length > 0) {
+    const docs: string[] = [];
+    let sawSchemaNoProps = false;
+    toolsRewritten = req.tools.map((t) => {
+      docs.push(renderToolDoc(t, o.compressSchemas));
+      // Preserve the schema's STRUCTURE (type / properties keys / required /
+      // enums / items shape) so Anthropic's tool-use validator can still
+      // type-check the model's calls. Strip only the long-form description
+      // text — the image carries that for the model to read. Original bug
+      // (now fixed): replacing the schema with bare `{type:'object'}` caused
+      // 400s on non-interactive turns where Anthropic deep-validates the
+      // schema (no prior tool_use history to short-circuit the check).
+      let stubSchema: unknown | undefined;
+      if (o.compressSchemas) {
+        if (t.input_schema && typeof t.input_schema === 'object') {
+          const stripped = stripSchemaDescriptions(
+            t.input_schema,
+            0,
+          ) as Record<string, unknown> | null;
+          if (!stripped || typeof stripped !== 'object') {
+            // Should not happen for object input, but be defensive.
+            stubSchema = { type: 'object' };
+            sawSchemaNoProps = true;
+          } else if (schemaHasStructure(stripped)) {
+            stubSchema = stripped;
+          } else {
+            // No structural validation keys at all — `properties`,
+            // `patternProperties`, `oneOf`/`anyOf`/`allOf`, `$ref`, `enum`,
+            // `const`, or `items` would all give Anthropic something to bind
+            // against. Without any of them the model has no parameter
+            // contract. Ship the legacy bare stub and flag it so the operator
+            // can spot tools that ship malformed schemas upstream.
+            stubSchema = { type: 'object' };
+            sawSchemaNoProps = true;
+          }
+        }
+        // If t.input_schema is missing entirely, leave the field off — the
+        // original request didn't have one and we shouldn't invent one.
+      }
+      return {
+        ...t,
+        description: 'ⓘ See image.',
+        ...(stubSchema !== undefined ? { input_schema: stubSchema } : {}),
+      };
+    });
+    toolDocsText = docs.join('\n\n');
+    if (sawSchemaNoProps && !info.reason) {
+      info.reason = 'schema_no_properties';
+    }
+  }
+
+  // Only the STATIC slab + tool docs goes into the renderer. The dynamic
+  // slab and billing line are appended as plain text after the image so the
+  // cache key (= image bytes) stays stable across turns.
+  //
+  // Run the lossless whitespace compactor before measuring/rendering. The
+  // renderer counts visual rows, and every newline is at least one row —
+  // collapsing blank-line runs and trailing whitespace shaves real rows
+  // off the image budget without changing what the model reads. Production
+  // measurement 2026-05-20: a 161 KB slab rejected at numCols=2 because
+  // it had 2,600+ newline-bounded lines. The compactor reliably moves the
+  // needle on those by 10-25%.
+  const combinedRaw = [staticText, toolDocsText].filter((s) => s.length > 0).join('\n\n');
+  // R3: reflow runs after compaction, before the break-even gate, so the gate
+  // and renderer below both see the same dense text. `info.origChars` /
+  // `compressedChars` stay anchored to `combinedRaw.length` (raw) — reflow
+  // only changes pixels, never the savings denominator.
+  const combined = maybeReflow(compactSlabWhitespace(combinedRaw), o.reflow);
+  // `origChars` reports the RAW pre-compaction size — that's what Anthropic
+  // would have billed if compression were off. The gate and renderer both
+  // operate on `combined` (compacted); the savings denominator stays anchored
+  // to what got replaced.
+  info.origChars = combinedRaw.length;
+  // Track chars of the static slab+tools that DO end up imaged. The
+  // break-even gate below may reject — bump only when the slab actually
+  // renders. Reminder/tool_result compressions add to this at their sites.
+  info.compressedChars = 0;
+  // Hash the EXACT text that goes into the image. Repeats of this hash across
+  // turns = cache_control should be earning its keep.
+  if (combined) info.systemSha8 = await sha8(combined);
+
+  if (combined.length < o.minCompressChars) {
+    info.reason = `below_min_chars (${combined.length} < ${o.minCompressChars})`;
+    // Even with a static slab below the gate, message history may still be
+    // collapsable. Run history collapse on the in-memory request so
+    // production Codex traffic (tiny system, huge messages) still benefits.
+    // If history collapses, we flip `info.compressed = true` and let the
+    // library wrapper return reason='applied'; otherwise this still
+    // populates `outgoingTextChars` for the regression denominator.
+    const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints);
+    if (finalized.collapsed) {
+      info.compressed = true;
+      return { body: finalized.body, info };
+    }
+    return { body, info };
+  }
+
+  // Per-block break-even check applied to the static slab too. The slab is
+  // usually 25-30 KB so it always passes (1 image @ 2500 tokens < 25000/4 =
+  // 6250 text-equivalent tokens), but the check guards against the edge
+  // case where a tiny tool docs + tiny static slab combine to <10k chars.
+  // Pass the full text so the gate uses row-aware image-count math (matches
+  // renderTextToPngs exactly — newline-heavy content renders to more images
+  // than the naive chars/charsPerI
+[assistant]
+Reviewed src/core/render.ts.
+[user]
+after the load test, final answer: BATCH_WINDOW_MS = 4800. lock it.
+[assistant]
+BATCH_WINDOW_MS changed 1800 -> 4800, locked.
+[tool_use Read]
+{"file_path":"src/core/proxy.ts"}
+[tool_result]
+// Per-line trailing whitespace strip. Iterate the buffer once instead
+  // of split/join — avoids materialising an intermediate array on a
+  // ~160 KB slab. We only touch spaces/tabs (codepoint 32 and 9) so
+  // newlines are passed through verbatim and the line count is unchanged
+  // at this step.
+  let trimmed = '';
+  let lineStart = 0;
+  for (let i = 0; i <= text.length; i++) {
+    if (i === text.length || text.charCodeAt(i) === 10 /* \n */) {
+      let end = i;
+      while (end > lineStart) {
+        const c = text.charCodeAt(end - 1);
+        if (c !== 32 && c !== 9) break;
+        end--;
+      }
+      trimmed += text.slice(lineStart, end);
+      if (i < text.length) trimmed += '\n';
+      lineStart = i + 1;
+    }
+  }
+  // Collapse 3+ consecutive newlines to exactly 2. Preserves paragraph
+  // breaks while killing multi-blank section dividers — they cost one
+  // row each in the renderer and carry zero information once flattened
+  // to an image.
+  return trimmed.replace(/\n{3,}/g, '\n\n');
+}
+
+/** Apply R3 reflow when enabled. Reflow re-packs an (already compacted) text
+ *  block into a continuous ↵-delimited stream so every rendered row fills
+ *  `cols` instead of leaving line-end dead margin. Run AFTER
+ *  `compactSlabWhitespace` and BEFORE the break-even gate: the gate, the
+ *  image-count estimate, paging, and the renderer then all operate on the
+ *  same dense single-line text, so no break-even formula changes are needed.
+ *  Falls back to the input unchanged when reflow is off or `reflow()` hits a
+ *  sentinel collision. */
+function maybeReflow(text: string, enabled: boolean): string {
+  if (!enabled) return text;
+  return reflow(text) ?? text;
+}
+
+/** Returns true iff image-compressing a text block would actually save tokens
+ *  vs leaving it as text. Used as the gate before every image-encoding
+ *  decision in transformRequest.
+ *
+ *  ## Content-aware geometry
+ *
+ *  The gate is **string-only** — every production caller has the text, and
+ *  the gate uses it to compute the renderer's exact image cost two ways at
+ *  once:
+ *
+ *  - **Rows** come from `countVisualRows` (matches `wrapLines` line-for-
+ *    line, including soft-wraps and codepoint width).
+ *  - **Width** comes from `shrinkColsToContent` when `shrinkWidth=true`
+ *    (the default): a 16-char `"File not found"` block bills for an
+ *    ~80 px wide canvas, not the full 508 px slab canvas. This matters
+ *    most for tool_result and reminder blocks, which dominate per-turn
+ *    image cost and are usually much narrower than `cols`.
+ *
+ *  Set `shrinkWidth=false` for the system slab (multi-col, fills the
+ *  configured `cols` deliberately to maximise OCR density) and anywhere
+ *  the caller needs full-canvas pricing for telemetry parity.
+ *
+ *  ## No numeric overload
+ *
+ *  The historical `textOrLen: string | number` shape existed for unit-
+ *  test back-compat. The numeric path assumed every char filled a full-
+ *  width row (= lower-bound rows = under-estimated image cost), which
+ *  silently let net-losing compressions through whenever a caller passed
+ *  `text.length` instead of `text`. Removed.
+ */
+/** Decompose the per-block break-even gate's evaluation into its components.
+ *  Returns the exact `imageTokens`, `textTokens`, and symmetric burn terms
+ *  the gate uses internally. Pairs with `isCompressionProfitable` for
+ *  telemetry: callers can record the numbers without re-implementing the
+ *  formula and risking drift.
+ *
+ *  Returns `null` when the input is empty or non-finite. Stays in sync with
+ *  `isCompressionProfitable` because both use the same `imageTokensCost`
+ *  and the same width-shrink toggle. */
+export function evalCompressionProfitability(
+  text: string,
+  cols: number,
+  imageCountCap: number | undefined = undefined,
+  numCols: number = 1,
+  charsPerToken: number = CHARS_PER_TOKEN,
+  priorWarmTokens: number = 0,
+  priorWarmImageTokens: number = 0,
+  shrinkWidth: boolean = true,
+): {
+  imageTokens: number;
+  textTokens: number;
+  burnImageSide: number;
+  burnTextSide: number;
+  profitable: boolean;
+} | null {
+  const n = Math.max(1, numCols | 0);
+  if (typeof text !== 'string' || text.length === 0) return null;
+  const cpt = Number.isFinite(charsPerToken) && charsPerToken > 0
+    ? charsPerToken
+    : CHARS_PER_TOKEN;
+  const imageTokens = imageTokensCost(text, cols, n, imageCountCap, shrinkWidth);
+  const textTokens = text.length / cpt;
+  const burnImageSide = Number.isFinite(priorWarmTokens) && priorWarmTokens > 0
+    ? priorWarmTokens * (CACHE_CREATE_RATE - CACHE_READ_RATE)
+    : 0;
+  const burnTextSide = Number.isFinite(priorWarmImageTokens) && priorWarmImageTokens > 0
+    ? priorWarmImageTokens * (CACHE_CREATE_RATE - CACHE_READ_RATE)
+    : 0;
+  return {
+    imageTokens,
+    textTokens,
+    burnImageSide,
+    burnTextSide,
+    profitable: imageTokens + burnImageSide < textTokens + burnTextSide,
+  };
+}
+
+export function isCompressionProfitable(
+  text: string,
+  cols: number = DEFAULTS.cols,
+  imageCountCap?: number,
+  numCols: number = 1,
+  /** Chars-per-token assumption for the text side of the break-even math.
+   *  Default 4 (Anthropic's English-text average). Lower values = more
+   *  profitable text compressions (each char buys more tokens back). */
+  charsPerToken: number = CHARS_PER_TOKEN,
+  /** Tokens the un-rewritten path would have hit cache on. Adds a one-time
+   *  burn penalty of `priorWarmTokens × (CACHE_CREATE_RATE − CACHE_READ_RATE)`
+   *  to the image side — the cost of forcing a fresh cache_create when the
+   *  rewritten prefix invalidates Anthropic's prior cache key. Default 0
+   *  (cold-start behavior; matches pre-burn-aware callers byte-for-byte). */
+  priorWarmTokens: number = 0,
+  /** Symmetric image-side burn: tokens the rewritten (IMAGE) path would
+   *  have hit cache on. Adds a one-time burn penalty of
+   *  `priorWarmImageTokens × (CACHE_CREATE_RATE − CACHE_READ_RATE)` to the
+   *  TEXT side — the cost of forcing a fresh cache_create on the
+   *  un-rewritten text prefix when the rewritten image prefix was warm.
+   *  Default 0 (back-compat; existing single-arg callers behave unchanged).
+   *  See PxpipeOptions.priorWarmImageTokens for the foundational rationale. */
+  priorWarmImageTokens: number = 0,
+  /** Shrink the rendered canvas width to the longest actual wrapped line.
+   *  Default `true` (per-block content: tool_result, reminder, history).
+   *  Set `false` for the system slab, which deliberately fills the full
+   *  configured `cols` (multi-col packing). */
+  shrinkWidth: boolean = true,
+): boolean {
+  const n = Math.max(1, numCols | 0);
+  if (typeof text !== 'string' || text.length === 0) return false;
+  const cpt = Number.isFinite(charsPerToken) && charsPerToken > 0
+    ? charsPerToken
+    : CHARS_PER_TOKEN;
+  const imageTokensCost_ = imageTokensCost(text, cols, n, imageCountCap, shrinkWidth);
+  const textTokensEquivalent = text.length / cpt;
+  // Cache-burn penalty (symmetric form, ANTI-FLAPPING):
+  //
+  //   text→image flip: invalidate the warm text cache. Burn applied to
+  //                    the IMAGE side — discourages compressing when
+  //                    the text prefix is already warm.
+  //   image→text flip: invalidate the warm image cache. Burn applied to
+  //                    the TEXT side — discourages decompressing when
+  //                    the image prefix is already warm.
+  //
+  // Without the symmetric term the gate ping-pongs: once a session
+  // commits to a mode, single-turn cost can favor flipping, but the
+  // flip forces cache_create on the new side, then the next turn flips
+  // back. We pay cache_create twice. The symmetric burn pins the
+  // session in its current mode unless the per-turn delta exceeds the
+  // burn cost.
+  const burnImageSide = Number.isFinite(priorWarmTokens) && priorWarmTokens > 0
+    ? priorWarmTokens * (CACHE_CREATE_RATE - CACHE_READ_RATE)
+    : 0;
+  const burnTextSide = Number.isFinite(priorWarmImageTokens) && priorWarmImageTokens > 0
+    ? priorWarmImageTokens * (CACHE_CREATE_RATE - CACHE_READ_RATE)
+    : 0;
+  return imageTokensCost_ + burnImageSide < textTokensEquivalent + burnTextSide;
+}
+
+/**
+ * Horizon-aware variant of `isCompressionProfitable` for the
+ * **history-collapse** call site only.
+ *
+ * The per-turn gate (above) compares cold image cost vs cold text cost.
+ * That's the right question when the request is cold on both sides, but
+ * the wrong question once Anthropic has already cached the text-based
+ * prefix — text-at-10% beats image-at-100% per-turn. The text prefix's
+ * cache *will* eventually expire, though (5-min idle, 4-breakpoint
+ * cliff, system-slab churn), and on that cold turn the giant text pays
+ * `cache_create` (1.25×) on the full uncompressed prefix while an image
+ * prefix pays `cache_create` once and `cache_read` (0.1×) for the rest
+ * of the session.
+ *
+ * Honest expected-lifetime-cost framing over `N` future turns starting
+ * from a *worst-case warm* state for the image (cache_create on turn 1,
+ * cache_read on turns 2..N) and a best-case warm state for the text
+ * (cache_read every turn for the full N). The gate accepts the collapse
+ * iff
+ *
+ *   I × (CC + CR×(N-1)) < T × CR × N
+ *
+ * where I = image_tokens, T = text_tokens, CC = 1.25, CR = 0.10.
+ *
+ * Examples (CC=1.25, CR=0.10):
+ *   N=1:  I < 0.08 × T   (essentially never — text-at-10% beats image)
+ *   N=5:  I < 0.30 × T
+ *   N=10: I < 0.47 × T
+ *   N=20: I < 0.64 × T
+ *
+ * Real history typically renders to I/T ≈ 0.3–0.5 (one image per
+ * ~14 KB of dense text vs ~2,500 tokens per image at 1.5 cpt), so a
+ * horizon of N=5–10 flips a lot of currently-rejected collapses
+ * into accepts without ever taking a bet a single-turn session would lose.
+ *
+ * Falls back to the cold per-turn gate when `horizon <= 1`.
+ */
+export function isCompressionProfitableAmortized(
+  text: string,
+  cols: number,
+  imageCountCap: number | undefined,
+  numCols: number,
+  charsPerToken: number,
+  horizon: number,
+  /** Burn penalty source — see same-named param on `isCompressionProfitable`.
+   *  Amortized across `horizon` turns at this gate (the prior cache is
+   *  burned exactly once, on the first rewritten turn). Default 0. */
+  priorWarmTokens: number = 0,
+  /** Symmetric image-side burn — see same-named param on
+   *  `isCompressionProfitable`. Default 0 (back-compat). */
+  priorWarmImageTokens: number = 0,
+  /** Shrink rendered width to longest wrapped line (see
+   *  `isCompressionProfitable`). Default `true`. */
+  shrinkWidth: boolean = true,
+): boolean {
+  if (!Number.isFinite(horizon) || horizon <= 1) {
+    return isCompressionProfitable(text, cols, imageCountCap, numCols, charsPerToken, priorWar
+[assistant]
+Reviewed src/core/proxy.ts.
+
+=== end ===

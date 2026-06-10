@@ -1,0 +1,918 @@
+=== session s2 transcript ===
+[tool_use Read]
+{"file_path":"src/core/render.ts"}
+[tool_result]
+eline_input + output × 5) × 100
+    //     What share of the TOTAL bill the proxy saved. Honest counter to the
+    //     input-only number: on output-heavy sessions (long thinking blocks,
+    //     big edits) the percentage shrinks because output dominates.
+    //
+    //   token_equivalent_total = Σ (actual_input + output × 5)
+    //     What Anthropic's weekly limit actually meters — input × 1.0 +
+    //     output × 5.0 (the same ratio as the per-MTok price card). This is
+    //     the number that moves your "%% used this week" indicator.
+    const baseline = this.totals.baselineInputWeighted;
+    const actual = this.totals.actualInputWeighted;
+    const output = this.totals.outputWeighted; // already × OUTPUT_TOKEN_RATE
+    const saved = baseline - actual;
+    const pctInput = baseline > 0 ? (saved / baseline) * 100 : 0;
+    const baselineTotal = baseline + output;
+    const actualTotal = actual + output;
+    const pctTotal = baselineTotal > 0 ? (saved / baselineTotal) * 100 : 0;
+
+    // Share-of-all-spend: honest denominator. The numerator can only credit
+    // savings against rows where we have a probe baseline (otherwise it's
+    // estimation), but the denominator MUST include every request the user
+    // actually paid for — including passthrough rows, probe-failed rows,
+    // and untransformed turns the gate said no to. Otherwise the headline
+    // answers "did pxpipe help on the rows where it ran" instead of
+    // "did pxpipe move my real bill". The first is a cherry-pick.
+    const allBaselineEquiv = this.totals.allBaselineEquivalentWeighted;
+    const allActual = this.totals.allActualInputWeighted;
+    const allOutput = this.totals.allOutputWeighted;
+    // Denominator = counterfactual all-rows bill: what the user would have
+    // paid with no pxpipe. Bounded ratio at 100%; a single cold-miss
+    // compressed request on an otherwise empty session shows ~99% saved,
+    // not 280%.
+    const allCounterfactualBill = allBaselineEquiv + allOutput;
+    const pctAllSpend =
+      allCounterfactualBill > 0 ? (saved / allCounterfactualBill) * 100 : 0;
+
+    // Direct observed split — actual $ per request, partitioned by which
+    // path ran. Token-equivalent (input × 1.0 + cache_create × 1.25 +
+    // cache_read × 0.10 + output × 5) → $ at the assumed Opus 4.7 input
+    // rate. Same $/Mtok rate is applied to both buckets, so the bias from
+    // the rate assumption cancels in the delta. Selection bias from the
+    // gate is NOT cancelled — the operator interprets that via the
+    // sample-count caveat below.
+    const compressedTokenEquiv =
+      this.totals.compressedActualInputWeighted +
+      this.totals.compressedOutputWeighted;
+    const passthroughTokenEquiv =
+      this.totals.passthroughActualInputWeighted +
+      this.totals.passthroughOutputWeighted;
+    const compressedActualUsd =
+      (compressedTokenEquiv * ASSUMED_INPUT_USD_PER_MTOK) / 1e6;
+    const passthroughActualUsd =
+      (passthroughTokenEquiv * ASSUMED_INPUT_USD_PER_MTOK) / 1e6;
+    const compressedAvgUsd =
+      this.totals.compressedPaidRequests > 0
+        ? compressedActualUsd / this.totals.compressedPaidRequests
+        : 0;
+    const passthroughAvgUsd =
+      this.totals.passthroughPaidRequests > 0
+        ? passthroughActualUsd / this.totals.passthroughPaidRequests
+        : 0;
+    // Sufficient-sample threshold is a soft heuristic. 20 paid requests per
+    // bucket is enough to see a real effect on Opus 4.7 traffic (a single
+    // big cold-miss can dominate at lower n). Below this, the UI shows the
+    // bucket numbers but hides the delta and surfaces "small sample".
+    const SUFFICIENT = 20;
+    const splitSufficient =
+      this.totals.compressedPaidRequests >= SUFFICIENT &&
+      this.totals.passthroughPaidRequests >= SUFFICIENT;
+    const splitDeltaUsd = compressedAvgUsd - passthroughAvgUsd;
+
+    const uptimeSec = Date.now() / 1000 - this.totals.startedAt;
+    const payload = {
+      requests: this.totals.requests,
+      compressed_requests: this.totals.compressedRequests,
+      baseline_input_weighted: Math.round(baseline),
+      actual_input_weighted: Math.round(actual),
+      saved_input_tokens: Math.round(saved),
+      // saved_pct kept for back-compat with existing dashboard HTML; it is
+      // the input-only number. New code should read saved_pct_input_only.
+      saved_pct: round1(pctInput),
+      saved_pct_input_only: round1(pctInput),
+      saved_pct_of_total_bill: round1(pctTotal),
+      // Honest "sha
+[assistant]
+Reviewed src/core/render.ts.
+[user]
+set FLUSH_INTERVAL_MS to 2400 to start.
+[assistant]
+FLUSH_INTERVAL_MS=2400 committed.
+[tool_use Read]
+{"file_path":"src/core/transform.ts"}
+[tool_result]
+  TextBlock across `system`, `messages[].content`, and any tool_result
+   *  text that didn't get image-compressed. Pairs with `imagePixels` and
+   *  the upstream token count so we can solve for chars-per-token (α) and
+   *  pixels-per-token (β) empirically: `total_tokens ≈ α·outgoingTextChars +
+   *  β·imagePixels`. On a cold-miss event the upstream `cache_create_tokens`
+   *  is the full LHS, so a regression over N cold-misses pins both. */
+  outgoingTextChars?: number;
+  /** Length of the static (cacheable) slab rendered into the image. */
+  staticChars: number;
+  /** Length of the dynamic (per-turn) slab kept as plain text. */
+  dynamicChars: number;
+  /** Number of dynamic blocks detected (<env>, <context>, etc.). */
+  dynamicBlockCount: number;
+  /** Tag-shaped blocks found in the *static* slab that are NOT in
+   *  DYNAMIC_BLOCK_TAGS. Early-warning canary: if Claude Code ships a new
+   *  per-turn tag, it'll show up here before our cache hit rate collapses. */
+  unknownStaticTags?: string[];
+  /** Parsed env block, if Claude Code injected one. Useful for telemetry
+   *  (per-project compression ratios, etc.). */
+  env?: EnvFields;
+  /** sha256[0..8] of the static slab + tool docs (what ends up in the image).
+   *  Repeats across turns → cache_control SHOULD be hitting upstream. */
+  systemSha8?: string;
+  /** sha256[0..8] of just the CLAUDE.md section if detectable. Lets us
+   *  bucket requests by project even when cwd is absent. */
+  claudeMdSha8?: string;
+  /** sha256[0..8] of the first user message text (first 4 KiB). Rough
+   *  thread/session id since the wire protocol carries none. */
+  firstUserSha8?: string;
+  /** Raw bytes of the FIRST rendered image. Used by the in-process dashboard
+   *  to show a preview. NOT persisted to JSONL (toTrackEvent drops it). */
+  firstImagePng?: Uint8Array;
+  /** Pixel dimensions of the first image. */
+  firstImageWidth?: number;
+  firstImageHeight?: number;
+  /** Every rendered PNG for this request, in render order. images[0] === firstImagePng.
+   *  Surfaced separately so the dashboard can pin any image individually. */
+  imagePngs?: Uint8Array[];
+  /** Matching pixel dimensions for each entry in imagePngs. */
+  imageDims?: Array<{ width: number; height: number }>;
+  /** The source text that was rendered into `imagePngs` (the combined
+   *  slab text, header included). Lets the dashboard show the before/after
+   *  pair so an operator can see exactly what JSON/tool-result text became
+   *  the image. Capped at 64 KiB to bound memory; NOT persisted to JSONL
+   *  (toTrackEvent drops it alongside the PNG bytes). */
+  imageSourceText?: string;
+  /** Number of images we added by compressing `<system-reminder>` blocks in
+   *  the first user message. */
+  reminderImgs?: number;
+  /** Number of images we added by compressing tool_result content across
+   *  user messages. */
+  toolResultImgs?: number;
+  /** Codepoints in the rendered text that weren't in the atlas. They
+   *  rendered as blank cells. A non-zero count means the user is producing
+   *  glyphs we don't ship — useful telemetry for tuning the atlas profile
+   *  (e.g. switch from `practical` → `full-bmp` if Hangul shows up). */
+  droppedChars?: number;
+  /** Top dropped codepoints by frequency for this request, keyed `U+HHHH`
+   *  (uppercase hex, at least 4 digits). At most 20 entries, sorted by count
+   *  descending. Only set when `droppedChars > 0`. Lets the operator
+   *  identify which Unicode blocks to add to the atlas profile without
+   *  having to capture & inspect the request body. */
+  droppedCodepointsTop?: Record<string, number>;
+  /** Counters for why blocks didn't get image-compressed this request.
+   *  Helps tune the break-even check vs the flat threshold:
+   *    - `below_threshold`: block below `minReminderChars` / `minToolResultChars`
+   *      (the fast-path skip; saves CPU on obvious-no cases)
+   *    - `not_profitable`: block above the threshold but `isCompressionProfitable`
+   *      returned false (image cost ≥ text cost at current cell config)
+   *  Only emitted when at least one counter is > 0. */
+  passthroughReasons?: { below_threshold?: number; not_profitable?: number };
+  /** Per-gate-call diagnostics — exactly what the slab break-even gate
+   *  saw and compared. Foundational observability for why a turn flipped
+   *  or stayed: hosts that persist this can compute the verdict margin
+   *  (`textTokens + burnTextSide − imageTokens − burnImageSide`),
+   *  measure flap-prevention efficacy (`burnTextSide` > 0 rows that
+   *  declined despite `imageTokens < textTokens`), and tune
+   *  `historyAmortizationHorizon` against observed cache lifetimes.
+   *
+   *  Currently emitted for the session-anchor slab gate only. Per-block
+   *  reminder / tool_result gates remain summarised in `passthroughReasons`
+   *  + `bucketChars` — adding per-call diagnostics there would multiply
+   *  event size without commensurate signal (those gates don't flap). */
+  gateEval?: {
+    /** "slab" today; reserved for future gates if they grow flapping risk. */
+    readonly site: 'slab';
+    /** Image-side cost estimate the gate used (token-equivalents). */
+    readonly imageTokens: number;
+    /** Text-side cost estimate the gate used (token-equivalents). */
+    readonly textTokens: number;
+    /** `priorWarmTokens × (1.25 − 0.10)` applied to the image side. */
+    readonly burnImageSide: number;
+    /** `priorWarmImageTokens × (1.25 − 0.10)` applied to the text side.
+     *  Non-zero rows are the anti-flapping anchor — text would otherwise
+     *  have looked cheaper. */
+    readonly burnTextSide: number;
+    /** Gate's verdict; `true` ⇒ compression applied on this turn. */
+    readonly profitable: boolean;
+  };
+  /** Per-bucket sum of TEXT chars that flowed through each gate-call site
+   *  (static slab, reminder, tool_result by classifyContent shape, history).
+   *  Pre-compaction lengths — stays comparable to `origChars` and to what
+   *  Anthropic would have billed if compression were off. Used by the
+   *  rolling-cpt regression (Task #18) to learn per-bucket marginal cpts
+   *  from production telemetry instead of relying on one global constant.
+   *  Absent when no bucket fired this request. */
+  bucketChars?: BucketChars;
+  /** Variant C history bucket: chars of TEXT that fed into the history-image
+   *  renderer (post-`messagesToHistoryText`, pre-`renderTextToPngs`). Folded
+   *  into `bucketChars.history` too — surfaced separately so the regression
+   *  can credit history-image cost even on no-collapse paths (where the
+   *  collapsed-prefix gate ran but landed on `not_profitable` / `render_empty`
+   *  and we still want to record that the bucket saw text). */
+  historyTextChars?: number;
+  /** Number of tool_result blocks where the source text exceeded the
+   *  per-tool_result image budget and was truncated before rendering. */
+  truncatedToolResults?: number;
+  /** Total chars elided by paging across all tool_results this request. */
+  omittedChars?: number;
+  /** Variant C history-image: how many original `messages[]` entries got
+   *  collapsed into the prepended synthetic user message. 0 / unset when
+   *  no collapse happened (no closed prefix, too few turns, gate rejected
+   *  as not_profitable, etc. — see `historyReason`). */
+  collapsedTurns?: number;
+  /** Variant C: total chars of text serialized into the history image(s)
+   *  before render (pre-OCR loss). */
+  collapsedChars?: number;
+  /** Variant C: number of PNG image blocks emitted for the history. Folded
+   *  into `info.imageCount` too — surfaced separately so dashboards can
+   *  attribute image-count growth to history vs system-slab vs reminders. */
+  collapsedImages?: number;
+  /** Variant C: sha8 of the concatenated history-image base64 emitted this
+   *  request. The quantized collapse boundary keeps the synthetic history
+   *  message byte-identical for a full `collapseChunk` window — an UNCHANGED
+   *  `history_image_sha8` across consecutive collapsed events is the
+   *  ground-truth proof that the upstream prompt cache can `cache_read` the
+   *  history prefix (0.1x) instead of re-billing `cache_create` (1.25x). A
+   *  hash that changes every turn ⟹ the cache-key drift bug is back. Only
+   *  set when a collapse actually produced image blocks. */
+  historyImageSha?: string;
+  /** Variant C: why the history collapse didn't run (or did). Diagnostic
+   *  only — see `HistoryCollapseInfo.reason` for the value set. */
+  historyReason?:
+    | 'no_history'
+    | 'prefix_too_short'
+    | 'no_closed_prefix'
+    | 'not_profitable'
+    | 'render_empty'
+    | 'collapsed';
+  /** Ground-truth baseline token count for THIS request, from a parallel
+   *  call to /v1/messages/count_tokens on the PRE-COMPRESSION body. The
+   *  endpoint is free (no input-token billing). Absent when the probe
+   *  failed (network, 4xx) — that event is then excluded from the
+   *  savings rollup. */
+  baselineTokens?: number;
+  /** Second baseline probe: input_tokens of the original body TRUNCATED at
+   *  the last `cache_control` marker — the prefix that would have cached
+   *  on the unproxied path. Used by the dashboard to weight the baseline by
+   *  the SAME cache class the proxied request landed in (cache_create ×1.25,
+   *  cache_read ×0.10, no-cache ×1.0), giving an exact cache-aware
+   *  counterfactual instead of cold-every-time. Absent when the original
+   *  body has no cache_control markers anywhere (in which case the unproxied
+   *  path doesn't cache and cacheable_prefix_tokens = 0). */
+  baselineCacheableTokens?: number;
+  /** Status of the cache-aware baseline probe for this request.
+   *
+   *   'ok'       both `baselineTokens` and `baselineCacheableTokens` resolved
+   *              (or the body had no `cache_control` markers, so cacheable=0
+   *              is exact, not estimated).
+   *   'partial'  the full-body probe resolved but the cacheable-prefix probe
+   *              didn't return a number even though the body had markers.
+   *              We can't honestly attribute savings on this row — the
+   *              dashboard must exclude it from the saved-cost rollup
+   *              rather than fall through to `cacheable=0`, which biases
+   *              the baseline up (= dishonest "$ saved").
+   *   'failed'   the full-body probe itself didn't resolve. No baseline at all.
+   *   undefined  no probe was attempted (proxy path didn't run /v1/messages
+   *              with a parseable body).
+   */
+  baselineProbeStatus?: 'ok' | 'partial' | 'failed';
+}
+
+// --- helpers ---------------------------------------------------------------
+
+/** Extract `(text, remainder)` from a system field that may be string or list. */
+function extractSystemText(sys: SystemField | undefined): { text: string; kept: SystemField } {
+  if (sys == null) return { text: '', kept: [] };
+  if (typeof sys === 'string') return { text: sys, kept: '' };
+  const textParts: string[] = [];
+  const kept: SystemField = [];
+  for (const block of sys) {
+    if (block && typeof block === 'object' && block.type === 'text') {
+      textParts.push(block.text);
+    } else {
+      kept.push(block);
+    }
+  }
+  return { text: textParts.join('\n\n'), kept };
+}
+
+function lastStaticSystemCacheControl(sys: SystemField | undefined): TextBlock['cache_control'] | undefined {
+  if (!Array.isArray(sys)) return undefined;
+  let cacheControl: TextBlock['cache_control'] | undefined;
+  for (const block of sys) {
+    if (!block || block.type !== 'text' || block.cache_control === undefined) continue;
+    const { body } = stripBillingLine(block.text);
+    if (splitStaticDynamic(body).staticText.length > 0) {
+      cacheControl = block.cache_control;
+    }
+  }
+  return cacheControl;
+}
+
+/**
+ * Claude Code injects a handful of per-turn dynamic blocks into the system
+ * prompt (e.g. <env>, <context>, <git_status>, <directoryStructure>,
+ * <system-reminder>). Including these in the rendered image kills the
+ * Anthropic prompt cache because the bytes drift turn-to-turn. Splitting
+ * them out lets us render the static slab (CLAUDE.md, agent defs, tool docs)
+ * with cache_control while forwarding the dynamic slab as cheap text so the
+ * model still sees cwd / git status / today's date.
+ */
+const DYNAMIC_BLOCK_TAGS = [
+  'env',
+  'context',
+  'git_status',
+  'directoryStructure',
+  'system-reminder',
+] as const;
+
+/**
+ * Tag-shaped blocks that DO appear in the static slab and SHOULD be baked into
+ * the cached image. These are part of Claude Code's built-in system prompt /
+ * tool documentation, not per-turn injections, so they're stable across turns.
+ *
+ * The canary in splitStaticDynamic flags any tag-shaped block in the static
+ * slab that isn't in DYNAMIC_BLOCK_TAGS — designed to catch a new Claude Code
+ * release that ships a per-turn tag we'd accidentally cache. Without this
+ * allowlist, known-static tags like <types> trigger the canary on most turns
+ * and drown out the real signal. Add a tag here only after confirming it's
+ * static (appears in the cacheable part of the prompt, not rotated per turn).
+ */
+const KNOWN_STATIC_TAGS = ['types'] as const;
+
+function splitStaticDynamic(text: string): {
+  staticText: string;
+  dynamicText: string;
+  blockCount: number;
+  unknownTags: string[];
+} {
+  if (!text)
+    return { staticText: '', dynamicText: '', blockCount: 0, unknownTags: [] };
+  // Match <tag ...?>...</tag> where tag ∈ DYNAMIC_BLOCK_TAGS. Closing tag
+  // must match opening tag exactly. Non-greedy body — earliest close wins.
+  const pattern = new RegExp(
+    `<(${DYNAMIC_BLOCK_TAGS.join('|')})(\\s[^>]*)?>[\\s\\S]*?</\\1>`,
+    'g',
+  );
+  const dynamicParts: string[] = [];
+  let staticBuf = '';
+  let cursor = 0;
+  let m: RegExpExecArray | null;
+  while ((m = pattern.exec(text)) !== null) {
+    staticBuf += text.slice(cursor, m.index);
+    dynamicParts.push(m[0]);
+    cursor = m.index + m[0].length;
+  }
+  staticBuf += text.slice(cursor);
+
+  // Sniff for OTHER tag-shaped blocks in the static slab. If Claude Code
+  // ships a new per-turn tag (say <recent_files>...</recent_files>) we'd
+  // silently bake it into the cached image and our cache hit rate would
+  // collapse. Surfacing the tag name as telemetry lets us detect that
+  // within hours of a Claude Code release.
+  const known = new Set<string>(DYN
+[assistant]
+Reviewed src/core/transform.ts.
+[user]
+p95 regressed, bump FLUSH_INTERVAL_MS to 8400.
+[assistant]
+FLUSH_INTERVAL_MS changed 2400 -> 8400.
+[tool_use Read]
+{"file_path":"src/core/render.ts"}
+[tool_result]
+ompression (and decide whether the headline % makes sense for their
+ *  workload). */
+export interface RecentRow {
+  ts: number;
+  method: string;
+  path: string;
+  status: number;
+  size_in?: number;
+  compressed: boolean;
+  cc_added?: number;
+  input_tokens?: number;
+  /** From /v1/messages `usage.output_tokens`. Identical with/without
+   *  compression — shown so the operator can see why an output-heavy
+   *  turn moves the headline less than a cache-create-heavy one. */
+  output_tokens?: number;
+  cache_create?: number;
+  cache_read?: number;
+  /** input + cache_create×1.25 + cache_read×0.10, from the upstream usage
+   *  block. Missing when the request 4xx'd or wasn't /v1/messages. */
+  actual_input?: number;
+  /** /v1/messages/count_tokens(originalBody).input_tokens. Missing when the
+   *  side-probe failed or the request body wasn't an Anthropic Messages payload. */
+  baseline_input?: number;
+  /** How much the running "saved" total moved on this request. */
+  session_saved_so_far_delta?: number;
+  /** Id of the image rendered for this request, if any — resolves against
+   *  the image ring via /proxy-latest-png?id=${img_id}. Absent when the
+   *  request rendered no image, or once the image has been evicted from the
+   *  ring (the id stays on the row but no longer fetches). */
+  img_id?: number;
+  img_ids?: number[];
+}
+
+/** Aggregate over the whole session. Reset on process restart unless
+ *  replay() is called to seed from the JSONL file.
+ *
+ *  The savings numerator is input-only — output is identical with and
+ *  without compression, so it cancels. The denominator is the FULL bill
+ *  (input + output×5 in input-token-equivalents) so the headline percentage
+ *  drops honestly toward zero on output-heavy workloads instead of hiding
+ *  the fact that the proxy only moves part of the cost.
+ *
+ *    Per event (see src/core/baseline.ts for the derivation):
+ *      cacheable = baseline_cacheable_tokens || 0     (tokens up to last cache_control)
+ *      cold_tail = baseline_tokens − cacheable        (always-cold input on both paths)
+ *      cc_u, cr_u = the unproxied path's counterfactual cache_create / cache_read split:
+ *                   cr > 0 ?  cc_u = min(cc, cacheable),  cr_u = cacheable − cc_u   (warm turn)
+ *                 : cc > 0 ?  cc_u = cacheable,           cr_u = 0                  (cold start)
+ *                 :           cc_u = 0,                   cr_u = 0                  (no caching)
+ *      baseline_input_eff = cc_u × 1.25 + cr_u × 0.10
+ *                         + (cacheable − cc_u − cr_u) × 1.0 + cold_tail × 1.0
+ *      actual_input_eff   = input + cache_create×1.25 + cache_read×0.10
+ *      output_equiv       = output × 5                (input-token-equivalent at the 5× output rate)
+ *      saved              = baseline_input_eff − actual_input_eff
+ *      baseline_total     = baseline_input_eff + output_equiv
+ *      actual_total       = actual_input_eff + output_equiv
+ *
+ *    Roll-up:
+ *      saved_pct = Σ saved / Σ baseline_total × 100
+ *
+ *  This is what Anthropic's weekly-limit meter actually counts — input +
+ *  output×5 in input-token-equivalents. The dashboard headline matches it
+ *  so a "20% saved" number means weekly-limit consumption dropped by 20%,
+ *  not "20% off the slice we touched while the other half stayed full." */
+/**
+ * Per-session aggregate. Same dollar-weighted savings math as the global
+ * `Totals` block, but partitioned by `info.firstUserSha8` so the dashboard
+ * can show "what's happening RIGHT NOW" instead of stale lifetime numbers.
+ * Field names mirror the JSON wire shape served by `serveCurrentSessionJson`.
+ */
+interface SessionTotals {
+  sessionId: string;
+  // Dollar-weighted accumulators. baseline/actual are the SAME math as the
+  // global `Totals.allBaselineEquivalentWeighted` / `allActualInputWeighted`,
+  // but scoped to a single session. Output is excluded because the proxy
+  // doesn't touch it.
+  baselineInputWeighted: number;
+  actualInputWeighted: number;
+  // Honest denominator for the headline: count of requests that contributed
+  // to `baselineInputWeighted` (events that carried a baseline measurement,
+  // matching the global `Totals.baselineMeasuredCount`).
+  baselineMeasuredCount: number;
+  // ALL-rows session totals (measured + unmeasured + passthrough). These pair
+  // up to form the full session bill in $ — used as the honest denominator
+  // for saved-% so the ratio matches the global `saved_pct_of_all_spend`
+  // math but scoped to a single session. Mirrors the global
+  // `Totals.allActualInputWeighted` / `allOutputWeighted` accumulators.
+  allActualInputWeighted: number;
+  allOutputWeighted: number;
+}
+
+interface Totals {
+  requests: number;
+  compressedRequests: number;
+  /** Sum of weighted actual input tokens we paid for, across all events that
+   *  also carried a baseline_tokens measurement (input + cache_create×1.25 +
+   *  cache_read×0.10). */
+  actualInputWeighted: number;
+  /** Sum of the cache-aware baseline (see formula above) across the same
+   *  events that contributed to `actualInputWeighted`. The honest counter-
+   *  factual cost of the unproxied path. */
+  baselineInputWeighted: number;
+  /** Sum of output_tokens × OUTPUT_TOKEN_RATE across the same events. Added
+   *  to BOTH sides of the savings math denominator so the headline % counts
+   *  output toward the total bill (it cancels in the numerator — proxy
+   *  doesn't touch output). Without this the headline ignores half the
+   *  bill on output-heavy sessions. */
+  outputWeighted: number;
+  /** Sum of weighted COUNTERFACTUAL input tokens across ALL requests
+   *  with a usage block. For measured rows: cache-aware baseline (what the
+   *  unproxied path would have billed). For unmeasured/probe-failed rows:
+   *  actual_input_eff (best available estimate — these rows didn't run
+   *  pxpipe or we can't measure what it would have cost, so the
+   *  counterfactual ≈ actual).
+   *
+   *  This is the right denominator for "share of bill saved": dividing
+   *  by what-you-would-have-paid is bounded at 100% (you can't save more
+   *  than you would have spent). Dividing by what-you-DID-pay is not
+   *  bounded — a single big cold-miss compressed request can make
+   *  saved/actual exceed 100% because pxpipe shrunk the actual to
+   *  near zero. */
+  allBaselineEquivalentWeighted: number;
+  /** Sum of weighted ACTUAL input tokens across the same all-rows set.
+   *  Kept for the diagnostic sub-line and the back-compat saved_usd math. */
+  allActualInputWeighted: number;
+  /** Sum of output_tokens × OUTPUT_TOKEN_RATE across the same all-rows set.
+   *  Output is identical with/without compression, so it appears in both
+   *  numerator and denominator at the same value and cancels in the savings
+   *  numerator. Included in the denominator so the headline drops honestly
+   *  toward zero on output-heavy workloads. */
+  allOutputWeighted: number;
+  /** Count of requests that contributed to allActualInputWeighted (had a
+   *  usage block). Lets the UI annotate "N of M paid requests". */
+  allUsageRequests: number;
+  /** Direct compressed-vs-passthrough actual-cost split. No counterfactuals,
+   *  no probe gating — just sum what each path actually billed.
+   *
+   *  These accumulate over `haveUsage` rows only (same gate as the all-rows
+   *  counters above) and partition that set by `info.compressed`. The point
+   *  is to answer "did the compressed path actually cost less per request
+   *  than the passthrough path, on real traffic" without inventing a
+   *  counterfactual. Selection bias is real (the gate decides which path
+   *  each turn lands on), so the UI surfaces sample counts so the operator
+   *  can judge sufficiency — the dashboard does not auto-claim significance. */
+  compressedPaidRequests: number;
+  compressedActualInputWeighted: number;
+  compressedOutputWeighted: number;
+  passthroughPaidRequests: number;
+  passthroughActualInputWeighted: number;
+  passthroughOutputWeighted: number;
+  /** Sum of ground-truth output character counts from the SSE/JSON scanner
+   *  (see `OutputMeasurement` in proxy.ts). These three accumulators are
+   *  independent of Anthropic's `usage.output_tokens` — they let the operator
+   *  compare what we measured vs what Anthropic billed and surface the gap
+   *  the redacted_thinking opaque blocks create. Counted in Unicode code
+   *  units (UTF-16 string .length). */
+  textCharsMeasured: number;
+  thinkingCharsMeasured: number;
+  toolUseCharsMeasured: number;
+  /** Number of `redacted_thinking` content blocks we saw. We can't read
+   *  their length (server-encrypted bytes) so we count blocks instead. */
+  redactedBlockCountMeasured: number;
+  /** How many events contributed measurement counters. Lets the UI annotate
+   *  the panel ("N of M events measured") when the scanner fell back. */
+  eventsWithMeasurement: number;
+  startedAt: number;
+}
+
+/*
+ * ─────────────────────────────────────────────────────────────────────────
+ *  PROVENANCE — every magic number below should trace to one of these:
+ *
+ *  [docs-pricing]   docs.anthropic.com/en/docs/about-claude/pricing
+ *                   Verified 2026-05-19 via WebFetch. The page lists per-model
+ *                   per-million-token rates and the cache-tier multipliers.
+ *
+ *  [count_tokens]   docs.anthropic.com/en/api/messages-count-tokens
+ *                   The dashboard's baseline number comes from a free side
+ *                   call to /v1/messages/count_tokens on the PRE-COMPRESSION
+ *                   body. No estimation, no α, no regression.
+ * ─────────────────────────────────────────────────────────────────────────
+ */
+
+/** Output-token rate multiplier (referenced to the input base rate).
+ *  Source: [docs-pricing] — Opus 4.7 lists $5/Mtok input and $25/Mtok
+ *  output (5×); Sonnet 4.7 lists $3/Mtok input and $15/Mtok output (5×).
+ *  Same ratio holds on Haiku 4.5 ($1/$5). */
+const OUTPUT_TOKEN_RATE = 5.0;
+
+/** Per-million-token input rate ASSUMED for the headline dollar figure.
+ *  Source: https://docs.claude.com/en/docs/about-claude/pricing — Opus 4.7
+ *  input is $5/Mtok (same as Opus 4.5 / 4.6; the previous "$2.50" value
+ *  here was a regression). Cache-write 5m = $6.25/Mtok (1.25×),
+ *  cache-read = $0.50/Mtok (0.10×).
+ *
+ *  This is exposed on /proxy-stats as `pricing_assumptions.input_per_mtok`
+ *  so the operator can see what we assumed and override if they're
+ *  running against a non-default deployment (Bedrock/Vertex add a 10%
+ *  premium; Sonnet would be $3/Mtok, etc.).
+ *
+ *  NOTE: Opus 4.7 uses a different tokenizer than 4.5/4.6 (per
+ *  docs.claude.com/en/docs/about-claude/pricing), so even at the same
+ *  $/Mtok rate, the same string maps to a different token count. The
+ *  honest oracle for "tokens in this body" is `count_tokens` against the
+ *  actual target model; do not trust hardcoded chars-per-token or
+ *  tokens-per-image constants on 4.7 without verifying against the
+ *  upstream probe. */
+// 2026-06-09: gate is Fable-5-only and Fable 5 bills $10/MTok input,
+// so the dashboard dollar figure uses that rate. Output tokens are
+// excluded entirely (the proxy can't move them), so this still
+// understates the real bill - treat it as "input-side $ saved".
+export const ASSUMED_INPUT_USD_PER_MTOK = 10.0;
+
+export class DashboardState {
+  private recent: RecentRow[] = [];
+  /** Per-session dollar-weighted totals, keyed by `info.firstUserSha8`. The
+   *  dashboard surfaces ONLY the most-recently-active session via the
+   *  `serveCurrentSessionJson` endpoint — older sessions linger in the Map
+   *  so a tab refresh during a brief lull still finds the previous session,
+   *  but get evicted at `SESSION_CAP` to bound memory in long-running hosts. */
+  private sessions: Map<string, SessionTotals> = new Map();
+  /** sha8 of the most-recently-active session id. null when no events have
+   *  ever carried a `firstUserSha8` (e.g. a cold start with only passthrough
+   *  hits that the upstream probe never tagged). */
+  private currentSessionId: string | null = null;
+  /** Hard cap on `sessions` Map entries. Keeps memory bounded in
+   *  long-running deployments. 50 sessions × ~13 numeric fields each is
+   *  comfortably under a MB even with fat bucket/passthrough histograms. */
+  private static readonly SESSION_CAP = 50;
+  private totals: Totals = {
+    requests: 0,
+    compressedRequests: 0,
+    actualInputWeighted: 0,
+    baselineInputWeighted: 0,
+    outputWeighted: 0,
+    allBaselineEquivalentWeighted: 0,
+    allActualInputWeighted: 0,
+    allOutputWeighted: 0,
+    allUsageRequests: 0,
+    compressedPaidRequests: 0,
+    compressedActualInputWeighted: 0,
+    compressedOutputWeighted: 0,
+    passthroughPaidRequests: 0,
+    passthroughActualInputWeighted: 0,
+    passthroughOutputWeighted: 0,
+    textCharsMeasured: 0,
+    thinkingCharsMeasured: 0,
+    toolUseCharsMeasured: 0,
+    redactedBlockCountMeasured: 0,
+    eventsWithMeasurement: 0,
+    startedAt: Date.now() / 1000,
+  };
+  /** Bounded ring of the most recently rendered images (last IMAGE_RING_CAP).
+   *  Each request that rendered an image pushes one entry; the matching
+   *  RecentRow carries `img_id` so the dashboard can pull any image still in
+   *  the ring via /proxy-latest-png?id=N. In-memory only — images are never
+   *  persisted, so a restart starts this empty. */
+  private images: ImageEntry[] = [];
+  /** Monotonic image id source. Never reset, never reused — an evicted id
+   *  stays dangling on its RecentRow rather than pointing at a new image. */
+  private nextImageId = 1;
+  /** Runtime kill switch for compression. When false, the proxy forwards
+   *  /v1/messages unchanged to upstream — pure passthrough, no images,
+   *  no transforms. Controlled by the dashboard "passthrough" toggle so
+   *  the operator can toggle the proxy's transform instantly.
+   *
+   *  Defaults to TRUE since 2026-06-09: scope is Fable 5 only, which reads
+   *  renders at 100/100 (no Opus read tax) with the same image billing, and
+   *  the live proxy record measured ~68% real input-token savings on dense
+   *  traffic — the old off-default rationale ("cache-illusory savings")
+   *  cited the superseded dead verdict. Verbatim recall is still lossy;
+   *  the dashboard toggle remains the kill switch. See FINDINGS.md. */
+  private compressionEnabled = true;
+  setCompressionEnabled(on: boolean): void {
+    this.compressionEnabled = on;
+  }
+  getCompressionEnabled(): boolean {
+    return this.compressionEnabled;
+  }
+  /** Resolved disk paths for the events.jsonl + 4xx-bodies sidecar dir. The
+   *  new sessions / cleanup endpoints need this; legacy callers that don't
+   *  pass `paths` opt out of those endpoints by returning 503. */
+  private readonly paths: SessionsPaths | undefined;
+
+  /** Test hook: when set, /api/sessions.json and /api/sessions/${id}.json
+   *  call this instead of `claudeCodeMap()` with the real `~/.claude/projects/`
+   *  path. Lets unit tests run in tens of ms instead of scanning hundreds of
+   *  the developer's actual Claude Code session files. */
+  private readonly ccMapFn: () => Promise<Map<string, ClaudeCodeSessionRef>>;
+
+  constructor(
+    paths?: SessionsPaths,
+    ccMapF
+[assistant]
+Reviewed src/core/render.ts.
+[user]
+after the load test, final answer: FLUSH_INTERVAL_MS = 7200. lock it.
+[assistant]
+FLUSH_INTERVAL_MS changed 8400 -> 7200, locked.
+[tool_use Read]
+{"file_path":"src/core/proxy.ts"}
+[tool_result]
+ Set on every
+   *  /v1/messages POST regardless of status. Lets future debuggers correlate
+   *  "same payload, sometimes works, sometimes fails" without storing bodies. */
+  reqBodySha8?: string;
+  /** Full gzipped transformed body, populated only on 4xx. The Node host may
+   *  redirect this to a sidecar file (see reqBodySamplePath) before the
+   *  tracker serializes the event; Workers always inline-cap at 32 KiB. */
+  reqBodyGz?: Uint8Array;
+  /** Set by the Node host *in place of* reqBodyGz when it wrote the gzipped
+   *  body to a sidecar file. The path lands in the JSONL as
+   *  `req_body_sample_path`. */
+  reqBodySamplePath?: string;
+  /** Ground-truth output measurement extracted from the response stream itself,
+   *  independent of Anthropic's `usage.output_tokens`. Lets the dashboard show
+   *  how much of the billed output was redacted_thinking (opaque server-encoded
+   *  bytes) vs real text/thinking/tool_use. Absent on requests that didn't
+   *  yield a body we could scan (no upstream response, 5xx, unknown
+   *  content-type). See OutputMeasurement for field meanings. */
+  measurement?: OutputMeasurement;
+}
+
+/** Max chars of upstream error body we surface on ProxyEvent. Keeps the JSONL
+ *  line small while still being big enough to hold Anthropic's full error JSON
+ *  (typically a few hundred bytes). */
+const ERROR_BODY_MAX = 2048;
+
+/** Cheap, bounded read of the top-level `model` field from an Anthropic
+ *  /v1/messages body. The field sits near the start of the JSON, so we decode
+ *  only the head rather than JSON-parsing the (potentially multi-MB) full
+ *  conversation just to read one string. Returns null when not found — callers
+ *  treat null as "outside supported scope" (fail-closed). */
+function readModelField(body: Uint8Array): string | null {
+  try {
+    const head = new TextDecoder().decode(body.subarray(0, 8192));
+    const m = /"model"\s*:\s*"([^"]{1,80})"/.exec(head);
+    return m ? m[1]! : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Gzip a byte buffer using the standard `CompressionStream`. Available in
+ *  Node 18+ and Cloudflare Workers — no Buffer / no zlib. */
+async function gzipBytes(body: Uint8Array): Promise<Uint8Array> {
+  // `body as BufferSource`: TS doesn't model Response taking a Uint8Array
+  // directly even though it works in both runtimes.
+  const stream = new Response(body as BufferSource).body!.pipeThrough(
+    new CompressionStream('gzip'),
+  );
+  const buf = await new Response(stream).arrayBuffer();
+  return new Uint8Array(buf);
+}
+
+/** sha256[0..8] of a byte buffer, hex. Same shape as the existing sha8(text)
+ *  helper in transform.ts but works on raw bytes (no extra encode pass). */
+async function sha8Bytes(body: Uint8Array): Promise<string> {
+  // Cast to BufferSource — Web Crypto accepts Uint8Array at runtime.
+  const digest = await crypto.subtle.digest('SHA-256', body as BufferSource);
+  const bytes = new Uint8Array(digest);
+  let hex = '';
+  for (let i = 0; i < 4; i++) hex += bytes[i]!.toString(16).padStart(2, '0');
+  return hex;
+}
+
+/**
+ * Ground-truth output measurement extracted from the response stream itself.
+ *
+ *  - `textChars` / `thinkingChars` / `toolUseChars` count Unicode code units
+ *    of the corresponding payload (`text_delta`, `thinking_delta`, and
+ *    `input_json_delta` for SSE; `content[].text` / `.thinking` /
+ *    JSON-encoded `.input` for non-stream responses).
+ *  - `redactedBlockCount` is the number of `redacted_thinking` content blocks
+ *    Anthropic returned — chars are unavailable for these (the field is
+ *    opaque server-encrypted bytes), so they get a low/mid/high estimate at
+ *    the dashboard layer instead of a precise char count.
+ *
+ * These numbers are independent of Anthropic's `usage.output_tokens` — they
+ * give us a real ruler against the redacted_thinking-inflated bill, which is
+ * exactly the gap the May-2026 weekly-meter audit surfaced. Live on `info`,
+ * so they ride the existing TrackEvent pipeline; the dashboard layer turns
+ * them into `output_chars_measured`, `tool_use_chars_measured`, etc.
+ */
+export interface OutputMeasurement {
+  textChars: number;
+  thinkingChars: number;
+  toolUseChars: number;
+  redactedBlockCount: number;
+}
+
+/** Walk a single SSE event (`event: …\ndata: …`) and fold it into the running
+ *  usage + measurement accumulators. Quiet on malformed events — a stream
+ *  with one corrupt line should not break the host's event log. */
+function processSseEvent(
+  block: string,
+  m: OutputMeasurement,
+  state: { usage: Usage | undefined },
+): void {
+  // Each SSE event is one or more lines; we only care about `event:` + `data:`.
+  // Continuation `data:` lines concatenate per the SSE spec, though Anthropic
+  // ships single-line JSON in practice.
+  let event = '';
+  let data = '';
+  for (const line of block.split('\n')) {
+    if (line.startsWith('event:')) event = line.slice(6).trim();
+    else if (line.startsWith('data:')) data += line.slice(5).replace(/^\s/, '');
+  }
+  if (!data) return;
+  let j: unknown;
+  try {
+    j = JSON.parse(data);
+  } catch {
+    return;
+  }
+  const obj = j as Record<string, unknown>;
+
+  // OpenAI Chat Completions streaming chunks usually have no `event:` line:
+  // each SSE block is `data: { choices, usage }`, with usage present only
+  // when stream_options.include_usage is enabled. Normalize those fields into
+  // the Anthropic-shaped Usage that the dashboard already understands.
+  const openAIUsage = normalizeUsage((obj as { usage?: unknown }).usage);
+  if (openAIUsage) state.usage = openAIUsage;
+  measureOpenAIChoices(obj, m);
+
+  if (event === 'message_start') {
+    const msg = obj.message as { usage?: Usage } | undefined;
+    const usage = normalizeUsage(msg?.usage);
+    if (usage) state.usage = usage;
+  } else if (event === 'content_block_start') {
+    const cb = obj.content_block as { type?: string } | undefined;
+    if (cb?.type === 'redacted_thinking') m.redactedBlockCount += 1;
+  } else if (event === 'content_block_delta') {
+    const d = obj.delta as
+      | { type?: string; text?: string; thinking?: string; partial_json?: string }
+      | undefined;
+    if (d?.type === 'text_delta' && typeof d.text === 'string') {
+      m.textChars += d.text.length;
+    } else if (d?.type === 'thinking_delta' && typeof d.thinking === 'string') {
+      m.thinkingChars += d.thinking.length;
+    } else if (d?.type === 'input_json_delta' && typeof d.partial_json === 'string') {
+      m.toolUseChars += d.partial_json.length;
+    }
+  } else if (event === 'message_delta') {
+    // Authoritative final output_tokens lives here; merge over the message_start
+    // baseline so the host event records the billed number, not the placeholder
+    // (message_start ships `output_tokens: 1` on day-zero Sonnet 4).
+    const u = obj.usage as Partial<Usage> | undefined;
+    if (u) {
+      if (!state.usage) state.usage = {} as Usage;
+      const cur = state.usage;
+      if (typeof u.output_tokens === 'number') cur.output_tokens = u.output_tokens;
+      if (typeof u.input_tokens === 'number' && cur.input_tokens === undefined) {
+        cur.input_tokens = u.input_tokens;
+      }
+      if (typeof u.cache_creation_input_tokens === 'number') {
+        cur.cache_creation_input_tokens = u.cache_creation_input_tokens;
+      }
+      if (typeof u.cache_read_input_tokens === 'number') {
+        cur.cache_read_input_tokens = u.cache_read_input_tokens;
+      }
+    }
+  }
+}
+
+function normalizeUsage(raw: unknown): Usage | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const u = raw as Record<string, unknown>;
+  const out: Usage = {};
+
+  if (typeof u.input_tokens === 'number') out.input_tokens = u.input_tokens;
+  if (typeof u.output_tokens === 'number') out.output_tokens = u.output_tokens;
+  if (typeof u.cache_creation_input_tokens === 'number') {
+    out.cache_creation_input_tokens = u.cache_creation_input_tokens;
+  }
+  if (typeof u.cache_read_input_tokens === 'number') {
+    out.cache_read_input_tokens = u.cache_read_input_tokens;
+  }
+  if (typeof u.cache_creation === 'object' && u.cache_creation !== null) {
+    out.cache_creation = u.cache_creation as Usage['cache_creation'];
+  }
+  if (typeof u.server_tool_use === 'object' && u.server_tool_use !== null) {
+    out.server_tool_use = u.server_tool_use as Usage['server_tool_use'];
+  }
+
+  // OpenAI Chat Completions shape.
+  if (typeof u.prompt_tokens === 'number') out.input_tokens = u.prompt_tokens;
+  if (typeof u.completion_tokens === 'number') out.output_tokens = u.completion_tokens;
+
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function measureOpenAIChoices(obj: Record<string, unknown>, m: OutputMeasurement): void {
+  const choices = obj.choices;
+  if (!Array.isArray(choices)) return;
+  for (const choice of choices) {
+    if (!choice || typeof choice !== 'object') continue;
+    const c = choice as { delta?: unknown; message?: unknown };
+    const payload = (c.delta ?? c.message) as Record<string, unknown> | undefined;
+    if (!payload || typeof payload !== 'object') continue;
+    if (typeof payload.content === 'string') m.textChars += payload.content.length;
+    const toolCalls = payload.tool_calls;
+    if (Array.isArray(toolCalls)) {
+      for (const tc of toolCalls) {
+        const fn = (tc as { function?: unknown } | undefined)?.function;
+        const args = (fn as { arguments?: unknown } | undefined)?.arguments;
+        if (typeof args === 'string') m.toolUseChars += args.length;
+      }
+    }
+  }
+}
+
+/** Measure non-stream `messages.content[]` directly. Same shape as the SSE
+ *  accumulator — output_*_chars carry char counts, redactedBlockCount counts
+ *  `redacted_thinking` blocks (no chars available). */
+function measureFromMessageJson(j: unknown): OutputMeasurement {
+  const m: OutputMeasurement = { textChars: 0, thinkingChars: 0, toolUseChars: 0, redactedBlockCount: 0 };
+  if (j && typeof j === 'object') measureOpenAIChoices(j as Record<string, unknown>, m);
+  const content = (j as { content?: unknown })?.content;
+  if (!Array.isArray(content)) return m;
+  for (const block of content) {
+    const b = block as { type?: string; text?: unknown; thinking?: unknown; input?: unknown };
+    if (b?.type === 'text' && typeof b.text === 'string') {
+      m.textChars += b.text.length;
+    } else if (b?.type === 'thinking' && typeof b.thinking === 'string') {
+      m.thinkingChars += b.thinking.length;
+    } else if (b?.type === 'redacted_thinking') {
+      m.redactedBlockCount += 1;
+    } else if (b?.type === 'tool_use') {
+      try {
+        m.toolUseChars += JSON.stringify(b.input ?? {}).length;
+      } catch {
+        /* circular / unserialisable input — leave the co
+[assistant]
+Reviewed src/core/proxy.ts.
+
+=== end ===

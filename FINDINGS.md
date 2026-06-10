@@ -1,10 +1,47 @@
 # FINDINGS — pxpipe (text→PNG token compression)
 
 **Status:** ⚠️ **VERDICT REVERSED — see correction below.** Originally ruled "dead"; live measurement shows pxpipe is a working *lossy gist-compressor* saving ~68% on real (dense) Claude Code traffic, with a known verbatim-recall gap.
-**Date:** 2026-05-28 (original) · 2026-05-29 (correction) · 2026-06-09 (Fable 5 update)
+**Date:** 2026-05-28 (original) · 2026-05-29 (correction) · 2026-06-09 (Fable 5 update) · 2026-06-10 (gist-recall A/B)
 **Models tested:** `claude-opus-4-5` (original run), `claude-opus-4-8` (re-test after a model bump), `claude-fable-5` (2026-06-09)
 **Model scope (current):** Fable 5 only, enforced in library + proxy (Opus disabled 2026-06-09 — see update below).
 **Harness:** `eval/needle-haystack/` (receipts preserved from `/tmp/needle_eval`)
+
+---
+
+## Update (2026-06-10) — gist-recall A/B: zero information loss measured at the gist tier
+
+The README's weakest claim ("useful when you know where to blur") had no
+number behind it. Built `eval/gist-recall/` — synthetic Claude Code-shaped
+sessions (15k–45k chars, 1–10 pages), facts injected at controlled depths with
+randomized values, history rendered through the real production pipeline
+(`renderTextToPngsWithCharLimit`, dense 5×8 cell), graded by exact string
+match, no LLM grader. Both arms via claude CLI on `claude-fable-5`, proxy
+bypassed so nothing interferes with the comparison.
+
+Three escalating tiers, text-history vs imaged-history per probe:
+
+| tier | probes | text | image |
+|---|---|---:|---:|
+| 1 — facts at depth (decisions, numerics, paths, names, negation) + distractors | 50/arm | 50/50 | **50/50** |
+| 2 — hard: 45k-char sessions, near-miss distractors (rejected package praised elsewhere, competing ms values, root-cause flag vs reviewer names) | 30/arm | 30/30 | **30/30** |
+| 3 — state tracking: value mutated 3× across session, ask final/first/change-count | 18/arm | 18/18 | **18/18** |
+| confabulation guard — probes about facts never stated (correct = UNKNOWN) | 8+6+2/arm | 0 confab | **0 confab** |
+
+98/98 text vs 98/98 image, zero wrong answers, zero confabulated
+unanswerables, in either arm, at any tier. The image arm correctly resolved
+every distractor and answered UNKNOWN on every never-stated probe.
+
+**What this establishes:** the gist tier — what the model actually needs from
+collapsed history (decisions, values, paths, names, state) — survives imaging
+with no measurable loss on Fable 5, even under deliberate adversarial
+pressure. Combined with the verbatim rows (0/15 Opus haystack, 3/4 Fable
+dense), the boundary is now bracketed from both sides: gist = lossless in
+measurement, exact-bytes = unsafe. That is exactly the line the architecture
+draws (verbatim-risk blocks stay text).
+
+**Not established:** end-to-end task completion parity (paired real-task A/B,
+compression ON vs OFF) — still the open tier. Raw outputs in
+`eval/gist-recall/work*/`, harness committed.
 
 ---
 

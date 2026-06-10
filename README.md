@@ -14,7 +14,7 @@ actual). Single sessions measure ~68%.
 
 This is what the model sees instead of text:
 
-![example: ~17k chars of tool-result JSON + prose rendered as one dense 1573×1280 page (what the dashboard shows)](docs/assets/example-render.png)
+![example: a real `transformRequest` output — system prompt + tool docs reflowed into one dense 1573×1248 page, instruction banner on top, ↵ marking original newlines](docs/assets/example-render.png)
 
 *~17k characters of tool-result JSON and prose — ≈9k text tokens as a
 transcript, ≈2.7k image tokens as this page. Synthetic content with the same

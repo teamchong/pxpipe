@@ -151,3 +151,55 @@ describe('serveApiStats', () => {
     expect(res.status).toBe(404);
   });
 });
+
+// ---- /fragments/* (htmx server-rendered HTML) ------------------------
+
+describe('serveFragment', () => {
+  const url = new URL('http://localhost/fragments/x');
+
+  it('routes /fragments/<name> via dashboardPath', () => {
+    expect(dashboardPath('/fragments/header')).toEqual({ kind: 'fragment', name: 'header' });
+    expect(dashboardPath('/fragments/latest')).toEqual({ kind: 'fragment', name: 'latest' });
+  });
+
+  it('renders the toggle fragment reflecting compression state', async () => {
+    const on = await dash.serveFragment('toggle', url, 1234);
+    expect(on.headers.get('content-type')).toContain('text/html');
+    expect(await on.text()).toContain('Disable compression');
+    dash.handleCompressionToggle({ enabled: false });
+    const off = await dash.serveFragment('toggle', url, 1234);
+    const offHtml = await off.text();
+    expect(offHtml).toContain('PASSTHROUGH MODE');
+    expect(offHtml).toContain('Enable compression');
+    dash.handleCompressionToggle({ enabled: true });
+  });
+
+  it('renders header + recent + stats fragments from the same payloads as JSON', async () => {
+    writeEvents(tmp, [
+      ev({ status: 200, compressed: true, orig_chars: 1000, image_bytes: 200 }),
+    ]);
+    const header = await (await dash.serveFragment('header', url, 4711)).text();
+    expect(header).toContain('4711');
+    const recent = await (await dash.serveFragment('recent', url, 4711)).text();
+    expect(recent).toContain('<table');
+    const stats = await (await dash.serveFragment('stats', url, 4711)).text();
+    expect(stats).toContain('requests');
+  });
+
+  it('escapes HTML in latest source text', async () => {
+    dash.captureImage({
+      imagePngs: [new Uint8Array([137, 80, 78, 71])],
+      imageDims: [{ width: 100, height: 80 }],
+      imageSourceText: '<script>alert(1)</script>',
+    } as never);
+    const srcUrl = new URL('http://localhost/fragments/latest?source=1');
+    const html = await (await dash.serveFragment('latest', srcUrl, 1)).text();
+    expect(html).not.toContain('<script>alert(1)</script>');
+    expect(html).toContain('&lt;script&gt;');
+  });
+
+  it('404s unknown fragments', async () => {
+    const res = await dash.serveFragment('nope', url, 1);
+    expect(res.status).toBe(404);
+  });
+});

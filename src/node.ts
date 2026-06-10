@@ -240,6 +240,28 @@ async function dispatchDashboard(
     case 'current-session':
       if (method !== 'GET') return undefined;
       return dashboard.serveCurrentSessionJson();
+    case 'fragment': {
+      // /fragments/toggle is the one mutating fragment - htmx POSTs the next
+      // state (urlencoded hx-vals or JSON), the server flips the switch and
+      // returns the re-rendered toggle markup.
+      if (route.name === 'toggle' && method === 'POST') {
+        let enabled = false;
+        try {
+          const raw = await readRequestBody(req);
+          try {
+            enabled = (JSON.parse(raw) as { enabled?: unknown }).enabled === true;
+          } catch {
+            enabled = new URLSearchParams(raw).get('enabled') === 'true';
+          }
+        } catch {
+          return new Response('bad request body', { status: 400 });
+        }
+        dashboard.handleCompressionToggle({ enabled });
+        return dashboard.serveFragment('toggle', url, port);
+      }
+      if (method !== 'GET') return undefined;
+      return dashboard.serveFragment(route.name, url, port);
+    }
     case 'api-compression': {
       if (method !== 'POST') {
         return new Response(

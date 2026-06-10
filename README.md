@@ -122,7 +122,7 @@ pnpm run build                # regenerates dist/
   (partly offset by the model ingesting fewer tokens). Responses stream normally.
 * ASCII/Latin-1 well tested; CJK works but conservatively.
 * `node-canvas` native dep on Node.
-* Fable 5 only. An unmeasured GPT 5.5 route exists (`OPENAI_BASE_URL=http://127.0.0.1:47821/v1`) — smoke-tested, not the focus.
+* Fable 5 only.
 
 ## License
 

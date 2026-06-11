@@ -155,6 +155,13 @@ Everything else passes through byte-identical: your messages, recent turns,
 the model's output (it is the response, the proxy never touches it), sparse
 prose, and anything too small to win. Non-Fable models pass through entirely.
 
+**Has it ever failed for real, outside the benchmarks?**
+Yes, once in weeks of daily use: the model recalled a person's name from
+imaged chat history and got it confidently wrong. No error, just a
+plausible wrong name. That is the documented failure mode: exact strings
+in imaged content are not byte-safe. Coding sessions tolerate this because
+the agent re-reads files before editing; pure chat recall has no such check.
+
 ## How it works
 
 ```

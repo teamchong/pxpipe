@@ -49,6 +49,11 @@ came back **0/15** on Opus and 3/4 on Fable 5, and the failure mode is
 need back byte-exact (IDs, hashes, secrets, exact numbers) must stay text.
 Recent turns do; a dedicated verbatim-risk guard is not built yet.
 
+**Does it break real work?** Not in what we measured: a 10-instance
+SWE-bench Lite pilot (the easy subset) resolved **10/10 on both arms** —
+pxpipe ON at $27 vs OFF at $54 token-equivalent. Small n, parity not
+superiority; details and caveats in the benchmarks below.
+
 **Savings are workload-dependent.** It wins on token-dense content
 (~1 char/token: code, JSON, hashes) and *loses money* on sparse English prose
 (~3.5 chars/token). The built-in gate only images content where the math wins,
@@ -89,7 +94,8 @@ the proxy's event log at Fable 5 rates (input $10/M, cache-write 1.25x,
 cache-read 0.1x, output $50/M). Caveats: n=10/arm, agentic runs are
 nondeterministic (the OFF arm took more turns — 337 vs 138 calls — so the −49%
 includes turn-count variance, not pure compression), and Lite instances are on
-the easier end. Harness, predictions, and grading reports: `eval/swe-bench/`.
+the easier end. Harness, predictions, and grading reports:
+[`eval/swe-bench/`](eval/swe-bench/).
 
 <sub>We also ran GSM8K: 96% imaged. But GSM8K is in training data, so the model
 recalls memorized answers through its own misreads, inflating the score, so we

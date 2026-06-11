@@ -55,15 +55,19 @@ def sh(cmd, **kw):
 
 def ensure_proxies():
     """Bench proxies only. Compression: ON arm default-on, OFF arm forced off."""
+    root = os.path.abspath(os.path.join(HERE, "..", ".."))
     for arm, port in ARMS.items():
-        if sh(f"curl -sf -o /dev/null http://127.0.0.1:{port}/").returncode != 0:
-            env = f"PORT={port} PXPIPE_LOG={LOGS[arm]}"
-            sh(f"cd {os.path.join(HERE, '..', '..')} && nohup env {env} node bin/cli.js "
-               f">> /tmp/pxpipe-bench-{arm}.log 2>&1 & disown")
-            time.sleep(2)
-        if arm == "off":
-            sh(f"curl -s -X POST http://127.0.0.1:{port}/api/compression "
-               f"-H 'content-type: application/json' -d '{{\"enabled\":false}}'")
+        for attempt in range(3):
+            if sh(f"curl -sf -o /dev/null http://127.0.0.1:{port}/").returncode == 0:
+                break
+            subprocess.Popen(
+                ["node", "bin/cli.js"], cwd=root,
+                env=dict(os.environ, PORT=str(port), PXPIPE_LOG=LOGS[arm]),
+                stdout=open(f"/tmp/pxpipe-bench-{arm}.log", "a"),
+                stderr=subprocess.STDOUT, start_new_session=True)
+            time.sleep(3)
+        else:
+            sys.exit(f"FATAL: bench proxy '{arm}' did not come up on :{port}")
     for arm, port in ARMS.items():
         r = sh(f"curl -s http://127.0.0.1:{port}/api/compression "
                f"-X POST -H 'content-type: application/json' "
@@ -91,9 +95,16 @@ def run_one(inst, arm):
     repo = inst["repo"]
     cache = os.path.join(CACHE, repo.replace("/", "_") + ".git")
     if not os.path.exists(cache):
-        r = sh(f"git clone -q --bare https://github.com/{repo}.git {cache}")
+        # clone to an arm-suffixed temp then rename: atomic vs the other arm
+        tmp = f"{cache}.tmp-{arm}"
+        sh(f"rm -rf {tmp}")
+        r = sh(f"git clone -q --bare https://github.com/{repo}.git {tmp}")
         if r.returncode != 0:
             return iid, arm, "cache-clone-fail"
+        if not os.path.exists(cache):
+            os.rename(tmp, cache)
+        else:
+            sh(f"rm -rf {tmp}")
     sh(f"rm -rf {d}")
     r = sh(f"git clone -q {cache} {d} && git -C {d} checkout -q {inst['base_commit']}")
     if r.returncode != 0:

@@ -12,19 +12,27 @@ Instance: `future-architect__vuls-36456cb...` (Go - implement
 
 | arm | resolved | API calls | image count | token-equivalent |
 |---|---|---|---|---|
-| pxpipe ON (47821) | 1/1 (both tests PASSED) | 19 | 2,925 | 453,944 |
+| pxpipe ON (47821) | 1/1 (both tests PASSED) | 10 | 45 | 116,690 |
 | OFF (47822, compress=false) | 1/1 (both tests PASSED) | 7 | 0 | 207,840 |
 
 - Per-request compression on the ON arm (clean number, no turn-count
   confound): each request's `count_tokens` probe of the uncompressed body
-  vs what was actually sent - **would-have-sent 8.61M vs sent 3.08M raw
-  tokens, -64% per request**.
-- Run totals are receipts, not a savings claim: the ON run happened to
-  take 2.7x the turns (19 vs 7) on this tiny task. Agentic runs are
-  nondeterministic; per-request is the isolated measurement.
+  vs what was actually sent - **would-have-sent 614,753 vs sent 210,443
+  raw tokens, -66% per request**.
 - Task quality: parity at n=1 - both arms produced a working
   `searchCache` and passed `TestSearchCache` + `TestRemoveInactive` under
   the official grader.
+
+### Verifying the ON arm actually went through pxpipe
+
+The ON proxy (47821) is shared with the operator's own Claude Code
+session, so the event window was contaminated; arm rows were separated by
+session shape (operator rows carry 320 images / ~315k cache reads; arm
+rows are a fresh session with 4-7 images, and bracket exactly the 100s
+run duration recorded in `run.log`). Direct proof compression engaged:
+both arms sent the identical first request (`input_tokens=1927`) - OFF
+wrote a 62,836-token text slab, ON wrote 22,097 text tokens + 4 rendered
+images, and every arm row after the warm-up logs `compressed=true`.
 
 ## Infra gotcha (Apple Silicon)
 

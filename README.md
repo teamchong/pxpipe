@@ -73,6 +73,24 @@ Measured with novel random-number problems the model cannot have memorized:
 | verbatim 12-char hex recall, dense render, Opus | 15 | 15/15 | **0/15** | - |
 | verbatim 12-char hex recall, dense render, Fable 5 | 4 | - | 3/4 | - |
 
+### SWE-bench Lite pilot (end-to-end task quality)
+
+10 SWE-bench Lite instances (10 diverse repos), Claude Code + Fable 5, paired
+runs through pxpipe ON vs OFF, same prompt and time budget. Graded with the
+official `swebench` Docker harness:
+
+| arm | resolved | API calls | cache_create | cache_read | output tok | $-equiv |
+|---|---:|---:|---:|---:|---:|---:|
+| pxpipe ON | **10/10** | 138 | 1.10M | 8.6M | 90k | **$27.27** |
+| OFF | 10/10 | 337 | 1.38M | 19.1M | 316k | $53.61 |
+
+Same resolve rate at 49% lower cost. Dollar figures are token-equivalents from
+the proxy's event log at Fable 5 rates (input $10/M, cache-write 1.25x,
+cache-read 0.1x, output $50/M). Caveats: n=10/arm, agentic runs are
+nondeterministic (the OFF arm took more turns — 337 vs 138 calls — so the −49%
+includes turn-count variance, not pure compression), and Lite instances are on
+the easier end. Harness, predictions, and grading reports: `eval/swe-bench/`.
+
 <sub>We also ran GSM8K: 96% imaged. But GSM8K is in training data, so the model
 recalls memorized answers through its own misreads, inflating the score, so we
 lead with the clean novel-number eval instead. Reproduce:

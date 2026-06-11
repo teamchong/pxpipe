@@ -1,7 +1,7 @@
 # FINDINGS — pxpipe (text→PNG token compression)
 
 **Status:** ⚠️ **VERDICT REVERSED — see correction below.** Originally ruled "dead"; live measurement shows pxpipe is a working *lossy gist-compressor* saving ~68% on real (dense) Claude Code traffic, with a known verbatim-recall gap.
-**Date:** 2026-05-28 (original) · 2026-05-29 (correction) · 2026-06-09 (Fable 5 update) · 2026-06-10 (gist-recall A/B)
+**Date:** 2026-05-28 (original) · 2026-05-29 (correction) · 2026-06-09 (Fable 5 update) · 2026-06-10 (gist-recall A/B, SWE-bench pilot)
 **Models tested:** `claude-opus-4-5` (original run), `claude-opus-4-8` (re-test after a model bump), `claude-fable-5` (2026-06-09)
 **Model scope (current):** Fable 5 only, enforced in library + proxy (Opus disabled 2026-06-09 — see update below).
 **Harness:** `eval/needle-haystack/` (receipts preserved from `/tmp/needle_eval`)
@@ -42,6 +42,15 @@ draws (verbatim-risk blocks stay text).
 **Not established:** end-to-end task completion parity (paired real-task A/B,
 compression ON vs OFF) — still the open tier. Raw outputs in
 `eval/gist-recall/work*/`, harness committed.
+
+## Update (2026-06-10, later) — SWE-bench Lite pilot: task-completion parity measured
+
+The open tier above is now measured: 10 SWE-bench Lite instances, Claude Code
++ Fable 5, paired ON/OFF runs, graded with the official `swebench` Docker
+harness. **10/10 resolved on both arms**; ON cost $27.27 vs OFF $53.61
+token-equivalent (−49%, includes turn-count variance — OFF took 337 API calls
+vs 138). Parity, not superiority: Lite is easy and n=10. Full receipts in
+`eval/swe-bench/README.md`.
 
 ---
 

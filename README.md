@@ -49,13 +49,13 @@ came back **0/15** on Opus and 3/4 on Fable 5, and the failure mode is
 need back byte-exact (IDs, hashes, secrets, exact numbers) must stay text.
 Recent turns do; a dedicated verbatim-risk guard is not built yet.
 
-**Does it break real work?** Mostly parity in what we measured: a
-10-instance SWE-bench Lite pilot (the easy subset) resolved **10/10 on
-both arms** — pxpipe ON at $27 vs OFF at $54 token-equivalent — and a
-9-pair SWE-bench Pro bench (harder, long-horizon) resolved 6/9 ON vs
-7/9 OFF at **-61% per-request**: verdicts agree on 8/9, the one split
-(ON fail) is within noise at this n but is the first measured task ON
-lost. Small n, details and caveats in the benchmarks below.
+**Does it break real work?** Parity in what we measured: a 10-instance
+SWE-bench Lite pilot (the easy subset) resolved **10/10 on both arms** —
+pxpipe ON at $27 vs OFF at $54 token-equivalent — and 19 SWE-bench Pro
+pairs (harder, long-horizon) resolved **14/19 ON vs 15/19 OFF** at
+**-60% per-request**: verdicts agree on 18/19, and the single split
+(one ON fail) re-resolved 3/3 when replicated, i.e. run-to-run agentic
+variance, not compression. Small n, details and caveats below.
 
 **Savings are workload-dependent.** It wins on token-dense content
 (~1 char/token: code, JSON, hashes) and *loses money* on sparse English prose
@@ -97,18 +97,20 @@ Run totals, receipts, caveats: [`eval/swe-bench/`](eval/swe-bench/).
 
 ### SWE-bench Pro bench (harder, long-horizon)
 
-9 completed pairs (1 dropped: checkout failed both arms), same setup,
-official `SWE-bench_Pro-os` Docker harness:
+19 completed pairs across two runs (2 dropped: checkout failed both
+arms), same setup, official `SWE-bench_Pro-os` Docker harness:
 
 | | pxpipe ON | OFF |
 |---|---:|---:|
-| resolved | 6/9 | 7/9 |
-| request size vs own uncompressed body | **−61%** | ±0 |
+| resolved | 14/19 | 15/19 |
+| request size vs own uncompressed body | **−60%** | ±0 |
 
-Verdicts agree on 8/9 (two instances failed both arms); the single
-split is one ON-arm fail — within run-to-run noise for nondeterministic
-agentic runs at this n, but logged as the first measured task ON lost.
-Receipts: [`eval/swe-bench-pro/`](eval/swe-bench-pro/).
+Verdicts agree on 18/19 (three instances failed both arms — one with
+byte-identical patches across arms). The single split (navidrome, ON
+fail) was replicated 3x on the ON arm: all three runs produced an
+identical patch and **resolved**, so the original loss was run-to-run
+agentic variance, not compression. Receipts:
+[`eval/swe-bench-pro/`](eval/swe-bench-pro/).
 
 <sub>We also ran GSM8K: 96% imaged. But GSM8K is in training data, so the model
 recalls memorized answers through its own misreads, inflating the score, so we

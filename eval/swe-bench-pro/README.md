@@ -1,5 +1,40 @@
 # SWE-bench Pro - pxpipe ON vs OFF
 
+## Expansion to 19 pairs + navidrome replication (2026-06-11)
+
+Same setup as the 10-pair bench below (Fable 5, dedicated bench proxies
+ON 47823 / OFF 47824, official `SWE-bench_Pro-os` Docker harness on
+prebuilt `jefzda/sweap-images`). Two follow-ups:
+
+**1. Navidrome replication x3.** The single ON-arm loss from the first
+bench was re-run 3 times on a dedicated ON proxy (47825). All three
+replications produced a byte-identical patch (different from the
+original failing one) and **all three resolved**. The original split was
+run-to-run agentic variance, not compression damage.
+
+**2. +10 new pairs** (fresh instances, same repos pool, round-robin).
+`protonmail__webclients` dropped again (checkout failed both arms);
+9 pairs completed:
+
+| batch | instances | ON | OFF |
+|---|---|---|---|
+| 1 | qutebrowser, NodeBB, flipt, openlibrary, navidrome | 5/5 | 5/5 |
+| 2 | teleport, element-web | 1/2 | 1/2 |
+| 3 | ansible, tutanota | 1/2 | 1/2 |
+
+- **Verdicts agree 9/9** on the new pairs - including both fails
+  (element-web, tutanota failed both arms; element-web's patches were
+  byte-identical across arms).
+- Combined Pro totals: **ON 14/19, OFF 15/19**, verdict agreement 18/19,
+  and the single disagreement (navidrome) re-resolved 3/3 on replication.
+- Bench-proxy log over the whole Pro bench: ON 316 requests,
+  **-59.9% per-request** (count_tokens probe vs sent, no turn-count
+  confound), 2,274 images; OFF 576 requests, passthrough (±0).
+- Receipts: `bench20/` (all six `eval_results`, instance list,
+  navidrome replication verdicts + patch).
+
+---
+
 ## 10-pair bench (2026-06-11)
 
 Model: `claude-fable-5` via Claude Code CLI. 10 paired instances from

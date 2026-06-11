@@ -51,8 +51,10 @@ Recent turns do; a dedicated verbatim-risk guard is not built yet.
 
 **Does it break real work?** Not in what we measured: a 10-instance
 SWE-bench Lite pilot (the easy subset) resolved **10/10 on both arms** —
-pxpipe ON at $27 vs OFF at $54 token-equivalent. Small n, parity not
-superiority; details and caveats in the benchmarks below.
+pxpipe ON at $27 vs OFF at $54 token-equivalent, and a SWE-bench Pro
+single-pair smoke test (harder, long-horizon) resolved 1/1 both arms at
+-66% per-request. Small n, parity not superiority; details and caveats
+in the benchmarks below.
 
 **Savings are workload-dependent.** It wins on token-dense content
 (~1 char/token: code, JSON, hashes) and *loses money* on sparse English prose
@@ -91,6 +93,10 @@ pxpipe ON vs OFF, graded with the official `swebench` Docker harness:
 The −65% is per-request (`count_tokens` probe of each body before
 compression), so it has no turn-count confound. n=10/arm, Lite skews easy.
 Run totals, receipts, caveats: [`eval/swe-bench/`](eval/swe-bench/).
+
+A SWE-bench Pro pilot (harder, long-horizon tasks) is at n=1: both arms
+resolved 1/1 with −66% per-request, consistent with Lite and the
+production log. Receipts: [`eval/swe-bench-pro/`](eval/swe-bench-pro/).
 
 <sub>We also ran GSM8K: 96% imaged. But GSM8K is in training data, so the model
 recalls memorized answers through its own misreads, inflating the score, so we

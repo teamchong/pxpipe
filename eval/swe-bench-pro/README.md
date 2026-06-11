@@ -1,4 +1,37 @@
-# SWE-bench Pro pilot - pxpipe ON vs OFF
+# SWE-bench Pro - pxpipe ON vs OFF
+
+## 10-pair bench (2026-06-11)
+
+Model: `claude-fable-5` via Claude Code CLI. 10 paired instances from
+SWE-bench Pro (public set, `ScaleAI/SWE-bench_Pro`), run on dedicated
+bench proxies (ON 47823 compressing, OFF 47824 passthrough - separate
+event logs, no operator contamination), graded with the official
+`SWE-bench_Pro-os` Docker harness on prebuilt `jefzda/sweap-images`
+amd64 images (colima + Rosetta).
+
+One pair (`protonmail__webclients`) failed `git checkout` on both arms
+and dropped out; 9 pairs completed.
+
+| arm | resolved | API calls | compressed | images | request size vs own uncompressed body |
+|---|---|---|---|---|---|
+| pxpipe ON | 6/9 | 136 | 117 | 987 | **-61%** |
+| OFF | 7/9 | 152 | 0 | 0 | ±0 |
+
+- The -61% is per-request: each body's free `count_tokens` probe vs what
+  was actually sent (no turn-count confound).
+- Verdicts agree on 8/9 instances (element-web and tutanota failed both
+  arms). The single split is `navidrome` (ON fail, OFF pass) - at n=9,
+  a 1-task delta is within run-to-run noise for nondeterministic agentic
+  runs, but it is the first measured task ON lost; logged honestly here.
+- Token-equivalents from the bench event logs: ON 1.60M vs OFF 2.78M
+  (-43%) - carries turn-count variance, quote the -61% per-request
+  number instead.
+- Receipts: `bench/` (both `eval_results`, both prediction sets,
+  per-instance run summary, instance list).
+
+---
+
+## Single-pair pilot (2026-06-11, earlier the same day)
 
 Date: 2026-06-11. Model: `claude-fable-5` via Claude Code CLI. n=1 paired
 instance from SWE-bench Pro (public set, `ScaleAI/SWE-bench_Pro`), graded

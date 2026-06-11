@@ -44,7 +44,7 @@ text; only older bulk history is imaged.
 
 **It is lossy.** pxpipe is a *gist* tier, not a lossless store. In a
 needle-in-haystack eval, exact 12-char hex strings inside dense imaged content
-came back **0/15** on Opus and 3/4 on Fable 5, and the failure mode is
+came back **0/15** on Opus and 13/15 on Fable 5, and the failure mode is
 *silent confabulation*: a plausible wrong value, not an error. Anything you
 need back byte-exact (IDs, hashes, secrets, exact numbers) must stay text.
 Recent turns do; a dedicated verbatim-risk guard is not built yet.
@@ -79,7 +79,7 @@ Measured with novel random-number problems the model cannot have memorized:
 | state tracking (value mutated 3x, final/first/count), Fable 5 | 18/arm | 18/18 | **18/18** | - |
 | confabulation on never-stated facts (lower is better), Fable 5 | 16/arm | 0/16 | **0/16** | - |
 | verbatim 12-char hex recall, dense render, Opus | 15 | 15/15 | **0/15** | - |
-| verbatim 12-char hex recall, dense render, Fable 5 | 4 | - | 3/4 | - |
+| verbatim 12-char hex recall, dense render, Fable 5 | 15 | - | **13/15** | - |
 
 ### SWE-bench Lite pilot (end-to-end task quality)
 

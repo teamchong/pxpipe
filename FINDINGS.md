@@ -82,6 +82,16 @@ documented failure mode, a single-glyph silent misread (`125f9e6e1c77` →
 `125f9e6a1c77`); one passing trial also misread an adjacent field
 (`cc33ae67` → `cc33a867`). The verbatim-risk guard remains required.
 
+*Expansion (2026-06-11, n=15 to match the Opus haystack count):* 5 fresh
+dense-JSON pages at the production 5×8 cell (40 lines/page, ~4.7k chars),
+3 needles per page, one-shot `claude -p` per trial, exact-match: **13/15**
+(vs Opus **0/15**). Both misses are single-glyph confabulations on visually
+adjacent hex digits — `5a7373d4187f` → `5a7973d4107f` (3→9, 8→0) and
+`b8fce698f971` → `b0fce698f971` (8→0) — plausible-looking, no error signal.
+Same conclusion at 4× the sample: Fable reads dense renders near-verbatim,
+but ~13% silent-misread on exact strings means the rule stands — anything
+that must round-trip byte-exact stays text.
+
 **4. Economics.** Fable is $10/$50 per MTok (2× Opus 4.8). Token-for-token
 savings are identical (same tokenizer), so every saved token is worth 2× the
 dollars — pxpipe is more valuable on Fable in absolute terms.

@@ -1,10 +1,49 @@
 # FINDINGS — pxpipe (text→PNG token compression)
 
 **Status:** ⚠️ **VERDICT REVERSED — see correction below.** Originally ruled "dead"; live measurement shows pxpipe is a working *lossy gist-compressor* saving ~68% on real (dense) Claude Code traffic, with a known verbatim-recall gap.
-**Date:** 2026-05-28 (original) · 2026-05-29 (correction) · 2026-06-09 (Fable 5 update) · 2026-06-10 (gist-recall A/B, SWE-bench pilot)
+**Date:** 2026-05-28 (original) · 2026-05-29 (correction) · 2026-06-09 (Fable 5 update) · 2026-06-10 (gist-recall A/B, SWE-bench pilot) · 2026-06-12 (field observation, n=1)
 **Models tested:** `claude-opus-4-5` (original run), `claude-opus-4-8` (re-test after a model bump), `claude-fable-5` (2026-06-09)
 **Model scope (current):** Fable 5 only, enforced in library + proxy (Opus disabled 2026-06-09 — see update below).
 **Harness:** `eval/needle-haystack/` (receipts preserved from `/tmp/needle_eval`)
+
+---
+
+## Update (2026-06-12) — field observation: live verbatim misreads in a real session (n=1, anecdotal)
+
+**Not a controlled eval.** Logged because it is the first *unprompted,
+in-the-wild* capture of the exact boundary the harnesses bracket, with
+ground truth available for post-hoc grading.
+
+Setup: a working session was resumed from imaged history (older context
+rendered to PNG pages, recent turns text — the production architecture).
+Mid-session, the assistant was challenged to transcribe, from the imaged
+history alone, ten 12-char hex IDs that had appeared in an earlier tool
+output. The transcription was committed *before* re-reading the source
+files on disk, which then served as ground truth.
+
+| tier | result |
+|---|---|
+| gist (resume a paused run: plan, counts, file states, next steps) | fully functional — zero observed errors, consistent with gist-recall 98/98 |
+| verbatim (10 × 12-char hex through imaged history) | **7/10 exact** · 4 char-level errors / 120 chars (~3.3%) |
+
+Misread detail: `0→8`, `e→4`, `e→8` substitutions plus one dropped `d` —
+the substitutions are the closed-counterform confusion classes the planned
+glyph-matrix experiment targets (see `eval/glyph-matrix/PLAN.md`). **2 of
+the 3 misses were silent** — stated confidently, no hedge — matching the
+needle-haystack failure mode (*silent confabulation*: plausible wrong hex,
+not an error). The one read the assistant self-flagged as low-confidence
+was indeed wrong (a weak calibration signal, n=1).
+
+**What this adds:** a live demonstration that flawless gist-tier recall and
+silent verbatim-tier corruption co-occur *in the same session, on the same
+imaged pages* — the boundary holds in the field exactly where the harness
+drew it (gist = functional, exact-bytes = unsafe, failure = silent).
+
+**Caveats:** n=1 session; the reader was the interactive session model, not
+the fable-5 production gate; render parameters of the imaged history were
+not recorded; session-internal images make this non-reproducible. Treat as
+illustration/motivation only — the numbers that matter come from
+`eval/glyph-matrix/` when it completes.
 
 ---
 

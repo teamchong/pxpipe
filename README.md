@@ -1,12 +1,13 @@
 # pxpipe
 
-**Cut Claude Code input-token spend by rendering old context as images.**
+**Cut Claude Code input-token spend by rendering bulky context as images.**
 
 Anthropic bills a 1568px-wide image at a flat rate regardless of how much text
 is inside it. Dense content (code, JSON, tool output) packs ~3.1 chars per
 image-token vs ~1 char per text-token on real Claude Code traffic. pxpipe is a
-local proxy that exploits that gap: it rewrites the bulky middle of your
-conversation into compact PNGs before the request leaves your machine.
+local proxy that exploits that gap: it rewrites the bulky parts of your
+request (system prompt, tool docs, older history) into compact PNGs before
+the request leaves your machine.
 
 Running against real Claude Code sessions, the production log (13,709
 requests) shows: a **$100 total bill becomes ~$41**, full dollar math, input
@@ -38,7 +39,7 @@ stats, every text→image conversion side by side, and a kill switch.
 
 Nothing else changes. Responses stream normally; pxpipe only compresses the
 *request* (your context going up), never the model's output. Recent turns stay
-text; only older bulk history is imaged.
+text; the system prompt, tool docs, and older bulk history are imaged.
 
 ## The honest part, read before relying on it
 

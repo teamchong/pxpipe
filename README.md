@@ -41,12 +41,6 @@ Nothing else changes. Responses stream normally; pxpipe only compresses the
 *request* (your context going up), never the model's output. Recent turns stay
 text; the system prompt, tool docs, and older bulk history are imaged.
 
-> Install fails with `ENOVERSIONS` or `notarget ... with a date before`? Your
-> project's `.npmrc` enforces `minimum-release-age` (common company policy;
-> this repo ships the same gate). Pinned versions are blocked too. The proxy
-> doesn't need to run inside your repo: `npx pxpipe-proxy` from any other
-> directory works, or wait it out, releases age past a 3-day gate on their own.
-
 ## The honest part, read before relying on it
 
 **It is lossy.** pxpipe is a *gist* tier, not a lossless store. In a

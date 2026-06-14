@@ -217,6 +217,27 @@ pnpm run build                # regenerates dist/
 * `node-canvas` native dep on Node.
 * Fable 5 only.
 
+## Roadmap
+
+Everything above is measured. Everything here is not. These are hypotheses, not
+claims; they ship as numbers with an n or they get cut.
+
+* **Sharper glyphs.** The 13/15 verbatim gap is partly font legibility, not just
+  the model. A per-char confusion matrix across render styles is paused mid-run
+  (`eval/glyph-matrix/`, resumes Jun 18); if a zero-cost style lowers read error,
+  the gate compresses harder at the same fidelity.
+* **Effective context.** Dense text carries at ~3x fewer tokens as images. If
+  that holds in the live window and not just the bill, 1M tokens holds ~2x the
+  real content. Open question: can a task needing ~2M raw context run inside
+  Fable's 1M once the bulk is imaged?
+* **Less active text, sharper model.** Long contexts degrade reasoning as they
+  fill. Imaging old bulk shrinks what the model actively reads while keeping it
+  reachable. Hypothesis: same information, smaller active context, better
+  long-task accuracy.
+
+One bet: longer effective context and a sharper model on long tasks, from the
+same Fable 5. Numbers or retraction, no hype between.
+
 ## License
 
 MIT.

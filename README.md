@@ -224,8 +224,8 @@ claims; they ship as numbers with an n or they get cut.
 
 * **Sharper glyphs.** The 13/15 verbatim gap is partly font legibility, not just
   the model. A per-char confusion matrix across render styles is paused mid-run
-  (`eval/glyph-matrix/`, resumes Jun 18); if a zero-cost style lowers read error,
-  the gate compresses harder at the same fidelity.
+  (`eval/glyph-matrix/`); if a zero-cost style lowers read error, the gate
+  compresses harder at the same fidelity.
 * **Effective context.** Dense text carries at ~3x fewer tokens as images. If
   that holds in the live window and not just the bill, 1M tokens holds ~2x the
   real content. Open question: can a task needing ~2M raw context run inside

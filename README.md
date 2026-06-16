@@ -9,12 +9,16 @@ local proxy that exploits that gap: it rewrites the bulky parts of your
 request (system prompt, tool docs, older history) into compact PNGs before
 the request leaves your machine.
 
-Running against real Claude Code sessions, the production log (13,709
-requests) shows: a **$100 total bill becomes ~$41**, full dollar math, input
-+ cache writes at 1.25× + cache reads at 0.1× + output at 5×, including the
-~6k small requests pxpipe correctly leaves untouched. On the large requests it
-actually compresses (7,756 of them), $100 of spend becomes ~$28. Quote the
-59%; the 72% only applies to touched requests.
+Savings are **workload-dependent** — pxpipe wins on token-dense content and
+leaves sparse/small requests untouched — so this is a measured snapshot, not a
+constant. Across production traces the **end-to-end bill drops ~59–70%**
+(**~72–74%** on the requests it actually compresses), with full dollar math:
+input + cache writes at 1.25× + cache reads at 0.1× + output at 5×, every
+request measured against its own `count_tokens` counterfactual. Two snapshots: a
+13,709-request log turned $100 into ~$41 (59% end-to-end; ~$28 / 72% on the
+7,756 it compressed); a later 8,904-compressed-request trace measured ~70%
+end-to-end / ~74% compressed. Reproduce it on your own traffic from
+`~/.pxpipe/events.jsonl`.
 
 This is what the model sees instead of text:
 
@@ -122,14 +126,15 @@ full analysis in [`FINDINGS.md`](FINDINGS.md).</sub>
 
 ## FAQ
 
-**Is the 59% end-to-end, or only on the requests you touched?**
+**Is the headline end-to-end, or only on the requests you touched?**
 End-to-end, the whole bill. Most compression tools report savings only on
-the input slice they touched, which flatters the number. The 59% denominator
-is every one of the 13,709 production requests: the ~6,000 small ones pxpipe
-correctly left untouched, all cache writes and reads, and all output tokens
-(which the proxy never compresses). $100 of real spend becomes ~$41.
-Touched-requests-only is -72% and is quoted separately, never as the
-headline.
+the input slice they touched, which flatters the number. The end-to-end
+denominator is *every* production request: the small ones pxpipe correctly
+left untouched, all cache writes and reads, and all output tokens (which the
+proxy never compresses). On a 13,709-request snapshot that was 59% ($100 →
+~$41); a later 8,904-compressed-request trace measured ~70%. Compressed-only
+runs higher (~72–74%) and is quoted separately, never as the headline. The
+exact figure is workload-dependent — reproduce it on your own log.
 
 **How is the math measured?**
 Both sides of the same request, at the same moment. For every `/v1/messages`

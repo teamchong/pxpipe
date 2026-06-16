@@ -111,10 +111,11 @@ export interface TransformOptions {
    *  (slab compression, image substitution, history collapse), the new
    *  prefix has a different cache key — Anthropic charges cache_create
    *  (1.25×) on the new prefix's first turn, destroying the prior warm
-   *  cache. The break-even gate accounts for this burn cost as a one-time
-   *  penalty amortized over `historyAmortizationHorizon` turns:
+   *  cache. The break-even gate accounts for this as a one-time burn penalty
+   *  added (undivided) to the image side of the comparison — matching the
+   *  symmetric `priorWarmImageTokens` term and all three gate call sites:
    *
-   *    burn = priorWarmTokens × (CACHE_CREATE_RATE − CACHE_READ_RATE) / N
+   *    burn = priorWarmTokens × (CACHE_CREATE_RATE − CACHE_READ_RATE)
    *
    *  Set by the host from a recent `count_tokens` cacheable-prefix probe
    *  on the un-rewritten body, or from a session-keyed LRU populated by

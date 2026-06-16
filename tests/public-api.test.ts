@@ -28,6 +28,28 @@ describe('public library API', () => {
     expect(isPxpipeSupportedModel(null)).toBe(false);
   });
 
+  it('strips bracketed variant tags like [1m] before matching', () => {
+    expect(isPxpipeSupportedModel('claude-fable-5[1m]')).toBe(true);
+    expect(isPxpipeSupportedModel('claude-fable-5-high[1m]')).toBe(true);
+    // a non-allowed base keeps being rejected even with a variant tag
+    expect(isPxpipeSupportedModel('claude-opus-4-8[1m]')).toBe(false);
+  });
+
+  it('honors PXPIPE_MODELS to widen the gate without a code change', () => {
+    const prev = process.env.PXPIPE_MODELS;
+    try {
+      process.env.PXPIPE_MODELS = 'claude-fable-5,claude-opus-4-8';
+      expect(isPxpipeSupportedModel('claude-opus-4-8')).toBe(true);
+      expect(isPxpipeSupportedModel('claude-opus-4-8[1m]')).toBe(true);
+      expect(isPxpipeSupportedModel('claude-fable-5')).toBe(true); // still listed
+      expect(isPxpipeSupportedModel('claude-opus-4-7')).toBe(false); // not listed
+      expect(isPxpipeSupportedModel('claude-sonnet-4-7')).toBe(false);
+    } finally {
+      if (prev === undefined) delete process.env.PXPIPE_MODELS;
+      else process.env.PXPIPE_MODELS = prev;
+    }
+  });
+
   it('recognizes only the GPT 5.5 family for OpenAI chat support', () => {
     expect(isPxpipeSupportedGptModel('gpt-5.5')).toBe(true);
     expect(isPxpipeSupportedGptModel('gpt-5.5-codex')).toBe(true);

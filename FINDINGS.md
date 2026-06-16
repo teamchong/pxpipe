@@ -1,12 +1,78 @@
 # FINDINGS — pxpipe (text→PNG token compression)
 
 **Status:** ⚠️ **VERDICT REVERSED — see correction below.** Originally ruled "dead"; live measurement shows pxpipe is a working *lossy gist-compressor* saving ~68% on real (dense) Claude Code traffic, with a known verbatim-recall gap.
-**Date:** 2026-05-28 (original) · 2026-05-29 (correction) · 2026-06-09 (Fable 5 update) · 2026-06-10 (gist-recall A/B, SWE-bench pilot) · 2026-06-12 (field observation, n=1)
-**Models tested:** `claude-opus-4-5` (original run), `claude-opus-4-8` (re-test after a model bump), `claude-fable-5` (2026-06-09)
-**Model scope (current):** Fable 5 only, enforced in library + proxy (Opus disabled 2026-06-09 — see update below).
+**Date:** 2026-05-28 (original) · 2026-05-29 (correction) · 2026-06-09 (Fable 5 update) · 2026-06-10 (gist-recall A/B, SWE-bench pilot) · 2026-06-12 (field observation, n=1) · 2026-06-16 (Opus 4.8 re-test)
+**Models tested:** `claude-opus-4-5` (original run), `claude-opus-4-8` (model-bump re-test, and again 2026-06-16), `claude-fable-5` (2026-06-09)
+**Model scope (current):** Fable 5 only by default, enforced in library + proxy (Opus disabled 2026-06-09; re-tested 2026-06-16 still taxed; now opt-in via `PXPIPE_MODELS` — see updates below).
 **Harness:** `eval/needle-haystack/` (receipts preserved from `/tmp/needle_eval`)
 
 ---
+
+## Update (2026-06-16) — Opus 4.8 re-test: read tax shrank but did not close
+
+Re-ran the two measurements that disabled Opus on 2026-06-09, against the
+current `claude-opus-4-8` CLI snapshot (proxy bypassed, subscription billing).
+
+| axis | Opus (at disablement) | Opus 4.8 (2026-06-16) | Fable 5 |
+|---|---|---|---|
+| novel-arithmetic, N=100 (readable content) | 93/100 (−7pp) | **98/100 (−2pp)** | 100/100 |
+| verbatim dense-hex recall, n=15 | 0/15 | **6/15** | 13/15 |
+
+Method: `eval/gsm8k/` (fixed seed → same problems as the original Opus run) and
+`eval/verbatim-15/` re-pointed to `claude-opus-4-8`. Every `None`/empty result
+was a load-induced dropped call (the text arm answered the same problem
+correctly) and re-ran to a HIT on a quiet machine; the genuine misses are 2
+arithmetic (`10200`→`9400`, `7873`→`7793`) and 9 verbatim, all silent
+single-glyph confusions — same failure mode as before.
+
+Read: the newer Opus snapshot reads pxpipe renders materially better than the
+one that was disabled, but still pays a measurable read tax and still
+confabulates silently on dense content — below Fable on both axes at identical
+image billing. So the default scope stays Fable-only; Opus is now opt-in via
+`PXPIPE_MODELS` (see `src/core/applicability.ts`). Open follow-up: whether a
+zero-cost render style (`eval/glyph-matrix/`) closes the remaining Opus gap —
+if so, re-enabling Opus becomes free.
+
+## Update (2026-06-16, later) — root cause of the Opus read tax: per-glyph resolution, not font shape
+
+Why does Opus misread pxpipe renders while Fable doesn't? Swept the glyph cell
+size on identical content, Opus reading **by eye** (`--disallowedTools Bash`, so
+it cannot zoom/crop), all images kept **<1568px** so Anthropic does not
+downscale them back. n=20 ids/size, dense 12-char hex transcription.
+
+| glyph cell | rel. area | Opus exact-read |
+|---|---|---|
+| 5×8 (production) | 1× | **10%** |
+| 7×10 | 1.75× | 35% |
+| 10×16 | 4× | **95%** |
+| 14×22 | 7.7× | 95% |
+| 20×32 | 16× | 100% |
+
+Reading: accuracy is a **monotonic function of pixels-per-glyph** with a knee at
+~10×16 (≈4× production area). Per-char confusions are broad at 5×8
+(`f→5, 1→d, 7→f, 4→d`…) and vanish by 10×16 (a single `3→5`) — they scale with
+resolution rather than persisting as fixed glyph-shape pairs, so the cause is
+**resolution (glyphs-per-encoder-patch), not an intrinsically confusable font.**
+A "bag of ids, ignore label" score equals the per-label score at every size, so
+it is pure *reading*, not row/label localization.
+
+Mechanism: Anthropic encodes/bills images in ~750px² units; a 5×8 cell packs
+~18 glyphs into one visual token, so sub-token glyph detail is recoverable only
+by a strong-enough encoder. Fable recovers it (≈87% verbatim / 100% arithmetic
+at 5×8); Opus 4.8 does not (10% here).
+
+**Economic consequence:** the 1568px ceiling locks pixels-per-glyph to
+chars-per-image. Opus needs ~4× the glyph area to read reliably → ~4× the image
+tokens for the same text → pxpipe's ~74% compressed-content saving inverts to
+roughly **break-even/negative**. There is no glyph size at which Opus both reads
+renders *and* saves tokens. This is the mechanistic reason the scope is
+Fable-only: Fable reads at the 5×8 cell where imaging is profitable.
+
+The Fable control on the identical sweep was **blocked — Fable 5 is currently
+unavailable** ("Claude Fable 5 is currently unavailable"), which is the reason
+this Opus re-test was run at all; Fable's 5×8 reading is sourced from prior runs.
+Caveats: n=20/size, one font, one task; the break-even is directional (published
+savings × measured 4× area). Receipts: [`eval/glyph-matrix/sweep/`](eval/glyph-matrix/sweep/).
 
 ## Update (2026-06-12) — field observation: live verbatim misreads in a real session (n=1, anecdotal)
 

@@ -65,6 +65,14 @@ came back **0/15** on Opus and 13/15 on Fable 5, and the failure mode is
 need back byte-exact (IDs, hashes, secrets, exact numbers) must stay text.
 Recent turns do; a dedicated verbatim-risk guard is not built yet.
 
+**Exact-recall escape hatch.** pxpipe only images Fable requests
+(`PXPIPE_MODELS=claude-fable-5`), so any subagent on a non-Fable model passes
+through as text. Route work that needs byte-exact values to one — globally with
+`CLAUDE_CODE_SUBAGENT_MODEL=claude-sonnet-4-6`, or per-agent with `model: sonnet`
+in the agent frontmatter. It reads from source (file/JSONL), not the imaged
+history. This covers exact-recall you route on purpose; it does **not** catch a
+silent misread you did not expect — that is the unbuilt guard above.
+
 **Does it break real work?** Parity in what we measured: a 10-instance
 SWE-bench Lite pilot (the easy subset) resolved **10/10 on both arms**,
 pxpipe ON at $27 vs OFF at $54 token-equivalent, and 19 SWE-bench Pro

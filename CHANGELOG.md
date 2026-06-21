@@ -4,6 +4,42 @@ All notable changes to pxpipe are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features /
 behavioral changes, patch = fixes).
 
+## 0.5.0 — 2026-06-20
+
+Cache-stable history-collapse imaging for both providers, with GPT-5.6 promoted
+to the default imaged scope. Old conversation history collapses into rendered
+PNG sections so the model reads a compact image instead of re-billed text, while
+prompt caching and tool-call behavior are preserved.
+
+### Added
+- **GPT history collapse (`openai-history.ts`).** Append-only, o200k
+  token-length sectioning. Sections seal only at a tool-closed boundary (the
+  open call-id set is empty), so a `function_call` and its
+  `function_call_output` never split across the collapse cut.
+- **GPT + Anthropic dashboard rendering.** Per-family model toggles, persisted
+  metrics, thumbnail-expired session UI, and reflow/newline handling.
+
+### Changed
+- **Default imaged scope is now `claude-fable-5` + `gpt-5.6`.** GPT-5.6 is
+  promoted from opt-in (0.4.0) to on by default. `gpt-5.5` and `claude-opus-4-8`
+  stay opt-in: they degrade reading dense imaged history (gist drift), so
+  silently imaging them by default is wrong. Promotion is gated on an OCR/recall
+  threshold.
+- **Anthropic cache contract (`history.ts`).** Append-only per-chunk rendering;
+  `cache_control` markers are preserved/moved, never added; chunk boundaries
+  align with caller marker seams for byte-stable prefix caching.
+- **GPT image budget (`openai.ts`).** `detail:'original'` for gpt-5.x, flagship
+  vision-multiplier fix, and a patch cap; schema-strip preserves real
+  descriptions.
+- **Savings accounting (`openai-savings.ts`).** Now computed on a
+  `cached_tokens` + vision-token basis.
+
+### Fixed
+- **OpenAI 400 on long Responses-API sessions.** `"No tool call found for
+  function call output with call_id ..."` no longer occurs — the tool-closed
+  sectioning boundary keeps each `function_call`/`function_call_output` pair
+  intact across the collapse cut.
+
 ## 0.4.0 — 2026-06-19
 
 New library surface for harness authors, opt-in GPT-5.x / Responses API support,

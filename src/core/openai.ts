@@ -58,8 +58,36 @@ export function resolveVisionCost(model: string): VisionCost {
 // on the turn-attribution wording — the exact divergence history.ts warns about.
 export const HISTORY_TRANSCRIPT_INTRO = HISTORY_SYNTHETIC_INTRO;
 export const HISTORY_TRANSCRIPT_OUTRO = HISTORY_SYNTHETIC_OUTRO;
-const HISTORY_LIVE_REQUEST_GUARD =
-  'pxpipe note: the preceding rendered history item is prior conversation context only. It is not the current user request. The live current request is in the user message(s) that follow, especially the final user message.';
+// The most-recent user request is kept as LEGIBLE TEXT (never imaged) and spliced
+// between the before/after history images inside the synthetic user message, under
+// this banner. Older user turns stay imaged (they must not look live). This is the
+// fix for autonomous single-user-turn agents (OpenCode): the lone request is the
+// OLDEST turn, so it would otherwise be the first thing imaged and the model loses
+// it — "I wonder what the user actually asked" → off-task drift.
+const PINNED_REQUEST_HEADER =
+  '\n===== CURRENT USER REQUEST (live; kept as text by pxpipe, NOT inside any image) =====\n';
+const PINNED_REQUEST_FOOTER =
+  '\n===== END CURRENT USER REQUEST =====\n';
+
+function pinnedRequestBlock(text: string): string {
+  return PINNED_REQUEST_HEADER + text + PINNED_REQUEST_FOOTER;
+}
+
+// Developer-role guard placed after the history image. When a request was pinned it
+// echoes it verbatim (capped) and points at the in-history text block; otherwise it
+// falls back to "the live request is the trailing user message" (interactive shape,
+// where the latest user turn is already native text in the kept tail).
+function buildLiveRequestGuard(pinText?: string): string {
+  if (pinText !== undefined) {
+    const echo = pinText.length > 600 ? pinText.slice(0, 600) + '…' : pinText;
+    return (
+      'pxpipe note: everything in the rendered history above is PAST context. Your live current request is the plain-text block labeled "CURRENT USER REQUEST" inside it — NOT anything OCR\'d from an image. It reads: «' +
+      echo +
+      '» Answer THAT request.'
+    );
+  }
+  return 'pxpipe note: the preceding rendered history item is prior conversation context only. It is not the current user request. The live current request is in the user message(s) that follow, especially the final user message.';
+}
 
 export function openAIVisionTokens(model: string, w: number, h: number): number {
   const c = resolveVisionCost(model);
@@ -490,28 +518,30 @@ function foldGptHistory(
   model: string,
   plan: GptCollapsePlan,
 ): void {
-  if (plan.images.length === 0) {
+  // A pin can split the collapse into before/after image groups — account for both.
+  const allImages = [...plan.images, ...plan.imagesAfter];
+  if (allImages.length === 0) {
     if (plan.reason) info.historyReason = plan.reason;
     if (plan.collapsedChars > 0) info.historyTextChars = plan.collapsedChars;
     return;
   }
-  info.imageTokens = (info.imageTokens ?? 0) + gptImageTokens(model, plan.images);
+  info.imageTokens = (info.imageTokens ?? 0) + gptImageTokens(model, allImages);
   // o200k token value of the collapsed transcript (what it cost as plain text).
   info.baselineImagedTokens = (info.baselineImagedTokens ?? 0) + gptTextTokens(plan.text);
-  info.imageCount = (info.imageCount ?? 0) + plan.images.length;
-  for (const img of plan.images) {
+  info.imageCount = (info.imageCount ?? 0) + allImages.length;
+  for (const img of allImages) {
     info.imageBytes = (info.imageBytes ?? 0) + img.png.length;
     info.imagePixels = (info.imagePixels ?? 0) + img.width * img.height;
   }
-  info.imagePngs = [...(info.imagePngs ?? []), ...plan.images.map((i) => i.png)];
+  info.imagePngs = [...(info.imagePngs ?? []), ...allImages.map((i) => i.png)];
   info.imageDims = [
     ...(info.imageDims ?? []),
-    ...plan.images.map((i) => ({ width: i.width, height: i.height })),
+    ...allImages.map((i) => ({ width: i.width, height: i.height })),
   ];
   if (plan.droppedChars > 0) info.droppedChars = (info.droppedChars ?? 0) + plan.droppedChars;
   info.collapsedTurns = plan.collapsedTurns;
   info.collapsedChars = plan.collapsedChars;
-  info.collapsedImages = plan.images.length;
+  info.collapsedImages = allImages.length;
   info.historyTextChars = plan.collapsedChars;
   info.historyReason = 'collapsed';
   info.bucketChars = { ...(info.bucketChars ?? {}), history: plan.collapsedChars };
@@ -676,18 +706,21 @@ export async function transformOpenAIChatCompletions(
       maxHeightPx: o.gptHistory?.maxHeightPx ?? resolveGptProfile(req.model).maxHeightPx,
     });
     foldGptHistory(info, req.model, plan);
-    if (plan.images.length > 0) {
-      const synthetic: OpenAIChatMessage = {
-        role: 'user',
-        content: [
-          { type: 'text', text: HISTORY_TRANSCRIPT_INTRO },
-          ...plan.images.map(openAIImagePart),
-          { type: 'text', text: HISTORY_TRANSCRIPT_OUTRO },
-        ],
-      };
+    const allImages = [...plan.images, ...plan.imagesAfter];
+    if (allImages.length > 0) {
+      // [intro][before-images][pinned request as TEXT][after-images][outro] —
+      // chronological, with the live ask legible (not OCR-only) in its real slot.
+      const content: OpenAIContentPart[] = [{ type: 'text', text: HISTORY_TRANSCRIPT_INTRO }];
+      for (const img of plan.images) content.push(openAIImagePart(img));
+      if (plan.pinText !== undefined) {
+        content.push({ type: 'text', text: pinnedRequestBlock(plan.pinText) });
+        for (const img of plan.imagesAfter) content.push(openAIImagePart(img));
+      }
+      content.push({ type: 'text', text: HISTORY_TRANSCRIPT_OUTRO });
+      const synthetic: OpenAIChatMessage = { role: 'user', content };
       const guard: OpenAIChatMessage = {
         role: 'developer',
-        content: HISTORY_LIVE_REQUEST_GUARD,
+        content: buildLiveRequestGuard(plan.pinText),
       };
       req.messages = [
         ...req.messages.slice(0, plan.start),
@@ -696,7 +729,7 @@ export async function transformOpenAIChatCompletions(
         ...req.messages.slice(plan.endExclusive),
       ];
       info.historyImageSha = await sha8(
-        plan.images.map((i) => bytesToBase64(i.png)).join(''),
+        allImages.map((i) => bytesToBase64(i.png)).join(''),
       );
     }
   }
@@ -895,18 +928,23 @@ export async function transformOpenAIResponses(
       maxHeightPx: o.gptHistory?.maxHeightPx ?? resolveGptProfile(req.model).maxHeightPx,
     });
     foldGptHistory(info, req.model, plan);
-    if (plan.images.length > 0) {
-      const synthetic: ResponsesInputItem = {
-        role: 'user',
-        content: [
-          { type: 'input_text', text: HISTORY_TRANSCRIPT_INTRO },
-          ...plan.images.map(responsesImagePart),
-          { type: 'input_text', text: HISTORY_TRANSCRIPT_OUTRO },
-        ],
-      };
+    const allImages = [...plan.images, ...plan.imagesAfter];
+    if (allImages.length > 0) {
+      // [intro][before-images][pinned request as TEXT][after-images][outro] —
+      // chronological, with the live ask legible (not OCR-only) in its real slot.
+      const content: ResponsesContentPart[] = [
+        { type: 'input_text', text: HISTORY_TRANSCRIPT_INTRO },
+      ];
+      for (const img of plan.images) content.push(responsesImagePart(img));
+      if (plan.pinText !== undefined) {
+        content.push({ type: 'input_text', text: pinnedRequestBlock(plan.pinText) });
+        for (const img of plan.imagesAfter) content.push(responsesImagePart(img));
+      }
+      content.push({ type: 'input_text', text: HISTORY_TRANSCRIPT_OUTRO });
+      const synthetic: ResponsesInputItem = { role: 'user', content };
       const guard: ResponsesInputItem = {
         role: 'developer',
-        content: HISTORY_LIVE_REQUEST_GUARD,
+        content: buildLiveRequestGuard(plan.pinText),
       };
       req.input = [
         ...inputItems.slice(0, plan.start),
@@ -915,7 +953,7 @@ export async function transformOpenAIResponses(
         ...inputItems.slice(plan.endExclusive),
       ];
       info.historyImageSha = await sha8(
-        plan.images.map((i) => bytesToBase64(i.png)).join(''),
+        allImages.map((i) => bytesToBase64(i.png)).join(''),
       );
     }
   }

@@ -117,11 +117,22 @@ export interface HistoryTurn {
   /** Item we can't safely serialize (unknown kind, item_reference) — a hard
    *  barrier: never collapse across it, since dropping it could lose state. */
   opaque: boolean;
+  /** Raw body when this item is a real USER request (role==='user', not a tool
+   *  result). The planner pins the MOST RECENT such turn as legible text instead
+   *  of imaging it, so the live ask is never OCR-only. undefined = not a user turn. */
+  userText?: string;
 }
 
 export interface GptCollapsePlan {
-  /** Rendered history images. Empty when no collapse happened. */
+  /** Rendered history images BEFORE the pinned user turn (or ALL images when no
+   *  turn was pinned). Empty when no collapse happened. */
   images: RenderedImage[];
+  /** Rendered history images AFTER the pinned user turn. Empty unless a pin split
+   *  the range. Total imaged = images ∪ imagesAfter. */
+  imagesAfter: RenderedImage[];
+  /** Raw text of the most-recent user request, kept legible (NOT imaged) and
+   *  spliced between `images` and `imagesAfter`. undefined = nothing pinned. */
+  pinText?: string;
   /** The collapsed transcript text that was rendered (for o200k token counting). */
   text: string;
   /** Inclusive start index into the original item array. */
@@ -171,6 +182,32 @@ function findClosedBoundary(
   return lastClosed;
 }
 
+/** True if [from, toExclusive) opens no tool call it doesn't also close (and hits
+ *  no opaque barrier). Used to confirm the pinned user turn sits at a tool-closed
+ *  boundary so force-sealing the section before it can't orphan a function call. */
+function isClosedPrefix(turns: HistoryTurn[], from: number, toExclusive: number): boolean {
+  const open = new Set<string>();
+  for (let i = from; i < toExclusive; i++) {
+    const t = turns[i]!;
+    if (t.opaque) return false;
+    for (const id of t.openIds) open.add(id);
+    for (const id of t.closeIds) open.delete(id);
+  }
+  return open.size === 0;
+}
+
+/** Join turn texts over [from, toExclusive), skipping empties and `skip` (the
+ *  pinned turn, which is emitted as text rather than imaged). */
+function joinTurns(turns: HistoryTurn[], from: number, toExclusive: number, skip: number): string {
+  const parts: string[] = [];
+  for (let i = from; i < toExclusive; i++) {
+    if (i === skip) continue;
+    const s = turns[i]!.text;
+    if (s && s.length > 0) parts.push(s);
+  }
+  return parts.join('\n\n');
+}
+
 /**
  * Plan + render a history collapse over pre-lowered turns. Pure w.r.t. the input
  * (caller does the splice and builds the format-specific synthetic item).
@@ -184,6 +221,7 @@ export async function planGptCollapse(
   const o: GptHistoryOptions = { ...GPT_HISTORY_DEFAULTS, ...opts };
   const base: GptCollapsePlan = {
     images: [],
+    imagesAfter: [],
     text: '',
     start: 0,
     endExclusive: 0,
@@ -216,11 +254,31 @@ export async function planGptCollapse(
   if (boundary + 1 - pp < o.minCollapsePrefix) {
     return { ...base, reason: 'prefix_too_short' };
   }
-  const text = turns
-    .slice(pp, boundary + 1)
-    .map((t) => t.text)
-    .filter((s) => s && s.length > 0)
-    .join('\n\n');
+  const rawEnd = boundary + 1;
+  // Pin the LIVE request — the most-recent user turn OVERALL — as legible TEXT so it
+  // is never OCR-only. Older user turns stay imaged (they must NOT look like the live
+  // request; that's the snap-to-first-prompt guard). The history BEFORE and AFTER the
+  // pin both stay imaged, so compression holds.
+  //
+  // CRITICAL: pin ONLY when the latest user turn falls INSIDE the collapse range. If
+  // it sits in the kept tail (ordinary interactive turn) it is already native text —
+  // pinning an OLDER in-range user turn would make the pin migrate across collapse-
+  // chunk boundaries and re-image frozen history (cache churn). Restricting the pin to
+  // the latest user turn means its position is fixed until the next prompt, so the
+  // before/after section grid stays byte-stable across a long run. This covers exactly
+  // the two shapes that need it: the autonomous single-prompt agent (pin == pp), and a
+  // long current turn whose tool loop overflowed the tail (pin in the middle).
+  let pinIdx = -1;
+  for (let i = turns.length - 1; i >= pp; i--) {
+    if (turns[i]!.userText !== undefined) { pinIdx = i; break; }
+  }
+  if (pinIdx >= rawEnd) pinIdx = -1; // latest user turn is in the live tail → already text
+  // Only pin at a tool-closed boundary: a user turn straddled by an open tool call
+  // (malformed input) would orphan the call when we seal the section before it.
+  if (pinIdx >= 0 && !isClosedPrefix(turns, pp, pinIdx)) pinIdx = -1;
+
+  // Imaged baseline EXCLUDES the pinned turn (it is emitted as text, not rendered).
+  const text = joinTurns(turns, pp, rawEnd, pinIdx);
   // Floor gate in o200k TOKENS, not chars: imaging bills vision tokens and the
   // text baseline is o200k tokens, so the break-even is a token comparison.
   if (!text || gptCountTokens(text) < o.minCollapseTokens) {
@@ -245,10 +303,14 @@ export async function planGptCollapse(
   // Leftover tail turns that don't fill a whole section are NOT collapsed: collapse
   // ends at the last SEALED boundary so every emitted image is a frozen section.
   // (freezeChunk 0 = legacy whole-blob: one section spanning the whole range.)
-  const rawEnd = boundary + 1;
+  // The pinned turn force-seals the section before it and starts a fresh section
+  // after it, so no image straddles the live request (history stays imaged on both
+  // sides). (freezeChunk 0 = legacy whole-blob, still split around the pin.)
   const sections: Array<[number, number]> = [];
   if (o.freezeChunk <= 0) {
-    sections.push([pp, rawEnd]); // legacy: whole range as one section
+    if (pinIdx > pp) sections.push([pp, pinIdx]);
+    const afterStart = pinIdx >= pp ? pinIdx + 1 : pp;
+    if (afterStart < rawEnd) sections.push([afterStart, rawEnd]);
   } else {
     let secStart = pp;
     let acc = 0;
@@ -262,6 +324,25 @@ export async function planGptCollapse(
     // because it collapses the whole closed prefix with no live leftover.
     const open = new Set<string>();
     for (let i = pp; i < rawEnd; i++) {
+      if (i === pinIdx) {
+        // Force-seal the before-pin section (open is empty here by isClosedPrefix)
+        // and skip the pin so it is never imaged. If the remainder since the last
+        // seal is too small to be worth its own image, MERGE it into the previous
+        // before-section (a slightly oversized image) rather than emitting a sub-
+        // threshold one — imaging ~200 tokens costs more in vision tokens than it
+        // saves. (open is empty here, so extending the prior section can't orphan.)
+        if (secStart < i) {
+          const prev = sections[sections.length - 1];
+          if (acc < o.sectionTokens && prev && prev[1] === secStart) {
+            prev[1] = i; // extend previous before-section through the remainder
+          } else {
+            sections.push([secStart, i]);
+          }
+        }
+        secStart = i + 1;
+        acc = 0;
+        continue;
+      }
       acc += gptCountTokens(turns[i]!.text);
       for (const id of turns[i]!.openIds) open.add(id);
       for (const id of turns[i]!.closeIds) open.delete(id);
@@ -279,15 +360,12 @@ export async function planGptCollapse(
     // cache-unstable partial blob.
     return { ...base, reason: 'below_min_tokens', collapsedChars: text.length };
   }
-  const imgs: RenderedImage[] = [];
   const maxImages = Math.max(0, Math.floor(o.maxImages));
+  const rendered: Array<{ s: number; e: number; imgs: RenderedImage[] }> = [];
+  let imgCount = 0;
   let collapseEnd = pp;
   for (const [s, e] of sections) {
-    const sectionText = turns
-      .slice(s, e)
-      .map((t) => t.text)
-      .filter((str) => str && str.length > 0)
-      .join('\n\n');
+    const sectionText = joinTurns(turns, s, e, -1);
     if (!sectionText || sectionText.length === 0) continue;
     const safeSection = neutralizeSentinel(sectionText);
     const sectionRender = o.reflow ? reflow(safeSection) ?? safeSection : sectionText;
@@ -295,38 +373,49 @@ export async function planGptCollapse(
     // the static slab. renderTextToPngs caps each PNG at MAX_HEIGHT_PX so a tall
     // section pages into N images, all still well under the 10,000-patch budget.
     const sectionImgs = await renderTextToPngs(sectionRender, o.cols, {}, o.maxHeightPx);
-    if (imgs.length + sectionImgs.length > maxImages) {
+    if (imgCount + sectionImgs.length > maxImages) {
       // TRUE cap: keep the sections already selected, leave this and every later
-      // section as normal text in the live remainder. Do NOT collapse nothing.
+      // section (and the pin, if not yet reached) as normal text in the remainder.
       break;
     }
-    for (const img of sectionImgs) imgs.push(img);
+    rendered.push({ s, e, imgs: sectionImgs });
+    imgCount += sectionImgs.length;
     collapseEnd = e;
   }
-  if (imgs.length === 0) {
+  // The pin is "consumed" (emitted as text inside the synthetic) only once we have
+  // collapsed PAST it. If the image cap stopped us before the pin, it survives as a
+  // native user message in the untouched remainder — still legible, no work lost.
+  const pinConsumed = pinIdx >= pp && collapseEnd > pinIdx;
+  const imagesBefore: RenderedImage[] = [];
+  const imagesAfter: RenderedImage[] = [];
+  for (const r of rendered) {
+    if (pinConsumed && r.s >= pinIdx + 1) imagesAfter.push(...r.imgs);
+    else imagesBefore.push(...r.imgs);
+  }
+  if (imagesBefore.length === 0 && imagesAfter.length === 0) {
     // First section alone exceeded the cap (or cap <= 0). Fall back to text.
     return { ...base, reason: 'too_many_images', collapsedChars: text.length };
   }
-  // The collapsed transcript / o200k baseline reflects ONLY what we imaged.
-  const collapsedText = turns
-    .slice(pp, collapseEnd)
-    .map((t) => t.text)
-    .filter((s) => s && s.length > 0)
-    .join('\n\n');
+  const pinText = pinConsumed ? turns[pinIdx]!.userText : undefined;
+  // The collapsed transcript / o200k baseline reflects ONLY what we imaged — the
+  // pin, when consumed, is text and is excluded from the imaged baseline.
+  const collapsedText = joinTurns(turns, pp, collapseEnd, pinConsumed ? pinIdx : -1);
   const droppedCodepoints = new Map<number, number>();
   let droppedChars = 0;
-  for (const img of imgs) {
+  for (const img of [...imagesBefore, ...imagesAfter]) {
     droppedChars += img.droppedChars;
     for (const [cp, n] of img.droppedCodepoints) {
       droppedCodepoints.set(cp, (droppedCodepoints.get(cp) ?? 0) + n);
     }
   }
   return {
-    images: imgs,
+    images: imagesBefore,
+    imagesAfter,
+    pinText,
     text: collapsedText,
     start: pp,
     endExclusive: collapseEnd,
-    collapsedTurns: collapseEnd - pp,
+    collapsedTurns: collapseEnd - pp - (pinConsumed ? 1 : 0),
     collapsedChars: collapsedText.length,
     droppedChars,
     droppedCodepoints,
@@ -403,7 +492,13 @@ function responsesItemToTurn(item: unknown, idx: number): HistoryTurn {
     // from turn 60 instead of resurfacing the salient opening turn. Stable per item →
     // cache-safe (mirrors src/core/history.ts). Tool turns stay unindexed (not mistakable
     // for a live request); the index rides the conversational role tags.
-    return { text: `<${tag} t="${idx}">\n${body}\n</${tag}>`, openIds: [], closeIds: [], opaque: false };
+    return {
+      text: `<${tag} t="${idx}">\n${body}\n</${tag}>`,
+      openIds: [],
+      closeIds: [],
+      opaque: false,
+      userText: role === 'user' ? body : undefined,
+    };
   }
   // Unknown item kind (e.g. item_reference) we can't safely serialize → barrier.
   return { text: '', openIds: [], closeIds: [], opaque: true };
@@ -472,7 +567,13 @@ function chatMessageToTurn(msg: unknown, idx: number): HistoryTurn {
   }
   if (!body.trim()) return { text: '', openIds: [], closeIds: [], opaque: false };
   const tag = role === 'user' ? 'user' : role || 'user';
-  return { text: `<${tag} t="${idx}">\n${body}\n</${tag}>`, openIds: [], closeIds: [], opaque: false };
+  return {
+    text: `<${tag} t="${idx}">\n${body}\n</${tag}>`,
+    openIds: [],
+    closeIds: [],
+    opaque: false,
+    userText: role === 'user' ? body : undefined,
+  };
 }
 
 export function chatMessagesToTurns(messages: unknown[]): HistoryTurn[] {

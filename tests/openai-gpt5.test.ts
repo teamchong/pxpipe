@@ -506,6 +506,113 @@ describe('transformOpenAIChatCompletions — history collapse', () => {
   });
 });
 
+// Autonomous agent shape (OpenCode / gpt-5.5): ONE human request, then a long
+// run of assistant + tool turns and NO further user turns. The lone request is the
+// OLDEST turn, so without pinning it is the first thing imaged and the model loses
+// it ("I wonder what the user actually asked" → off-task drift). The pin keeps the
+// most-recent (here: only) user turn as legible text while the work still images.
+function buildAutonomousResponses(turns: number): Array<Record<string, unknown>> {
+  const items: Array<Record<string, unknown>> = [
+    { role: 'user', content: `${LIVE_PROMPT_MARKER} `.repeat(40) },
+  ];
+  for (let i = 0; i < turns; i++) {
+    const id = `call_${i}`;
+    items.push({ role: 'assistant', content: `Working on step ${i}. `.repeat(30) });
+    items.push({ type: 'function_call', call_id: id, name: 'read', arguments: `{"path":"f${i}"}` });
+    items.push({ type: 'function_call_output', call_id: id, output: `result ${i} `.repeat(50) });
+  }
+  return items;
+}
+
+function buildAutonomousChat(turns: number): Array<Record<string, unknown>> {
+  const msgs: Array<Record<string, unknown>> = [
+    { role: 'system', content: BIG_SLAB },
+    { role: 'user', content: `${LIVE_PROMPT_MARKER} `.repeat(40) },
+  ];
+  for (let i = 0; i < turns; i++) {
+    const id = `call_${i}`;
+    msgs.push({
+      role: 'assistant',
+      content: `Working on step ${i}. `.repeat(30),
+      tool_calls: [{ id, type: 'function', function: { name: 'read', arguments: `{"path":"f${i}"}` } }],
+    });
+    msgs.push({ role: 'tool', tool_call_id: id, content: `result ${i} `.repeat(50) });
+  }
+  return msgs;
+}
+
+describe('GPT history collapse — pins the live request as text (autonomous shape)', () => {
+  it('Responses: lone request kept as legible text + echoed in the guard, work imaged', async () => {
+    const body = enc.encode(JSON.stringify({
+      model: 'gpt-5.6',
+      instructions: BIG_SLAB,
+      input: buildAutonomousResponses(24),
+    }));
+    const result = await transformOpenAIResponses(body, { charsPerToken: 1, minCompressChars: 1 });
+    expect(result.info.historyReason).toBe('collapsed');
+    expect(result.info.collapsedImages ?? 0).toBeGreaterThan(0);
+
+    const out = JSON.parse(dec.decode(result.body)) as { input: Array<Record<string, unknown>> };
+    const serialized = JSON.stringify(out.input);
+    // The request survives as LEGIBLE TEXT (not OCR-only) under the pin banner.
+    expect(serialized).toContain('CURRENT USER REQUEST');
+    expect(serialized).toContain(LIVE_PROMPT_MARKER);
+    // The synthetic HISTORY item (not the slab) carries the pinned text + images.
+    const hist = out.input.find((it) => {
+      const c = (it as { content?: unknown }).content;
+      return (
+        Array.isArray(c) &&
+        c.some((p) => (p as { type?: string }).type === 'input_image') &&
+        c.some((p) => (p as { text?: string }).text?.includes('attribute every turn strictly by its tag'))
+      );
+    }) as { content: Array<{ type: string; text?: string }> };
+    expect(hist).toBeDefined();
+    expect(hist.content.some((p) => p.type === 'input_text' && p.text?.includes(LIVE_PROMPT_MARKER))).toBe(true);
+    // The developer guard echoes the request verbatim.
+    const dev = out.input.find((it) => (it as { role?: string }).role === 'developer');
+    expect(JSON.stringify(dev)).toContain(LIVE_PROMPT_MARKER);
+  });
+
+  it('Chat: lone request kept as legible text + echoed in the guard, work imaged', async () => {
+    const body = enc.encode(JSON.stringify({
+      model: 'gpt-5.6',
+      messages: buildAutonomousChat(24),
+    }));
+    const result = await transformOpenAIChatCompletions(body, { charsPerToken: 1, minCompressChars: 1 });
+    expect(result.info.historyReason).toBe('collapsed');
+    expect(result.info.collapsedImages ?? 0).toBeGreaterThan(0);
+
+    const out = JSON.parse(dec.decode(result.body)) as { messages: Array<Record<string, unknown>> };
+    const serialized = JSON.stringify(out.messages);
+    expect(serialized).toContain('CURRENT USER REQUEST');
+    expect(serialized).toContain(LIVE_PROMPT_MARKER);
+    const hist = out.messages.find((m) => {
+      const c = (m as { content?: unknown }).content;
+      return (
+        Array.isArray(c) &&
+        c.some((p) => (p as { type?: string }).type === 'image_url') &&
+        c.some((p) => (p as { text?: string }).text?.includes('attribute every turn strictly by its tag'))
+      );
+    }) as { content: Array<{ type: string; text?: string }> };
+    expect(hist).toBeDefined();
+    expect(hist.content.some((p) => p.type === 'text' && p.text?.includes(LIVE_PROMPT_MARKER))).toBe(true);
+    const dev = out.messages.find((m) => (m as { role?: string }).role === 'developer');
+    expect(JSON.stringify(dev)).toContain(LIVE_PROMPT_MARKER);
+  });
+
+  it('Responses: byte-stable history image sha across identical autonomous requests', async () => {
+    const make = () => enc.encode(JSON.stringify({
+      model: 'gpt-5.6',
+      instructions: BIG_SLAB,
+      input: buildAutonomousResponses(24),
+    }));
+    const a = await transformOpenAIResponses(make(), { charsPerToken: 1, minCompressChars: 1 });
+    const b = await transformOpenAIResponses(make(), { charsPerToken: 1, minCompressChars: 1 });
+    expect(a.info.historyImageSha).toBeDefined();
+    expect(a.info.historyImageSha).toBe(b.info.historyImageSha);
+  });
+});
+
 // ── Vision cost: gpt-5.x FLAGSHIP patch model (multiplier 1.0, original detail) ──
 // Per OpenAI docs (patch tokenization): flagship gpt-5.4/5.5/5.6 have NO listed
 // multiplier (= 1.0); the 1.62/2.46 values are mini/nano ONLY. And `detail:original`

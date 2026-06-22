@@ -228,6 +228,126 @@ describe('planGptCollapse — reflow (↵ packing)', () => {
   });
 });
 
+describe('planGptCollapse — pin the latest user request as text', () => {
+  // Turns with REAL user requests (userText set) at the given indices; the rest is
+  // assistant work. Varied words so o200k token counts clear the gates realistically.
+  function turnsWithUser(n: number, userIndices: number[], reps = 60): HistoryTurn[] {
+    return Array.from({ length: n }, (_, i) => {
+      const isUser = userIndices.includes(i);
+      const body =
+        (isUser ? `USER REQUEST ${i} ` : `assistant work ${i} `) +
+        `alpha beta gamma delta epsilon ${i} `.repeat(reps);
+      const tag = isUser ? 'user' : 'assistant';
+      return {
+        text: `<${tag} t="${i}">\n${body}\n</${tag}>`,
+        openIds: [],
+        closeIds: [],
+        opaque: false,
+        userText: isUser ? body : undefined,
+      };
+    });
+  }
+
+  it('autonomous (single user turn at the front): request kept as TEXT, work imaged', async () => {
+    const turns = turnsWithUser(40, [0]);
+    const plan = await planGptCollapse(turns, 0, yes);
+    expect(plan.pinText).toBeDefined();
+    expect(plan.pinText).toContain('USER REQUEST 0');
+    // Nothing before the pin (it is the first collapsible turn); work imaged after it.
+    expect(plan.images).toHaveLength(0);
+    expect(plan.imagesAfter.length).toBeGreaterThan(0);
+    expect(plan.start).toBe(0);
+    // The pinned request is NOT part of the imaged baseline (it stays text).
+    expect(plan.text).not.toContain('USER REQUEST 0');
+  });
+
+  it('interactive: pins the LATEST user turn, images history BEFORE and AFTER it', async () => {
+    const turns = turnsWithUser(40, [0, 20]);
+    const plan = await planGptCollapse(turns, 0, yes, { collapseChunk: 0, sectionTokens: 100, maxImages: 100 });
+    // The newest user turn in range (20) is pinned; the older one (0) stays imaged.
+    expect(plan.pinText).toContain('USER REQUEST 20');
+    expect(plan.pinText).not.toContain('USER REQUEST 0');
+    expect(plan.text).toContain('USER REQUEST 0'); // older user turn IS imaged
+    expect(plan.text).not.toContain('USER REQUEST 20'); // pinned turn is NOT imaged
+    // History stays imaged on BOTH sides of the live request (no compression drop).
+    expect(plan.images.length).toBeGreaterThan(0);
+    expect(plan.imagesAfter.length).toBeGreaterThan(0);
+  });
+
+  it('does not orphan a tool call when sealing the section around the pin', async () => {
+    const turns = turnsWithUser(40, [0, 20]);
+    turns[10] = { text: '[tool_use a]\n{}', openIds: ['a'], closeIds: [], opaque: false };
+    turns[11] = { text: '[tool_result]\nok', openIds: [], closeIds: ['a'], opaque: false };
+    turns[25] = { text: '[tool_use b]\n{}', openIds: ['b'], closeIds: [], opaque: false };
+    turns[26] = { text: '[tool_result]\nok', openIds: [], closeIds: ['b'], opaque: false };
+    const plan = await planGptCollapse(turns, 0, yes, { collapseChunk: 0, sectionTokens: 100, maxImages: 100 });
+    expect(plan.pinText).toContain('USER REQUEST 20');
+    // Every opened call id in the imaged range (pin excluded) must close in it.
+    const open = new Set<string>();
+    for (let i = plan.start; i < plan.endExclusive; i++) {
+      for (const id of turns[i]!.openIds) open.add(id);
+      for (const id of turns[i]!.closeIds) open.delete(id);
+    }
+    expect(open.size).toBe(0);
+  });
+
+  it('cap stopping BEFORE the pin leaves the request native (not consumed)', async () => {
+    const turns = turnsWithUser(40, [0, 30]); // latest user request sits deep at 30
+    const plan = await planGptCollapse(turns, 0, yes, { collapseChunk: 0, sectionTokens: 100, maxImages: 1 });
+    expect(plan.images.length).toBe(1); // cap honored
+    expect(plan.imagesAfter).toHaveLength(0);
+    expect(plan.pinText).toBeUndefined(); // never reached the pin → it stays a native message
+    expect(plan.endExclusive).toBeLessThanOrEqual(30);
+  });
+
+  it('pin is cache-stable: same request + sealed window across appended turns', async () => {
+    // collapseChunk 10 snaps L=40 and L=41 to the SAME cutoff (30) → identical plan.
+    const base = turnsWithUser(60, [0]);
+    const a = await planGptCollapse(base.slice(0, 40), 0, yes, { collapseChunk: 10 });
+    const b = await planGptCollapse(base.slice(0, 41), 0, yes, { collapseChunk: 10 });
+    expect(a.pinText).toBe(b.pinText);
+    expect(a.text).toBe(b.text);
+    expect(a.endExclusive).toBe(b.endExclusive);
+  });
+
+  it('no pin when the only user turn is in the kept tail (interactive shape)', async () => {
+    // User turn at 38 is within keepTail (last 6 of 40) → already native text, nothing to pin.
+    const turns = turnsWithUser(40, [38]);
+    const plan = await planGptCollapse(turns, 0, yes);
+    expect(plan.pinText).toBeUndefined();
+    expect(plan.imagesAfter).toHaveLength(0);
+    expect(plan.images.length).toBeGreaterThan(0);
+  });
+
+  it('does NOT pin an older in-range user turn when the LATEST user turn is in the tail', async () => {
+    // Ordinary interactive shape: latest request (37) is in the kept tail (native text).
+    // Pinning the older in-range turn (20) would make the pin migrate across collapse
+    // boundaries and re-image frozen history — so nothing is pinned, older user turns
+    // (0, 20) stay imaged. Regression guard for the cache-churn finding.
+    const turns = turnsWithUser(40, [0, 20, 37]);
+    const plan = await planGptCollapse(turns, 0, yes, { collapseChunk: 0, sectionTokens: 100, maxImages: 100 });
+    expect(plan.pinText).toBeUndefined();
+    expect(plan.imagesAfter).toHaveLength(0);
+    expect(plan.text).toContain('USER REQUEST 0');
+    expect(plan.text).toContain('USER REQUEST 20');
+  });
+
+  it('pin position is stable as the current turn\'s tool loop grows (no re-image churn)', async () => {
+    // "Long current turn": users at 0 and 20, then a growing tool loop after 20 with no
+    // new user turn. The pin stays at 20 (fixed) as work is appended, so before-pin
+    // content and the request stay byte-identical (frozen) while after-pin grows.
+    const base = turnsWithUser(80, [0, 20]);
+    const a = await planGptCollapse(base.slice(0, 50), 0, yes, { collapseChunk: 10 });
+    const b = await planGptCollapse(base.slice(0, 51), 0, yes, { collapseChunk: 10 });
+    expect(a.pinText).toBe(b.pinText);
+    expect(a.pinText).toContain('USER REQUEST 20');
+    expect(a.start).toBe(b.start);
+    // Both still image history on each side of the pinned request.
+    expect(a.images.length).toBeGreaterThan(0);
+    expect(a.imagesAfter.length).toBeGreaterThan(0);
+  });
+});
+
 describe('planGptCollapse — chunk-snapped boundary (cache byte-stability)', () => {
   it('seals the same token sections as turns are appended (byte-stable window)', async () => {
     // 128 o200k tokens/turn, sectionTokens 2000 → a section seals every ~16 turns.

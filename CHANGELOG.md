@@ -4,6 +4,24 @@ All notable changes to pxpipe are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features /
 behavioral changes, patch = fixes).
 
+## 0.6.2 — 2026-06-22
+
+### Fixed
+- **GPT history image cap.** A hard cap (16) on GPT history images. Long OpenCode
+  sessions could otherwise render 80+ images — token-cheap but slow enough that
+  gpt-5.5 times out before first token. The cap images the oldest sections up to the
+  limit and leaves the rest as text; no context dropped, no live tool state orphaned.
+  (`openai-history.ts`)
+- **GPT "live request" guard.** A `developer`-role note after the history image tells
+  the model the image is prior context, not the current request — reinforcing the
+  turn-index so a stale opening turn doesn't read as live. (`openai.ts`)
+- **Honest cache math.** Savings are priced warm whenever a cache read was actually
+  observed (`cache_read > 0`), even when pxpipe has no in-memory warmth prior (after a
+  restart/eviction or on the first tracked turn). Pricing those turns cold billed the
+  text counterfactual a 1.25× create on a prefix we know was cached — fabricating
+  inflated "saved" rows. Applied across the live dashboard, its replay path, and the
+  Sessions panel. (`dashboard.ts`, `sessions.ts`)
+
 ## 0.6.1 — 2026-06-21
 
 ### Fixed

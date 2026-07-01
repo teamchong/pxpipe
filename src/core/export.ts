@@ -21,8 +21,9 @@ import { renderTextToImages } from './library.js';
 import { estimateImageCount, ANTHROPIC_PIXELS_PER_TOKEN, IMAGE_COST_SAFETY_MARGIN, REPORT_CHARS_PER_TOKEN } from './transform.js';
 import { openAIVisionTokens } from './openai.js';
 import {
-  factSheetTextFromTokens,
+  factSheetTextFromEntries,
   extractFactSheetTokensAllPages,
+  extractFactSheetEntriesAllPages,
 } from './factsheet.js';
 
 // ---------------------------------------------------------------------------
@@ -450,11 +451,11 @@ export async function runExportCore(
       : 0;
 
   // Extract factsheet tokens across ALL pages so identifiers from page 3+ are covered.
-  const { kept: fsKept, dropped: fsDropped } = extractFactSheetTokensAllPages(
+  const { kept: fsKept, dropped: fsDropped } = extractFactSheetEntriesAllPages(
     sourceText,
     DENSE_CONTENT_CHARS_PER_IMAGE,
   );
-  const fsText = factSheetTextFromTokens(fsKept);
+  const fsText = factSheetTextFromEntries(fsKept);
   const tokenReport: ExportTokenReport = {
     textTokens,
     imageTokens,

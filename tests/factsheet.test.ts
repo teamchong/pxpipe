@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { extractFactSheetTokens, factSheetText } from '../src/core/factsheet.js';
+import {
+  extractFactSheetTokens,
+  extractFactSheetEntries,
+  extractFactSheetEntriesAllPages,
+  factSheetText,
+} from '../src/core/factsheet.js';
 
 describe('factsheet extraction', () => {
   it('captures precision-critical, hard-to-OCR tokens', () => {
@@ -55,5 +60,63 @@ describe('factsheet extraction', () => {
     expect(toks).toContain('47821');
     expect(toks.length).toBeLessThanOrEqual(64);
     expect(toks.filter((t) => t.startsWith('http')).length).toBeLessThanOrEqual(8);
+  });
+});
+
+describe('ticket-style codes and occurrence counts', () => {
+  it('captures uppercase hyphenated codes that contain a digit', () => {
+    const toks = extractFactSheetTokens(
+      'audit marker AUDIT-ZX9 tracked as PROJ-1482, see CVE-2024-30078 for details',
+    );
+    expect(toks).toContain('AUDIT-ZX9');
+    expect(toks).toContain('PROJ-1482');
+    expect(toks).toContain('CVE-2024-30078');
+  });
+
+  it('does not flag digit-free hyphenated prose (READ-ONLY, NON-NULL)', () => {
+    const toks = extractFactSheetTokens('column is READ-ONLY and NON-NULL by default');
+    expect(toks).not.toContain('READ-ONLY');
+    expect(toks).not.toContain('NON-NULL');
+  });
+
+  it('annotates repeated tokens with ×N and explains the notation', () => {
+    const text = 'retry DEPLOY-77 failed\nretry DEPLOY-77 ok\nfinal DEPLOY-77 done\nsha 9d121ac';
+    const sheet = factSheetText(text);
+    expect(sheet).toContain('DEPLOY-77 ×3');
+    expect(sheet).toContain('×N marks a token that occurs N times');
+    expect(sheet).not.toContain('9d121ac ×');
+  });
+
+  it('emits byte-identical sheets to the pre-count format when nothing repeats', () => {
+    const text = 'commit 9d121ac on port 47821';
+    expect(factSheetText(text)).toContain('from the image: ');
+    expect(factSheetText(text)).not.toContain('×');
+  });
+
+  it('never double-counts one span matched by two patterns', () => {
+    // 1.2.3 is hit by the version pattern; its 1.2 substring by decimal — offset dedup
+    // plus substring-collapse must leave a single un-annotated v1.2.3-style entry.
+    const sheet = factSheetText('release v1.2.3 shipped');
+    expect(sheet).not.toMatch(/×\d/);
+  });
+
+  it('keeps a rare ticket code over a flood of per-line hex ids (log-file shape)', () => {
+    const lines = Array.from({ length: 300 }, (_, i) =>
+      `2026-07-26T09:40:41Z WARN svc=ingest req=${(0x10000000 + i * 7919).toString(16)} shard=12 msg=processed batch ${10000 + i} ok`,
+    );
+    lines[137] += ' AUDIT-ZX9';
+    lines[201] += ' AUDIT-ZX9';
+    const entries = extractFactSheetEntries(lines.join('\n'));
+    const hit = entries.find((e) => e.token === 'AUDIT-ZX9');
+    expect(hit).toBeDefined();
+    expect(hit!.count).toBe(2);
+  });
+
+  it('sums counts across pages in the all-pages variant', () => {
+    const page = 'x'.repeat(90) + ' TICK-42 ';
+    const { kept } = extractFactSheetEntriesAllPages(page.repeat(5), 100);
+    const hit = kept.find((e) => e.token === 'TICK-42');
+    expect(hit).toBeDefined();
+    expect(hit!.count).toBe(5);
   });
 });

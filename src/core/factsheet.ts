@@ -27,6 +27,9 @@ const PATTERNS: readonly RegExp[] = [
   /\b\d[\d,_]{3,}\b/g, // large / separated number
   /\b\d+\.\d+\b/g, // decimal
   /\b[A-Z][A-Z0-9]{2,}(?:_[A-Z0-9]+)+\b/g, // CONST_IDS / env var names
+  // Ticket/advisory-style codes: uppercase hyphenated with ≥1 digit (PROJ-1482,
+  // CVE-2024-30078, AUDIT-ZX9). Digit lookahead is bounded → no backtracking blowup.
+  /\b(?=[A-Z0-9-]{0,119}\d)[A-Z][A-Z0-9]+(?:-[A-Z0-9]+)+\b/g,
 ];
 
 const MIN_LEN = 3;
@@ -48,6 +51,7 @@ const MAX_CHUNK = 512; // whitespace-free chunks longer than this are blobs (bas
 const SHAPE_UUID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 const SHAPE_HEX = /^(?=[0-9a-f]*\d)[0-9a-f]{7,40}$/; // git sha / opaque hex
 const SHAPE_CONST = /^[A-Z][A-Z0-9]{2,}(?:_[A-Z0-9]+)+$/; // CONST_IDS / env vars
+const SHAPE_TICKET = /^(?=[A-Z0-9-]*\d)[A-Z][A-Z0-9]+(?:-[A-Z0-9]+)+$/; // PROJ-1482 / CVE-2024-30078
 const SHAPE_FLAG = /^--?[A-Za-z][\w-]+$/; // CLI flag
 const SHAPE_NUM = /^\d[\d,_]*$|^\d+\.\d+$/; // port / large or separated number / decimal
 const SHAPE_URL = /^https?:\/\//;
@@ -58,6 +62,7 @@ function priorityTier(tok: string): 0 | 1 | 2 {
     SHAPE_HEX.test(tok) ||
     SHAPE_UUID.test(tok) ||
     SHAPE_CONST.test(tok) ||
+    SHAPE_TICKET.test(tok) ||
     SHAPE_FLAG.test(tok) ||
     SHAPE_NUM.test(tok)
   ) {
@@ -80,24 +85,51 @@ function priorityTier(tok: string): 0 | 1 | 2 {
  * minified bundles (which embed `/` and would otherwise make the path patterns blow up).
  */
 export function extractFactSheetTokens(text: string): string[] {
+  return extractFactSheetEntries(text).map((e) => e.token);
+}
+
+/** A kept fact-sheet token plus how many times it occurs in the scanned text.
+ *  Counts are advisory (occurrences, not lines) but deterministic → cache-stable. */
+export interface FactSheetEntry {
+  readonly token: string;
+  readonly count: number;
+}
+
+/**
+ * Like `extractFactSheetTokens`, but each kept token carries its occurrence count.
+ * Counts make the fact sheet a *quantitative* index: tally questions over imaged
+ * content ("how many lines mention CODE-X?") become answerable from text instead
+ * of from counting rows of 5×8 px glyphs — the one operation page images are worst
+ * at. The kept-token SET and its order are byte-identical to the pre-count
+ * behaviour; only counts are new. Same-token spans matched by two patterns are
+ * deduped by offset so a token is never double-counted.
+ */
+export function extractFactSheetEntries(text: string): FactSheetEntry[] {
   const scan = text.length > MAX_SCAN ? text.slice(0, MAX_SCAN) : text;
-  const seen = new Set<string>();
+  const counts = new Map<string, number>();
   for (const chunk of scan.split(/\s+/)) {
     if (chunk.length < MIN_LEN || chunk.length > MAX_CHUNK) continue;
+    // Offset-level dedup WITHIN this chunk: two patterns matching the identical
+    // token at the same position must count once. Keyed by token+start offset.
+    const spanSeen = new Set<string>();
     for (const re of PATTERNS) {
       for (const m of chunk.matchAll(re)) {
         // Strip trailing sentence punctuation pulled in from prose (`pull/93.` → `pull/93`);
         // no real identifier we extract ends in these.
         const tok = (m[1] ?? m[0]).trim().replace(/[.,;:!?]+$/, '');
-        if (tok.length >= MIN_LEN && tok.length <= MAX_LEN) seen.add(tok);
+        if (tok.length < MIN_LEN || tok.length > MAX_LEN) continue;
+        const key = `${m.index ?? 0}\x00${tok}`;
+        if (spanSeen.has(key)) continue;
+        spanSeen.add(key);
+        counts.set(tok, (counts.get(tok) ?? 0) + 1);
       }
     }
-    if (seen.size >= MAX_SEEN) break;
+    if (counts.size >= MAX_SEEN) break;
   }
   // Phase 1 — substring collapse (length-desc): keep the most-specific form, folding e.g.
   // a URL's path-portion into the full URL. Cross-tier on purpose. Total order (length,
   // then lexical) so the result is independent of Set iteration order.
-  const ordered = [...seen].sort((a, b) => b.length - a.length || (a < b ? -1 : a > b ? 1 : 0));
+  const ordered = [...counts.keys()].sort((a, b) => b.length - a.length || (a < b ? -1 : a > b ? 1 : 0));
   const specific: string[] = [];
   for (const t of ordered) {
     if (!specific.some((k) => k.includes(t))) specific.push(t);
@@ -115,7 +147,7 @@ export function extractFactSheetTokens(text: string): string[] {
     if (tier === 2 && urls++ >= MAX_URLS) continue;
     kept.push(t);
   }
-  return kept;
+  return kept.map((t) => ({ token: t, count: counts.get(t) ?? 1 }));
 }
 
 /**
@@ -136,19 +168,27 @@ export function extractFactSheetTokensAllPages(
   text: string,
   charsPerPage: number,
 ): { kept: string[]; dropped: number } {
-  const seen = new Set<string>();
+  const { kept, dropped } = extractFactSheetEntriesAllPages(text, charsPerPage);
+  return { kept: kept.map((e) => e.token), dropped };
+}
+
+/** Entry-carrying variant of `extractFactSheetTokensAllPages`: same kept set and
+ *  order, with per-token occurrence counts summed across all pages. */
+export function extractFactSheetEntriesAllPages(
+  text: string,
+  charsPerPage: number,
+): { kept: FactSheetEntry[]; dropped: number } {
+  const counts = new Map<string, number>();
   const all: string[] = [];
 
   // Walk the text in page-sized chunks. Each chunk is ≤ charsPerPage < MAX_SCAN,
-  // so extractFactSheetTokens will not truncate within a chunk.
+  // so extractFactSheetEntries will not truncate within a chunk.
   const pageCount = Math.max(1, Math.ceil(text.length / charsPerPage));
   for (let i = 0; i < pageCount; i++) {
     const chunk = text.slice(i * charsPerPage, (i + 1) * charsPerPage);
-    for (const tok of extractFactSheetTokens(chunk)) {
-      if (!seen.has(tok)) {
-        seen.add(tok);
-        all.push(tok);
-      }
+    for (const { token, count } of extractFactSheetEntries(chunk)) {
+      if (!counts.has(token)) all.push(token);
+      counts.set(token, (counts.get(token) ?? 0) + count);
     }
   }
 
@@ -157,12 +197,12 @@ export function extractFactSheetTokensAllPages(
   const ranked = all
     .map((t) => ({ t, tier: priorityTier(t) }))
     .sort((a, b) => a.tier - b.tier || b.t.length - a.t.length || (a.t < b.t ? -1 : a.t > b.t ? 1 : 0));
-  const kept: string[] = [];
+  const kept: FactSheetEntry[] = [];
   let urls = 0;
   for (const { t, tier } of ranked) {
     if (kept.length >= MAX_TOKENS) break;
     if (tier === 2 && urls++ >= MAX_URLS) continue;
-    kept.push(t);
+    kept.push({ token: t, count: counts.get(t) ?? 1 });
   }
 
   return { kept, dropped: all.length - kept.length };
@@ -170,13 +210,26 @@ export function extractFactSheetTokensAllPages(
 
 const OPEN =
   '[Exact identifiers from the rendered context above (paths, ids, versions, numbers) — quote these verbatim instead of transcribing them from the image: ';
+/** Variant used when at least one token repeats — explains the ×N annotation so the
+ *  model can answer tally questions from the sheet instead of counting glyph rows. */
+const OPEN_COUNTS =
+  '[Exact identifiers from the rendered context above (paths, ids, versions, numbers) — quote these verbatim instead of transcribing them from the image; ×N marks a token that occurs N times within the imaged content: ';
 
 /** Build the one-line fact-sheet string from a pre-extracted token list. */
 export function factSheetTextFromTokens(tokens: string[]): string {
   return tokens.length > 0 ? OPEN + tokens.join(' · ') + ']' : '';
 }
 
+/** Build the one-line fact-sheet string from token+count entries. Byte-identical to
+ *  `factSheetTextFromTokens` when no token repeats, so existing sheets stay cache-stable. */
+export function factSheetTextFromEntries(entries: readonly FactSheetEntry[]): string {
+  if (entries.length === 0) return '';
+  const anyRepeat = entries.some((e) => e.count >= 2);
+  const body = entries.map((e) => (e.count >= 2 ? `${e.token} ×${e.count}` : e.token)).join(' · ');
+  return (anyRepeat ? OPEN_COUNTS : OPEN) + body + ']';
+}
+
 /** One-line fact-sheet string for `text`, or `''` when nothing notable was found. */
 export function factSheetText(text: string): string {
-  return factSheetTextFromTokens(extractFactSheetTokens(text));
+  return factSheetTextFromEntries(extractFactSheetEntries(text));
 }

@@ -28,14 +28,15 @@ import {
   DENSE_CONTENT_CHARS_PER_IMAGE,
   DENSE_CONTENT_COLS,
   DENSE_RENDER_STYLE,
+  READABLE_CHARS_PER_IMAGE,
   renderTextToPngsWithCharLimit,
 } from '../src/core/render.js';
 
-// Default render config: cols=100, 240 lines/img → ~24,000 chars/img if
+// Default render config: cols=100, 90 lines/img → ~9,000 chars/img if
 // lines fully fill the width. For shorter lines, the budget is dominated
 // by row count (each line takes ≥1 row regardless of length).
 const COLS = 100;
-const ROWS_PER_IMG = 240; // floor((1932 - 8) / 8), Spleen 5×8 production cell
+const ROWS_PER_IMG = 90; // floor((728 - 8) / 8), Anthropic-clamped 1568×728 page
 
 describe('estimateImageCount', () => {
   it('returns 1 for empty / tiny text', () => {
@@ -44,13 +45,13 @@ describe('estimateImageCount', () => {
   });
 
   it('scales linearly with row count for short-line content', () => {
-    // Full-canvas policy: 100 cols × 240 rows = 24,000 chars/page.
+    // Full-canvas policy: 100 cols × 90 rows = 9,000 chars/page.
     const oneImage = Array.from({ length: ROWS_PER_IMG }, () => 'x').join('\n');
     expect(estimateImageCount(oneImage, COLS)).toBe(1);
-    // 196 short lines spill into a second page.
+    // ROWS_PER_IMG + 1 short lines spill into a second page.
     const justOver = Array.from({ length: ROWS_PER_IMG + 1 }, () => 'x').join('\n');
     expect(estimateImageCount(justOver, COLS)).toBe(2);
-    // 10 × 240 rows → exactly 10 full pages.
+    // 10 × ROWS_PER_IMG rows → exactly 10 full pages.
     const tenImages = Array.from({ length: ROWS_PER_IMG * 10 }, () => 'x').join('\n');
     expect(estimateImageCount(tenImages, COLS)).toBe(10);
   });
@@ -59,19 +60,19 @@ describe('estimateImageCount', () => {
     // A single 1000-char line wraps to ceil(1000/100) = 10 rows.
     const wrapped = 'x'.repeat(1000);
     expect(estimateImageCount(wrapped, COLS)).toBe(1); // 10 rows, fits in 1 img
-    // 24,000 chars on one line wraps to 240 rows → exactly 1 full page.
-    const oneImg = 'x'.repeat(24_000);
+    // COLS × ROWS_PER_IMG chars on one line wrap to exactly 1 full page.
+    const oneImg = 'x'.repeat(COLS * ROWS_PER_IMG);
     expect(estimateImageCount(oneImg, COLS)).toBe(1);
-    // 24,001 chars overflows into a second page.
-    const twoImgs = 'x'.repeat(24_001);
+    // One char more overflows into a second page.
+    const twoImgs = 'x'.repeat(COLS * ROWS_PER_IMG + 1);
     expect(estimateImageCount(twoImgs, COLS)).toBe(2);
   });
 
   it('also accepts a numeric length (legacy chars-based estimate)', () => {
-    // Numeric path uses the full READABLE_CHARS_PER_IMAGE (50k) budget per page.
+    // Numeric path uses the full READABLE_CHARS_PER_IMAGE budget per page.
     expect(estimateImageCount(0, COLS)).toBe(1);
-    expect(estimateImageCount(50_000, COLS)).toBe(1);
-    expect(estimateImageCount(50_001, COLS)).toBe(2);
+    expect(estimateImageCount(READABLE_CHARS_PER_IMAGE, COLS)).toBe(1);
+    expect(estimateImageCount(READABLE_CHARS_PER_IMAGE + 1, COLS)).toBe(2);
   });
 });
 
@@ -89,10 +90,10 @@ describe('dense readable render profile', () => {
     );
 
     expect(imgs.length).toBeGreaterThanOrEqual(3);
-    // 384 cols × 5 px bare cell + 8 px pad = 1928 px wide — the dense path fills
-    // the ~1932×1932 ceiling (≤2000 px) at the 5×8 cell for Fable / Opus 4.8.
-    expect(imgs[0]!.width).toBeGreaterThan(1900);
-    expect(imgs[0]!.width).toBeLessThanOrEqual(2000);
+    // 312 cols × 5 px bare cell + 8 px pad = 1568 px wide — the dense path fills
+    // Anthropic's long-edge bound exactly (any wider → server-side resample).
+    expect(imgs[0]!.width).toBeGreaterThan(1500);
+    expect(imgs[0]!.width).toBeLessThanOrEqual(1568);
   });
 
   it('pages diff-shaped tool output at the dense readable budget', async () => {
@@ -355,12 +356,14 @@ describe('paging end-to-end (transformRequest)', () => {
   });
 
   it('pages dense medium tool_results instead of packing them into one image', async () => {
-    const lockish = Array.from({ length: 1200 }, (_, i) =>
+    const lockish = Array.from({ length: 600 }, (_, i) =>
       `  pkg-${i}@npm:1.${i}.0(peer@npm:^${i}.0.0)(typescript@npm:^5.${i % 10}.0): checksum=${'a'.repeat(24)}`,
     ).join('\n');
-    // > one dense page (DENSE_CONTENT_CHARS_PER_IMAGE ≈ 92k) so it genuinely pages.
-    expect(lockish.length).toBeGreaterThan(100_000);
-    expect(lockish.length).toBeLessThan(150_000);
+    // > 2 dense pages (DENSE_CONTENT_CHARS_PER_IMAGE = 28,080) so it genuinely
+    // pages, while 600 short rows / 90 per page = 7 images stays under the ≤10
+    // per-tool_result clamp (no truncation).
+    expect(lockish.length).toBeGreaterThan(2 * DENSE_CONTENT_CHARS_PER_IMAGE);
+    expect(lockish.length).toBeLessThan(80_000);
 
     const { info } = await transformRequest(makeReq(lockish), { multiCol: 1, charsPerToken: 2 });
     expect(info.compressed).toBe(true);

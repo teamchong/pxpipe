@@ -1943,17 +1943,18 @@ describe('transform', () => {
   // responds to `cols` (which scales chars/image linearly the same way a smaller
   // cell-H would).
 
-  it('maxCharsPerImage: fills the canvas (READABLE_CHARS_PER_IMAGE = 50k)', () => {
-    // Policy: maximum chars per page, full ~1932-px-tall canvas. At cols=100 the
-    // canvas holds 100 × 240 = 24,000 chars per page (height-limited).
-    expect(maxCharsPerImage(100)).toBe(24_000);
+  it('maxCharsPerImage: fills the canvas (READABLE_CHARS_PER_IMAGE = 28,080)', () => {
+    // Policy: maximum chars per page, full 728-px-tall canvas (Anthropic
+    // 1568-edge / ~1.15 MP clamp). At cols=100 the canvas holds
+    // 100 × 90 = 9,000 chars per page (height-limited).
+    expect(maxCharsPerImage(100)).toBe(9_000);
   });
 
-  it('maxCharsPerImage: scales with cols and caps at the 50k page budget', () => {
-    expect(maxCharsPerImage(20)).toBe(4_800);    // 20 × 240 = 4,800 (height-bound)
-    expect(maxCharsPerImage(50)).toBe(12_000);   // 50 × 240 = 12,000 (height-bound)
-    expect(maxCharsPerImage(200)).toBe(48_000);  // 200 × 240 = 48,000 (height-bound)
-    expect(maxCharsPerImage(313)).toBe(50_000);  // 313 × 240 = 75,120 → capped at READABLE
+  it('maxCharsPerImage: scales with cols and caps at the 28k page budget', () => {
+    expect(maxCharsPerImage(20)).toBe(1_800);    // 20 × 90 = 1,800 (height-bound)
+    expect(maxCharsPerImage(50)).toBe(4_500);    // 50 × 90 = 4,500 (height-bound)
+    expect(maxCharsPerImage(200)).toBe(18_000);  // 200 × 90 = 18,000 (height-bound)
+    expect(maxCharsPerImage(313)).toBe(28_080);  // 313 × 90 = 28,170 → capped at READABLE
   });
 
   it('isCompressionProfitable: doubling cols halves the 2-image break-even threshold', () => {

@@ -165,7 +165,7 @@ export interface RenderTextToImagesOptions {
   readonly maxCharsPerImage?: number;
   /** Render style. Default DENSE_RENDER_STYLE (bare 5×8 cell, anti-aliased). */
   readonly style?: RenderStyle;
-  /** Max page height in px. Default MAX_HEIGHT_PX (1932). */
+  /** Max page height in px. Default MAX_HEIGHT_PX (728 — Anthropic 1568-edge / ~1.15 MP safe). */
   readonly maxHeightPx?: number;
 }
 

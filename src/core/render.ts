@@ -23,21 +23,26 @@ import {
 } from './atlas-gray.js';
 import { encodeGrayPng, encodeRgbPng } from './png.js';
 
-/** Page-height ceiling. 1932 px → 384-col page = 69×69 = 4761 tokens, under both Fable/Opus 4.8
- *  limits (≤4784 tokens AND ≤2000 px/side for >20-image requests). Exported for transform.ts math. */
-export const MAX_HEIGHT_PX = 1932;
-/** Char budget for the static slab (system + tools + CLAUDE.md). ~50k leaves headroom for
- *  soft-wrap and dropped chars; pages stay well under the 1932 px ceiling at cols=313. */
-export const READABLE_CHARS_PER_IMAGE = 50000;
-/** Char budget for dense content (tool output, collapsed history). 384 cols × 240 rows = 92160 chars
- *  fills the full ~1932×1932 ceiling. NOTE: verbatim recall of imaged text is unreliable at any size. */
-export const DENSE_CONTENT_CHARS_PER_IMAGE = 92160;
-export const DENSE_CONTENT_COLS = 384;
+/** Page-height ceiling. Measured (2026-07-01, count_tokens sweep, claude-sonnet-4-5 — see
+ *  /tmp/pxexp/LEVER1-findings.md): the API downscales any image to fit BOTH long-edge ≤1568
+ *  AND ~1.15 MP (≈1,143,750 px), then bills ≈ px/750 (≈1525 tok cap, applied per-image).
+ *  The old 1932×1932 page was billed at cap but resampled 0.555× → 5×8 glyphs reached the
+ *  encoder at ~2.8×4.4 px. New page shape 1568×728 = 1,141,504 px fits both bounds →
+ *  WYSIWYG for the vision encoder (also satisfies ≤2000 px/side for >20-image requests). */
+export const MAX_HEIGHT_PX = 728;
+/** Char budget for the static slab (system + tools + CLAUDE.md). Matches physical page
+ *  capacity at 312 cols × 90 rows so image-count estimates track real pagination. */
+export const READABLE_CHARS_PER_IMAGE = 28080;
+/** Char budget for dense content (tool output, collapsed history). 312 cols × 90 rows = 28080
+ *  chars fills the 1568×728 page. NOTE: verbatim recall of imaged text is unreliable at any size. */
+export const DENSE_CONTENT_CHARS_PER_IMAGE = 28080;
+export const DENSE_CONTENT_COLS = 312;
 /** Bare 5×8 cell (no padding). A/B showed 5×8 beats 7×10 on dense JSON (4/5 vs 3/5 reads, 42% fewer tokens).
  *  Revert to {cellWBonus:2, cellHBonus:2} if misread rates rise. */
 export const DENSE_RENDER_STYLE: RenderStyle = { cellWBonus: 0, cellHBonus: 0, aa: true };
-/** Default columns for the static slab. 313 × 5 px + 8 px pad = 1573 px — under the 1932 px ceiling. */
-const DEFAULT_COLS = 313;
+/** Default columns for the static slab. 312 × 5 px + 8 px pad = 1568 px — exactly the API's
+ *  long-edge bound (313 cols = 1573 px would trigger a 0.997× resample, blurring every glyph). */
+const DEFAULT_COLS = 312;
 /** Horizontal padding (left + right each), px. Exported for transform.ts token-cost math. */
 export const PAD_X = 4;
 /** Vertical padding (top + bottom each), px. Exported for transform.ts token-cost math. */
@@ -732,9 +737,9 @@ export async function renderTextToPngs(
 // OCR column ordering is the risk — gated behind an opt-in flag pending empirical eval.
 
 const GUTTER_CELLS = 4;
-// Width is capped at 1932 px, not 2000 px: a 1932-tall page = 69 patches, so width must
-// also be ≤69 patches (4761 tokens ≤ 4784). A 2000-px width → 72×69 = 4968 > 4784 → REJECTED.
-const MAX_WIDTH_PX = 1932;
+// Width hard-capped at the API's long-edge bound: anything wider is resampled server-side
+// (measured 2026-07-01: fit-within 1568-edge AND ~1.15 MP, then ≈px/750 billing).
+const MAX_WIDTH_PX = 1568;
 
 const GUTTER_DIVIDER_INK = 64; // pre-invert → 191 post-invert: light gray column separator
 const GUTTER_DIVIDER_INSET_PX = 2; // keep divider clear of padding rows

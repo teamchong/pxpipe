@@ -16,7 +16,15 @@
  *   PXPIPE_GPT_PROFILES='{"gpt-5.6":{"stripCols":176}}'   # widen only
  */
 
-import { MAX_HEIGHT_PX } from './render.js';
+/**
+ * GPT strip height, DECOUPLED from render.ts's MAX_HEIGHT_PX (which is Anthropic's
+ * 1568-edge / ~1.15 MP clamp). OpenAI's pre-tokenize resize is different: fit within
+ * 2048×2048, then shortest side → 768. A 768-px-wide portrait strip up to 2048 px tall
+ * survives un-resampled, so GPT keeps the taller page. Every built-in cost number below
+ * (1190 / 1445 / 2372 / 1464 / 630 …) was calibrated at this height — do not re-link to
+ * the Anthropic constant.
+ */
+export const GPT_MAX_HEIGHT_PX = 1932;
 
 /** Image-token cost model (mirrors OpenAI's mandatory pre-tokenize resize). */
 export type GptVisionCost =
@@ -38,7 +46,7 @@ export interface GptModelProfile {
 export const DEFAULT_GPT_STRIP_COLS = 152;
 
 const C = DEFAULT_GPT_STRIP_COLS;
-const H = MAX_HEIGHT_PX;
+const H = GPT_MAX_HEIGHT_PX;
 
 /**
  * Conservative fallback for unrecognized models: tile 85/170 over-states cost,

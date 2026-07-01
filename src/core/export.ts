@@ -33,7 +33,7 @@ import {
 export const DEFAULT_EXPORT_MODEL = 'claude-sonnet-4-5';
 // Chars-per-token for the reporting estimate now lives in transform.ts as
 // REPORT_CHARS_PER_TOKEN (single source of truth for all token-estimate constants).
-/** Default column width — dense content mode (384 cols = 1928 px). */
+/** Default column width — dense content mode (312 cols = 1568 px). */
 export const DEFAULT_EXPORT_COLS: number = DENSE_CONTENT_COLS;
 
 // ---------------------------------------------------------------------------

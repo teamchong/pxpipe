@@ -37,6 +37,11 @@ import {
  *  control. No CLI flags beyond --help/--version. */
 interface RuntimeConfig {
   port: number;
+  /** Interface to bind. Defaults to 127.0.0.1 (loopback only) — the dashboard
+   *  is unauthenticated and serves captured request context, so it must not be
+   *  exposed to the LAN by default. Set HOST=0.0.0.0 to opt into all interfaces
+   *  (e.g. reaching the dashboard from another device / the host of a container). */
+  host: string;
   upstream: string;
   openAIUpstream: string;
   openAIApiKey?: string;
@@ -101,6 +106,8 @@ function parseCli(argv: string[]): RuntimeConfig {
   const sharedUpstream = process.env.PXPIPE_UPSTREAM;
   return {
     port: Number(process.env.PORT ?? 47821),
+    // Loopback by default; opt into all-interfaces exposure explicitly via HOST.
+    host: process.env.HOST?.trim() || '127.0.0.1',
     upstream: process.env.ANTHROPIC_UPSTREAM ?? sharedUpstream ?? 'https://api.anthropic.com',
     openAIUpstream: process.env.OPENAI_UPSTREAM ?? sharedUpstream ?? 'https://api.openai.com',
     openAIApiKey: process.env.OPENAI_API_KEY,
@@ -140,6 +147,9 @@ Flags:
 
 Environment:
   PORT                    listen port (default 47821)
+  HOST                    interface to bind (default 127.0.0.1, loopback only).
+                          Set 0.0.0.0 to expose the dashboard off-host — note it
+                          is unauthenticated and serves captured request context.
   PXPIPE_UPSTREAM         upstream API base for every API family
   ANTHROPIC_UPSTREAM      Anthropic API base; overrides PXPIPE_UPSTREAM
                            (default https://api.anthropic.com)
@@ -1055,8 +1065,19 @@ async function main(): Promise<void> {
       });
   });
 
-  server.listen(opts.port, () => {
-    console.log(`[pxpipe] listening on http://127.0.0.1:${opts.port}`);
+  // IPv6 literals need bracket notation to form a valid URL (http://[::1]:47821).
+  const displayHost = opts.host.includes(':') ? `[${opts.host}]` : opts.host;
+  const isLoopbackHost =
+    opts.host === '127.0.0.1' || opts.host === 'localhost' || opts.host === '::1';
+  server.listen(opts.port, opts.host, () => {
+    console.log(`[pxpipe] listening on http://${displayHost}:${opts.port}`);
+    if (!isLoopbackHost) {
+      console.warn(
+        `[pxpipe] WARNING: bound to ${opts.host} — the unauthenticated dashboard ` +
+          `(captured request context + kill switch) is reachable off-host. ` +
+          `Unset HOST to restrict to loopback.`,
+      );
+    }
     const routes = resolveUpstreams(config);
     console.log(`[pxpipe] anthropic upstream → ${routes.anthropic}`);
     console.log(`[pxpipe] openai upstream → ${routes.openai}`);

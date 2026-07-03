@@ -988,3 +988,109 @@ describe('collapseHistory — opening-turn request quarantine (regression #14)',
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// #7: the inverse trap of regression #14. When the opening turn is the ONLY
+// user-typed text in the session (later user turns are tool_results/reminders),
+// demoting it to a 300-char preview DESTROYS the task: the EC demo's 577-char
+// prompt lost its questions and its "Reply as:" output format (offset 531) —
+// they existed nowhere, in text or pixels. The recency pointer must fall
+// through to the demoted head and carry the typed text VERBATIM. This must NOT
+// weaken #14: when a later typed turn exists, it wins the scan and the opening
+// ask stays quarantined (asserted there).
+// ---------------------------------------------------------------------------
+describe('collapseHistory — opening task carried verbatim from the demoted head (#7)', () => {
+  const TASK =
+    'context/ has needle.txt plus filler-NNN.txt files. Using the Read tool on each file ' +
+    'individually (do NOT use grep, bash, find, or any search tool): FIRST read needle.txt, ' +
+    'THEN read every filler-NNN.txt in numerical order. As you read, COUNT the lines that ' +
+    'contain the exact token "AUDIT-ZX9". Only after reading ALL files, answer using only ' +
+    'what you read: (1) the final ledger balance of account ZX-9 from needle.txt, (2) how ' +
+    'many lines contained "AUDIT-ZX9", and (3) their sum. ' +
+    'Reply as: balance=<n>, count=<m>, final=<n+m>.';
+
+  it('falls through reminder-only turns to the head and keeps the trailing output format', async () => {
+    expect(TASK.length).toBeGreaterThan(300); // must exceed the preview cap to regress
+
+    const msgs: Message[] = [
+      usr([
+        { type: 'text', text: '<system-reminder>claudeMd noise — not the task</system-reminder>' },
+        { type: 'text', text: TASK },
+        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'U0xBQg==' } },
+      ]),
+    ];
+    // Turns 1..12: assistant narration + user turns that carry NO typed text
+    // (system-reminder only) — the EC session shape (tool_results/reminders).
+    for (let i = 1; i <= 12; i++) {
+      msgs.push(
+        i % 2 === 1
+          ? asst(`turn ${i}: ` + 'x'.repeat(2800))
+          : usr([{ type: 'text', text: `<system-reminder>nudge ${i} ` + 'x'.repeat(2800) + '</system-reminder>' }]),
+      );
+    }
+    msgs.push(usr('LIVE: you have read every file — answer now.'));
+
+    const { messages: out, info } = await collapseHistory(msgs, isCompressionProfitable, {
+      keepTail: 1,
+      minCollapsePrefix: 5,
+      cols: 100,
+      collapseChunk: 0,
+      protectedPrefix: 1,
+    });
+
+    expect(info.reason).toBe(undefined);
+    expect(out.length).toBe(3);
+
+    // Head still tombstoned (byte-stable anchor semantics unchanged).
+    const headText = (out[0]!.content as Array<Record<string, unknown>>).filter(
+      (c) => c.type === 'text',
+    ) as Array<{ text: string }>;
+    expect(headText[0]!.text).toContain('PRIOR CONTEXT ONLY');
+
+    // The pointer in the synthetic message carries the task VERBATIM — including
+    // everything past the 300-char preview cap: the questions and the format.
+    const synthText = (out[1]!.content as Array<Record<string, unknown>>).filter(
+      (c) => c.type === 'text',
+    ) as Array<{ text: string }>;
+    const pointer = synthText.find((t) => t.text.includes('Most recent collapsed user turn'));
+    expect(pointer).toBeDefined();
+    expect(pointer!.text).toContain('carried verbatim');
+    expect(pointer!.text).toContain('<user t="0">');
+    expect(pointer!.text).toContain('COUNT the lines that contain the exact token "AUDIT-ZX9"');
+    expect(pointer!.text).toContain('Reply as: balance=<n>, count=<m>, final=<n+m>.');
+    // Scaffolding never leaks into the carried text.
+    expect(pointer!.text).not.toContain('claudeMd noise');
+  });
+
+  it('elides the middle, never the tail, when the typed task exceeds the verbatim cap', async () => {
+    const longTask =
+      'SETUP: ' + 'a'.repeat(6000) + ' Reply as: balance=<n>, count=<m>, final=<n+m>.';
+    const msgs: Message[] = [
+      usr([{ type: 'text', text: longTask }]),
+    ];
+    for (let i = 1; i <= 12; i++) {
+      msgs.push(
+        i % 2 === 1
+          ? asst(`turn ${i}: ` + 'x'.repeat(2800))
+          : usr([{ type: 'text', text: `<system-reminder>nudge ${i} ` + 'x'.repeat(2800) + '</system-reminder>' }]),
+      );
+    }
+    msgs.push(usr('LIVE: answer now.'));
+
+    const { messages: out } = await collapseHistory(msgs, isCompressionProfitable, {
+      keepTail: 1,
+      minCollapsePrefix: 5,
+      cols: 100,
+      collapseChunk: 0,
+      protectedPrefix: 1,
+    });
+
+    const synthText = (out[1]!.content as Array<Record<string, unknown>>).filter(
+      (c) => c.type === 'text',
+    ) as Array<{ text: string }>;
+    const pointer = synthText.find((t) => t.text.includes('Most recent collapsed user turn'))!;
+    expect(pointer.text).toContain('middle elided');
+    expect(pointer.text).toContain('SETUP: '); // head kept
+    expect(pointer.text).toContain('Reply as: balance=<n>, count=<m>, final=<n+m>.'); // tail kept
+  });
+});

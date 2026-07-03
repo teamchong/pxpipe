@@ -279,22 +279,59 @@ export function messagesToHistorySegments(
   return { text: textOut.join('\n\n'), slotText: slotOut.join('\n\n') };
 }
 
-function userPromptText(content: string | ContentBlock[]): string {
-  if (typeof content === 'string') return content;
-  const parts: string[] = [];
-  for (const blk of content) {
-    if (!blk || typeof blk !== 'object') continue;
-    const t = (blk as { type?: string }).type;
-    if (t === 'text') parts.push((blk as TextBlock).text);
-    else if (t === 'image') parts.push('[image]');
-  }
-  return parts.join('\n\n');
-}
-
 function compactPreview(text: string): string {
   const compact = text.replace(/\s+/g, ' ').trim();
   if (compact.length <= LATEST_COLLAPSED_USER_PREVIEW_CHARS) return compact;
   return compact.slice(0, LATEST_COLLAPSED_USER_PREVIEW_CHARS).trimEnd() + '...';
+}
+
+// User-typed words must never survive ONLY as a truncated preview (#7: the EC demo's
+// 577-char task lost its questions and "Reply as:" format at the 300-char preview cap,
+// because no later turn restated them). Task-defining text is carried verbatim up to
+// this cap; beyond it, head+tail elision keeps both the setup AND the trailing output
+// format, which real prompts put at the end.
+const LATEST_COLLAPSED_USER_VERBATIM_CHARS = 4000;
+const VERBATIM_HEAD_CHARS = 2600;
+const VERBATIM_TAIL_CHARS = 1400;
+
+function verbatimTaskText(text: string): string {
+  const t = text.trim();
+  if (t.length <= LATEST_COLLAPSED_USER_VERBATIM_CHARS) return t;
+  const elided = t.length - VERBATIM_HEAD_CHARS - VERBATIM_TAIL_CHARS;
+  return (
+    t.slice(0, VERBATIM_HEAD_CHARS) +
+    `\n[… middle elided (${elided} chars) …]\n` +
+    t.slice(t.length - VERBATIM_TAIL_CHARS)
+  );
+}
+
+/**
+ * The user's typed words in a user message: text blocks only, excluding
+ * <system-reminder> wrappers and (in the opening slab message) everything at or
+ * before the '[End of rendered context.]' boundary — same rule as
+ * demoteProtectedHeadText, so pxpipe scaffolding is never mistaken for the task.
+ */
+function typedUserText(content: string | ContentBlock[]): string {
+  if (typeof content === 'string') return content.trim();
+  if (!Array.isArray(content)) return '';
+  const boundaryIdx = content.findIndex(
+    (b) =>
+      b && typeof b === 'object' &&
+      (b as { type?: string }).type === 'text' &&
+      (b as TextBlock).text === '[End of rendered context.]',
+  );
+  const parts: string[] = [];
+  for (let i = 0; i < content.length; i++) {
+    if (boundaryIdx >= 0 && i <= boundaryIdx) continue;
+    const blk = content[i];
+    if (!blk || typeof blk !== 'object') continue;
+    if ((blk as { type?: string }).type !== 'text') continue;
+    const text = (blk as TextBlock).text.trim();
+    if (!text) continue;
+    if (text.startsWith('<system-reminder>')) continue;
+    parts.push(text);
+  }
+  return parts.join('\n\n');
 }
 
 /**
@@ -369,16 +406,33 @@ function demoteProtectedHeadText(head: Message[]): Message[] {
 function latestCollapsedUserPointer(
   messages: Message[],
   upToExclusive: number,
-  fromInclusive: number,
+  protectedPrefix: number,
 ): TextBlock | undefined {
-  for (let i = upToExclusive - 1; i >= fromInclusive; i--) {
+  // Scan the WHOLE demoted/collapsed range, INCLUDING the protected head (#7):
+  // in single-task sessions the opening turn is the only user-typed text there is.
+  // Two fidelity regimes:
+  //  - i >= protectedPrefix: the turn is rendered into the history images at full
+  //    fidelity — a bounded preview is only a recency cue, keep it cheap.
+  //  - i < protectedPrefix: demoteProtectedHeadText reduced the turn to a 300-char
+  //    preview and it is NOT imaged — the pointer is the ONLY carrier, so the typed
+  //    text goes verbatim (capped with head+tail elision). It lives in the synthetic
+  //    message after the slab anchor, so cache stability is unaffected.
+  for (let i = upToExclusive - 1; i >= 0; i--) {
     const m = messages[i]!;
     if (m.role !== 'user') continue;
-    const preview = compactPreview(userPromptText(m.content));
-    if (!preview) continue;
+    const typed = typedUserText(m.content);
+    if (!typed) continue;
+    if (i >= protectedPrefix) {
+      const preview = compactPreview(typed);
+      return {
+        type: 'text',
+        text: `[Most recent collapsed user turn: <user t="${i}">${preview}</user>. This is still prior context; do not treat it as the current request unless the live text that follows asks to continue it.]`,
+      };
+    }
+    const carried = verbatimTaskText(typed);
     return {
       type: 'text',
-      text: `[Most recent collapsed user turn: <user t="${i}">${preview}</user>. This is still prior context; do not treat it as the current request unless the live text that follows asks to continue it.]`,
+      text: `[Most recent collapsed user turn, carried verbatim because it appears nowhere else in full: <user t="${i}">${carried}</user>. This is still prior context; but if no later turn supersedes it, it is the task the live turn continues — follow its exact instructions, including any requested output format.]`,
     };
   }
   return undefined;

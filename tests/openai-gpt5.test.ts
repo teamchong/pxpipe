@@ -4,7 +4,36 @@
  */
 import { describe, expect, it } from 'vitest';
 import { isPxpipeSupportedGptModel } from '../src/core/applicability.js';
-import { openAIVisionTokens, resolveVisionCost, transformOpenAIChatCompletions, transformOpenAIResponses } from '../src/core/openai.js';
+import {
+  openAIVisionTokens,
+  resolveVisionCost,
+  transformOpenAIChatCompletions,
+  transformOpenAIResponses,
+  CHAT_HEADER,
+  RESPONSES_HEADER,
+  CHAT_POINTER,
+  RESPONSES_POINTER,
+} from '../src/core/openai.js';
+
+describe('rendered-context wording (post tool-doc dedupe)', () => {
+  // The tool description stays in the native JSON, so the imaged docs are the
+  // SCHEMA only — the framing must not claim the image holds "full tool" docs.
+  it('never claims the image holds full tool documentation', () => {
+    for (const s of [CHAT_HEADER, RESPONSES_HEADER, CHAT_POINTER, RESPONSES_POINTER]) {
+      expect(s.toLowerCase()).not.toContain('full tool');
+    }
+  });
+
+  it('keeps native tool definitions authoritative in the framing', () => {
+    for (const s of [CHAT_HEADER, RESPONSES_HEADER, CHAT_POINTER, RESPONSES_POINTER]) {
+      expect(s).toContain('native JSON');
+    }
+    // Headers spell out that native definitions carry name + description.
+    for (const s of [CHAT_HEADER, RESPONSES_HEADER]) {
+      expect(s).toContain('name and description');
+    }
+  });
+});
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();

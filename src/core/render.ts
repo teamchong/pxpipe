@@ -1,8 +1,8 @@
 /**
  * Text → PNG renderer. Blits atlas glyphs into a grayscale framebuffer, then PNG-encodes.
  * Iterates by codepoint so East Asian Wide chars (2-cell advance) and surrogate pairs handled correctly.
- * Pages capped at ~1932×1932 px: Fable/Opus 4.8 >20-image requests are held to ≤2000 px/side
- * (REJECTED if exceeded, not silently downscaled); ≤4784 token limit binds first at 1932 px.
+ * Pages capped at 1568×728 px (1.14 MP): under both Anthropic tiers' limits, so every
+ * page bills at its raw 28-px patch count with no server-side downscale (WYSIWYG).
  */
 
 import {

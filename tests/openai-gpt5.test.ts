@@ -256,6 +256,35 @@ describe('transformOpenAIResponses (gpt-5.6)', () => {
     expect(tools[0]!.parameters?.properties?.x?.description).toBeUndefined();
   });
 
+  it('images developer/system items whose content is an input_text part array, not just a string', async () => {
+    // Responses allows message content as a string OR an array of parts. The
+    // array form for a developer/system item used to be dropped: not imaged and
+    // not stubbed, so the verbose text rode uncompressed as native input.
+    const body = enc.encode(JSON.stringify({
+      model: 'gpt-5.6',
+      input: [
+        { role: 'developer', content: [{ type: 'input_text', text: BIG_INSTRUCTIONS }] },
+        { role: 'user', content: 'Please do the thing.' },
+      ],
+    }));
+
+    const result = await transformOpenAIResponses(body, { charsPerToken: 1, minCompressChars: 1 });
+    expect(result.info.compressed).toBe(true);
+    expect(result.info.imageCount).toBeGreaterThan(0);
+    // The array-form developer text is now counted as static context.
+    expect(result.info.staticChars).toBeGreaterThanOrEqual(BIG_INSTRUCTIONS.length);
+
+    const out = JSON.parse(dec.decode(result.body)) as { input: Array<{ role: string; content: unknown }> };
+    const dev = out.input.find((i) => i.role === 'developer')!;
+    // Array shape preserved, but the big text is gone — replaced by a pointer part.
+    expect(Array.isArray(dev.content)).toBe(true);
+    const devParts = dev.content as Array<{ type: string; text?: string }>;
+    expect(devParts).toHaveLength(1);
+    expect(devParts[0]!.type).toBe('input_text');
+    expect(devParts[0]!.text).toContain('rendered into image');
+    expect(JSON.stringify(dev.content)).not.toContain('These are detailed');
+  });
+
   it('images GPT Responses tool definitions even when there is no instruction context', async () => {
     const body = enc.encode(JSON.stringify({
       model: 'gpt-5.6',

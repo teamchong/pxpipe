@@ -805,7 +805,9 @@ export async function transformOpenAIResponses(
     const r = (item as ResponsesInputItem).role;
     if (r !== 'system' && r !== 'developer') continue;
     const content = (item as ResponsesInputItem).content;
-    const text = typeof content === 'string' ? content : '';
+    // content may be a string OR an array of input_text parts (both are valid
+    // Responses shapes for system/developer items) — read either form.
+    const text = responsesContentText(content);
     if (!text) continue;
     authorityDocs.push(`## ${String(r).toUpperCase()} MESSAGE\n${text}`);
     systemTexts.push(text);
@@ -918,14 +920,19 @@ export async function transformOpenAIResponses(
     req.instructions = RESPONSES_POINTER;
   }
 
-  // Replace system/developer input items with pointer.
+  // Replace system/developer input items with a pointer. Mirror the collection
+  // gate above for BOTH content shapes: a string becomes the pointer string; an
+  // input_text part array keeps its array shape with a single pointer part, so a
+  // request the caller sent as parts is not silently reshaped into a string.
   if (!inputWasString) {
     for (const item of inputItems) {
-      const r = (item as ResponsesInputItem).role;
-      if (r !== 'system' && r !== 'developer') continue;
-      const content = (item as ResponsesInputItem).content;
-      if (typeof content === 'string' && content.length > 0) {
-        (item as ResponsesInputItem).content = RESPONSES_POINTER;
+      const it = item as ResponsesInputItem;
+      if (it.role !== 'system' && it.role !== 'developer') continue;
+      const content = it.content;
+      if (typeof content === 'string') {
+        if (content.length > 0) it.content = RESPONSES_POINTER;
+      } else if (Array.isArray(content) && responsesContentText(content).length > 0) {
+        it.content = [{ type: 'input_text', text: RESPONSES_POINTER }];
       }
     }
   }

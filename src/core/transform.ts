@@ -35,6 +35,7 @@ import {
   renderTextToPngsWithCharLimit,
 } from './render.js';
 import { factSheetText } from './factsheet.js';
+import { extractExactTokens, hasSecret } from './exact-token-extractor.js';
 import { stripSchemaDescriptions, schemaHasStructure } from './schema-strip.js';
 import { bytesToBase64 } from './png.js';
 import { collapseHistory, HISTORY_SYNTHETIC_INTRO } from './history.js';
@@ -121,6 +122,12 @@ export interface TransformOptions {
    *  for every block rendered to images. Off by default (entries inflate `info`;
    *  only a stateful harness can use them). */
   emitRecoverable?: boolean;
+  /** When true, if the static system slab contains a secret-like value, keep the
+   *  WHOLE request as text (skip imaging) rather than render the secret into the slab
+   *  PNG where a capable model could read it back. Off by default; set by the context
+   *  router (PXPIPE_CONTEXT_ROUTER). Only fires on secrets — a slab full of paths/
+   *  versions still images normally, so compression is unaffected in the common case. */
+  guardSlabSecrets?: boolean;
 }
 
 const DEFAULTS: Required<TransformOptions> = {
@@ -146,6 +153,7 @@ const DEFAULTS: Required<TransformOptions> = {
   reflow: true,
   keepSharp: () => false,
   emitRecoverable: false,
+  guardSlabSecrets: false,
   // GPT-only knobs; the Anthropic transform ignores them but Required<> needs them.
   collapseHistory: true,
   gptHistory: {},
@@ -1608,6 +1616,19 @@ export async function transformRequest(
   info.origChars = combinedRaw.length;
   info.compressedChars = 0;
   if (combined) info.systemSha8 = await sha8(combined);
+
+  // Slab secret guard (opt-in): a secret in the static slab would render into the
+  // slab PNG where a capable model can read it back. Only the live-region paths have
+  // keepSharp; the slab has no such check. If a secret is present, keep the WHOLE
+  // request as text (no slab image, and — since history may also carry secrets — no
+  // history collapse either). Fires ONLY on secrets, so an ordinary path/version-rich
+  // tool-doc slab still images normally; compression is untouched in the common case.
+  if (o.guardSlabSecrets && combinedRaw && hasSecret(extractExactTokens(combinedRaw))) {
+    info.reason = 'slab_secret_guard';
+    bumpPassthrough(info, 'kept_sharp');
+    info.keptSharpBlocks = (info.keptSharpBlocks ?? 0) + 1;
+    return { body, info };
+  }
 
   if (combined.length < o.minCompressChars) {
     info.reason = `below_min_chars (${combined.length} < ${o.minCompressChars})`;

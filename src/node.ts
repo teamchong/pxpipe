@@ -8,6 +8,7 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { once } from 'node:events';
+import { makeKeepSharp, contextRouterPolicyFromEnv } from './core/context-router.js';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
@@ -955,6 +956,12 @@ async function main(): Promise<void> {
       // still logging real usage + count_tokens baselines to its own PXPIPE_LOG.
       // (The dashboard kill switch does the same thing at runtime.)
       if (forcePassthrough || !dashboard.getCompressionEnabled()) return { compress: false };
+      // Context risk router (opt-in via PXPIPE_CONTEXT_ROUTER). Supplies a keepSharp
+      // predicate that pins secrets + high-risk/dense blocks to text instead of
+      // silently imaging them (the factsheet already rescues sparse anchors on the
+      // blocks that DO image). Off by default → identical to prior behavior.
+      const routerPolicy = contextRouterPolicyFromEnv();
+      if (routerPolicy) return { keepSharp: makeKeepSharp(routerPolicy), guardSlabSecrets: true };
       // Active path: use DEFAULTS in transform.ts for break-even gating.
       return {};
     },

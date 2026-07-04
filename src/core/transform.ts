@@ -143,7 +143,7 @@ const DEFAULTS: Required<TransformOptions> = {
   historyAmortizationHorizon: 1,
   priorWarmTokens: 0,
   priorWarmImageTokens: 0,
-  // Multi-col off: single-col slab already holds ~50k chars; extra OCR risk not worth it.
+  // Multi-col off: single-col slab already holds ~28k chars/page at the 1568×728 cap; extra OCR risk not worth it.
   multiCol: 1,
   reflow: true,
   keepSharp: () => false,

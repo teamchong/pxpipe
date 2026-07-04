@@ -41,44 +41,83 @@ describe('anthropicVisionProfile — tier by model', () => {
   });
 });
 
-describe('anthropicVisionTokens — documented cost with downscale', () => {
-  it('charges the raw patch count when the image already fits (no clamp)', () => {
-    // pxpipe's full dense page fits on BOTH tiers unchanged.
-    expect(anthropicVisionTokens('claude-fable-5', 1568, 728)).toBe(1456);
-    expect(anthropicVisionTokens('claude-opus-4-5', 1568, 728)).toBe(1456);
-    // 1000×1000 fits both tiers.
-    expect(anthropicVisionTokens('claude-fable-5', 1000, 1000)).toBe(1296);
-    expect(anthropicVisionTokens('claude-opus-4-5', 1000, 1000)).toBe(1296);
-  });
+// Independent translation of Anthropic's documented resize + patch count, used
+// as the oracle for the property test below. Kept separate from the production
+// code so a future edit to one is caught by the other.
+function refVisionTokens(maxEdge: number, maxTok: number, W: number, H: number): number {
+  const pt = (w: number, h: number): number => Math.ceil(w / 28) * Math.ceil(h / 28);
+  const fits = (w: number, h: number): boolean =>
+    Math.ceil(w / 28) * 28 <= maxEdge && Math.ceil(h / 28) * 28 <= maxEdge && pt(w, h) <= maxTok;
+  const resize = (w: number, h: number): [number, number] => {
+    if (fits(w, h)) return [w, h];
+    if (h > w) { const [rh, rw] = resize(h, w); return [rw, rh]; }
+    const a = h / w;
+    let lo = 1, hi = w, best = 1;
+    while (lo <= hi) {
+      const m = (lo + hi) >> 1;
+      if (fits(m, Math.max(1, Math.round(m * a)))) { best = m; lo = m + 1; } else hi = m - 1;
+    }
+    return [best, Math.max(1, Math.round(best * a))];
+  };
+  const [rw, rh] = resize(Math.max(1, Math.floor(W)), Math.max(1, Math.floor(H)));
+  return pt(rw, rh);
+}
 
-  it('leaves a big image unchanged on the high-res tier when it fits 2576/4784', () => {
-    // 1928² (old page): padded 1932 ≤ 2576 and 4761 ≤ 4784 → unchanged.
-    expect(anthropicVisionTokens('claude-fable-5', 1928, 1928)).toBe(4761);
-    // 1568² fits high-res (3136 ≤ 4784, 1568 ≤ 2576).
-    expect(anthropicVisionTokens('claude-fable-5', 1568, 1568)).toBe(3136);
-  });
+const STD = 'claude-opus-4-5'; // standard tier: 1568 / 1568
+const HI = 'claude-fable-5'; // high-res tier: 2576 / 4784
 
-  it('downscales to the token budget on the standard tier', () => {
-    // 1568² standard: 3136 > 1568 budget → shrinks to a 39×39 = 1521-token image.
-    expect(anthropicVisionTokens('claude-opus-4-5', 1568, 1568)).toBe(1521);
-    // 1928² standard: edge-clamp to 1568² then budget-clamp → 1521.
-    expect(anthropicVisionTokens('claude-opus-4-5', 1928, 1928)).toBe(1521);
-  });
-
-  it('caps at the tier budget for very large images', () => {
-    // 3840×2160 high-res: edge-clamps to 2576 long edge, lands exactly on the 4784 cap.
-    expect(anthropicVisionTokens('claude-fable-5', 3840, 2160)).toBe(4784);
-    // Any result must never exceed the tier's visual-token budget.
-    for (const [w, h] of [[8000, 8000], [4000, 500], [500, 4000]] as const) {
-      expect(anthropicVisionTokens('claude-fable-5', w, h)).toBeLessThanOrEqual(4784);
-      expect(anthropicVisionTokens('claude-opus-4-5', w, h)).toBeLessThanOrEqual(1568);
+describe('anthropicVisionTokens — documented cost with resize', () => {
+  it('reproduces Anthropic\'s worked cost table on both tiers', () => {
+    const rows: Array<[string, number, number, number, number]> = [
+      // model, w, h, standard, high-res
+      [STD, 200, 200, 64, 64], [STD, 1000, 1000, 1296, 1296], [STD, 1092, 1092, 1521, 1521],
+      [STD, 1920, 1080, 1560, 2691], [STD, 2000, 1500, 1564, 3888], [STD, 3840, 2160, 1560, 4784],
+    ];
+    for (const [, w, h, std, hi] of rows) {
+      expect(anthropicVisionTokens(STD, w, h), `${w}x${h} standard`).toBe(std);
+      expect(anthropicVisionTokens(HI, w, h), `${w}x${h} high-res`).toBe(hi);
     }
   });
 
-  it('is ~4–5% below the retired w×h/750 approximation for standard-tier pages', () => {
-    // The old gate used ceil(w*h/750). Patch is the exact grid it approximated.
+  it('is exact on extreme aspect ratios (where a continuous scale would drift)', () => {
+    // These caught the old sqrt/decrement approximation (it gave 1008 / 896 / 1504).
+    expect(anthropicVisionTokens(STD, 2510, 7800)).toBe(1064);
+    expect(anthropicVisionTokens(STD, 1194, 4171)).toBe(952);
+    expect(anthropicVisionTokens(STD, 2384, 1625)).toBe(1551);
+  });
+
+  it('charges the raw patch count when the image already fits', () => {
+    // pxpipe's full dense page (1568×728) fits BOTH tiers unchanged.
+    expect(anthropicVisionTokens(HI, 1568, 728)).toBe(1456);
+    expect(anthropicVisionTokens(STD, 1568, 728)).toBe(1456);
+    // High-res leaves 1928² and 1568² unchanged; standard shrinks them to 1521.
+    expect(anthropicVisionTokens(HI, 1928, 1928)).toBe(4761);
+    expect(anthropicVisionTokens(HI, 1568, 1568)).toBe(3136);
+    expect(anthropicVisionTokens(STD, 1568, 1568)).toBe(1521);
+    expect(anthropicVisionTokens(STD, 1928, 1928)).toBe(1521);
+  });
+
+  it('never exceeds the tier visual-token budget', () => {
+    for (const [w, h] of [[8000, 8000], [4000, 500], [500, 4000], [7680, 1080]] as const) {
+      expect(anthropicVisionTokens(HI, w, h)).toBeLessThanOrEqual(4784);
+      expect(anthropicVisionTokens(STD, w, h)).toBeLessThanOrEqual(1568);
+    }
+  });
+
+  it('equals the independent reference across a spread of sizes and aspects', () => {
+    // Deterministic LCG — no Math.random, reproducible.
+    let seed = 0x9e3779b9;
+    const next = (n: number): number => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) % n) + 1;
+    for (let i = 0; i < 400; i++) {
+      const w = next(9000);
+      const h = next(9000);
+      expect(anthropicVisionTokens(STD, w, h), `std ${w}x${h}`).toBe(refVisionTokens(1568, 1568, w, h));
+      expect(anthropicVisionTokens(HI, w, h), `hi ${w}x${h}`).toBe(refVisionTokens(2576, 4784, w, h));
+    }
+  });
+
+  it('is below the retired w×h/750 approximation for the standard-tier page', () => {
     const legacy750 = Math.ceil((1568 * 728) / 750); // 1522
-    expect(anthropicVisionTokens('claude-fable-5', 1568, 728)).toBeLessThan(legacy750);
-    expect(legacy750 - anthropicVisionTokens('claude-fable-5', 1568, 728)).toBeLessThan(legacy750 * 0.06);
+    expect(anthropicVisionTokens(HI, 1568, 728)).toBeLessThan(legacy750);
   });
 });

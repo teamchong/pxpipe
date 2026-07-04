@@ -117,6 +117,31 @@ Policies: `default | coding-agent | research | strict`.
 To disable: unset the env var (or don't pass `keepSharp`). Default proxy behavior
 is unchanged.
 
+## Measured savings (replay)
+
+`npx tsx scripts/context-router-bench.ts` prices a turn three ways using pxpipe's own
+cost model (`evalCompressionProfitability`): ALL-TEXT (no pxpipe), IMAGE-EVERY (no
+router), ROUTER-ON. Two scenarios:
+
+| scenario | IMAGE-EVERY | ROUTER-ON | cost of safety | secret |
+|----------|-------------|-----------|----------------|--------|
+| **Typical turn** (no secret, sparse anchors) | 76.0% | **76.0%** | **0.0pp** | safe both |
+| **Risky turn** (secret in a profitable log + path-dense listing) | 75.4% ⚠ *images the secret* | 39.1% | 36.3pp | IMAGE-EVERY leaks; ROUTER safe |
+
+Takeaways:
+- **Common case is free** — with no secret and no anchor-dense block, the router
+  images exactly what pxpipe would; savings are identical.
+- **The cost shows up only on risky turns**, and it's dominated by the conservative
+  policy of keeping a *whole* block as text when it contains a secret (a 6.5k-token
+  log with one secret line stays fully text). That's the safe default, and the bench
+  makes its price visible.
+- **Biggest savings-recovery lever = redaction.** Masking just the secret *value* and
+  imaging the rest would keep the block safe *and* compressed, recovering most of the
+  36pp. That's the top future-work item (the lane is even named `redact_or_block`; it
+  currently only "blocks" = keeps text). The path-dense `text_only` fallback is a
+  separate, genuine exactness-vs-savings tradeoff (the factsheet caps at 64 tokens, so
+  it can't rescue *every* path on a large listing).
+
 ## Known limitations
 
 1. **Rescue on imaged blocks is pxpipe's factsheet, not this module's strip.** When

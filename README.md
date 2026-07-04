@@ -117,9 +117,9 @@ sparse prose stays text. Events log to `~/.pxpipe/events.jsonl`.
 ## Library use (no proxy)
 
 ```ts
-import { renderTextToPngs, transformAnthropicMessages } from "pxpipe";
+import { renderTextToImages, transformAnthropicMessages } from "pxpipe-proxy";
 
-const imgs = await renderTextToPngs(toolResultText);            // RenderedImage[]
+const { pages } = await renderTextToImages(toolResultText);     // pages[i].png: Uint8Array
 const { body, applied, info } = await transformAnthropicMessages({
   body: requestBytes,
   model: "claude-fable-5",

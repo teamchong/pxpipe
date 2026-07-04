@@ -90,13 +90,25 @@ export function isPxpipeSupportedGptModel(model: string | null | undefined): boo
   return isAllowed(model);
 }
 
+/** Canonical set of Anthropic Messages routes pxpipe transforms. Shared with
+ *  createProxy (src/core/proxy.ts) so the public applicability helper and the
+ *  proxy router can never disagree on which paths are eligible — they did: the
+ *  proxy accepts /anthropic/messages, but the helper's old `endsWith` check
+ *  rejected it (and would have wrongly accepted /foo/v1/messages). Exact matches
+ *  only, so /v1/messages/count_tokens stays unsupported. */
+export function isAnthropicMessagesPath(pathname: string): boolean {
+  return pathname === '/v1/messages'
+    || pathname === '/anthropic/v1/messages'
+    || pathname === '/anthropic/messages';
+}
+
 export function shouldTransformAnthropicMessages(
   input: PxpipeApplicabilityInput,
 ): { eligible: boolean; reason: PxpipeApplicabilityReason } {
   if (input.method !== undefined && input.method !== null && input.method.toUpperCase() !== 'POST') {
     return { eligible: false, reason: 'unsupported_method' };
   }
-  if (input.path !== undefined && input.path !== null && !input.path.endsWith('/v1/messages')) {
+  if (input.path !== undefined && input.path !== null && !isAnthropicMessagesPath(input.path)) {
     return { eligible: false, reason: 'unsupported_path' };
   }
   if (input.bodyBytes !== undefined && input.bodyBytes !== null && input.bodyBytes <= 0) {

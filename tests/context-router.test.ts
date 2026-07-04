@@ -11,11 +11,14 @@ import {
   extractExactTokens,
   hasSecret,
   shannonEntropy,
+  redactSecrets,
+  SECRET_REDACTION,
 } from '../src/core/exact-token-extractor.js';
 import { assessContextRisk } from '../src/core/risk-classifier.js';
 import {
   routeBlock,
   makeKeepSharp,
+  makeRedactingHooks,
   buildRescueStrip,
 } from '../src/core/context-router.js';
 
@@ -144,6 +147,39 @@ describe('router + keepSharp adapter', () => {
     const keepStrict = makeKeepSharp('strict');
     const small = 'the file is src/index.ts';
     expect(keepStrict({ text: small })).toBe(true);
+  });
+
+  it('redactSecrets masks the value in place, preserves the rest, leaks nothing', () => {
+    const secret = 'sk-ant-api03-REDACTsecret1234567890abcdef';
+    const text = `preamble line\nANTHROPIC_API_KEY=${secret}\ntrailing line`;
+    const { redacted, count } = redactSecrets(text);
+    expect(count).toBe(1);
+    expect(redacted).not.toContain(secret);
+    expect(redacted).toContain(SECRET_REDACTION);
+    expect(redacted).toContain('preamble line');
+    expect(redacted).toContain('trailing line');
+  });
+
+  it('redactSecrets is a no-op when there is no secret', () => {
+    const text = 'just a path src/index.ts and a version v1.2.3';
+    const { redacted, count } = redactSecrets(text);
+    expect(count).toBe(0);
+    expect(redacted).toBe(text);
+  });
+
+  it('makeRedactingHooks: secret block redacts (not kept text); prose neither', () => {
+    const { keepSharp, redactBlock } = makeRedactingHooks('coding-agent');
+    const secretText = 'log\n'.repeat(50) + 'TOKEN=abcdEFGH1234secretVALUE6789xyz';
+    // Secret block is NOT pinned as text — it will image with the value masked.
+    expect(keepSharp({ text: secretText })).toBe(false);
+    const masked = redactBlock({ text: secretText });
+    expect(masked).not.toBeNull();
+    expect(masked!).toContain(SECRET_REDACTION);
+    expect(masked!).not.toContain('abcdEFGH1234secretVALUE6789xyz');
+    // Prose: no redaction, and (large) it images.
+    expect(redactBlock({ text: PROSE })).toBeNull();
+    // A non-secret dense/high-risk block still stays text under keepSharp.
+    expect(keepSharp({ text: 'file at src/a.ts' })).toBe(true);
   });
 
   it('rescue strip lists exact tokens and prints no raw secret', () => {

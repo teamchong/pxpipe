@@ -245,3 +245,26 @@ export function extractExactTokens(text: string): ExactToken[] {
 export function hasSecret(tokens: readonly ExactToken[]): boolean {
   return tokens.some((t) => t.kind === 'secret_like');
 }
+
+/** Replacement token written over a secret's span. Fixed + value-free: two different
+ *  secrets redact to the same string, so nothing about the value (not even length or
+ *  prefix) survives into the redacted text. */
+export const SECRET_REDACTION = '[redacted-secret]';
+
+/**
+ * Replace every secret span in `text` with `SECRET_REDACTION`, leaving all other
+ * content untouched. Enables the redaction lane: mask the secret *value* so the block
+ * can still be imaged (savings preserved) without rendering a live secret into pixels.
+ * Splices from the end so earlier spans' offsets stay valid. Deterministic; the raw
+ * secret never appears in the output.
+ */
+export function redactSecrets(text: string): { redacted: string; count: number } {
+  if (typeof text !== 'string' || text.length === 0) return { redacted: text, count: 0 };
+  const secrets = extractExactTokens(text)
+    .filter((t) => t.kind === 'secret_like')
+    .sort((a, b) => b.start - a.start); // end → start so splices don't shift later spans
+  if (secrets.length === 0) return { redacted: text, count: 0 };
+  let out = text;
+  for (const s of secrets) out = out.slice(0, s.start) + SECRET_REDACTION + out.slice(s.end);
+  return { redacted: out, count: secrets.length };
+}

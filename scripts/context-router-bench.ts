@@ -18,6 +18,7 @@
 import { evalCompressionProfitability } from '../src/core/transform.js';
 import { DENSE_CONTENT_COLS } from '../src/core/render.js';
 import { routeBlock } from '../src/core/context-router.js';
+import { redactSecrets } from '../src/core/exact-token-extractor.js';
 
 const CPT = 4; // chars/token for tool_result/reminder text (the live gate's default)
 const COLS = DENSE_CONTENT_COLS;
@@ -58,22 +59,31 @@ const tok = (text: string) => {
 const pct = (from: number, to: number) => `${(((from - to) / from) * 100).toFixed(1)}%`;
 
 function run(label: string, blocks: Block[]): void {
-  let allText = 0, imageEvery = 0, routerOn = 0;
-  let secretImagedEvery = false, secretImagedRouter = false;
+  let allText = 0, imageEvery = 0, routerOn = 0, routerRedact = 0;
+  let secretLeakEvery = false, secretLeakRouter = false, secretLeakRedact = false;
   const rows: string[] = [];
   for (const b of blocks) {
     const t = tok(b.text);
-    const keptText = routeBlock(b.text, 'coding-agent').keepAsText;
-    const decision = routeBlock(b.text, 'coding-agent').assessment.decision;
+    const { keepAsText: keptText, assessment: { decision } } = routeBlock(b.text, 'coding-agent');
     const textCost = Math.round(t.text);
     const imageCost = Number.isFinite(t.image) ? Math.round(t.image) : textCost;
     allText += textCost;
-    const everyCost = t.profitable ? imageCost : textCost;
-    imageEvery += everyCost;
-    if (t.profitable && b.hasSecret) secretImagedEvery = true;
-    const routerCost = keptText ? textCost : (t.profitable ? imageCost : textCost);
-    routerOn += routerCost;
-    if (!keptText && t.profitable && b.hasSecret) secretImagedRouter = true;
+    // IMAGE-EVERY: image whenever profitable (no safety) — leaks a secret if imaged.
+    imageEvery += t.profitable ? imageCost : textCost;
+    if (t.profitable && b.hasSecret) secretLeakEvery = true;
+    // ROUTER-ON (keep-text): secrets/dense stay text.
+    routerOn += keptText ? textCost : (t.profitable ? imageCost : textCost);
+    if (!keptText && t.profitable && b.hasSecret) secretLeakRouter = true;
+    // ROUTER+REDACT: non-secret text_only stays text; a secret block images with the
+    // value MASKED (priced on the redacted text); other lanes image as usual.
+    let redactCost: number;
+    if (decision === 'text_only') redactCost = textCost;
+    else if (decision === 'redact_or_block') {
+      const rt = tok(redactSecrets(b.text).redacted);
+      redactCost = rt.profitable ? Math.round(rt.image) : Math.round(rt.text);
+      // imaged but masked → no leak.
+    } else redactCost = t.profitable ? imageCost : textCost;
+    routerRedact += redactCost;
     rows.push(
       `  ${b.name.padEnd(28)} text=${String(textCost).padStart(6)} img=${String(imageCost).padStart(6)}` +
       `  every:${(t.profitable ? 'IMG' : 'txt').padEnd(3)} router:${decision}`,
@@ -81,10 +91,10 @@ function run(label: string, blocks: Block[]): void {
   }
   console.log(`\n=== ${label} ===`);
   console.log(rows.join('\n'));
-  console.log(`  ALL-TEXT      ${String(allText).padStart(7)}`);
-  console.log(`  IMAGE-EVERY   ${String(imageEvery).padStart(7)}  saves ${pct(allText, imageEvery)}  secret imaged: ${secretImagedEvery ? 'YES ⚠ UNSAFE' : 'no'}`);
-  console.log(`  ROUTER-ON     ${String(routerOn).padStart(7)}  saves ${pct(allText, routerOn)}  secret imaged: ${secretImagedRouter ? 'YES ⚠' : 'no ✓'}`);
-  console.log(`  cost of safety: ${(((routerOn - imageEvery) / allText) * 100).toFixed(1)}pp of baseline`);
+  console.log(`  ALL-TEXT        ${String(allText).padStart(7)}`);
+  console.log(`  IMAGE-EVERY     ${String(imageEvery).padStart(7)}  saves ${pct(allText, imageEvery)}  secret leaked: ${secretLeakEvery ? 'YES ⚠ UNSAFE' : 'no'}`);
+  console.log(`  ROUTER-ON       ${String(routerOn).padStart(7)}  saves ${pct(allText, routerOn)}  secret leaked: ${secretLeakRouter ? 'YES ⚠' : 'no ✓'}`);
+  console.log(`  ROUTER+REDACT   ${String(routerRedact).padStart(7)}  saves ${pct(allText, routerRedact)}  secret leaked: ${secretLeakRedact ? 'YES ⚠' : 'no ✓'}`);
 }
 
 run('Scenario A — RISKY turn (secret + path-dense; worst case)', RISKY);

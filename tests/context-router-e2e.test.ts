@@ -9,7 +9,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { transformRequest } from '../src/core/transform.js';
-import { makeKeepSharp, contextRouterPolicyFromEnv } from '../src/core/context-router.js';
+import { makeKeepSharp, makeRedactingHooks, contextRouterPolicyFromEnv } from '../src/core/context-router.js';
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -97,6 +97,33 @@ describe('context router e2e via keepSharp', () => {
 function makeReqWithSystem(system: string, content: unknown[], model = 'claude-fable-5') {
   return enc.encode(JSON.stringify({ model, system, messages: [{ role: 'user', content }] }));
 }
+
+describe('redaction lane e2e', () => {
+  it('images the secret block with the value masked (savings recovered, not kept text)', async () => {
+    const { body, info } = await transformRequest(
+      makeReq([{ type: 'tool_result', tool_use_id: 'toolu_r', content: SECRET_PAYLOAD }]),
+      { multiCol: 1, charsPerToken: 2, emitRecoverable: true, ...makeRedactingHooks('coding-agent') },
+    );
+    // Imaged (savings recovered) instead of pinned fully to text.
+    expect(info.toolResultImgs ?? 0).toBeGreaterThan(0);
+    expect(info.keptSharpBlocks ?? 0).toBe(0);
+    // No raw secret anywhere in the outgoing body.
+    expect(bodyText(body)).not.toContain(SECRET);
+    // The rendered text (recorded via emitRecoverable) is the REDACTED form —
+    // proves the secret was masked BEFORE it reached the renderer/pixels.
+    const rec = info.recoverable?.find((r) => r.kind === 'tool_result');
+    expect(rec?.text).toContain('[redacted-secret]');
+    expect(rec?.text).not.toContain(SECRET);
+  });
+
+  it('safe block is unaffected by redaction hooks (still images normally)', async () => {
+    const { info } = await transformRequest(
+      makeReq([{ type: 'tool_result', tool_use_id: 'toolu_ok', content: SAFE_PAYLOAD }]),
+      { multiCol: 1, charsPerToken: 2, ...makeRedactingHooks('coding-agent') },
+    );
+    expect(info.toolResultImgs ?? 0).toBeGreaterThan(0);
+  });
+});
 
 describe('slab secret guard', () => {
   // A large static slab (images by default) that hides a secret in it.

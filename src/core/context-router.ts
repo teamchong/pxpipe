@@ -23,6 +23,7 @@ import {
   type ClassifierOptions,
   type ContextRiskAssessment,
 } from './risk-classifier.js';
+import { redactSecrets } from './exact-token-extractor.js';
 
 export type ContextPolicy = 'default' | 'coding-agent' | 'research' | 'strict';
 
@@ -61,9 +62,23 @@ export function contextRouterPolicyFromEnv(): ContextPolicy | null {
   const v = raw.trim().toLowerCase();
   if (v === '' || /^(0|false|no|off|none)$/.test(v)) return null;
   if (v === 'on' || v === 'true' || v === '1') return 'coding-agent';
+  if (v === 'redact') return 'coding-agent'; // redaction mode → coding-agent policy
   if (v === 'strict' || v === 'research' || v === 'default') return v;
   if (v === 'coding-agent' || v === 'coding_agent') return 'coding-agent';
   return 'coding-agent';
+}
+
+/**
+ * True when `PXPIPE_CONTEXT_ROUTER=redact` — the operator has opted into the
+ * redaction lane (mask the secret value in place and image the rest, recovering the
+ * savings a secret-bearing block would otherwise lose). Opt-in because redaction
+ * MUTATES content: a secret false-positive replaces that token with `[redacted-secret]`
+ * rather than merely keeping it as text, so it's a knowing trade of a rare localized
+ * content loss for compression. Default (`=on`) stays keep-text.
+ */
+export function contextRouterRedactFromEnv(): boolean {
+  const raw = typeof process !== 'undefined' ? process.env?.PXPIPE_CONTEXT_ROUTER : undefined;
+  return typeof raw === 'string' && raw.trim().toLowerCase() === 'redact';
 }
 
 /** Route a single block's text under a policy. */
@@ -93,6 +108,39 @@ export function makeKeepSharp(
   return (block) => {
     if (!block || typeof block.text !== 'string') return false;
     return routeBlock(block.text, policy).keepAsText;
+  };
+}
+
+/**
+ * Redaction hooks — the savings-recovering alternative to keeping a whole
+ * secret-bearing block as text. Returns a `{ keepSharp, redactBlock }` pair:
+ *
+ * - `keepSharp` keeps only NON-secret `text_only` blocks (dense/high-risk) as text.
+ *   Secret blocks return `false` here so they proceed to the image path...
+ * - `redactBlock` masks the secret VALUE in those blocks (→ `[redacted-secret]`) so
+ *   pxpipe images the masked text: safe (no secret in pixels) AND compressed.
+ *
+ * A block with a secret that is ALSO dense stays text (keepSharp true via text_only?
+ * no — secret forces redact_or_block, so keepSharp is false and redactBlock masks it,
+ * then the normal gate decides image-vs-not on the masked text). Net: secrets never
+ * image un-masked and never force a large block fully to text.
+ */
+export function makeRedactingHooks(policy: ContextPolicy = 'default'): {
+  keepSharp: (block: { text: string }) => boolean;
+  redactBlock: (block: { text: string }) => string | null;
+} {
+  return {
+    keepSharp: (block) => {
+      if (!block || typeof block.text !== 'string') return false;
+      // Only non-secret text_only stays text; secrets fall through to redactBlock.
+      return routeBlock(block.text, policy).assessment.decision === 'text_only';
+    },
+    redactBlock: (block) => {
+      if (!block || typeof block.text !== 'string') return null;
+      if (routeBlock(block.text, policy).assessment.decision !== 'redact_or_block') return null;
+      const { redacted, count } = redactSecrets(block.text);
+      return count > 0 ? redacted : null;
+    },
   };
 }
 

@@ -118,6 +118,13 @@ export interface TransformOptions {
    *  consulted on per-block live-region paths (reminders, tool_results). A throwing
    *  or non-boolean return is treated as `false`. */
   keepSharp?: (block: KeepSharpBlock) => boolean;
+  /** Redaction companion to `keepSharp`: return a rewritten string to render IN PLACE
+   *  OF the block's text (e.g. a secret value masked to `[redacted-secret]`), or
+   *  null/undefined to leave it unchanged. Consulted only when `keepSharp` did NOT pin
+   *  the block as text. The returned text is what gets gated, imaged, fact-sheeted, and
+   *  recorded as recoverable — so the original secret never reaches the image or a
+   *  restore. A throw or non-string return is treated as null (image original). */
+  redactBlock?: (block: KeepSharpBlock) => string | null;
   /** When true, populate `TransformInfo.recoverable` with original text + provenance
    *  for every block rendered to images. Off by default (entries inflate `info`;
    *  only a stateful harness can use them). */
@@ -152,6 +159,7 @@ const DEFAULTS: Required<TransformOptions> = {
   multiCol: 1,
   reflow: true,
   keepSharp: () => false,
+  redactBlock: () => null,
   emitRecoverable: false,
   guardSlabSecrets: false,
   // GPT-only knobs; the Anthropic transform ignores them but Required<> needs them.
@@ -453,6 +461,21 @@ function callerKeepsSharp(
     return fn(block) === true;
   } catch {
     return false;
+  }
+}
+
+/** Invoke `redactBlock` defensively; returns the rewritten string, or null on throw /
+ *  non-string / no-op. Callers use `redactBlock(...) ?? original` to feed the renderer. */
+function callerRedact(
+  fn: ((block: KeepSharpBlock) => string | null) | undefined,
+  block: KeepSharpBlock,
+): string | null {
+  if (typeof fn !== 'function') return null;
+  try {
+    const r = fn(block);
+    return typeof r === 'string' ? r : null;
+  } catch {
+    return null;
   }
 }
 
@@ -1825,7 +1848,12 @@ export async function transformRequest(
           // width, so stripped trailing whitespace + collapsed blank-line
           // runs reduce real renderer cost without changing what the
           // model reads.
-          const reminderRaw = (blk as TextBlock).text;
+          // Redaction lane: mask secret values in-place so the block can still image
+          // (savings preserved) without rendering the secret into the PNG. keepSharp
+          // above already saw the original, so its decision is unaffected.
+          const reminderRaw =
+            callerRedact(o.redactBlock, { kind: 'reminder', text: (blk as TextBlock).text }) ??
+            (blk as TextBlock).text;
           const reminderText = maybeReflow(compactSlabWhitespace(reminderRaw), o.reflow);
           if (!isCompressionProfitable(reminderText, denseGeo.cols, undefined, numCols, o.charsPerToken, 0, 0, true, denseGeo.maxChars)) {
             bumpPassthrough(info, 'not_profitable');
@@ -1899,7 +1927,11 @@ export async function transformRequest(
                 rewritten.push(blk);
                 continue;
               }
-              const inner = compactSlabWhitespace(innerRaw);
+              // Redaction lane: mask secrets after keepSharp saw the original, so the
+              // block can still image without the secret reaching the PNG.
+              const innerSrc =
+                callerRedact(o.redactBlock, { kind: 'tool_result', text: innerRaw, toolUseId: tr.tool_use_id }) ?? innerRaw;
+              const inner = compactSlabWhitespace(innerSrc);
               // classifyContent sees pre-reflow `inner` so shape bucketing reflects real structure.
               const innerR = maybeReflow(inner, o.reflow);
               if (innerR.length < o.minToolResultChars) {
@@ -1926,7 +1958,7 @@ export async function transformRequest(
                 await recordRecoverable(info, o.emitRecoverable, {
                   kind: 'tool_result',
                   toolUseId: tr.tool_use_id,
-                  text: innerRaw,
+                  text: innerSrc, // redacted — never restore a raw secret
                   imageCount: imgs.length,
                 });
                 info.compressedChars += innerRaw.length; // original length = what text billing would be
@@ -1934,7 +1966,7 @@ export async function transformRequest(
                 for (const [cp, n] of dcp) {
                   droppedCodepoints.set(cp, (droppedCodepoints.get(cp) ?? 0) + n);
                 }
-                const trFactSheet = factSheetText(innerRaw);
+                const trFactSheet = factSheetText(innerSrc);
                 rewritten.push({
                   ...tr,
                   content: trFactSheet ? [...imgs, { type: 'text' as const, text: trFactSheet }] : imgs,
@@ -1962,8 +1994,11 @@ export async function transformRequest(
                   newInner.push(ib as TextBlock | ImageBlock);
                   continue;
                 }
+                // Redaction lane: mask secrets after keepSharp saw the original.
+                const innerTextSrc =
+                  callerRedact(o.redactBlock, { kind: 'tool_result_part', text: innerTextRaw, toolUseId: tr.tool_use_id }) ?? innerTextRaw;
                 // Lossless whitespace compaction before gate + render.
-                const innerText = compactSlabWhitespace(innerTextRaw);
+                const innerText = compactSlabWhitespace(innerTextSrc);
                 // R3: gate/page/render on reflowed text; classify pre-reflow.
                 const innerTextR = maybeReflow(innerText, o.reflow);
                 if (innerTextR.length < o.minToolResultChars) {
@@ -1995,7 +2030,7 @@ export async function transformRequest(
                   newInner.push(out as ImageBlock);
                   info.imageBytes += approxBlockBytes(img);
                 }
-                const partFactSheet = factSheetText(innerTextRaw);
+                const partFactSheet = factSheetText(innerTextSrc);
                 if (partFactSheet) newInner.push({ type: 'text', text: partFactSheet });
                 info.imagePixels = (info.imagePixels ?? 0) + pixels;
                 info.toolResultImgs = (info.toolResultImgs ?? 0) + imgs.length;
@@ -2003,7 +2038,7 @@ export async function transformRequest(
                 await recordRecoverable(info, o.emitRecoverable, {
                   kind: 'tool_result_part',
                   toolUseId: tr.tool_use_id,
-                  text: innerTextRaw,
+                  text: innerTextSrc, // redacted — never restore a raw secret
                   imageCount: imgs.length,
                 });
                 info.compressedChars += innerTextRaw.length;

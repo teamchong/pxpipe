@@ -87,7 +87,8 @@ shows a 0.977-coverage block correctly falling back to `text_only`.)
 **Live proxy (wired):** set the env var. Off/unset = unchanged behavior.
 
 ```
-PXPIPE_CONTEXT_ROUTER=on        # → coding-agent policy
+PXPIPE_CONTEXT_ROUTER=on        # → coding-agent policy (secrets kept as text)
+PXPIPE_CONTEXT_ROUTER=redact    # coding-agent + redaction lane (mask secret, image rest)
 PXPIPE_CONTEXT_ROUTER=strict    # any anchor stays text
 PXPIPE_CONTEXT_ROUTER=research  # prose-heavy, images more
 PXPIPE_CONTEXT_ROUTER=off       # (default) no change
@@ -119,28 +120,26 @@ is unchanged.
 
 ## Measured savings (replay)
 
-`npx tsx scripts/context-router-bench.ts` prices a turn three ways using pxpipe's own
-cost model (`evalCompressionProfitability`): ALL-TEXT (no pxpipe), IMAGE-EVERY (no
-router), ROUTER-ON. Two scenarios:
+`npx tsx scripts/context-router-bench.ts` prices a turn using pxpipe's own cost model
+(`evalCompressionProfitability`): ALL-TEXT (no pxpipe), IMAGE-EVERY (no router),
+ROUTER-ON (keep-text), ROUTER+REDACT (`=redact`). Two scenarios (savings vs ALL-TEXT):
 
-| scenario | IMAGE-EVERY | ROUTER-ON | cost of safety | secret |
-|----------|-------------|-----------|----------------|--------|
-| **Typical turn** (no secret, sparse anchors) | 76.0% | **76.0%** | **0.0pp** | safe both |
-| **Risky turn** (secret in a profitable log + path-dense listing) | 75.4% ⚠ *images the secret* | 39.1% | 36.3pp | IMAGE-EVERY leaks; ROUTER safe |
+| scenario | IMAGE-EVERY | ROUTER-ON | ROUTER+REDACT | secret |
+|----------|-------------|-----------|---------------|--------|
+| **Typical turn** (no secret, sparse anchors) | 76.0% | 76.0% | **76.0%** | safe all |
+| **Risky turn** (secret in a profitable log + path-dense listing) | 75.4% ⚠ *leaks secret* | 39.1% | **63.4%** | ROUTER/REDACT safe |
 
 Takeaways:
-- **Common case is free** — with no secret and no anchor-dense block, the router
-  images exactly what pxpipe would; savings are identical.
-- **The cost shows up only on risky turns**, and it's dominated by the conservative
-  policy of keeping a *whole* block as text when it contains a secret (a 6.5k-token
-  log with one secret line stays fully text). That's the safe default, and the bench
-  makes its price visible.
-- **Biggest savings-recovery lever = redaction.** Masking just the secret *value* and
-  imaging the rest would keep the block safe *and* compressed, recovering most of the
-  36pp. That's the top future-work item (the lane is even named `redact_or_block`; it
-  currently only "blocks" = keeps text). The path-dense `text_only` fallback is a
-  separate, genuine exactness-vs-savings tradeoff (the factsheet caps at 64 tokens, so
-  it can't rescue *every* path on a large listing).
+- **Common case is free** — no secret, no anchor-dense block → the router images
+  exactly what pxpipe would; savings identical across all modes.
+- **Keep-text (`=on`) is safe but costs on risky turns** — keeping a *whole* block as
+  text when it holds a secret (a 6.5k-token log with one secret line stays fully text)
+  is the conservative default; the bench makes its price visible (39% vs an unsafe 75%).
+- **Redaction (`=redact`) recovers most of it** — masking just the secret *value* and
+  imaging the rest keeps the block safe *and* compressed: **63.4% vs 39.1%** on the
+  risky turn, still zero secret leak. The residual gap vs IMAGE-EVERY is the path-dense
+  listing kept as `text_only` — a genuine exactness-vs-savings tradeoff (the factsheet
+  caps at 64 tokens, so it can't rescue *every* path on a large listing).
 
 ## Known limitations
 
@@ -152,46 +151,47 @@ Takeaways:
    keep secret blocks out of the image path entirely. `buildRescueStrip` /
    `routeBlock().rescueStrip` remain available for callers that walk the request
    themselves and want the classifier's own strip instead.
-2. **Only the 3 live-region sites are guarded.** `keepSharp` fires on reminders and
-   tool_results — where tool output (the likely secret carrier: a printed env, a
-   leaked token in a log) flows. The static system slab + tool-doc path has no
-   keepSharp check, so a secret embedded in a system prompt or tool description would
-   still image. Rare, but real; guarding the slab is future work.
+2. **Redaction mutates content (opt-in for that reason).** Under `=redact`, a secret
+   span is replaced with `[redacted-secret]` before imaging. A secret *false positive*
+   (e.g. the entropy heuristic flagging a high-entropy non-secret) therefore destroys
+   that token rather than merely keeping it as text. The loss is localized to the one
+   flagged span (the rest of the block images fine), and the threshold is conservative,
+   but this is why redaction is opt-in and `=on` (keep-text) is the default.
 3. **Regex extraction is heuristic.** Unix path detection is greedy; `line_number`
    (`42:13`) can collide with times/ratios; `hash` requires ≥1 `a–f` letter so a
    7-digit decimal isn't mistaken for a short hash (a hex-looking decimal still
    could be). Conservative-false-positive by policy: over-flagging keeps content as
    text, which is safe.
-3. **`unknown_identifier` is not emitted.** A deterministic regex can't separate a
+4. **`unknown_identifier` is not emitted.** A deterministic regex can't separate a
    must-stay-exact identifier from a prose noun. Left as future work.
-4. **No cost measurement yet.** The router decides by heuristic density, not by
-   actually pricing image-vs-text-plus-rescue per block. pxpipe already has
-   `isCompressionProfitable()` / `evalCompressionProfitability()`; a real
-   integration should feed the rescue-strip size into that gate.
-5. **Not production-safe.** Prototype. No claim of completeness on secret formats.
+5. **Density gate is heuristic, not priced.** The `text_only` fallback uses an
+   anchor-coverage threshold, not a per-block image-vs-text-plus-rescue price. Feeding
+   factsheet size into `evalCompressionProfitability` would make it measured.
+6. **Slab redaction not implemented.** `guardSlabSecrets` keeps the *whole* request as
+   text when the system slab holds a secret (safe, rare); it does not yet redact the
+   slab in place the way the 3 live-region sites do.
+7. **Not production-safe.** Prototype. No claim of completeness on secret formats.
 
 ## What's wired vs. what's next
 
-**Wired (this change):** `PXPIPE_CONTEXT_ROUTER` → `node.ts` injects
-`keepSharp: makeKeepSharp(policy)` per request. Secret + high-risk/dense blocks stay
-text; safe blocks image as before (with the factsheet rescue). Off by default; the
-e2e test proves the secret gap and the fix.
+**Wired (`PXPIPE_CONTEXT_ROUTER`, off by default):**
+- `=on` / policy names → `keepSharp: makeKeepSharp(policy)`: secrets + high-risk/dense
+  blocks stay text; safe blocks image (with the factsheet rescue).
+- `=redact` → `makeRedactingHooks(policy)`: secret *values* masked in place and the
+  block imaged — safe **and** compressed (63.4% vs 39.1% keep-text on the risky turn).
+- `guardSlabSecrets: true` (both modes) → a secret in the static system slab keeps the
+  whole request as text (the slab has no `keepSharp`/`redactBlock` check).
+- Redaction wired at all 3 live-region sites (reminder / tool_result / tool_result_part)
+  via the new `TransformOptions.redactBlock` hook; the redacted text is what gets
+  gated, imaged, fact-sheeted, and recorded as recoverable.
 
 **Next:**
-1. Guard the static slab / tool-doc path (no `keepSharp` there today) so a secret in
-   a system prompt can't image.
-2. Feed rescue-strip / factsheet size into `evalCompressionProfitability` for a
-   *measured* density gate instead of the heuristic coverage threshold.
-3. Before/after token-count replay on real production traces (from `events.jsonl`)
-   to quantify the savings delta from pinning secret/dense blocks to text — expected
-   small, since those blocks were marginal to image anyway.
-4. Then PR upstream with the replay numbers.
+1. Redact the slab in place (instead of whole-request-to-text) to recover slab savings.
+2. Feed factsheet size into `evalCompressionProfitability` for a *measured* density gate.
+3. Replay on real production traces (`events.jsonl`) beyond the synthetic bench.
 
 ## Future work
 
-- Feed rescue-strip size into `evalCompressionProfitability` for a measured (not
-  heuristic) density gate.
-- A/B replay: full-text vs image-only vs image+rescue token counts on real traces.
 - Per-model policy matrix keyed on measured visual exactness (FINDINGS.md data).
 - Context ledger: per-block routing decision + preserved-token count into
   `~/.pxpipe/events.jsonl`.

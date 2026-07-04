@@ -8,7 +8,7 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { once } from 'node:events';
-import { makeKeepSharp, contextRouterPolicyFromEnv } from './core/context-router.js';
+import { makeKeepSharp, makeRedactingHooks, contextRouterPolicyFromEnv, contextRouterRedactFromEnv } from './core/context-router.js';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
@@ -961,7 +961,15 @@ async function main(): Promise<void> {
       // silently imaging them (the factsheet already rescues sparse anchors on the
       // blocks that DO image). Off by default → identical to prior behavior.
       const routerPolicy = contextRouterPolicyFromEnv();
-      if (routerPolicy) return { keepSharp: makeKeepSharp(routerPolicy), guardSlabSecrets: true };
+      if (routerPolicy) {
+        // =redact: mask secret values in place and image the rest (recovers savings).
+        // Otherwise keep secrets/high-risk blocks fully as text.
+        if (contextRouterRedactFromEnv()) {
+          const { keepSharp, redactBlock } = makeRedactingHooks(routerPolicy);
+          return { keepSharp, redactBlock, guardSlabSecrets: true };
+        }
+        return { keepSharp: makeKeepSharp(routerPolicy), guardSlabSecrets: true };
+      }
       // Active path: use DEFAULTS in transform.ts for break-even gating.
       return {};
     },

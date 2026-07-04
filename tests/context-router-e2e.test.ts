@@ -154,6 +154,17 @@ describe('slab secret guard', () => {
     expect(bodyText(body)).toContain(SLAB_SECRET); // preserved verbatim, never imaged
   });
 
+  it('REDACT: with redactSlab, the slab images with the secret masked (savings kept)', async () => {
+    const { body, info } = await transformRequest(
+      makeReqWithSystem(SECRET_SLAB, trivial),
+      { charsPerToken: 2, guardSlabSecrets: true, redactSlab: true },
+    );
+    expect(info.compressed).toBe(true); // slab imaged, not kept fully as text
+    expect(info.slabSecretsRedacted ?? 0).toBeGreaterThan(0);
+    expect(info.reason).not.toBe('slab_secret_guard');
+    expect(bodyText(body)).not.toContain(SLAB_SECRET); // masked before render
+  });
+
   it('NO FALSE TRIGGER: a path/version-rich slab with no secret still images', async () => {
     const { info } = await transformRequest(
       makeReqWithSystem(SAFE_SLAB, trivial),

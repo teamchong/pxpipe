@@ -167,28 +167,27 @@ Takeaways:
 5. **Density gate is heuristic, not priced.** The `text_only` fallback uses an
    anchor-coverage threshold, not a per-block image-vs-text-plus-rescue price. Feeding
    factsheet size into `evalCompressionProfitability` would make it measured.
-6. **Slab redaction not implemented.** `guardSlabSecrets` keeps the *whole* request as
-   text when the system slab holds a secret (safe, rare); it does not yet redact the
-   slab in place the way the 3 live-region sites do.
-7. **Not production-safe.** Prototype. No claim of completeness on secret formats.
+6. **Not production-safe.** Prototype. No claim of completeness on secret formats.
 
 ## What's wired vs. what's next
 
 **Wired (`PXPIPE_CONTEXT_ROUTER`, off by default):**
 - `=on` / policy names → `keepSharp: makeKeepSharp(policy)`: secrets + high-risk/dense
   blocks stay text; safe blocks image (with the factsheet rescue).
-- `=redact` → `makeRedactingHooks(policy)`: secret *values* masked in place and the
-  block imaged — safe **and** compressed (63.4% vs 39.1% keep-text on the risky turn).
-- `guardSlabSecrets: true` (both modes) → a secret in the static system slab keeps the
-  whole request as text (the slab has no `keepSharp`/`redactBlock` check).
+- `=redact` → `makeRedactingHooks(policy)` + `redactSlab: true`: secret *values* masked
+  in place and the block imaged — safe **and** compressed (63.4% vs 39.1% keep-text on
+  the risky turn).
+- `guardSlabSecrets: true` (both modes) → a secret in the static system slab is handled:
+  under `=redact` (`redactSlab`) the slab is masked in place and still images
+  (`info.slabSecretsRedacted` counts the masks); otherwise the whole request is kept as
+  text. The slab has no `keepSharp`/`redactBlock` walk, so this is its dedicated guard.
 - Redaction wired at all 3 live-region sites (reminder / tool_result / tool_result_part)
   via the new `TransformOptions.redactBlock` hook; the redacted text is what gets
   gated, imaged, fact-sheeted, and recorded as recoverable.
 
 **Next:**
-1. Redact the slab in place (instead of whole-request-to-text) to recover slab savings.
-2. Feed factsheet size into `evalCompressionProfitability` for a *measured* density gate.
-3. Replay on real production traces (`events.jsonl`) beyond the synthetic bench.
+1. Feed factsheet size into `evalCompressionProfitability` for a *measured* density gate.
+2. Replay on real production traces (`events.jsonl`) beyond the synthetic bench.
 
 ## Future work
 

@@ -966,7 +966,7 @@ async function main(): Promise<void> {
         // Otherwise keep secrets/high-risk blocks fully as text.
         if (contextRouterRedactFromEnv()) {
           const { keepSharp, redactBlock } = makeRedactingHooks(routerPolicy);
-          return { keepSharp, redactBlock, guardSlabSecrets: true };
+          return { keepSharp, redactBlock, guardSlabSecrets: true, redactSlab: true };
         }
         return { keepSharp: makeKeepSharp(routerPolicy), guardSlabSecrets: true };
       }

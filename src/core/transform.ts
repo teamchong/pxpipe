@@ -35,7 +35,7 @@ import {
   renderTextToPngsWithCharLimit,
 } from './render.js';
 import { factSheetText } from './factsheet.js';
-import { extractExactTokens, hasSecret } from './exact-token-extractor.js';
+import { extractExactTokens, hasSecret, redactSecrets } from './exact-token-extractor.js';
 import { stripSchemaDescriptions, schemaHasStructure } from './schema-strip.js';
 import { bytesToBase64 } from './png.js';
 import { collapseHistory, HISTORY_SYNTHETIC_INTRO } from './history.js';
@@ -135,6 +135,10 @@ export interface TransformOptions {
    *  router (PXPIPE_CONTEXT_ROUTER). Only fires on secrets — a slab full of paths/
    *  versions still images normally, so compression is unaffected in the common case. */
   guardSlabSecrets?: boolean;
+  /** With `guardSlabSecrets`, redact the secret value in the slab IN PLACE and image the
+   *  redacted slab (keeps the slab savings) instead of keeping the whole request as text.
+   *  Off by default; set by the router's redaction mode (PXPIPE_CONTEXT_ROUTER=redact). */
+  redactSlab?: boolean;
 }
 
 const DEFAULTS: Required<TransformOptions> = {
@@ -162,6 +166,7 @@ const DEFAULTS: Required<TransformOptions> = {
   redactBlock: () => null,
   emitRecoverable: false,
   guardSlabSecrets: false,
+  redactSlab: false,
   // GPT-only knobs; the Anthropic transform ignores them but Required<> needs them.
   collapseHistory: true,
   gptHistory: {},
@@ -600,6 +605,8 @@ export interface TransformInfo {
   historyTextChars?: number;
   /** Blocks pinned as text by the caller's `keepSharp` predicate this request. */
   keptSharpBlocks?: number;
+  /** Secret spans masked in the static slab this request (redactSlab mode). */
+  slabSecretsRedacted?: number;
   /** Imaged live-region blocks with original text + provenance, when `emitRecoverable`. */
   recoverable?: RecoverableBlock[];
   truncatedToolResults?: number;
@@ -1630,28 +1637,38 @@ export async function transformRequest(
       toolDocsText +
       '\n=== END TOOL REFERENCE ==='
     : '';
-  const combinedRaw = [staticText, toolReferenceText]
+  let combinedRaw = [staticText, toolReferenceText]
     .filter((s) => s.length > 0)
     .join('\n\n');
+
+  // Slab secret handling (opt-in via guardSlabSecrets). The slab has no keepSharp
+  // check, so a secret in it would render into the slab PNG where a capable model can
+  // read it back. When a secret is present:
+  //   - redaction mode (redactSlab): mask the secret value in place; the redacted slab
+  //     still images normally, so the slab savings are kept.
+  //   - keep-text mode: return the WHOLE request as text (no slab image, and — since
+  //     history may also carry secrets — no history collapse).
+  // Fires ONLY on secrets, so an ordinary path/version-rich tool-doc slab is untouched.
+  if (o.guardSlabSecrets && combinedRaw && hasSecret(extractExactTokens(combinedRaw))) {
+    if (o.redactSlab) {
+      const r = redactSecrets(combinedRaw);
+      combinedRaw = r.redacted;
+      info.slabSecretsRedacted = r.count;
+    } else {
+      info.origChars = combinedRaw.length;
+      info.reason = 'slab_secret_guard';
+      bumpPassthrough(info, 'kept_sharp');
+      info.keptSharpBlocks = (info.keptSharpBlocks ?? 0) + 1;
+      return { body, info };
+    }
+  }
+
   // Compact then reflow before the gate; gate/renderer/paging all see the same text.
   // origChars anchored to raw length — that's what Anthropic would have billed.
   const combined = maybeReflow(compactSlabWhitespace(combinedRaw), o.reflow);
   info.origChars = combinedRaw.length;
   info.compressedChars = 0;
   if (combined) info.systemSha8 = await sha8(combined);
-
-  // Slab secret guard (opt-in): a secret in the static slab would render into the
-  // slab PNG where a capable model can read it back. Only the live-region paths have
-  // keepSharp; the slab has no such check. If a secret is present, keep the WHOLE
-  // request as text (no slab image, and — since history may also carry secrets — no
-  // history collapse either). Fires ONLY on secrets, so an ordinary path/version-rich
-  // tool-doc slab still images normally; compression is untouched in the common case.
-  if (o.guardSlabSecrets && combinedRaw && hasSecret(extractExactTokens(combinedRaw))) {
-    info.reason = 'slab_secret_guard';
-    bumpPassthrough(info, 'kept_sharp');
-    info.keptSharpBlocks = (info.keptSharpBlocks ?? 0) + 1;
-    return { body, info };
-  }
 
   if (combined.length < o.minCompressChars) {
     info.reason = `below_min_chars (${combined.length} < ${o.minCompressChars})`;

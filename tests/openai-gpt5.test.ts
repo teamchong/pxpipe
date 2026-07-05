@@ -332,6 +332,35 @@ describe('transformOpenAIResponses (gpt-5.6)', () => {
     expect(tools[0]!.parameters?.properties?.x?.description).toBeUndefined();
   });
 
+   it('images developer/system items whose content is an input_text part array, not just a string', async () => {
+    // Responses allows message content as a string OR an array of parts. The
+    // array form for a developer/system item used to be dropped: not imaged and
+    // not stubbed, so the verbose text rode uncompressed as native input.
+    const body = enc.encode(JSON.stringify({
+      model: 'gpt-5.6',
+      input: [
+        { role: 'developer', content: [{ type: 'input_text', text: BIG_INSTRUCTIONS }] },
+        { role: 'user', content: 'Please do the thing.' },
+      ],
+    }));
+
+    const result = await transformOpenAIResponses(body, { charsPerToken: 1, minCompressChars: 1 });
+    expect(result.info.compressed).toBe(true);
+    expect(result.info.imageCount).toBeGreaterThan(0);
+    // The array-form developer text is now counted as static context.
+    expect(result.info.staticChars).toBeGreaterThanOrEqual(BIG_INSTRUCTIONS.length);
+
+    const out = JSON.parse(dec.decode(result.body)) as { input: Array<{ role: string; content: unknown }> };
+    const dev = out.input.find((i) => i.role === 'developer')!;
+    // Array shape preserved, but the big text is gone — replaced by a pointer part.
+    expect(Array.isArray(dev.content)).toBe(true);
+    const devParts = dev.content as Array<{ type: string; text?: string }>;
+    expect(devParts).toHaveLength(1);
+    expect(devParts[0]!.type).toBe('input_text');
+    expect(devParts[0]!.text).toContain('rendered into image');
+    expect(JSON.stringify(dev.content)).not.toContain('These are detailed');
+  });
+
   it('images a substantial GPT Responses tool schema even when there is no instruction context', async () => {
     // Big SCHEMA, not a big description — the flat description stays native and
     // is not imaged, so the schema is what makes this profitable with no context.
@@ -398,6 +427,61 @@ describe('transformOpenAIResponses (gpt-5.6)', () => {
     // Original string preserved as input_text part.
     const textParts = parts.filter((p) => p.type === 'input_text');
     expect(textParts.some((p) => p.text?.includes('Do the thing'))).toBe(true);
+  });
+
+  it('records outgoingTextChars for compressed Responses requests, counting text but not image base64', async () => {
+    const body = enc.encode(JSON.stringify({
+      model: 'gpt-5.6',
+      instructions: BIG_INSTRUCTIONS,
+      input: [{ role: 'user', content: 'Please do the thing.' }],
+      tools: [{ type: 'function', name: 'do_thing', description: 'pick a thing', parameters: { type: 'object', properties: {} } }],
+    }));
+    const result = await transformOpenAIResponses(body, { charsPerToken: 1, minCompressChars: 1 });
+    expect(result.info.compressed).toBe(true);
+    const otc = result.info.outgoingTextChars ?? 0;
+    expect(otc).toBeGreaterThan(0);
+
+    const out = JSON.parse(dec.decode(result.body)) as {
+      instructions?: string;
+      input: Array<{ content?: unknown }>;
+      tools?: Array<{ name?: string; description?: string; parameters?: unknown }>;
+    };
+
+    // A real rendered image rode along as input_image base64 (thousands of chars)…
+    let imageChars = 0;
+    for (const item of out.input) {
+      const c = item.content;
+      if (Array.isArray(c)) {
+        for (const p of c as Array<{ type?: string; image_url?: unknown }>) {
+          if (p.type === 'input_image' && typeof p.image_url === 'string') imageChars += p.image_url.length;
+        }
+      }
+    }
+    expect(imageChars).toBeGreaterThan(2000);
+    // …and the denominator must NOT include any of that base64.
+    expect(otc).toBeLessThan(imageChars);
+
+    // It DOES count the instructions pointer + input_text parts + tool fields.
+    let textChars = 0;
+    if (typeof out.instructions === 'string') textChars += out.instructions.length;
+    for (const item of out.input) {
+      const c = item.content;
+      if (typeof c === 'string') textChars += c.length;
+      else if (Array.isArray(c)) {
+        for (const p of c as Array<{ type?: string; text?: string }>) {
+          if (p.type === 'input_text' && typeof p.text === 'string') textChars += p.text.length;
+        }
+      }
+    }
+    for (const t of out.tools ?? []) {
+      if (typeof t.name === 'string') textChars += t.name.length;
+      if (typeof t.description === 'string') textChars += t.description.length;
+      if (t.parameters !== undefined) textChars += JSON.stringify(t.parameters).length;
+    }
+    // otc equals the text sum up to the '\n\n' separators responsesContentText adds
+    // between array parts (a handful of chars) — and is nowhere near the base64.
+    expect(otc).toBeGreaterThanOrEqual(textChars);
+    expect(otc).toBeLessThanOrEqual(textChars + 64);
   });
 
   it('returns compressed=false with not_profitable/below_min reason for small input', async () => {

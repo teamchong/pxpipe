@@ -16,10 +16,10 @@ import { createProxy, parseGatewayHeaders, resolveUpstreams, type ProxyConfig } 
 import {
   parseExportArgv,
   runExportCore,
-  shouldIncludeFile,
   type ExportParsed,
   type ExportResult,
 } from './core/export.js';
+import { readExportTextFile } from './export-collect.js';
 import {
   toTrackEvent,
   TRACK_BODY_INLINE_MAX,
@@ -176,9 +176,17 @@ Use with OpenAI-compatible GPT clients:
 `);
 }
 
+// Package version, inlined at bundle time by scripts/build.mjs via esbuild
+// `define`. Under a non-bundled dev runner (tsx) the identifier is not defined;
+// `typeof` returns "undefined" instead of throwing (ECMA-262 §13.5.3), so the
+// guard is safe. `npm_package_version` is only a dev fallback: npm sets it just
+// inside its own run-script env, so for `npx pxpipe-proxy` or a global bin it is
+// undefined (or reflects the *consumer's* package), never this tool's version.
+declare const __PXPIPE_VERSION__: string | undefined;
+
 function printVersion(): void {
-  // Filled in at bundle time by esbuild.define; falls back here.
-  console.log(process.env.npm_package_version ?? '0.2.0');
+  const injected = typeof __PXPIPE_VERSION__ === 'string' ? __PXPIPE_VERSION__ : undefined;
+  console.log(injected ?? process.env.npm_package_version ?? 'unknown');
 }
 
 // ---- node:http <-> Web Request/Response bridge ---------------------------
@@ -622,17 +630,6 @@ const WALK_SKIP_DIRS = new Set([
   '__pycache__', '.cache', '.next', '.nuxt', '.turbo',
 ]);
 
-const MAX_FILE_BYTES = 1_000_000; // 1 MiB
-
-/** Returns true if `buf` looks like binary (contains a null byte in the first 512 bytes). */
-function looksLikeBinary(buf: Buffer): boolean {
-  const check = Math.min(buf.byteLength, 512);
-  for (let i = 0; i < check; i++) {
-    if (buf[i] === 0) return true;
-  }
-  return false;
-}
-
 interface CollectedFile {
   relPath: string;
   content: string;
@@ -659,14 +656,10 @@ function walkDir(
       if (WALK_SKIP_DIRS.has(entry.name)) continue;
       walkDir(full, rootDir, include, exclude, out);
     } else if (entry.isFile()) {
-      if (!shouldIncludeFile(rel, include, exclude)) continue;
-      let stat: fs.Stats;
-      try { stat = fs.statSync(full); } catch { continue; }
-      if (stat.size > MAX_FILE_BYTES) continue;
-      let buf: Buffer;
-      try { buf = fs.readFileSync(full); } catch { continue; }
-      if (looksLikeBinary(buf)) continue;
-      out.push({ relPath: rel, content: buf.toString('utf8') });
+      // Bulk directory walk: skip silently on any gate miss (per-file warnings
+      // would be noise across a whole tree).
+      const r = readExportTextFile(full, rel, include, exclude);
+      if (r.kind === 'ok') out.push({ relPath: rel, content: r.content });
     }
   }
 }
@@ -688,18 +681,11 @@ function collectFilesFromTargets(
       walkDir(target, target, include, exclude, files);
     } else if (st.isFile()) {
       const rel = path.basename(target);
-      if (!shouldIncludeFile(rel, include, exclude)) continue;
-      if (st.size > MAX_FILE_BYTES) {
-        console.warn(`[pxpipe export] skipping oversized file: ${target}`);
-        continue;
+      const r = readExportTextFile(target, rel, include, exclude);
+      if (r.kind === 'ok') files.push({ relPath: rel, content: r.content });
+      else if (r.kind !== 'excluded') {
+        console.warn(`[pxpipe export] skipping ${r.kind} file: ${target}`);
       }
-      let buf: Buffer;
-      try { buf = fs.readFileSync(target); } catch { continue; }
-      if (looksLikeBinary(buf)) {
-        console.warn(`[pxpipe export] skipping binary file: ${target}`);
-        continue;
-      }
-      files.push({ relPath: rel, content: buf.toString('utf8') });
     }
   }
   return files;
@@ -748,10 +734,13 @@ async function collectSource(opts: ExportParsed): Promise<[string, string[]]> {
     let untracked = '';
     for (const rel of untrackedFiles) {
       const full = path.join(cwd, rel);
-      let buf: Buffer;
-      try { buf = fs.readFileSync(full); } catch { continue; }
-      if (!looksLikeBinary(buf)) {
-        untracked += `\n===== ${rel} =====\n` + buf.toString('utf8');
+      // Same include/exclude + size + binary gate as directory mode. Untracked
+      // files previously bypassed all of it: --include/--exclude were ignored
+      // and an oversized file was read fully into memory.
+      const r = readExportTextFile(full, rel, opts.include, opts.exclude);
+      if (r.kind === 'ok') untracked += `\n===== ${rel} =====\n` + r.content;
+      else if (r.kind !== 'excluded') {
+        console.warn(`[pxpipe export] skipping ${r.kind} untracked file: ${rel}`);
       }
     }
     const sourceText = diff + untracked;

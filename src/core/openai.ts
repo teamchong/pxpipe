@@ -425,6 +425,32 @@ function countOutgoingTextChars(req: OpenAIChatRequest): number {
   return n;
 }
 
+/** Outgoing text-char denominator for the GPT Responses regression, mirroring
+ *  countOutgoingTextChars for Chat: instructions + message-item text (string or
+ *  input_text parts) + flat tool name/description/parameters. input_image base64
+ *  is excluded on purpose — it is image cost, not text (responsesContentText
+ *  already drops non-text parts). */
+function countResponsesOutgoingTextChars(req: ResponsesRequest): number {
+  let n = 0;
+  if (typeof req.instructions === 'string') n += req.instructions.length;
+  if (typeof req.input === 'string') {
+    n += req.input.length;
+  } else if (Array.isArray(req.input)) {
+    for (const item of req.input) {
+      n += responsesContentText((item as ResponsesInputItem).content).length;
+    }
+  }
+  if (Array.isArray(req.tools)) {
+    for (const tool of req.tools) {
+      if (!isFlatFunctionTool(tool)) continue;
+      if (typeof tool.name === 'string') n += tool.name.length;
+      if (typeof tool.description === 'string') n += tool.description.length;
+      if (tool.parameters !== undefined) n += safeStringifyLen(tool.parameters);
+    }
+  }
+  return n;
+}
+
 function safeStringifyLen(v: unknown): number {
   try {
     return JSON.stringify(v)?.length ?? 0;
@@ -814,7 +840,9 @@ export async function transformOpenAIResponses(
     const r = (item as ResponsesInputItem).role;
     if (r !== 'system' && r !== 'developer') continue;
     const content = (item as ResponsesInputItem).content;
-    const text = typeof content === 'string' ? content : '';
+    // content may be a string OR an array of input_text parts (both are valid
+    // Responses shapes for system/developer items) — read either form.
+    const text = responsesContentText(content);
     if (!text) continue;
     authorityDocs.push(`## ${String(r).toUpperCase()} MESSAGE\n${text}`);
     systemTexts.push(text);
@@ -927,14 +955,19 @@ export async function transformOpenAIResponses(
     req.instructions = RESPONSES_POINTER;
   }
 
-  // Replace system/developer input items with pointer.
+  // Replace system/developer input items with a pointer. Mirror the collection
+  // gate above for BOTH content shapes: a string becomes the pointer string; an
+  // input_text part array keeps its array shape with a single pointer part, so a
+  // request the caller sent as parts is not silently reshaped into a string.
   if (!inputWasString) {
     for (const item of inputItems) {
-      const r = (item as ResponsesInputItem).role;
-      if (r !== 'system' && r !== 'developer') continue;
-      const content = (item as ResponsesInputItem).content;
-      if (typeof content === 'string' && content.length > 0) {
-        (item as ResponsesInputItem).content = RESPONSES_POINTER;
+      const it = item as ResponsesInputItem;
+      if (it.role !== 'system' && it.role !== 'developer') continue;
+      const content = it.content;
+      if (typeof content === 'string') {
+        if (content.length > 0) it.content = RESPONSES_POINTER;
+      } else if (Array.isArray(content) && responsesContentText(content).length > 0) {
+        it.content = [{ type: 'input_text', text: RESPONSES_POINTER }];
       }
     }
   }
@@ -988,6 +1021,9 @@ export async function transformOpenAIResponses(
 
   if (rewrittenTools !== undefined) req.tools = rewrittenTools;
 
+  // Regression denominator, same as the Chat path — Responses was the only
+  // transform that never recorded it.
+  info.outgoingTextChars = countResponsesOutgoingTextChars(req);
   info.compressed = true;
   return { body: new TextEncoder().encode(JSON.stringify(req)), info };
 }

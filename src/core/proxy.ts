@@ -5,7 +5,7 @@
 
 import { transformRequest, type TransformOptions, type TransformInfo } from './transform.js';
 import { transformOpenAIChatCompletions, transformOpenAIResponses } from './openai.js';
-import { isPxpipeSupportedGptModel, isPxpipeSupportedModel } from './applicability.js';
+import { isAnthropicMessagesPath, isPxpipeSupportedGptModel, isPxpipeSupportedModel } from './applicability.js';
 import {
   buildBaselineCountTokensBody,
   buildCacheablePrefixCountTokensBody,
@@ -506,12 +506,6 @@ const PASSTHROUGH_PREFIXES = [
 
 function isProviderPrefixedPath(pathname: string): boolean {
   return PASSTHROUGH_PREFIXES.some((prefix) => pathname.startsWith(prefix));
-}
-
-function isAnthropicMessagesPath(pathname: string): boolean {
-  return pathname === '/v1/messages'
-    || pathname === '/anthropic/v1/messages'
-    || pathname === '/anthropic/messages';
 }
 
 function isOpenAIChatPath(pathname: string): boolean {

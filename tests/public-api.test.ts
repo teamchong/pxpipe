@@ -143,6 +143,16 @@ describe('public library API', () => {
       path: '/v1/messages',
       bodyBytes: 10,
     }).reason).toBe('unsupported_method');
+    // Provider-prefixed routes createProxy() also transforms must be eligible
+    // here too — the old endsWith('/v1/messages') check rejected /anthropic/messages.
+    for (const path of ['/anthropic/v1/messages', '/anthropic/messages']) {
+      expect(shouldTransformAnthropicMessages({
+        model: 'claude-fable-5',
+        method: 'POST',
+        path,
+        bodyBytes: 10,
+      })).toEqual({ eligible: true, reason: 'eligible' });
+    }
     expect(shouldTransformAnthropicMessages({
       model: 'claude-fable-5',
       method: 'POST',

@@ -56,19 +56,28 @@ Risk levels: `low | medium | high | critical`.
 3. **Small block** (≤ `smallBlockChars`, default 6000) → `text_only`. Below pxpipe's
    own break-even, imaging can't profit anyway, so keeping it exact is free.
 4. **Large, no anchors** → `image_only`.
-5. **Large, with anchors** → density decides:
-   - anchor char coverage ≥ `denseAnchorCoverage` (default 0.12) → `text_only`
+5. **Large, with anchors** → the **measured rescue-budget gate** decides:
+   - count of **distinct** high-risk anchors > `rescueBudget` → `text_only`
    - else → `image_plus_exact_rescue`
 
-### Why the density fallback matters (the non-obvious part)
+### Why the measured gate (the non-obvious part)
 
-`image_plus_exact_rescue` only saves tokens when exact anchors are **sparse**. If a
-block is anchor-dense — a diff, a stack dump, a path listing — extracting every
-anchor into a text rescue strip reproduces most of the block as text. You'd then
-pay image cost **plus** near-full text cost: worse than just keeping it text. So
-above the coverage threshold the router routes `text_only`. Without this guard the
-feature is self-defeating on exactly the blocks it's meant to protect. (Demo case 6
-shows a 0.977-coverage block correctly falling back to `text_only`.)
+`image_plus_exact_rescue` is only safe when the rescue mechanism can preserve *every*
+exact anchor. That mechanism is pxpipe's `factSheetText()`, which rescues at most
+`MAX_TOKENS` (64) **distinct** tokens next to the image. So the gate asks the real
+question directly: *does the block carry more distinct anchors than the factsheet can
+rescue?* If yes, imaging would drop the overflow anchors to (mis-OCR-able) pixels →
+keep it `text_only`. If no, every anchor is rescued → image the bulk safely.
+
+This replaced an earlier heuristic (anchor **char coverage** ≥ 0.12). Coverage was a
+crude proxy and got a common case wrong: a listing of 300 *identical* paths has huge
+coverage but only **one** distinct anchor — the factsheet dedupes it to a single
+rescue slot, so it's trivially safe to image. The distinct-count gate images it
+(savings) where the coverage heuristic wrongly kept it as text. Per-policy
+`rescueBudget` (default 48, coding-agent 32, research 64) sets a safety margin at or
+below the factsheet's real 64-token cap. Without this guard the router would silently
+lose exact anchors on exactly the blocks it's meant to protect. (Demo case 6 shows a
+400-distinct-path block correctly routing `text_only` via `anchors_exceed_rescue_budget`.)
 
 ## Secret handling
 
@@ -164,9 +173,11 @@ Takeaways:
    text, which is safe.
 4. **`unknown_identifier` is not emitted.** A deterministic regex can't separate a
    must-stay-exact identifier from a prose noun. Left as future work.
-5. **Density gate is heuristic, not priced.** The `text_only` fallback uses an
-   anchor-coverage threshold, not a per-block image-vs-text-plus-rescue price. Feeding
-   factsheet size into `evalCompressionProfitability` would make it measured.
+5. **Rescue-budget gate approximates the factsheet, doesn't call it.** The gate counts
+   distinct high-risk anchors from *this* module's extractor against the factsheet's
+   `MAX_TOKENS`; the factsheet's own extractor uses slightly different patterns, so the
+   count is a close proxy, not the exact set it would keep. Calling
+   `extractFactSheetTokensAllPages().dropped` directly would be exact (at extra cost).
 6. **Not production-safe.** Prototype. No claim of completeness on secret formats.
 
 ## What's wired vs. what's next
@@ -185,9 +196,13 @@ Takeaways:
   via the new `TransformOptions.redactBlock` hook; the redacted text is what gets
   gated, imaged, fact-sheeted, and recorded as recoverable.
 
+- Measured rescue-budget gate (§ decision logic #5): distinct anchors vs the
+  factsheet's real `MAX_TOKENS` cap, replacing the earlier coverage heuristic.
+
 **Next:**
-1. Feed factsheet size into `evalCompressionProfitability` for a *measured* density gate.
-2. Replay on real production traces (`events.jsonl`) beyond the synthetic bench.
+1. Replay on real production traces (`events.jsonl`) beyond the synthetic bench.
+2. Exact gate: call `extractFactSheetTokensAllPages().dropped` instead of the
+   distinct-count proxy (§ limitation 5).
 
 ## Future work
 

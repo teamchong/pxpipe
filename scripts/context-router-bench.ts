@@ -37,7 +37,7 @@ const SECRET = 'sk-ant-api03-BENCHsecretDEADBEEF1234567890abcd';
 const RISKY: Block[] = [
   { name: 'system prose doc', text: 'This assistant follows the project conventions described here. '.repeat(360) },
   { name: 'log (sparse anchors)', text: 'INFO worker processed batch, moving on\n'.repeat(500) + 'built dist/app.js at commit a1b2c3d\n' },
-  { name: 'file listing (path-dense)', text: 'src/core/module/handler-file-name.ts\n'.repeat(360) },
+  { name: 'file listing (350 distinct paths)', text: Array.from({ length: 350 }, (_, i) => `src/core/module${i}/handler-file-${i}.ts`).join('\n') + '\n' },
   { name: 'stack trace', text: "Error: boom\n    at src/core/index.ts:42:13\n    at tests/x.test.ts:7:5\n" },
   { name: 'command block', text: 'pnpm install && pnpm test\nANTHROPIC_BASE_URL=http://127.0.0.1:47821 claude\n' },
   { name: 'log w/ SECRET (profitable)', text: '2026-05-19T10:00:00Z INFO request handled ok in 42ms, cache warm, upstream 200 rows=17\n'.repeat(300) + `resolved ANTHROPIC_API_KEY=${SECRET} for upstream call\n`, hasSecret: true },

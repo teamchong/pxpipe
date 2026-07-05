@@ -117,13 +117,24 @@ describe('risk classifier — handoff cases', () => {
     expect(vals.some((v) => v === 'a1b2c3d')).toBe(true);
   });
 
-  it('density fallback: anchor-dense large block routes text_only, not rescue', () => {
-    // A large block that is almost entirely file paths — rescue strip would be
-    // as big as the text, so imaging must NOT be chosen.
-    const dense = 'src/core/module-number-XX/file-name-here.ts\n'.repeat(300);
-    const a = assessContextRisk(dense);
+  it('measured gate: MANY DISTINCT anchors exceed the rescue budget → text_only', () => {
+    // 200 distinct paths — more than the factsheet can rescue, so imaging would drop
+    // the overflow to OCR. Must stay text.
+    const distinctPaths = Array.from({ length: 200 }, (_, i) => `src/mod${i}/file${i}.ts`).join('\n');
+    const big = distinctPaths + '\n' + 'x'.repeat(7000); // push over the small-block floor
+    const a = assessContextRisk(big);
     expect(a.decision).toBe('text_only');
-    expect(a.reasons.some((r) => r.startsWith('dense_anchors'))).toBe(true);
+    expect(a.reasons.some((r) => r.startsWith('anchors_exceed_rescue_budget'))).toBe(true);
+  });
+
+  it('measured gate: many IDENTICAL anchors dedupe to one → images (rescuable)', () => {
+    // 300 copies of the SAME path = 1 distinct anchor. The factsheet dedupes, so one
+    // rescue slot covers them all — this SHOULD image (the old coverage heuristic
+    // wrongly kept it as text).
+    const repeated = 'src/core/module-number-XX/file-name-here.ts\n'.repeat(300);
+    const a = assessContextRisk(repeated);
+    expect(a.decision).toBe('image_plus_exact_rescue');
+    expect(a.reasons.some((r) => r.startsWith('rescuable_anchors'))).toBe(true);
   });
 });
 

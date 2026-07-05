@@ -17,6 +17,7 @@ import {
   hasSecret,
   type ExactToken,
 } from './exact-token-extractor.js';
+import { MAX_TOKENS as FACTSHEET_RESCUE_BUDGET } from './factsheet.js';
 
 export type ContextRisk = 'low' | 'medium' | 'high' | 'critical';
 
@@ -41,17 +42,20 @@ export interface ClassifierOptions {
    *  break-even (~6k) imaging can't profit anyway, so keep them exact for free.
    *  Default 6000 (matches transform.ts minReminderChars/minToolResultChars). */
   smallBlockChars?: number;
-  /** Exact-token char coverage above which a large block routes `text_only`
-   *  instead of image_plus_exact_rescue (the rescue strip would be too big to pay
-   *  off). Default 0.12. */
-  denseAnchorCoverage?: number;
+  /** Max number of DISTINCT high-risk anchors a large block may carry and still be
+   *  imaged. The rescue mechanism (pxpipe's factsheet) preserves at most this many
+   *  distinct exact tokens as text next to the image; above it, the overflow anchors
+   *  would survive only as (mis-OCR-able) pixels, so the block routes `text_only`.
+   *  Defaults to the factsheet's real cap (`MAX_TOKENS`, 64) — this is the measured
+   *  gate: it asks the actual rescue's capacity, not a heuristic coverage guess. */
+  rescueBudget?: number;
   /** Strict mode: ANY exact anchor forces `text_only` (max fidelity, min savings). */
   strict?: boolean;
 }
 
 const DEFAULTS: Required<ClassifierOptions> = {
   smallBlockChars: 6000,
-  denseAnchorCoverage: 0.12,
+  rescueBudget: FACTSHEET_RESCUE_BUDGET,
   strict: false,
 };
 
@@ -67,16 +71,11 @@ const HIGH_RISK_KINDS = new Set<ExactToken['kind']>([
   'error_code',
 ]);
 
-/** Fraction of `text` covered by non-secret exact-token spans. Secrets excluded —
- *  they're masked (value length ≠ span length) and drive the critical path anyway. */
-function anchorCoverage(text: string, tokens: readonly ExactToken[]): number {
-  if (!text.length) return 0;
-  let covered = 0;
-  for (const t of tokens) {
-    if (t.kind === 'secret_like') continue;
-    covered += t.end - t.start;
-  }
-  return covered / text.length;
+/** Count of DISTINCT values among the given tokens. The factsheet dedupes before it
+ *  rescues, so N identical paths cost ONE rescue slot — what matters for "can the
+ *  rescue preserve every anchor?" is the distinct count, not the raw occurrence count. */
+function distinctValues(tokens: readonly ExactToken[]): number {
+  return new Set(tokens.map((t) => t.value)).size;
 }
 
 /**
@@ -96,7 +95,6 @@ export function assessContextRisk(
 
   const exactTokens = extractExactTokens(text);
   const highRiskTokens = exactTokens.filter((t) => HIGH_RISK_KINDS.has(t.kind));
-  const coverage = anchorCoverage(text, exactTokens);
 
   // 1. Secrets → critical, never image. Redact/block regardless of size.
   if (hasSecret(exactTokens)) {
@@ -123,13 +121,16 @@ export function assessContextRisk(
     return { risk: 'low', decision: 'image_only', reasons, exactTokens, compressible: true };
   }
 
-  // 5. Large block WITH anchors. Density decides: dense → text_only (rescue strip
-  //    wouldn't pay off); sparse → image the bulk + rescue the anchors.
-  if (coverage >= o.denseAnchorCoverage) {
-    reasons.push(`dense_anchors(coverage=${coverage.toFixed(3)}>=${o.denseAnchorCoverage})`);
+  // 5. Large block WITH anchors. Measured against the rescue's real capacity: if the
+  //    block has more DISTINCT high-risk anchors than the factsheet can preserve
+  //    (`rescueBudget`), imaging drops the overflow to OCR → keep text. Otherwise the
+  //    rescue covers every anchor, so image the bulk + rescue is safe and cheap.
+  const distinct = distinctValues(highRiskTokens);
+  if (distinct > o.rescueBudget) {
+    reasons.push(`anchors_exceed_rescue_budget(${distinct}>${o.rescueBudget})`);
     return { risk: 'high', decision: 'text_only', reasons, exactTokens, compressible: false };
   }
 
-  reasons.push(`sparse_anchors(coverage=${coverage.toFixed(3)},n=${highRiskTokens.length})`);
+  reasons.push(`rescuable_anchors(${distinct}<=${o.rescueBudget})`);
   return { risk: 'medium', decision: 'image_plus_exact_rescue', reasons, exactTokens, compressible: true };
 }

@@ -44,9 +44,9 @@ const CASES: Case[] = [
     text: bigLog + '\nartifact at dist/out.js built from commit a1b2c3d\n',
   },
   {
-    name: '6. density fallback (anchor-dense, large)',
+    name: '6. measured gate (many DISTINCT anchors > rescue budget)',
     policy: 'coding-agent',
-    text: 'src/core/module-number-XX/file-name-here.ts\n'.repeat(300),
+    text: Array.from({ length: 400 }, (_, i) => `src/core/module${i}/submodule/handler-file-${i}.ts`).join('\n'),
   },
 ];
 

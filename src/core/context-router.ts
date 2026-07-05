@@ -29,14 +29,17 @@ export type ContextPolicy = 'default' | 'coding-agent' | 'research' | 'strict';
 
 /** Per-policy classifier tuning. `coding-agent` protects the most; `research`
  *  compresses hardest; `strict` pins anything with an anchor to text. */
+// rescueBudget = max DISTINCT anchors a large block may carry and still image (the
+// factsheet rescues up to 64). Lower = more conservative (keeps text with a safety
+// margin below the real cap); 64 = trust the full factsheet capacity.
 const POLICIES: Record<ContextPolicy, ClassifierOptions> = {
-  default: { smallBlockChars: 6000, denseAnchorCoverage: 0.12, strict: false },
-  // Code work is anchor-dense (paths, hashes, diffs) — protect aggressively:
-  // lower dense threshold so more blocks stay text, larger "small" floor.
-  'coding-agent': { smallBlockChars: 8000, denseAnchorCoverage: 0.08, strict: false },
-  // Prose-heavy research: image more, only truly dense anchor blocks stay text.
-  research: { smallBlockChars: 4000, denseAnchorCoverage: 0.2, strict: false },
-  strict: { smallBlockChars: 6000, denseAnchorCoverage: 0.12, strict: true },
+  default: { smallBlockChars: 6000, rescueBudget: 48, strict: false },
+  // Code work is anchor-dense (paths, hashes, diffs) — protect aggressively: smaller
+  // budget so a listing with many distinct paths stays exact, larger "small" floor.
+  'coding-agent': { smallBlockChars: 8000, rescueBudget: 32, strict: false },
+  // Prose-heavy research: image more, trust the factsheet's full rescue capacity.
+  research: { smallBlockChars: 4000, rescueBudget: 64, strict: false },
+  strict: { smallBlockChars: 6000, rescueBudget: 48, strict: true },
 };
 
 export interface RouteResult {

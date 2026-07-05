@@ -18,13 +18,17 @@
  *  deeper nodes are left untouched rather than corrupted. */
 const SCHEMA_STRIP_MAX_DEPTH = 20;
 
-/** Metadata keys that add tokens but no validation; the image carries them for the model. */
+/** Metadata keys that add tokens but no validation; the image carries them for the model.
+ *  `$schema` is deliberately NOT here: it is the dialect declaration, not an annotation.
+ *  Stripping it re-dialects the schema to the validator's default (JSON Schema 2020-12),
+ *  which 400s draft-07 constructs the original legally used — e.g. tuple-form
+ *  `items: [...]` in Voiceflow MCP tools ("tools.N.custom.input_schema: JSON schema
+ *  is invalid. It must match JSON Schema draft 2020-12"). */
 const SCHEMA_STRIP_KEYS = new Set([
   'description',
   'title',
   'examples',
   'default',
-  '$schema',
   '$id',
   '$comment',
 ]);

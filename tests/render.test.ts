@@ -747,9 +747,9 @@ describe('transform', () => {
   it('ships annotation-stripped schemas in tools[], full schema in the imaged reference', async () => {
     // History: a bare `{type:'object'}` stub caused validator 400s; a text
     // reference paid the annotations at text rates. Current contract: tools[]
-    // keeps the structural contract (type/properties/required/enum) for the
-    // validator, annotations (description/default/$schema) move into the
-    // imaged reference where they cost image rates.
+    // keeps the structural contract (type/properties/required/enum) AND the
+    // `$schema` dialect declaration for the validator; annotations
+    // (description/default) move into the imaged reference at image rates.
     const req = JSON.stringify({
       model: 'claude-3-5-sonnet',
       messages: [{ role: 'user', content: 'hi' }],
@@ -821,9 +821,11 @@ describe('transform', () => {
     expect(Object.keys(s0.properties)).toEqual(['file_path', 'mode']);
     expect(s0.required).toEqual(['file_path']);
     expect(s0.properties.mode.enum).toEqual(['read', 'binary']);
-    // Annotations are stripped from tools[] everywhere in the tree.
+    // Annotations are stripped from tools[] everywhere in the tree — but the
+    // `$schema` dialect declaration survives (stripping it re-dialects a
+    // draft-07 schema to 2020-12 and the validator 400s legal draft-07 syntax).
     expect(JSON.stringify(s0)).not.toContain('description');
-    expect(s0.$schema).toBeUndefined();
+    expect(s0.$schema).toBe('http://json-schema.org/draft-07/schema#');
     expect(s0.properties.mode.default).toBeUndefined();
     const s1 = out.tools[1].input_schema;
     expect(s1.required).toEqual(['command']);
@@ -837,6 +839,61 @@ describe('transform', () => {
     // Stubs cite the reference heading.
     expect(out.tools[0].description).toContain('"## Tool: Read"');
     expect(out.tools[1].description).toContain('"## Tool: Bash"');
+  });
+
+  it('keeps $schema so draft-07 tuple items stay valid under the declared dialect', async () => {
+    // Regression (2026-07-05): Voiceflow MCP's voiceflow_transcript declares
+    // draft-07 and uses tuple-form `items: [...]`, which is illegal in the
+    // API's default dialect (2020-12, where tuples are `prefixItems`).
+    // Stripping `$schema` re-dialected the schema and every compressed request
+    // 400'd: "tools.N.custom.input_schema: JSON schema is invalid. It must
+    // match JSON Schema draft 2020-12". Passthrough of the same schema is
+    // accepted — so the transform must keep the declaration.
+    const req = JSON.stringify({
+      model: 'claude-3-5-sonnet',
+      messages: [{ role: 'user', content: 'hi' }],
+      system: 'x'.repeat(30000),
+      tools: [
+        {
+          name: 'voiceflow_transcript',
+          description: 'Search transcripts',
+          input_schema: {
+            $schema: 'http://json-schema.org/draft-07/schema#',
+            type: 'object',
+            properties: {
+              filters: {
+                type: 'array',
+                items: {
+                  oneOf: [
+                    {
+                      type: 'object',
+                      properties: {
+                        op: { type: 'string', enum: ['between'], description: 'operator' },
+                        // draft-07 tuple validation — array-form `items`.
+                        value: { type: 'array', items: [{ type: 'number' }, { type: 'number' }] },
+                      },
+                      required: ['op', 'value'],
+                    },
+                  ],
+                },
+              },
+            },
+            required: ['filters'],
+          },
+        },
+      ],
+    });
+    const { body, info } = await transformRequest(new TextEncoder().encode(req));
+    expect(info.compressed).toBe(true);
+    const out = JSON.parse(new TextDecoder().decode(body));
+    const s = out.tools[0].input_schema;
+    // Dialect declaration survives — the tuple `items` stays legal.
+    expect(s.$schema).toBe('http://json-schema.org/draft-07/schema#');
+    const between = s.properties.filters.items.oneOf[0];
+    expect(Array.isArray(between.properties.value.items)).toBe(true);
+    expect(between.properties.value.items).toEqual([{ type: 'number' }, { type: 'number' }]);
+    // Annotations still stripped.
+    expect(between.properties.op.description).toBeUndefined();
   });
 
   it('passes a bare {type:"object"} schema through with no advisory', async () => {

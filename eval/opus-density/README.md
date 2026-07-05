@@ -62,6 +62,13 @@ pnpm exec tsx eval/opus-density/run.mjs
 ANTHROPIC_API_KEY=sk-ant-... pnpm exec tsx eval/opus-density/run.mjs
 ```
 
-Results are written to `eval/opus-density/results.json`. This directory holds no
-committed results yet — it is the harness only; fill it in on a machine with API
-access.
+Results are written to `eval/opus-density/results.json`.
+
+A first live run (2026-07-05) is committed here: `results.json` plus a write-up in
+[`RESULTS.md`](./RESULTS.md). Short version — Opus reads **4/4 exact, 0 confab** at
+the largest cell (`9x12`, still 45% savings), climbing from 1/4 at production
+`5x8`, so the issue-#6 answer is yes and density-dependent. Running it also surfaced
+two response-reading bugs in this harness (now fixed in `run.mjs`): the answer of an
+always-on-thinking model isn't in `content[0]`, and a classifier refusal was being
+scored as a confabulation. `verify.mjs` reproduces both receipts plus the guard-
+question caveat.

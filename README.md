@@ -55,6 +55,23 @@ normally — pxpipe compresses the *request* only, never the model's output.
 Recent turns stay text; the system prompt, tool docs, and older bulk history
 are imaged.
 
+## Offline export
+
+You can also render local text, files, or diffs to PNG pages without running
+the proxy or connecting Claude Code:
+
+```bash
+echo "your prompt text" | npx pxpipe-proxy export --stdin --open
+npx pxpipe-proxy export path/to/folder
+npx pxpipe-proxy export . --include "*.ts"
+npx pxpipe-proxy export --git
+```
+
+`pxpipe export` writes `page-001.png...`, `factsheet.txt`, `manifest.json`,
+and `prompt.txt` to an output folder. Use this for bulky code, logs, JSON, or
+docs that another vision-capable client can accept as image uploads; short
+prompts usually cost less as plain text.
+
 ## The honest part
 
 - **It is lossy.** Exact 12-char hex strings in dense imaged content:

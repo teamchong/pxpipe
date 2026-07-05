@@ -54,6 +54,49 @@ high-leverage lever — it spends savings *only* on the content that actually
 breaks OCR. Final variant choice is **gated on the scored run** (gist==baseline,
 zero silent-wrong exact strings); enabling Opus in production stays out of scope
 until those numbers clear.
+
+### Lever C — font legibility (`eval/glyph-confusability/`)
+
+A/B trade savings for OCR fidelity or spend tokens on a sidecar. **C is
+different: it can raise recall at the SAME cell size and SAME token cost**, so
+any gain it buys is spendable as more density — the only lever with upside on
+Fable, which already reads 5×8 fine.
+
+`analyze.mjs` decodes the real production Spleen 5×8 atlas (+ the pre-built
+AA-gray atlas), simulates the vision encoder's low-pass (3×3 blur), and ranks
+glyph pairs by post-blur shape distance — a proxy, not ground truth, but
+API-key-free and immediately actionable. Findings on the shipping font:
+
+- **AA is a no-op for code glyphs.** ASCII glyphs in `atlas-gray.ts` are pure
+  `{0,255}` — zero fractional coverage (AA only touches CJK/symbol fallback).
+  The token-free AA sub-lever buys nothing for hex/code recall; don't score it.
+- **20/40 classic confusable classes flagged RISK**, dominated by exactly the
+  dense-hex failure set: `8~B`=.019, `0~O`=.016, `5~S`=.023, `2~Z`=.043,
+  `6~G`=.061. Scoped to ~15 glyphs.
+
+`harden.mjs` prototypes hand-designed pixel patches for the worst offenders and
+re-scans the **full alphabet** (not just the target pairs) to catch
+side-effects. Result — a real negative finding:
+
+| glyph | technique | target Δ | side effects |
+|---|---|---|---|
+| `2` | break an accidental shared pixel with `Z` | **+0.0121** | none |
+| `5` | break an accidental shared pixel with `S` | **+0.0160** | none |
+| `0` | bolden (bigger center dot) | +0.0043 | created 2 new worst-24 collisions (`0~8`, `0~9`) — net negative |
+| `B` | bolden (wider bars) | **−0.0026 worse** | broad convergence toward every boxy capital; `B~O` crashed to 0.0196 |
+| `G` | bolden (bigger crossbar) | ~0 | same broad convergence as `B` |
+
+**Mechanism:** at 5×8 + blur + cosine-distance, adding ink pushes a glyph
+toward a generic dense blob that *other* bold capitals also blur into —
+distance to the one target improves (maybe) while distance to everything else
+shrinks. The techniques that worked instead **relocated or removed** a pixel
+the confusable partner already shared by coincidence — surgical de-collision,
+not bolding. Only `2` and `5` are kept; `0`/`B`/`G` are reverted pending a
+redesign that follows the de-collision technique.
+
+Both scripts are offline (no `ANTHROPIC_API_KEY`, `pnpm exec tsx <script>.mjs`)
+and exist to cheaply screen candidates before spending a scored run on them —
+they do not replace the acceptance bar above.
 - **Models:** `claude-opus-4-8`, `claude-fable-5` (both high-res tier).
 - **Tasks** (each answer committed before ground truth is revealed):
   1. exact 12-char hex recall

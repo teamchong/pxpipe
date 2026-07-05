@@ -1134,11 +1134,6 @@ async function run(opts: RuntimeConfig, mode: 'plain' | 'mitm'): Promise<void> {
   process.on('SIGTERM', () => shutdown('SIGTERM'));
 }
 
-main().catch((err) => {
-  console.error('[pxpipe] fatal:', err);
-  process.exit(1);
-});
-
 // ---- pxpipe mitm ----------------------------------------------------------
 
 const CLAUDE_SETTINGS = path.join(os.homedir(), '.claude', 'settings.json');
@@ -1340,3 +1335,10 @@ function mitmDoctor(): void {
     console.log(`  launchd agent: ${loaded ? 'loaded' : 'not loaded'} (${LAUNCH_AGENT_PATH})`);
   }
 }
+
+// Entry point invoked LAST, after every module-level const above is initialized
+// — main() runs synchronously into the mitm subcommands, which read those consts.
+main().catch((err) => {
+  console.error('[pxpipe] fatal:', err);
+  process.exit(1);
+});

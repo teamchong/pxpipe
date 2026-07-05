@@ -520,7 +520,14 @@ function isOpenAIResponsesPath(pathname: string): boolean {
 
 function isCanonicalOpenAIPath(pathname: string, headers: Headers, hasOpenAIKey: boolean): boolean {
   const isModelsPath = pathname === '/v1/models' || pathname.startsWith('/v1/models/');
-  const looksOpenAIAuth = hasOpenAIKey || (headers.has('authorization') && !headers.has('x-api-key'));
+  // `/v1/models` exists on BOTH APIs, so it is routed by auth style — but an
+  // `sk-ant-…` bearer is Anthropic by construction (Claude Code subscription
+  // auth sends `authorization: Bearer sk-ant-oat01-…` with no x-api-key).
+  // Without this check that OAuth token would be forwarded to the OpenAI
+  // upstream: a credential leak, and a guaranteed 401.
+  const bearerIsAnthropic = /^Bearer\s+sk-ant-/i.test(headers.get('authorization') ?? '');
+  const looksOpenAIAuth =
+    hasOpenAIKey || (headers.has('authorization') && !headers.has('x-api-key') && !bearerIsAnthropic);
   return pathname === '/v1/chat/completions'
     || pathname === '/v1/responses'
     || pathname.startsWith('/v1/responses/')

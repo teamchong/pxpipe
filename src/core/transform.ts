@@ -1541,6 +1541,18 @@ export async function transformRequest(
   if (o.compressTools && Array.isArray(req.tools) && req.tools.length > 0) {
     const docs: string[] = [];
     toolsRewritten = req.tools.map((t) => {
+      // Native server-side tools (`advisor_20260301`, `web_search_20250305`,
+      // `computer_20250124`, `bash_20250124`, `text_editor_20250429`, ...) carry
+      // a versioned `type` fixed by Anthropic's own API schema, which rejects a
+      // `description` field on that tool entry outright (400 invalid_request_error:
+      // "tools.N.<type>.description: Extra inputs are not permitted" — reproduced
+      // 4/4 on claude-fable-5, 2026-07-05). Only the default 'custom' shape (no
+      // `type`, or `type: 'custom'`) accepts a description/input_schema rewrite.
+      // Pass anything else through byte-identical: it never had docs to relocate,
+      // so there's nothing to move into the imaged Tool Reference either.
+      if (typeof t.type === 'string' && t.type !== 'custom') {
+        return t;
+      }
       docs.push(renderToolDoc(t));
       // tools[] keeps the annotation-STRIPPED schema: structure (type/properties/
       // required/enum/items) stays for Anthropic's tool-use validator — a bare

@@ -744,6 +744,40 @@ describe('transform', () => {
     expect(refHeader).toContain("this user's local proxy");
   });
 
+  it('skips tool-doc rewriting for native typed tools', async () => {
+    const req = JSON.stringify({
+      model: 'claude-3-5-sonnet',
+      messages: [{ role: 'user', content: 'hi' }],
+      system: 'x'.repeat(30000),
+      tools: [
+        {
+          type: 'advisor_20260301',
+          name: 'advisor_20260301',
+          description: 'Native advisor tool docs should stay intact.',
+          input_schema: { type: 'object', properties: { prompt: { type: 'string' } } },
+        },
+        {
+          type: 'custom',
+          name: 'CustomTool',
+          description: 'Custom tool should still be compressed.',
+          input_schema: { type: 'object', properties: { arg: { type: 'string' } } },
+        },
+      ],
+    });
+    const bytes = new TextEncoder().encode(req);
+    const { body, info } = await transformRequest(bytes);
+    expect(info.compressed).toBe(true);
+    expect(info.toolDocsChars).toBeGreaterThan(0);
+
+    const out = JSON.parse(new TextDecoder().decode(body));
+    const nativeTool = out.tools.find((tool: { type?: string }) => tool.type === 'advisor_20260301');
+    const customTool = out.tools.find((tool: { type?: string }) => tool.type === 'custom');
+    expect(nativeTool).toBeDefined();
+    expect(customTool).toBeDefined();
+    expect(nativeTool?.description).toBe('Native advisor tool docs should stay intact.');
+    expect(customTool?.description).toContain('Tool Reference');
+  });
+
   it('ships annotation-stripped schemas in tools[], full schema in the imaged reference', async () => {
     // History: a bare `{type:'object'}` stub caused validator 400s; a text
     // reference paid the annotations at text rates. Current contract: tools[]

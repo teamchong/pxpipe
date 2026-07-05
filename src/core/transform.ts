@@ -1536,11 +1536,15 @@ export async function transformRequest(
   //    and cache-friendly. Each stub description cites its own heading
   //    ("## Tool: <name>") so the model can link stub → full doc
   //    deterministically.
-  let toolDocsText = '';
-  let toolsRewritten: ToolDef[] | undefined;
-  if (o.compressTools && Array.isArray(req.tools) && req.tools.length > 0) {
+    let toolDocsText = '';
+    let toolsRewritten: ToolDef[] | undefined;
+    if (o.compressTools && Array.isArray(req.tools) && req.tools.length > 0) {
     const docs: string[] = [];
     toolsRewritten = req.tools.map((t) => {
+      const toolType = (t as { type?: unknown }).type;
+      if (typeof toolType === 'string' && toolType !== 'custom') {
+        return t;
+      }
       docs.push(renderToolDoc(t));
       // tools[] keeps the annotation-STRIPPED schema: structure (type/properties/
       // required/enum/items) stays for Anthropic's tool-use validator — a bare

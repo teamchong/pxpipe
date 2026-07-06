@@ -744,6 +744,39 @@ describe('transform', () => {
     expect(refHeader).toContain("this user's local proxy");
   });
 
+  it('passes native typed tools through untouched, only stubs custom tools', async () => {
+    const nativeTool = { type: 'bash_20250124', name: 'bash' };
+    const customTool = {
+      name: 'BigTool',
+      description: 'A very long tool description. '.repeat(500),
+      input_schema: { type: 'object', properties: { x: { type: 'string' } } },
+    };
+    const req = JSON.stringify({
+      model: 'claude-3-5-sonnet',
+      messages: [{ role: 'user', content: 'hi' }],
+      system: 'x'.repeat(30000),
+      tools: [nativeTool, customTool],
+    });
+    const bytes = new TextEncoder().encode(req);
+    const { body, info } = await transformRequest(bytes);
+    expect(info.compressed).toBe(true);
+
+    const out = JSON.parse(new TextDecoder().decode(body));
+    // Native tool: byte-identical passthrough — this is the exact shape that
+    // previously caused the 400 (an injected `description` key on a native tool).
+    expect(out.tools[0]).toEqual(nativeTool);
+    expect('description' in out.tools[0]).toBe(false);
+    // Custom tool: still stubbed and imaged as before.
+    expect(out.tools[1].name).toBe('BigTool');
+    expect(out.tools[1].description).toContain('"## Tool: BigTool"');
+    expect(out.tools[1].description).toContain('Tool Reference');
+
+    // Native tool must not appear in the imaged Tool Reference (nothing to move).
+    const imgSrc = info.imageSourceText ?? '';
+    expect(imgSrc).not.toContain('## Tool: bash');
+    expect(imgSrc).toContain('## Tool: BigTool');
+  });
+
   it('ships annotation-stripped schemas in tools[], full schema in the imaged reference', async () => {
     // History: a bare `{type:'object'}` stub caused validator 400s; a text
     // reference paid the annotations at text rates. Current contract: tools[]

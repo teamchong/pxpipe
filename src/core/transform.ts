@@ -1035,6 +1035,18 @@ function stripMarkdownEnvSection(text: string): { kept: string; body: string } {
  *  at text rates would have duplicated what tools[] already pays for; at image
  *  rates the duplicate structure is cheap and the stripped annotations are the
  *  compression.) */
+/** Anthropic's native/versioned tools (e.g. `bash_20250124`, `web_search_20250305`,
+ *  `advisor_20260301`) carry a fixed server-side schema that does NOT accept a
+ *  `description` field — injecting one 400s with "Extra inputs are not permitted"
+ *  and Claude Code silently falls back to a different model. Anthropic marks
+ *  user-defined tools with `type: 'custom'` or omits `type`; any other string is a
+ *  native tool pxpipe must pass through untouched. Exclusion check, not an
+ *  allowlist (cf. openai.ts's isFunctionTool), because new native type strings
+ *  ship faster than pxpipe can track them. */
+function isNativeTypedTool(t: ToolDef): boolean {
+  return typeof t.type === 'string' && t.type !== 'custom';
+}
+
 function renderToolDoc(t: ToolDef): string {
   const parts: string[] = [`## Tool: ${t.name ?? '?'}`];
   if (t.description) parts.push(t.description);
@@ -1541,6 +1553,8 @@ export async function transformRequest(
   if (o.compressTools && Array.isArray(req.tools) && req.tools.length > 0) {
     const docs: string[] = [];
     toolsRewritten = req.tools.map((t) => {
+      if (isNativeTypedTool(t)) return t; // byte-identical passthrough; nothing to doc/stub
+
       docs.push(renderToolDoc(t));
       // tools[] keeps the annotation-STRIPPED schema: structure (type/properties/
       // required/enum/items) stays for Anthropic's tool-use validator — a bare

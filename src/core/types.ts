@@ -50,6 +50,7 @@ export interface Message {
 
 export interface ToolDef {
   name: string;
+  type?: string;
   description?: string;
   input_schema?: unknown;
   cache_control?: CacheControl;

@@ -36,6 +36,20 @@ const MIN_LEN = 3;
 const MAX_LEN = 120;
 /** Budget cap: highest-priority tokens kept first. Exported so consumers can report drops. */
 export const MAX_TOKENS = 64;
+/**
+ * Runtime budget: `PXPIPE_FACTSHEET_MAX_TOKENS` env var, clamped to [MAX_TOKENS, 512];
+ * absent/invalid → MAX_TOKENS. Raising it trades a few hundred prefix-stable text tokens
+ * for fewer image re-reads — worthwhile for models with a higher imaged-recall error rate
+ * (issue #6: Opus 4.8). Clamped from BELOW at MAX_TOKENS so an env typo can never shrink
+ * the sheet under the calibrated default. Read per call (cheap) so tests can mutate env.
+ */
+export function factSheetBudget(): number {
+  const raw = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env?.[
+    'PXPIPE_FACTSHEET_MAX_TOKENS'
+  ];
+  const n = raw === undefined || raw === '' ? NaN : Number(raw);
+  return Number.isFinite(n) ? Math.min(512, Math.max(MAX_TOKENS, Math.floor(n))) : MAX_TOKENS;
+}
 // At most this many URL exemplars: URLs are long, structured, low OCR-risk, and usually
 // reconstructable, so they must never crowd out short zero-redundancy tokens.
 const MAX_URLS = 8;
@@ -143,7 +157,7 @@ export function extractFactSheetEntries(text: string): FactSheetEntry[] {
   const kept: string[] = [];
   let urls = 0;
   for (const { t, tier } of ranked) {
-    if (kept.length >= MAX_TOKENS) break;
+    if (kept.length >= factSheetBudget()) break;
     if (tier === 2 && urls++ >= MAX_URLS) continue;
     kept.push(t);
   }
@@ -200,7 +214,7 @@ export function extractFactSheetEntriesAllPages(
   const kept: FactSheetEntry[] = [];
   let urls = 0;
   for (const { t, tier } of ranked) {
-    if (kept.length >= MAX_TOKENS) break;
+    if (kept.length >= factSheetBudget()) break;
     if (tier === 2 && urls++ >= MAX_URLS) continue;
     kept.push({ token: t, count: counts.get(t) ?? 1 });
   }

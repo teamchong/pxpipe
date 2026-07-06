@@ -164,6 +164,11 @@ Environment:
                           default claude-fable-5,gpt-5.6; off disables
   PXPIPE_CONFIG           JSON config path (default ~/.config/pxpipe/config.json)
                           supports {"models": [...]} or {"models": "off"}
+  PXPIPE_FACTSHEET_MAX_TOKENS
+                          per-block budget for the verbatim fact-sheet that rides
+                          next to imaged content (default 64, clamped to 64..512).
+                          Raise for models that misread imaged identifiers more
+                          often; costs a few hundred prefix-stable text tokens.
   PXPIPE_LOG              JSONL events path (default ~/.pxpipe/events.jsonl)
   PXPIPE_DUMP_DIR         debug: write every rendered PNG here (what the model
                           sees); off unless set. Compress arm only.

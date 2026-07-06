@@ -193,7 +193,9 @@ exact-string recall off rendered pages (blind reads top out at 63% on dense
 identifiers, with every miss predicted by a glyph-confusability matrix) and
 documents the shipped mitigations — page geometry clamped to the API's
 resample cap so billed pixels actually reach the vision encoder, and exact
-identifiers (SHAs, numbers) riding alongside as text.
+identifiers (SHAs, numbers) riding alongside as text — that fact-sheet's
+budget is tunable via `PXPIPE_FACTSHEET_MAX_TOKENS` (default 64, clamped to
+64–512; see `pxpipe --help`).
 
 **Why are misses silent confabulations instead of read errors?**
 Because model vision is not OCR: the image becomes patch embeddings, never

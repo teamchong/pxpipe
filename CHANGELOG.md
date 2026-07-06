@@ -4,6 +4,17 @@ All notable changes to pxpipe are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features /
 behavioral changes, patch = fixes).
 
+## Unreleased
+
+### Added
+- `PXPIPE_FACTSHEET_MAX_TOKENS`: runtime override for the verbatim
+  fact-sheet token budget per imaged block (default 64, clamped to 64–512;
+  invalid or absent values fall back to the default, and the clamp floor
+  means a typo can never shrink the sheet below the calibrated default).
+  Raising it trades prefix-stable text tokens for fewer image re-reads —
+  useful for models with a higher imaged-recall error rate (issue #6,
+  Opus 4.8). Documented in `pxpipe --help` and the README FAQ.
+
 ## 0.8.0 — 2026-07-03
 
 ### Security

@@ -1,9 +1,11 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import {
   extractFactSheetTokens,
   extractFactSheetEntries,
   extractFactSheetEntriesAllPages,
   factSheetText,
+  factSheetBudget,
+  MAX_TOKENS,
 } from '../src/core/factsheet.js';
 
 describe('factsheet extraction', () => {
@@ -118,5 +120,40 @@ describe('ticket-style codes and occurrence counts', () => {
     const hit = kept.find((e) => e.token === 'TICK-42');
     expect(hit).toBeDefined();
     expect(hit!.count).toBe(5);
+  });
+});
+
+describe('PXPIPE_FACTSHEET_MAX_TOKENS env override', () => {
+  const ENV = 'PXPIPE_FACTSHEET_MAX_TOKENS';
+  const saved = process.env[ENV];
+  afterEach(() => {
+    if (saved === undefined) delete process.env[ENV];
+    else process.env[ENV] = saved;
+  });
+
+  it('defaults to MAX_TOKENS when unset, empty, or garbage', () => {
+    delete process.env[ENV];
+    expect(factSheetBudget()).toBe(MAX_TOKENS);
+    process.env[ENV] = '';
+    expect(factSheetBudget()).toBe(MAX_TOKENS);
+    process.env[ENV] = 'lots';
+    expect(factSheetBudget()).toBe(MAX_TOKENS);
+  });
+
+  it('never shrinks below MAX_TOKENS and caps at 512', () => {
+    process.env[ENV] = '8';
+    expect(factSheetBudget()).toBe(MAX_TOKENS);
+    process.env[ENV] = '100000';
+    expect(factSheetBudget()).toBe(512);
+    process.env[ENV] = '128.9';
+    expect(factSheetBudget()).toBe(128); // floored to an integer budget
+  });
+
+  it('raises the keep-loop cap so a larger sheet actually materializes', () => {
+    process.env[ENV] = '256';
+    const many = Array.from({ length: 400 }, (_, i) => `/dir${i}/file${i}.ts`).join(' ');
+    const n = extractFactSheetTokens(many).length;
+    expect(n).toBeGreaterThan(MAX_TOKENS);
+    expect(n).toBeLessThanOrEqual(256);
   });
 });

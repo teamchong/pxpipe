@@ -140,6 +140,13 @@ pnpm install && pnpm test
 pnpm run build                # regenerates dist/
 ```
 
+Inside a checkout of this repo, `npx pxpipe-proxy` (the quickstart command
+above) won't work — npm sees the local `package.json` name matches and tries
+to run *this checkout's own* bin instead of fetching the published package,
+but an unbuilt checkout has no `dist/` to run. Use `pnpm run dev:node` (runs
+`src/node.ts` directly, no build needed) or `pnpm run build && node
+bin/cli.js` instead.
+
 ## FAQ
 
 **Is the headline end-to-end, or only on the requests you touched?**

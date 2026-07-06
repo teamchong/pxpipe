@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   renderChunkToPng,
   renderTextToPngs,
@@ -15,6 +15,7 @@ import {
   CELL_H,
   CELL_W,
 } from '../src/core/render.js';
+import * as renderModule from '../src/core/render.js';
 import { encodeGrayPng, bytesToBase64 } from '../src/core/png.js';
 import {
   transformRequest,
@@ -693,6 +694,41 @@ describe('transform', () => {
     // And the system field must NOT contain image blocks (would 400).
     if (Array.isArray(out.system)) {
       for (const b of out.system) expect(b.type).not.toBe('image');
+    }
+  });
+
+  it('caches the slab render: a repeat request with an identical system+tools payload is a pure cache hit', async () => {
+    // Regression guard for the render-cache bottleneck fix: the static
+    // system-prompt slab is byte-stable per session, so a second identical
+    // request must not re-invoke the renderer at all, and must return
+    // byte-identical image bytes. Nonce keeps this test's cache key from
+    // colliding with any other test's identical-looking slab content —
+    // the render cache is a module-level singleton shared across this file.
+    const nonce = `nonce-${Math.random()}`;
+    const bigSystem = `${nonce} You are a helpful assistant. `.repeat(5000);
+    const req = JSON.stringify({
+      model: 'claude-3-5-sonnet',
+      messages: [{ role: 'user', content: 'hi' }],
+      system: bigSystem,
+    });
+    const bytes = new TextEncoder().encode(req);
+
+    const spy = vi.spyOn(renderModule, 'renderTextToPngs');
+    try {
+      const first = await transformRequest(bytes);
+      const callsAfterFirst = spy.mock.calls.length;
+      expect(callsAfterFirst).toBeGreaterThan(0);
+
+      const second = await transformRequest(bytes);
+      expect(spy.mock.calls.length).toBe(callsAfterFirst); // no new render calls
+
+      const outA = JSON.parse(new TextDecoder().decode(first.body));
+      const outB = JSON.parse(new TextDecoder().decode(second.body));
+      const imagesOf = (out: any) =>
+        (out.messages[0].content as any[]).filter((b) => b.type === 'image');
+      expect(JSON.stringify(imagesOf(outA))).toBe(JSON.stringify(imagesOf(outB)));
+    } finally {
+      spy.mockRestore();
     }
   });
 

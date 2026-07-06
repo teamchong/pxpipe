@@ -15,7 +15,7 @@
  *     enough turns to fire, off when no closed prefix exists.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   findClosedPrefixBoundary,
   blocksToText,
@@ -26,6 +26,7 @@ import {
 } from '../src/core/history.js';
 import { transformRequest, isCompressionProfitable } from '../src/core/transform.js';
 import { DENSE_CONTENT_CHARS_PER_IMAGE } from '../src/core/render.js';
+import * as renderModule from '../src/core/render.js';
 import type { Message } from '../src/core/types.js';
 
 // A tiny helper so test fixtures are readable.
@@ -551,6 +552,34 @@ describe('collapseHistory', () => {
     const c = await collapseHistory(mk(70), profitable);
     expect(c.info.collapsedTurns).toBe(50);
     expect(JSON.stringify(imagesOf(c))).not.toBe(JSON.stringify(imgA));
+  });
+
+  it('reuses the render cache instead of re-rendering an unchanged collapsed chunk', async () => {
+    // Same fixture as the byte-identical-image test above: two conversations
+    // whose collapsed prefix (and therefore chunkRender/chunkSlot) is
+    // identical. The first call must render; the second must be a pure
+    // cache hit — proving the cache introduced for the performance
+    // bottleneck (re-rendering byte-stable history on every turn) is wired
+    // up, not just that the output happens to match.
+    const mk = (n: number): Message[] => {
+      const m: Message[] = [];
+      for (let i = 0; i < n; i++) {
+        const body = `turn ${i}: ` + 'y'.repeat(2800);
+        m.push(i % 2 === 0 ? usr(body) : asst(body));
+      }
+      return m;
+    };
+    const spy = vi.spyOn(renderModule, 'renderTextToPngsWithCharLimit');
+    try {
+      await collapseHistory(mk(20), profitable);
+      const callsAfterFirst = spy.mock.calls.length;
+      expect(callsAfterFirst).toBeGreaterThan(0);
+
+      await collapseHistory(mk(22), profitable);
+      expect(spy.mock.calls.length).toBe(callsAfterFirst); // no new renders — cache hit
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
 

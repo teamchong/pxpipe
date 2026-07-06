@@ -15,6 +15,8 @@ import type { CacheControl, ContentBlock, ImageBlock, Message, TextBlock, ToolUs
 import { DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_CONTENT_COLS, DENSE_RENDER_STYLE, neutralizeSentinel, reflow, renderTextToPngsWithCharLimit, roleSlotSegment, SLOT_MARK_ASSISTANT, SLOT_MARK_USER } from './render.js';
 import { factSheetText } from './factsheet.js';
 import { bytesToBase64 } from './png.js';
+import { sha8 } from './hash.js';
+import { cachedRender } from './render-cache.js';
 
 /**
  * Banner text blocks that bracket the collapsed-history image(s) in the synthetic
@@ -600,13 +602,20 @@ export async function collapseHistory(
     // colorByRole tints the structural <role> tags so turn boundaries are scannable
     // in the history image; it's token-free (vision cost is by pixel dims, not PNG
     // byte depth) and carries the serialize-time slot string instead of re-parsing.
-    const imgs = await renderTextToPngsWithCharLimit(
-      chunkRender,
-      DENSE_CONTENT_COLS,
-      DENSE_CONTENT_CHARS_PER_IMAGE,
-      { ...DENSE_RENDER_STYLE, colorByRole: true },
-      undefined,
-      chunkSlot,
+    // Cached: a frozen chunk's (chunkRender, chunkSlot) pair is a pure function of an
+    // immutable message range (see the append-only freeze design above), so repeat
+    // turns skip the glyph blit + PNG deflate for every chunk except the newest one.
+    const imgs = await cachedRender(
+      `hist:${await sha8(chunkRender + ' ' + chunkSlot)}`,
+      () =>
+        renderTextToPngsWithCharLimit(
+          chunkRender,
+          DENSE_CONTENT_COLS,
+          DENSE_CONTENT_CHARS_PER_IMAGE,
+          { ...DENSE_RENDER_STYLE, colorByRole: true },
+          undefined,
+          chunkSlot,
+        ),
     );
     const markerCC = markerByEnd.get(chunkEnd);
     for (let k = 0; k < imgs.length; k++) {

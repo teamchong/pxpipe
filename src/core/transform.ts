@@ -40,6 +40,8 @@ import { bytesToBase64 } from './png.js';
 import { collapseHistory, HISTORY_SYNTHETIC_INTRO } from './history.js';
 import type { GptHistoryOptions } from './openai-history.js';
 import { CACHE_CREATE_RATE, CACHE_READ_RATE } from './baseline.js';
+import { sha8 } from './hash.js';
+import { cachedRender } from './render-cache.js';
 
 /** Per-block descriptor passed to `TransformOptions.keepSharp`. */
 export interface KeepSharpBlock {
@@ -777,15 +779,7 @@ function observeStaticTagChurn(
   return churned;
 }
 
-/** sha256[0..8] hex via Web Crypto (works in Node 18+ and Workers). 32-bit collision-safe. */
-export async function sha8(text: string): Promise<string> {
-  const buf = new TextEncoder().encode(text);
-  const digest = await crypto.subtle.digest('SHA-256', buf);
-  const bytes = new Uint8Array(digest);
-  let hex = '';
-  for (let i = 0; i < 4; i++) hex += bytes[i]!.toString(16).padStart(2, '0');
-  return hex;
-}
+export { sha8 } from './hash.js';
 
 /** Record a recovery entry when `emitRecoverable` is on. No-op (no hash cost) when off. */
 async function recordRecoverable(
@@ -1709,10 +1703,15 @@ export async function transformRequest(
   // single-modal framing keeps encoder in image-reading mode for both header + content).
   // Header text is continuous prose (no hard \n) so the renderer soft-wraps densely.
   // 3. Render to PNGs at slabCols width (banner sets natural floor).
-  const images =
-    numCols > 1
-      ? await renderTextToPngsMultiCol(combinedWithHeader, slabCols, numCols)
-      : await renderTextToPngs(combinedWithHeader, slabCols);
+  // Cached: combinedWithHeader is byte-stable per session (same CLAUDE.md + tool
+  // list), so repeat turns skip the glyph blit + PNG deflate entirely.
+  const images = await cachedRender(
+    `slab:${await sha8(combinedWithHeader)}:${slabCols}:${numCols}`,
+    () =>
+      numCols > 1
+        ? renderTextToPngsMultiCol(combinedWithHeader, slabCols, numCols)
+        : renderTextToPngs(combinedWithHeader, slabCols),
+  );
   const imageBlocks: ImageBlock[] = [];
   for (let i = 0; i < images.length; i++) {
     const img = images[i]!;

@@ -7,6 +7,20 @@ behavioral changes, patch = fixes).
 ## Unreleased
 
 ### Added
+- **Per-model Claude render profiles (`claude-model-profiles.ts`).** Render
+  density (glyph cell size → columns, lines/page, chars/page, slab width) is
+  now a per-model property, retunable via `PXPIPE_CLAUDE_PROFILES` (a JSON
+  model-id-prefix map; longest prefix wins, partial fields fall back to the
+  built-in table) without a code change — mirrors `PXPIPE_GPT_PROFILES`.
+  Built-in default is behavior-identical to the prior hardcoded 5×8 geometry
+  (312 cols, 90 lines, 28080 chars/page), so existing models' pagination,
+  gate math, and cache keys are unchanged. Ships a built-in 9×12 Opus profile
+  — the only variant that cleared the issue-#6 bar (4/4 exact reads,
+  0 confabulations, 45% savings; `eval/opus-density/RESULTS.md`) — dormant
+  unless the host opts an Opus model into `PXPIPE_MODELS`. The transform gate
+  prices pixels with the profile's cell, so wide-cell profiles no longer
+  under-predict image cost. Documented in `pxpipe --help` and the README
+  roadmap.
 - `PXPIPE_FACTSHEET_MAX_TOKENS`: runtime override for the verbatim
   fact-sheet token budget per imaged block (default 64, clamped to 64–512;
   invalid or absent values fall back to the default, and the clamp floor

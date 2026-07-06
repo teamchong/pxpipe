@@ -233,7 +233,10 @@ canary + re-fetch, surrogate-reader pre-flight) are in
 [FINDINGS.md](FINDINGS.md), 2026-07-05 entry. Watch condition: re-run the
 resolution sweep per model release; readable density moved ~4x in glyph
 area from Opus 4.8 to Fable 5, and a model that reads production cells
-near 100% means savings rise for free.
+near 100% means savings rise for free. Density is now a per-model knob:
+`PXPIPE_CLAUDE_PROFILES` / `PXPIPE_GPT_PROFILES` retune render geometry per
+model-id prefix without a code change (see `pxpipe --help`), so a sweep
+result turns into a one-line profile instead of a release.
 
 Still open, unchanged: whether imaged bulk stretches effective context (~2x
 the real content in the same 1M window), and whether a smaller active

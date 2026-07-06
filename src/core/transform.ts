@@ -30,11 +30,14 @@ import {
   CELL_H,
   READABLE_CHARS_PER_IMAGE,
   DENSE_CONTENT_CHARS_PER_IMAGE,
-  DENSE_CONTENT_COLS,
-  DENSE_RENDER_STYLE,
   renderTextToPngsWithCharLimit,
 } from './render.js';
 import { factSheetText } from './factsheet.js';
+import {
+  DEFAULT_CLAUDE_PROFILE,
+  resolveClaudeProfile,
+  type ClaudeModelProfile,
+} from './claude-model-profiles.js';
 import { stripSchemaDescriptions, schemaHasStructure } from './schema-strip.js';
 import { bytesToBase64 } from './png.js';
 import { collapseHistory, HISTORY_SYNTHETIC_INTRO } from './history.js';
@@ -192,17 +195,26 @@ export const ANTHROPIC_PIXELS_PER_TOKEN = 750;
 export const IMAGE_COST_SAFETY_MARGIN = 1.10;
 
 /** Width in px of a single-col PNG. Must stay in sync with `renderChunkToPng` (render.ts). */
-function singleColWidthPx(cols: number): number {
-  return 2 * PAD_X + cols * CELL_W;
+function singleColWidthPx(cols: number, cellW: number = CELL_W): number {
+  return 2 * PAD_X + cols * cellW;
 }
 
 /** Width in px of a multi-col PNG. Mirrors `multiColWidth()` in render.ts. */
-function multiColWidthPx(cols: number, numCols: number): number {
+function multiColWidthPx(cols: number, numCols: number, cellW: number = CELL_W): number {
   const n = Math.max(1, numCols | 0);
-  if (n === 1) return singleColWidthPx(cols);
+  if (n === 1) return singleColWidthPx(cols, cellW);
   const GUTTER_CELLS = 4; // must match render.ts (not exported)
-  return 2 * PAD_X + n * cols * CELL_W + (n - 1) * GUTTER_CELLS * CELL_W;
+  return 2 * PAD_X + n * cols * cellW + (n - 1) * GUTTER_CELLS * cellW;
 }
+
+/** Rendered cell size in px for the gate's pixel-cost math. Defaults to the
+ *  production 5×8; per-model profiles (claude-model-profiles.ts) supply wider
+ *  cells so wide-cell pages are priced at their REAL pixel area. */
+export interface GateCellPx {
+  w: number;
+  h: number;
+}
+const DEFAULT_GATE_CELL: GateCellPx = { w: CELL_W, h: CELL_H };
 
 /** Exact image-token cost for `visualRows` at given column/multi-col geometry.
  *  Mirrors the renderer's height math so the gate matches Anthropic billing.
@@ -213,11 +225,12 @@ function imageTokensForRows(
   numCols: number = 1,
   imageCountCap?: number,
   maxCharsPerImage: number = READABLE_CHARS_PER_IMAGE,
+  cell: GateCellPx = DEFAULT_GATE_CELL,
 ): number {
   if (!Number.isFinite(visualRows) || visualRows <= 0) return 0;
   const n = Math.max(1, numCols | 0);
-  const widthPx = multiColWidthPx(cols, n);
-  const hardLinesPerImg = Math.max(1, Math.floor((MAX_HEIGHT_PX - 2 * PAD_Y) / CELL_H));
+  const widthPx = multiColWidthPx(cols, n, cell.w);
+  const hardLinesPerImg = Math.max(1, Math.floor((MAX_HEIGHT_PX - 2 * PAD_Y) / cell.h));
   const readableLinesPerCol = Math.max(1, Math.floor(maxCharsPerImage / Math.max(1, cols)));
   const linesPerImg = Math.min(hardLinesPerImg, readableLinesPerCol);
   const rowsPerImage = linesPerImg; // pixel rows per image (height)
@@ -230,8 +243,8 @@ function imageTokensForRows(
   const linesInLast = visualRows - fullImages * linesPerImage;
   // Column-major layout: pixel rows = min(linesInLast, rowsPerImage).
   const rowsInLast = Math.min(Math.max(1, linesInLast), rowsPerImage);
-  const fullImageHeight = 2 * PAD_Y + rowsPerImage * CELL_H;
-  const lastImageHeight = 2 * PAD_Y + rowsInLast * CELL_H;
+  const fullImageHeight = 2 * PAD_Y + rowsPerImage * cell.h;
+  const lastImageHeight = 2 * PAD_Y + rowsInLast * cell.h;
   const totalPixels = fullImages * widthPx * fullImageHeight + widthPx * lastImageHeight;
   return Math.ceil((totalPixels / ANTHROPIC_PIXELS_PER_TOKEN) * IMAGE_COST_SAFETY_MARGIN);
 }
@@ -246,19 +259,28 @@ function imageTokensCost(
   imageCountCap?: number,
   shrinkWidth: boolean = true,
   maxCharsPerImage: number = READABLE_CHARS_PER_IMAGE,
+  cell: GateCellPx = DEFAULT_GATE_CELL,
 ): number {
   const effectiveCols = shrinkWidth ? shrinkColsToContent(text, cols) : cols;
   const rows = countVisualRows(text, effectiveCols);
-  return imageTokensForRows(rows, effectiveCols, numCols, imageCountCap, maxCharsPerImage);
+  return imageTokensForRows(rows, effectiveCols, numCols, imageCountCap, maxCharsPerImage, cell);
 }
 
 /** Gate geometry for the single-col dense path (tool_result, reminder, history).
- *  Dense single-col uses DENSE_CONTENT_COLS/DENSE_CONTENT_CHARS_PER_IMAGE;
- *  multi-col uses configured `cols` at READABLE budget. Slab uses its own path. */
-function denseGateGeometry(cols: number, numCols: number): { cols: number; maxChars: number } {
+ *  Dense single-col uses the model profile's denseCols/denseCharsPerImage
+ *  (312/28080 at the default 5×8 — the old DENSE_CONTENT_* constants);
+ *  multi-col uses configured `cols` at READABLE budget. Slab uses its own path.
+ *  NOTE: multi-col keeps the default 5×8 geometry — renderTextToPngsMultiCol
+ *  has no style plumbing, so gating multi-col at profile cells would price a
+ *  page the renderer never produces. */
+function denseGateGeometry(
+  cols: number,
+  numCols: number,
+  profile: ClaudeModelProfile = DEFAULT_CLAUDE_PROFILE,
+): { cols: number; maxChars: number } {
   return Math.max(1, numCols | 0) > 1
     ? { cols, maxChars: READABLE_CHARS_PER_IMAGE }
-    : { cols: DENSE_CONTENT_COLS, maxChars: DENSE_CONTENT_CHARS_PER_IMAGE };
+    : { cols: profile.denseCols, maxChars: profile.denseCharsPerImage };
 }
 
 /** Visual rows per image: `floor((MAX_HEIGHT_PX − 2·PAD_Y) / CELL_H)`. Derived
@@ -320,6 +342,7 @@ export function evalCompressionProfitability(
   priorWarmTokens: number = 0,
   priorWarmImageTokens: number = 0,
   shrinkWidth: boolean = true,
+  cell: GateCellPx = DEFAULT_GATE_CELL,
 ): {
   imageTokens: number;
   textTokens: number;
@@ -332,7 +355,7 @@ export function evalCompressionProfitability(
   const cpt = Number.isFinite(charsPerToken) && charsPerToken > 0
     ? charsPerToken
     : CHARS_PER_TOKEN;
-  const imageTokens = imageTokensCost(text, cols, n, imageCountCap, shrinkWidth);
+  const imageTokens = imageTokensCost(text, cols, n, imageCountCap, shrinkWidth, undefined, cell);
   const textTokens = text.length / cpt;
   const burnImageSide = Number.isFinite(priorWarmTokens) && priorWarmTokens > 0
     ? priorWarmTokens * (CACHE_CREATE_RATE - CACHE_READ_RATE)
@@ -359,13 +382,14 @@ export function isCompressionProfitable(
   priorWarmImageTokens: number = 0,
   shrinkWidth: boolean = true,
   maxCharsPerImage: number = READABLE_CHARS_PER_IMAGE,
+  cell: GateCellPx = DEFAULT_GATE_CELL,
 ): boolean {
   const n = Math.max(1, numCols | 0);
   if (typeof text !== 'string' || text.length === 0) return false;
   const cpt = Number.isFinite(charsPerToken) && charsPerToken > 0
     ? charsPerToken
     : CHARS_PER_TOKEN;
-  const imageTokensCost_ = imageTokensCost(text, cols, n, imageCountCap, shrinkWidth, maxCharsPerImage);
+  const imageTokensCost_ = imageTokensCost(text, cols, n, imageCountCap, shrinkWidth, maxCharsPerImage, cell);
   const textTokensEquivalent = text.length / cpt;
   // Symmetric burn penalty (anti-flapping): switching modes invalidates the warm
   // cache on whichever side was warm, paying cache_create. Burn is added to the
@@ -400,9 +424,10 @@ export function isCompressionProfitableAmortized(
   priorWarmImageTokens: number = 0,
   shrinkWidth: boolean = true,
   maxCharsPerImage: number = READABLE_CHARS_PER_IMAGE,
+  cell: GateCellPx = DEFAULT_GATE_CELL,
 ): boolean {
   if (!Number.isFinite(horizon) || horizon <= 1) {
-    return isCompressionProfitable(text, cols, imageCountCap, numCols, charsPerToken, priorWarmTokens, priorWarmImageTokens, shrinkWidth, maxCharsPerImage);
+    return isCompressionProfitable(text, cols, imageCountCap, numCols, charsPerToken, priorWarmTokens, priorWarmImageTokens, shrinkWidth, maxCharsPerImage, cell);
   }
   const N = Math.max(2, Math.floor(horizon));
   const n = Math.max(1, numCols | 0);
@@ -410,7 +435,7 @@ export function isCompressionProfitableAmortized(
   const cpt = Number.isFinite(charsPerToken) && charsPerToken > 0
     ? charsPerToken
     : CHARS_PER_TOKEN;
-  const imageTokens = imageTokensCost(text, cols, n, imageCountCap, shrinkWidth, maxCharsPerImage);
+  const imageTokens = imageTokensCost(text, cols, n, imageCountCap, shrinkWidth, maxCharsPerImage, cell);
   const textTokens = text.length / cpt;
   // Worst-case-for-image vs best-case-for-text (conservative, on purpose).
   const imageLifetime = imageTokens * (CACHE_CREATE_RATE + CACHE_READ_RATE * (N - 1));
@@ -1301,6 +1326,12 @@ export async function textToImageBlocks(
   /** Shrink canvas to the longest wrapped line. `false` for the slab path
    *  (fills full `cols` for multi-col packing). Default `true`. */
   shrinkWidth: boolean = true,
+  /** Per-model render geometry (claude-model-profiles.ts). The single-col
+   *  dense branch renders at the profile's denseCols/denseCharsPerImage/style
+   *  so a wide-cell model gets legible pages AND the gate that priced them
+   *  agrees. Default = production 5×8 (behavior-identical to the old
+   *  DENSE_CONTENT_* constants). */
+  profile: ClaudeModelProfile = DEFAULT_CLAUDE_PROFILE,
 ): Promise<{
   blocks: ImageBlock[];
   /** Raw PNG bytes parallel to `blocks` (avoids re-decoding base64 for dashboard). */
@@ -1319,10 +1350,11 @@ export async function textToImageBlocks(
   const imgs =
     effectiveNumCols > 1
       ? await renderTextToPngsMultiCol(text, effectiveCols, effectiveNumCols)
-      // Single-col dense: shrink the 384-col base to content so the renderer matches the
-      // gate (denseGateGeometry uses DENSE_CONTENT_COLS, priced via shrinkColsToContent).
-      // Was hard-coded to DENSE_CONTENT_COLS, which threw away the shrink the gate assumed.
-      : await renderTextToPngsWithCharLimit(text, shrinkColsToContent(text, DENSE_CONTENT_COLS), DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_RENDER_STYLE);
+      // Single-col dense: shrink the profile's dense width to content so the renderer
+      // matches the gate (denseGateGeometry uses profile.denseCols, priced via
+      // shrinkColsToContent). Was hard-coded to DENSE_CONTENT_COLS, which threw away
+      // the shrink the gate assumed.
+      : await renderTextToPngsWithCharLimit(text, shrinkColsToContent(text, profile.denseCols), profile.denseCharsPerImage, profile.style);
   let droppedChars = 0;
   let pixels = 0;
   const droppedCodepoints = new Map<number, number>();
@@ -1369,6 +1401,7 @@ async function runHistoryCollapseAndFinalize(
   o: Required<TransformOptions>,
   opts: TransformOptions,
   droppedCodepoints: Map<number, number>,
+  profile: ClaudeModelProfile = DEFAULT_CLAUDE_PROFILE,
 ): Promise<{ body: Uint8Array; info: TransformInfo; collapsed: boolean }> {
   let collapsedFlag = false;
   if (Array.isArray(req.messages) && req.messages.length > 0) {
@@ -1383,10 +1416,10 @@ async function runHistoryCollapseAndFinalize(
     // 2026-05-23 showed three-turn sessions paying cache_create every
     // turn because the history gate ignored priorWarmImageTokens.
     const historyProfitable = (text: string, cols: number): boolean => {
-      // History always renders single-col at the dense 384-col / 240-row page
-      // (history.ts → renderTextToPngsWithCharLimit with DENSE_CONTENT_COLS /
-      // DENSE_CONTENT_CHARS_PER_IMAGE), so gate at THAT geometry, not o.cols.
-      const g = denseGateGeometry(cols, 1);
+      // History always renders single-col at the profile's dense page
+      // (history.ts → renderTextToPngsWithCharLimit with profile.denseCols /
+      // profile.denseCharsPerImage), so gate at THAT geometry, not o.cols.
+      const g = denseGateGeometry(cols, 1, profile);
       return isCompressionProfitableAmortized(
         text, g.cols, undefined, 1, historyCpt, horizon,
         o.priorWarmTokens, o.priorWarmImageTokens, true, g.maxChars,
@@ -1398,7 +1431,7 @@ async function runHistoryCollapseAndFinalize(
     const { messages: newMessages, info: histInfo } = await collapseHistory(
       req.messages,
       historyProfitable,
-      { cols: o.cols, protectedPrefix: 0, reflow: o.reflow },
+      { cols: o.cols, protectedPrefix: 0, reflow: o.reflow, profile },
     );
     if (histInfo.collapsedTurns > 0) {
       req.messages = newMessages;
@@ -1481,6 +1514,13 @@ export async function transformRequest(
     info.reason = `parse_error: ${(e as Error).message}`;
     return { body, info };
   }
+
+  // Per-model render geometry, resolved ONCE per request and threaded through
+  // every dense single-col render AND its profitability gate — a gate priced at
+  // one geometry while the renderer draws another silently mis-prices every
+  // borderline decision. Unknown models resolve to the production 5×8 default,
+  // so non-Claude traffic is behavior-identical.
+  const profile = resolveClaudeProfile(req.model);
 
   // 1. Pull system text out. Split into:
   //    - billingLine: Claude Code's per-turn random header (must NOT be cached).
@@ -1617,7 +1657,7 @@ export async function transformRequest(
     // If history collapses, we flip `info.compressed = true` and let the
     // library wrapper return reason='applied'; otherwise this still
     // populates `outgoingTextChars` for the regression denominator.
-    const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints);
+    const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints, profile);
     if (finalized.collapsed) {
       info.compressed = true;
       return { body: finalized.body, info };
@@ -1632,7 +1672,7 @@ export async function transformRequest(
     Math.max(1, maxFittingCols(o.cols)),
   );
   // Gate geometry for dense single-col (tool_result/reminder) paths — 384-col/240-row.
-  const denseGeo = denseGateGeometry(o.cols, numCols);
+  const denseGeo = denseGateGeometry(o.cols, numCols, profile);
   // Use slab cpt (2.0) unless host pinned charsPerToken explicitly.
   const slabCpt = opts.charsPerToken !== undefined
     ? o.charsPerToken
@@ -1683,7 +1723,7 @@ export async function transformRequest(
     info.reason = `not_profitable (slab=${combined.length} chars)`;
     bumpPassthrough(info, 'not_profitable');
     // Slab not profitable but history may still be collapsable — try before returning.
-    const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints);
+    const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints, profile);
     if (finalized.collapsed) {
       info.compressed = true;
       return { body: finalized.body, info };
@@ -1812,7 +1852,7 @@ export async function transformRequest(
             continue;
           }
           const { blocks: imgs, pngs: rawPngs, dims: rawDims, droppedChars, droppedCodepoints: dcp, pixels } =
-            await textToImageBlocks(reminderText, o.cols, numCols);
+            await textToImageBlocks(reminderText, o.cols, numCols, true, profile);
           (info.imagePngs ??= []).push(...rawPngs);
           (info.imageDims ??= []).push(...rawDims);
           const srcCacheControl = (blk as { cache_control?: unknown }).cache_control;
@@ -1880,6 +1920,7 @@ export async function transformRequest(
               }
               const inner = compactSlabWhitespace(innerRaw);
               // classifyContent sees pre-reflow `inner` so shape bucketing reflects real structure.
+              const trBucket = toolResultBucket(classifyContent(inner));
               const innerR = maybeReflow(inner, o.reflow);
               if (innerR.length < o.minToolResultChars) {
                 bumpPassthrough(info, 'below_threshold');
@@ -1895,7 +1936,7 @@ export async function transformRequest(
                   info.omittedChars = (info.omittedChars ?? 0) + paged.omittedChars;
                 }
                 const { blocks: imgs, pngs: rawPngs, dims: rawDims, droppedChars, droppedCodepoints: dcp, pixels } =
-                  await textToImageBlocks(paged.text, o.cols, numCols);
+                  await textToImageBlocks(paged.text, o.cols, numCols, true, profile);
                 (info.imagePngs ??= []).push(...rawPngs);
                 (info.imageDims ??= []).push(...rawDims);
                 for (const img of imgs) info.imageBytes += approxBlockBytes(img);
@@ -1919,7 +1960,7 @@ export async function transformRequest(
                   content: trFactSheet ? [...imgs, { type: 'text' as const, text: trFactSheet }] : imgs,
                 });
                 changed = true;
-                bumpBucket(info, toolResultBucket(classifyContent(inner)), innerRaw.length);
+                bumpBucket(info, trBucket, innerRaw.length);
               }
             } else if (Array.isArray(innerRaw)) {
               const newInner: Array<TextBlock | ImageBlock> = [];
@@ -1944,6 +1985,7 @@ export async function transformRequest(
                 // Lossless whitespace compaction before gate + render.
                 const innerText = compactSlabWhitespace(innerTextRaw);
                 // R3: gate/page/render on reflowed text; classify pre-reflow.
+                const partBucket = toolResultBucket(classifyContent(innerText));
                 const innerTextR = maybeReflow(innerText, o.reflow);
                 if (innerTextR.length < o.minToolResultChars) {
                   bumpPassthrough(info, 'below_threshold');
@@ -1961,7 +2003,7 @@ export async function transformRequest(
                   info.omittedChars = (info.omittedChars ?? 0) + paged.omittedChars;
                 }
                 const { blocks: imgs, pngs: rawPngs, dims: rawDims, droppedChars, droppedCodepoints: dcp, pixels } =
-                  await textToImageBlocks(paged.text, o.cols, numCols);
+                  await textToImageBlocks(paged.text, o.cols, numCols, true, profile);
                 (info.imagePngs ??= []).push(...rawPngs);
                 (info.imageDims ??= []).push(...rawDims);
                 const srcCacheControl = (ib as { cache_control?: unknown }).cache_control;
@@ -1990,7 +2032,7 @@ export async function transformRequest(
                 for (const [cp, n] of dcp) {
                   droppedCodepoints.set(cp, (droppedCodepoints.get(cp) ?? 0) + n);
                 }
-                bumpBucket(info, toolResultBucket(classifyContent(innerText)), innerTextRaw.length);
+                bumpBucket(info, partBucket, innerTextRaw.length);
                 innerChanged = true;
               }
               if (innerChanged) {
@@ -2023,8 +2065,8 @@ export async function transformRequest(
       : HISTORY_CHARS_PER_TOKEN;
     const horizon = Math.max(1, Math.floor(o.historyAmortizationHorizon));
     const historyProfitable = (text: string, cols: number): boolean => {
-      // Gate at dense 384-col/240-row geometry (matches history.ts renderer).
-      const g = denseGateGeometry(cols, 1);
+      // Gate at the profile's dense geometry (matches history.ts renderer).
+      const g = denseGateGeometry(cols, 1, profile);
       return isCompressionProfitableAmortized(
         text, g.cols, undefined, 1, historyCpt, horizon,
         o.priorWarmTokens, o.priorWarmImageTokens, true, g.maxChars,
@@ -2034,7 +2076,7 @@ export async function transformRequest(
     const { messages: newMessages, info: histInfo } = await collapseHistory(
       req.messages,
       historyProfitable,
-      { cols: o.cols, protectedPrefix: slabAnchorIdx >= 0 ? slabAnchorIdx + 1 : 0, reflow: o.reflow },
+      { cols: o.cols, protectedPrefix: slabAnchorIdx >= 0 ? slabAnchorIdx + 1 : 0, reflow: o.reflow, profile },
     );
     if (histInfo.collapsedTurns > 0) {
       req.messages = newMessages;

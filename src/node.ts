@@ -169,6 +169,15 @@ Environment:
                           next to imaged content (default 64, clamped to 64..512).
                           Raise for models that misread imaged identifiers more
                           often; costs a few hundred prefix-stable text tokens.
+  PXPIPE_CLAUDE_PROFILES  per-model render density override: JSON map of
+                          model-id prefix -> {cellWBonus,cellHBonus,aa}, e.g.
+                          '{"claude-opus-":{"cellWBonus":4,"cellHBonus":4}}'.
+                          Longest matching prefix wins over the built-in table;
+                          partial fields fall back to the built-in match.
+                          Geometry only — does NOT enable a model for imaging
+                          (see PXPIPE_MODELS).
+  PXPIPE_GPT_PROFILES     same idea for GPT model ids: JSON prefix map tuning
+                          vision-cost regime, strip width, max image height.
   PXPIPE_LOG              JSONL events path (default ~/.pxpipe/events.jsonl)
   PXPIPE_DUMP_DIR         debug: write every rendered PNG here (what the model
                           sees); off unless set. Compress arm only.

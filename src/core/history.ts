@@ -12,7 +12,8 @@
  */
 
 import type { CacheControl, ContentBlock, ImageBlock, Message, TextBlock, ToolUseBlock, ToolResultBlock } from './types.js';
-import { DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_CONTENT_COLS, DENSE_RENDER_STYLE, neutralizeSentinel, reflow, renderTextToPngsWithCharLimit, roleSlotSegment, SLOT_MARK_ASSISTANT, SLOT_MARK_USER } from './render.js';
+import { neutralizeSentinel, reflow, renderTextToPngsWithCharLimit, roleSlotSegment, SLOT_MARK_ASSISTANT, SLOT_MARK_USER } from './render.js';
+import { DEFAULT_CLAUDE_PROFILE, type ClaudeModelProfile } from './claude-model-profiles.js';
 import { factSheetText } from './factsheet.js';
 import { bytesToBase64 } from './png.js';
 
@@ -71,6 +72,12 @@ export interface HistoryCollapseOptions {
    *  identical — it just removes the blank-row waste. `collapsedChars` still
    *  reports the ORIGINAL transcript length. Default true. */
   reflow: boolean;
+  /** Per-model render geometry (claude-model-profiles.ts): denseCols /
+   *  denseCharsPerImage / style used by the history renderer. Callers must pass
+   *  the SAME profile to the profitability gate (denseGateGeometry in
+   *  transform.ts) or the gate prices pages the renderer never produces.
+   *  Default = production 5×8 (the old DENSE_CONTENT_* constants). */
+  profile: ClaudeModelProfile;
 }
 
 export const HISTORY_DEFAULTS: HistoryCollapseOptions = {
@@ -81,6 +88,7 @@ export const HISTORY_DEFAULTS: HistoryCollapseOptions = {
   freezeChunk: 10,
   protectedPrefix: 0,
   reflow: true,
+  profile: DEFAULT_CLAUDE_PROFILE,
 };
 
 /** Per-request telemetry surfaced back to TransformInfo. */
@@ -602,9 +610,9 @@ export async function collapseHistory(
     // byte depth) and carries the serialize-time slot string instead of re-parsing.
     const imgs = await renderTextToPngsWithCharLimit(
       chunkRender,
-      DENSE_CONTENT_COLS,
-      DENSE_CONTENT_CHARS_PER_IMAGE,
-      { ...DENSE_RENDER_STYLE, colorByRole: true },
+      o.profile.denseCols,
+      o.profile.denseCharsPerImage,
+      { ...o.profile.style, colorByRole: true },
       undefined,
       chunkSlot,
     );

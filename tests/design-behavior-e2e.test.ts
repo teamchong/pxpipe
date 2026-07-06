@@ -181,6 +181,8 @@ describe('design: TOOLS IN RECENT TURNS (Anthropic)', () => {
 
 // ===========================================================================
 describe('design: RECENT REQUEST stays legible (GPT)', () => {
+  // Real PNG render of a 60k-char slab; the default 5s timeout is too tight
+  // when the full suite renders in parallel under CPU contention.
   it('images the system slab but keeps the most-recent user request as readable text', async () => {
     const turns = Array.from({ length: 12 }, (_, i) => ({
       role: (i % 2 === 0 ? 'user' : 'assistant') as 'user' | 'assistant',
@@ -198,5 +200,5 @@ describe('design: RECENT REQUEST stays legible (GPT)', () => {
     expect(imageCount(out)).toBeGreaterThan(0); // system imaged
     // The agent's live request must remain legible text, never OCR-only.
     expect(hay).toContain('FINAL_REQUEST_MARKER please answer');
-  });
+  }, 20_000);
 });

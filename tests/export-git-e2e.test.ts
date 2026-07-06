@@ -10,7 +10,10 @@ import { fileURLToPath } from 'node:url';
 // Runs the actual CLI via tsx against a throwaway git repo and asserts the
 // untracked-file filtering. Kept in its own file because it spawns a subprocess.
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const tsxBin = path.join(repoRoot, 'node_modules', '.bin', 'tsx');
+// On Windows the .bin entry is `tsx.cmd`, which Node can only exec through a
+// shell; POSIX runs the extensionless shim directly.
+const isWin = process.platform === 'win32';
+const tsxBin = path.join(repoRoot, 'node_modules', '.bin', isWin ? 'tsx.cmd' : 'tsx');
 
 function git(cwd: string, args: string[]): void {
   const r = spawnSync('git', args, { cwd, encoding: 'utf8' });
@@ -45,7 +48,7 @@ describe('pxpipe export --git (end-to-end)', () => {
     const run = spawnSync(
       tsxBin,
       ['src/node.ts', 'export', '--git', repo, '--include', '*.ts', '--out', outDir, '--json'],
-      { cwd: repoRoot, encoding: 'utf8', timeout: 120_000 },
+      { cwd: repoRoot, encoding: 'utf8', timeout: 120_000, shell: isWin },
     );
     expect(run.status, `stderr:\n${run.stderr}`).toBe(0);
 

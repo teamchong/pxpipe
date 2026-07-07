@@ -735,6 +735,8 @@ export function createProxy(config: ProxyConfig = {}) {
     let bodyOut: BodyInit | null = null;
     let info: TransformInfo | undefined;
     let requestModel: string | undefined;
+    /** Pre-transform request bytes, kept for the E13 refusal auto-retry. */
+    let originalBody: Uint8Array | undefined;
 
     // Two count_tokens probes on the pre-compression body (see docs/HISTORY_CACHE_MODEL.md):
     //   baselinePromise          → full-body input_tokens
@@ -746,6 +748,7 @@ export function createProxy(config: ProxyConfig = {}) {
 
     if (isMessages || isOpenAIChat || isOpenAIResponses) {
       const bodyIn = new Uint8Array(await req.arrayBuffer());
+      originalBody = bodyIn;
       try {
         const transformOpts =
           typeof config.transform === 'function' ? config.transform() : config.transform;
@@ -855,7 +858,39 @@ export function createProxy(config: ProxyConfig = {}) {
         headers: { 'content-type': 'application/json' },
       });
     }
-    const upstreamRes: Response = fetchedRes;
+    let upstreamRes: Response = fetchedRes;
+
+    // E13 refusal auto-retry (non-streaming only): a COMPRESSED request whose
+    // response ends stop_reason:'refusal' is re-sent ONCE with the ORIGINAL
+    // untransformed body — the classifier fired on the transformed shape, not
+    // the user's content. SSE responses can't be retried here (bytes already
+    // belong to the client); the host-side session guard
+    // (TransformOptions.passthroughGuard) covers a streaming session's
+    // remaining turns instead.
+    if (
+      isMessages &&
+      info?.compressed === true &&
+      originalBody !== undefined &&
+      upstreamRes.ok &&
+      (upstreamRes.headers.get('content-type') ?? '').includes('application/json')
+    ) {
+      try {
+        const peek = (await upstreamRes.clone().json()) as { stop_reason?: unknown };
+        if (peek.stop_reason === 'refusal') {
+          const { res: retryRes } = await fetchUpstreamWithRetry(
+            upstreamUrl,
+            { method: req.method, headers: outHeaders, body: originalBody } as RequestInit,
+            { maxAttempts: 1 },
+          );
+          if (retryRes?.ok) {
+            info.refusalRetried = true;
+            upstreamRes = retryRes;
+          }
+        }
+      } catch {
+        // Body wasn't JSON despite the header — forward the original response.
+      }
+    }
 
     const firstByteMs = Date.now() - t0;
 

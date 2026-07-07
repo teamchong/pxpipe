@@ -167,6 +167,11 @@ Environment:
   PXPIPE_LOG              JSONL events path (default ~/.pxpipe/events.jsonl)
   PXPIPE_DUMP_DIR         debug: write every rendered PNG here (what the model
                           sees); off unless set. Compress arm only.
+  PXPIPE_CACHE_TTL_1H     1 = upgrade the cache breakpoints pxpipe relocates
+                          (slab/history anchors) to 1h TTL (2× write, 0.1× read)
+  PXPIPE_REFUSAL_TRIP     refusals on compressed requests before a session is
+                          forced to passthrough (default 1; 0 disables)
+  PXPIPE_RENDER_CACHE     0 = disable the content-addressed PNG render cache
 
 Use with Claude Code:
   ANTHROPIC_BASE_URL=http://127.0.0.1:47821 claude
@@ -876,6 +881,19 @@ async function main(): Promise<void> {
   if (forcePassthrough) {
     console.log('[pxpipe] PXPIPE_DISABLE set — passthrough mode (compress=false), still logging usage + baselines');
   }
+  // E13 refusal kill-switch: a session whose COMPRESSED requests came back
+  // stop_reason:'refusal' stops being compressed (see passthroughGuard below).
+  // Keyed by firstUserSha8 (fallback claudeMdSha8) — the same privacy-safe
+  // fingerprints the transform already emits. Process-local by design: a
+  // restart clears the veto, which is fine — the guard exists to stop repeat
+  // classifier trips within a live session, not to persist policy.
+  const refusalTrip = Number.parseInt(process.env.PXPIPE_REFUSAL_TRIP ?? '1', 10);
+  const refusalsBySession = new Map<string, number>();
+  // Opt-in 1h TTL upgrade on relocated cache breakpoints (TransformOptions.cacheTtl1h).
+  const cacheTtl1h = /^(1|true|yes|on)$/i.test(process.env.PXPIPE_CACHE_TTL_1H ?? '');
+  if (cacheTtl1h) {
+    console.log('[pxpipe] PXPIPE_CACHE_TTL_1H set — relocated cache breakpoints upgraded to 1h TTL');
+  }
   // Debug aid: when PXPIPE_DUMP_DIR is set, persist every rendered PNG this
   // process emits, so you can eyeball exactly what the model received (OCR /
   // legibility audits, demo inspection). Best-effort — never affects requests.
@@ -892,8 +910,9 @@ async function main(): Promise<void> {
       imageDumpDir = undefined;
     }
   }
-  // Transform options pass through empty — the proxy uses the DEFAULTS
-  // baked into transform.ts. There are no behavior toggles: system slab,
+  // Transform options stay minimal — the proxy uses the DEFAULTS baked into
+  // transform.ts, plus exactly two host-wired knobs: the E13 refusal guard
+  // and the opt-in 1h-TTL upgrade (both above). No gate tuning: system slab,
   // reminders, tool_results, and history compression all run
   // unconditionally; the per-block break-even gate decides per-call
   // whether to actually image each piece. The function-form `transform`
@@ -944,8 +963,18 @@ async function main(): Promise<void> {
       // still logging real usage + count_tokens baselines to its own PXPIPE_LOG.
       // (The dashboard kill switch does the same thing at runtime.)
       if (forcePassthrough || !dashboard.getCompressionEnabled()) return { compress: false };
-      // Active path: use DEFAULTS in transform.ts for break-even gating.
-      return {};
+      // Active path: DEFAULTS in transform.ts for break-even gating, plus the
+      // E13 session guard and the opt-in 1h-TTL breakpoint upgrade. The guard
+      // closure reads the live refusal map on every request, so a session
+      // trips mid-flight without any config reload.
+      return {
+        cacheTtl1h,
+        passthroughGuard: (ids) => {
+          if (!Number.isFinite(refusalTrip) || refusalTrip <= 0) return false;
+          const key = ids.firstUserSha8 ?? ids.claudeMdSha8;
+          return key !== undefined && (refusalsBySession.get(key) ?? 0) >= refusalTrip;
+        },
+      };
     },
     onRequest: async (e) => {
       // Feed the dashboard BEFORE tracker.emit — toTrackEvent strips
@@ -986,6 +1015,23 @@ async function main(): Promise<void> {
       console.log(
         `[${new Date().toISOString()}] ${e.method} ${e.path} → ${e.status} (${e.durationMs}ms) ${tag}${usageTag}`,
       );
+
+      // E13: count refusals on compressed rows; once a session reaches
+      // PXPIPE_REFUSAL_TRIP, the passthroughGuard above vetoes compression
+      // for its remaining turns. (Non-streaming refusals are also retried
+      // in-flight by the proxy — see info.refusalRetried.)
+      if (e.stopReason === 'refusal' && e.info?.compressed) {
+        const key = e.info.firstUserSha8 ?? e.info.claudeMdSha8;
+        if (key) {
+          const n = (refusalsBySession.get(key) ?? 0) + 1;
+          refusalsBySession.set(key, n);
+          const tripped = Number.isFinite(refusalTrip) && refusalTrip > 0 && n >= refusalTrip;
+          console.warn(
+            `[pxpipe] refusal on compressed request (session ${key}, #${n})` +
+              (tripped ? ' — compression disabled for this session' : ''),
+          );
+        }
+      }
 
       // Surface upstream 4xx error bodies inline so a regression in the
       // request shape is obvious without having to grep events.jsonl. The

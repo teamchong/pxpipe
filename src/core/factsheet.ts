@@ -279,6 +279,15 @@ export function factSheetTextFromEntries(entries: readonly FactSheetEntry[], dro
 
 /** One-line fact-sheet string for `text`, or `''` when nothing notable was found. */
 export function factSheetText(text: string): string {
-  const { entries, dropped } = extractFactSheetEntriesWithDrop(text);
-  return factSheetTextFromEntries(entries, dropped);
+  return factSheetTextWithDrop(text).text;
+}
+
+/** Like `factSheetText`, but also returns `tier0Dropped` — the per-block count of
+ *  zero-redundancy tokens that exceeded MAX_TIER0. Callers that accumulate telemetry
+ *  (transform.ts -> TransformInfo) use this instead of `factSheetText` so the passive
+ *  eviction-rate signal (multi-specialist debate 2026-07-07) costs no extra extraction
+ *  pass — same underlying call, both fields already computed. */
+export function factSheetTextWithDrop(text: string): { text: string; tier0Dropped: number } {
+  const { entries, dropped, tier0Dropped } = extractFactSheetEntriesWithDrop(text);
+  return { text: factSheetTextFromEntries(entries, dropped), tier0Dropped };
 }

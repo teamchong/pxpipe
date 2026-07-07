@@ -4,6 +4,7 @@ import {
   extractFactSheetEntries,
   extractFactSheetEntriesAllPages,
   factSheetText,
+  factSheetTextWithDrop,
 } from '../src/core/factsheet.js';
 
 describe('factsheet extraction', () => {
@@ -165,5 +166,25 @@ describe('factsheet tier-0 budget', () => {
     // All 150 tier-0 ids present, and NO omission marker (nothing evicted).
     expect(sheet).not.toMatch(/\+\d+ more/);
     for (const h of hexes) expect(sheet).toContain(h);
+  });
+});
+
+// Passive instrumentation (multi-specialist debate 2026-07-07): callers (transform.ts)
+// need the per-block tier0Dropped count alongside the caption text, to accumulate into
+// TransformInfo without a model call — the panel's load-bearing, near-free measurement
+// of how often the >MAX_TIER0 case actually occurs on real traffic.
+describe('factSheetTextWithDrop', () => {
+  it('returns the same text as factSheetText, plus tier0Dropped', () => {
+    const text = 'commit 9d121ac on port 47821';
+    const { text: sheet, tier0Dropped } = factSheetTextWithDrop(text);
+    expect(sheet).toBe(factSheetText(text));
+    expect(tier0Dropped).toBe(0);
+  });
+
+  it('reports tier0Dropped > 0 when tier-0 tokens exceed MAX_TIER0', () => {
+    const hexes = Array.from({ length: 260 }, (_, i) => (0xe8d4a51000 + i).toString(16));
+    const text = hexes.map((h) => `id ${h}`).join('\n');
+    const { tier0Dropped } = factSheetTextWithDrop(text);
+    expect(tier0Dropped).toBeGreaterThanOrEqual(68); // 260 - 192
   });
 });

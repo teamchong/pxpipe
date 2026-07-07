@@ -34,7 +34,17 @@ import {
   DENSE_RENDER_STYLE,
   renderTextToPngsWithCharLimit,
 } from './render.js';
-import { factSheetText } from './factsheet.js';
+import { factSheetTextWithDrop } from './factsheet.js';
+
+/** factSheetTextWithDrop wrapper that also accumulates tier0Dropped into `info` —
+ *  every call site below needs both the caption text and the running total, so this
+ *  keeps the accumulation in one place instead of repeating `info.tier0DroppedTotal =
+ *  (info.tier0DroppedTotal ?? 0) + ...` at each of the 4 sites. */
+function factSheetTextTracked(info: TransformInfo, text: string): string {
+  const { text: sheet, tier0Dropped } = factSheetTextWithDrop(text);
+  if (tier0Dropped > 0) info.tier0DroppedTotal = (info.tier0DroppedTotal ?? 0) + tier0Dropped;
+  return sheet;
+}
 import { stripSchemaDescriptions, schemaHasStructure } from './schema-strip.js';
 import { bytesToBase64 } from './png.js';
 import { collapseHistory, HISTORY_SYNTHETIC_INTRO } from './history.js';
@@ -571,6 +581,12 @@ export interface TransformInfo {
   keptSharpBlocks?: number;
   /** Imaged live-region blocks with original text + provenance, when `emitRecoverable`. */
   recoverable?: RecoverableBlock[];
+  /** Σ tier0Dropped across every fact-sheet caption built this request (slab, reminders,
+   *  tool_results). Passive per-request signal (multi-specialist debate 2026-07-07) for
+   *  how often a single block carries more than MAX_TIER0 zero-redundancy tokens (hex/
+   *  uuid/const-id/ticket/flag/number) — the case the fact-sheet's static budget cannot
+   *  cover and that would need a verbatim-recovery mechanism. Zero model calls to observe. */
+  tier0DroppedTotal?: number;
   truncatedToolResults?: number;
   omittedChars?: number;
   /** History-collapse: messages collapsed into the synthetic prepended user message. */
@@ -1825,7 +1841,7 @@ export async function transformRequest(
             processedExisting.push(out as ImageBlock);
             info.imageBytes += approxBlockBytes(img);
           }
-          const reminderFactSheet = factSheetText(reminderRaw);
+          const reminderFactSheet = factSheetTextTracked(info, reminderRaw);
           if (reminderFactSheet) processedExisting.push({ type: 'text', text: reminderFactSheet });
           info.imagePixels = (info.imagePixels ?? 0) + pixels;
           info.reminderImgs = (info.reminderImgs ?? 0) + imgs.length;
@@ -1846,7 +1862,7 @@ export async function transformRequest(
         processedExisting.push(...existing);
       }
 
-      const slabFactSheet = factSheetText(combinedRaw);
+      const slabFactSheet = factSheetTextTracked(info, combinedRaw);
       m.content = [
         ...imageBlocks,
         ...(slabFactSheet ? [{ type: 'text' as const, text: slabFactSheet }] : []),
@@ -1913,7 +1929,7 @@ export async function transformRequest(
                 for (const [cp, n] of dcp) {
                   droppedCodepoints.set(cp, (droppedCodepoints.get(cp) ?? 0) + n);
                 }
-                const trFactSheet = factSheetText(innerRaw);
+                const trFactSheet = factSheetTextTracked(info, innerRaw);
                 rewritten.push({
                   ...tr,
                   content: trFactSheet ? [...imgs, { type: 'text' as const, text: trFactSheet }] : imgs,
@@ -1974,7 +1990,7 @@ export async function transformRequest(
                   newInner.push(out as ImageBlock);
                   info.imageBytes += approxBlockBytes(img);
                 }
-                const partFactSheet = factSheetText(innerTextRaw);
+                const partFactSheet = factSheetTextTracked(info, innerTextRaw);
                 if (partFactSheet) newInner.push({ type: 'text', text: partFactSheet });
                 info.imagePixels = (info.imagePixels ?? 0) + pixels;
                 info.toolResultImgs = (info.toolResultImgs ?? 0) + imgs.length;

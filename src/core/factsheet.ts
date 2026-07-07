@@ -34,8 +34,15 @@ const PATTERNS: readonly RegExp[] = [
 
 const MIN_LEN = 3;
 const MAX_LEN = 120;
-/** Budget cap: highest-priority tokens kept first. Exported so consumers can report drops. */
+/** Budget cap for tier-1/2 (reconstructable) tokens — paths, versions, URLs. */
 export const MAX_TOKENS = 64;
+/** Separate, higher cap for tier-0 zero-redundancy tokens (SHAs, ports, flags, uuids,
+ *  const-ids, ticket codes) — the ones a model genuinely can't reconstruct and most
+ *  needs verbatim. Giving them their own larger budget (multi-specialist debate
+ *  2026-07-07) closes most of the eviction gap deterministically and cache-stably,
+ *  without a flat MAX_TOKENS bump (which would tax reconstructable tokens on all
+ *  traffic) or a content-adaptive budget (which risks cache-prefix storms). */
+export const MAX_TIER0 = 192;
 // At most this many URL exemplars: URLs are long, structured, low OCR-risk, and usually
 // reconstructable, so they must never crowd out short zero-redundancy tokens.
 const MAX_URLS = 8;
@@ -70,6 +77,32 @@ function priorityTier(tok: string): 0 | 1 | 2 {
   }
   if (SHAPE_URL.test(tok)) return 2;
   return 1;
+}
+
+/** Apply the two-cap budget to tier-ranked tokens: tier-0 up to MAX_TIER0, tier-1/2 up
+ *  to MAX_TOKENS combined (tier-2/URLs additionally capped at MAX_URLS). Shared by the
+ *  single-page and all-pages selectors so both stay in lockstep. `ranked` MUST be sorted
+ *  tier-ascending. Returns the kept token order plus tier0Dropped — the per-block count
+ *  of zero-redundancy tokens that exceeded MAX_TIER0 (the passive eviction signal). */
+function applyTierBudget(ranked: readonly { t: string; tier: 0 | 1 | 2 }[]): { kept: string[]; tier0Dropped: number } {
+  const kept: string[] = [];
+  let tier0 = 0;
+  let lower = 0;
+  let urls = 0;
+  let tier0Dropped = 0;
+  for (const { t, tier } of ranked) {
+    if (tier === 0) {
+      if (tier0 >= MAX_TIER0) { tier0Dropped++; continue; }
+      tier0++;
+      kept.push(t);
+    } else {
+      if (lower >= MAX_TOKENS) continue;
+      if (tier === 2 && urls++ >= MAX_URLS) continue;
+      lower++;
+      kept.push(t);
+    }
+  }
+  return { kept, tier0Dropped };
 }
 
 /**
@@ -113,7 +146,7 @@ export function extractFactSheetEntries(text: string): FactSheetEntry[] {
  *  the caption can honestly signal truncation instead of presenting a silently
  *  clipped list as a complete one (multi-specialist debate 2026-07-07). The public
  *  `extractFactSheetEntries` returns only `.entries`, so existing callers are unchanged. */
-export function extractFactSheetEntriesWithDrop(text: string): { entries: FactSheetEntry[]; dropped: number } {
+export function extractFactSheetEntriesWithDrop(text: string): { entries: FactSheetEntry[]; dropped: number; tier0Dropped: number } {
   const scan = text.length > MAX_SCAN ? text.slice(0, MAX_SCAN) : text;
   const counts = new Map<string, number>();
   for (const chunk of scan.split(/\s+/)) {
@@ -149,19 +182,15 @@ export function extractFactSheetEntriesWithDrop(text: string): { entries: FactSh
   const ranked = specific
     .map((t) => ({ t, tier: priorityTier(t) }))
     .sort((a, b) => a.tier - b.tier || b.t.length - a.t.length || (a.t < b.t ? -1 : a.t > b.t ? 1 : 0));
-  const kept: string[] = [];
-  let urls = 0;
-  for (const { t, tier } of ranked) {
-    if (kept.length >= MAX_TOKENS) break;
-    if (tier === 2 && urls++ >= MAX_URLS) continue;
-    kept.push(t);
-  }
+  const { kept, tier0Dropped } = applyTierBudget(ranked);
   // dropped = extracted-and-deduped identifiers that did NOT make the caption
   // (budget-evicted or URL-capped). Deterministic pure function of the block →
-  // the honesty marker built from it stays cache-stable across turns.
+  // the honesty marker built from it stays cache-stable across turns. tier0Dropped
+  // is the passive per-block signal for how often high-consequence tokens overflow.
   return {
     entries: kept.map((t) => ({ token: t, count: counts.get(t) ?? 1 })),
     dropped: ranked.length - kept.length,
+    tier0Dropped,
   };
 }
 
@@ -192,7 +221,7 @@ export function extractFactSheetTokensAllPages(
 export function extractFactSheetEntriesAllPages(
   text: string,
   charsPerPage: number,
-): { kept: FactSheetEntry[]; dropped: number } {
+): { kept: FactSheetEntry[]; dropped: number; tier0Dropped: number } {
   const counts = new Map<string, number>();
   const all: string[] = [];
 
@@ -212,15 +241,10 @@ export function extractFactSheetEntriesAllPages(
   const ranked = all
     .map((t) => ({ t, tier: priorityTier(t) }))
     .sort((a, b) => a.tier - b.tier || b.t.length - a.t.length || (a.t < b.t ? -1 : a.t > b.t ? 1 : 0));
-  const kept: FactSheetEntry[] = [];
-  let urls = 0;
-  for (const { t, tier } of ranked) {
-    if (kept.length >= MAX_TOKENS) break;
-    if (tier === 2 && urls++ >= MAX_URLS) continue;
-    kept.push({ token: t, count: counts.get(t) ?? 1 });
-  }
+  const { kept: keptTokens, tier0Dropped } = applyTierBudget(ranked);
+  const kept: FactSheetEntry[] = keptTokens.map((t) => ({ token: t, count: counts.get(t) ?? 1 }));
 
-  return { kept, dropped: all.length - kept.length };
+  return { kept, dropped: all.length - kept.length, tier0Dropped };
 }
 
 const OPEN =

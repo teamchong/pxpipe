@@ -128,18 +128,18 @@ describe('ticket-style codes and occurrence counts', () => {
 // the list as complete and confabulates the missing token). The caption must admit
 // when it is truncated.
 describe('factsheet caption honesty (omission marker)', () => {
-  it('marks omission when the budget evicts tokens on a dense block', () => {
-    // 100 distinct hex ids >> MAX_TOKENS=64, so >=36 are evicted.
-    const text = Array.from({ length: 100 }, (_, i) =>
+  it('marks omission when the budget evicts tokens on a very dense block', () => {
+    // 260 distinct tier-0 hex ids > MAX_TIER0 (192), so >=68 are evicted.
+    const text = Array.from({ length: 260 }, (_, i) =>
       `cache key ${(0xe8d4a51000 + i).toString(16)} ok`,
     ).join('\n');
     const sheet = factSheetText(text);
     expect(sheet).not.toBe('');
     // Must carry an explicit omission signal with a count, not present a closed list.
     expect(sheet).toMatch(/\+\d+ more/);
-    // The count must be honest: at least (100 - 64) = 36 omitted.
+    // The count must be honest: at least (260 - 192) = 68 omitted.
     const m = sheet.match(/\+(\d+) more/);
-    expect(Number(m![1])).toBeGreaterThanOrEqual(36);
+    expect(Number(m![1])).toBeGreaterThanOrEqual(68);
   });
 
   it('is byte-identical to the old caption when nothing is evicted (cache-stable common case)', () => {
@@ -147,5 +147,23 @@ describe('factsheet caption honesty (omission marker)', () => {
     const sheet = factSheetText('commit 9d121ac on port 47821 in src/net/pool.ts');
     expect(sheet).not.toMatch(/\+\d+ more/);
     expect(sheet.endsWith(']')).toBe(true);
+  });
+});
+
+// tier-0 budget raise (multi-specialist debate 2026-07-07): the high-consequence,
+// zero-redundancy tokens (SHAs, ports, flags, uuids, const-ids, ticket codes) are
+// exactly the ones a model can't reconstruct and most needs verbatim. Giving them a
+// higher keep-cap than the reconstructable tier-1/2 tail closes most of the gap that
+// motivated the (dead-on-arrival) recover feature — deterministically, cache-stably,
+// with no round-trips.
+describe('factsheet tier-0 budget', () => {
+  it('keeps far more than the old 64-token cap of zero-redundancy tier-0 ids', () => {
+    // 150 distinct hex ids: above the old flat 64 cap, below the tier-0 cap (192).
+    const hexes = Array.from({ length: 150 }, (_, i) => (0xa100000000 + i).toString(16));
+    const text = hexes.map((h) => `id ${h}`).join('\n');
+    const sheet = factSheetText(text);
+    // All 150 tier-0 ids present, and NO omission marker (nothing evicted).
+    expect(sheet).not.toMatch(/\+\d+ more/);
+    for (const h of hexes) expect(sheet).toContain(h);
   });
 });

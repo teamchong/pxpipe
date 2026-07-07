@@ -47,6 +47,8 @@ export interface TrackEvent {
   tool_docs_chars?: number;
   /** tool_result blocks where text exceeded the per-result image budget and was truncated. */
   truncated_tool_results?: number;
+  /** Total tier-0 tokens/identifiers dropped from the factsheet caption this request. */
+  tier0_dropped_total?: number;
   /** Chars elided by paging across all tool_results this request. */
   omitted_chars?: number;
   /** History-image: messages collapsed into the synthetic prepended user message. */
@@ -218,6 +220,9 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     if (info.toolDocsChars !== undefined) out.tool_docs_chars = info.toolDocsChars;
     if (info.truncatedToolResults !== undefined && info.truncatedToolResults > 0) {
       out.truncated_tool_results = info.truncatedToolResults;
+    }
+    if (info.tier0DroppedTotal !== undefined && info.tier0DroppedTotal > 0) {
+      out.tier0_dropped_total = info.tier0DroppedTotal;
     }
     if (info.omittedChars !== undefined && info.omittedChars > 0) {
       out.omitted_chars = info.omittedChars;

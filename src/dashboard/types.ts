@@ -80,6 +80,7 @@ export interface RecentRow {
   session_saved_so_far_delta?: number;
   img_id?: number;
   img_ids?: number[];
+  tier0_dropped?: number;
 }
 
 /** /api/sessions.json payload. */

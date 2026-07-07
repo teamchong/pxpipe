@@ -510,8 +510,11 @@ export function renderRecentFragment(p: RecentPayload): string {
                 : saved < 0
                   ? `<td class="num neg">${numFmt(saved)}${createNote}</td>`
                   : `<td class="num">0</td>`;
+            const droppedBadge = e.tier0_dropped
+              ? `<span class="badge badge-dropped" title="${e.tier0_dropped} critical identifiers omitted due to factsheet budget! Increase factsheet budget or reduce context.">${e.tier0_dropped} dropped</span>`
+              : '';
             const imaged = e.cc_added
-              ? `<span class="badge badge-img">image</span>`
+              ? `<span class="badge badge-img">image</span>${droppedBadge}`
               : `<span class="badge badge-txt">text</span>`;
             return (
               `<tr>` +
@@ -927,6 +930,7 @@ const CSS = `
     border-radius: 999px; padding: 0 5px; margin-left: 4px; vertical-align: 1px; cursor: help; white-space: nowrap; }
   .badge-img { background: var(--img-tint); color: var(--img-ink); }
   .badge-txt { background: var(--txt-tint); color: var(--txt-ink); }
+  .badge-dropped { background: var(--bad-tint); color: var(--bad); margin-left: 4px; }
 
   /* inspector */
   .viewer-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }

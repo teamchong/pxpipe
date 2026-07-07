@@ -206,7 +206,7 @@ describe('serveFragment', () => {
 
   it('renders header + recent + stats fragments from the same payloads as JSON', async () => {
     writeEvents(tmp, [
-      ev({ status: 200, model: 'gpt-5.5', compressed: true, orig_chars: 1000, image_bytes: 200 }),
+      ev({ status: 200, model: 'gpt-5.5', compressed: true, orig_chars: 1000, image_bytes: 200, tier0_dropped_total: 12 }),
     ]);
     const header = await (await dash.serveFragment('header', url, 4711)).text();
     expect(header).toContain('4711');
@@ -214,6 +214,7 @@ describe('serveFragment', () => {
     const recent = await (await dash.serveFragment('recent', url, 4711)).text();
     expect(recent).toContain('<table');
     expect(recent).toContain('gpt-5.5');
+    expect(recent).toContain('12 dropped');
     const stats = await (await dash.serveFragment('stats', url, 4711)).text();
     expect(stats).toContain('requests');
   });
@@ -581,5 +582,21 @@ describe('server-observed warmth: text follows actual cache_read', () => {
     expect(row.baseline_input).toBe(12000);
     expect(row.baseline_input).not.toBe(35000); // the inflated cold-priced bug value
     expect(row.session_saved_so_far_delta).toBe(9900);
+  });
+
+  it('carries tier0_dropped from live event update to recent list', async () => {
+    dash.update({
+      method: 'POST',
+      path: '/v1/messages',
+      status: 200,
+      durationMs: 10,
+      info: {
+        compressed: true,
+        tier0DroppedTotal: 5,
+      },
+    } as never);
+    const recent = (await dash.serveRecent().json()) as RecentPayload;
+    const row = recent.recent.at(-1)!;
+    expect(row.tier0_dropped).toBe(5);
   });
 });

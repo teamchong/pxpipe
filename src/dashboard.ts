@@ -145,6 +145,7 @@ export interface RecentRow {
    *  ring (the id stays on the row but no longer fetches). */
   img_id?: number;
   img_ids?: number[];
+  tier0_dropped?: number;
 }
 
 /** Aggregate over the whole session. Reset on process restart unless
@@ -870,6 +871,7 @@ export class DashboardState {
         creditSaving ? round1(baselineInputEff - actualInputEff) : undefined,
       img_id: imgId,
       img_ids: imgIds,
+      tier0_dropped: ev.info?.tier0DroppedTotal,
     };
     this.recent.push(row);
     if (this.recent.length > RECENT_CAP) this.recent.splice(0, this.recent.length - RECENT_CAP);
@@ -1052,6 +1054,7 @@ export class DashboardState {
           creditSaving ? round1(baselineInputEff - actualInputEff) : undefined,
         img_id: imgId,
         img_ids: imgId !== undefined ? [imgId] : undefined,
+        tier0_dropped: (t as any).tier0_dropped_total,
       };
       this.recent.push(row);
     }

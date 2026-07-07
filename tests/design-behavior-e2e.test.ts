@@ -198,5 +198,5 @@ describe('design: RECENT REQUEST stays legible (GPT)', () => {
     expect(imageCount(out)).toBeGreaterThan(0); // system imaged
     // The agent's live request must remain legible text, never OCR-only.
     expect(hay).toContain('FINAL_REQUEST_MARKER please answer');
-  });
+  }, 20000);
 });

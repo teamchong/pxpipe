@@ -16,7 +16,7 @@ function markdownFiles(): string[] {
     const abs = path.join(repoRoot, rel);
     if (!fs.existsSync(abs)) return;
     for (const name of fs.readdirSync(abs, { withFileTypes: true })) {
-      const childRel = path.join(rel, name.name);
+      const childRel = path.join(rel, name.name).replace(/\\/g, '/');
       if (name.isDirectory()) {
         if (name.name === 'node_modules' || name.name.startsWith('.')) continue;
         walk(childRel, opts);

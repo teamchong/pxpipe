@@ -520,7 +520,12 @@ function isOpenAIResponsesPath(pathname: string): boolean {
 
 function isCanonicalOpenAIPath(pathname: string, headers: Headers, hasOpenAIKey: boolean): boolean {
   const isModelsPath = pathname === '/v1/models' || pathname.startsWith('/v1/models/');
-  const looksOpenAIAuth = hasOpenAIKey || (headers.has('authorization') && !headers.has('x-api-key'));
+  // Anthropic clients on subscription OAuth send Authorization: Bearer without
+  // x-api-key — the same shape as OpenAI auth. anthropic-version/-beta headers
+  // are the reliable discriminator: never route those clients to OpenAI.
+  const looksAnthropicClient = headers.has('anthropic-version') || headers.has('anthropic-beta');
+  const looksOpenAIAuth = !looksAnthropicClient
+    && (hasOpenAIKey || (headers.has('authorization') && !headers.has('x-api-key')));
   return pathname === '/v1/chat/completions'
     || pathname === '/v1/responses'
     || pathname.startsWith('/v1/responses/')

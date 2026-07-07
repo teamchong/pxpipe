@@ -49,6 +49,10 @@ npx pxpipe-proxy                                  # proxy on 127.0.0.1:47821
 ANTHROPIC_BASE_URL=http://127.0.0.1:47821 claude  # point Claude Code at it
 ```
 
+OpenAI-compatible clients can use `OPENAI_BASE_URL=http://127.0.0.1:47821/v1`.
+Set `OPENAI_API_KEY` to override auth; if it is unset, the Node proxy also
+uses Codex ChatGPT login from `~/.codex/auth.json` when present.
+
 Dashboard at <http://127.0.0.1:47821/>: tokens saved, every text→image
 conversion side by side, kill switch, live model chips. Responses stream
 normally — pxpipe compresses the *request* only, never the model's output.

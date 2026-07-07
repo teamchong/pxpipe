@@ -12,7 +12,9 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { spawnSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import { createProxy, parseGatewayHeaders, resolveUpstreams, type ProxyConfig } from './core/proxy.js';
+import { resolveOpenAIApiKey } from './node-auth.js';
 import {
   parseExportArgv,
   runExportCore,
@@ -35,7 +37,7 @@ import {
 /** Runtime config. The core transform tuning comes from DEFAULTS in
  *  transform.ts; startup knobs cover deployment plus emergency GPT scope
  *  control. No CLI flags beyond --help/--version. */
-interface RuntimeConfig {
+export interface RuntimeConfig {
   port: number;
   /** Interface to bind. Defaults to 127.0.0.1 (loopback only) — the dashboard
    *  is unauthenticated and serves captured request context, so it must not be
@@ -52,6 +54,7 @@ interface RuntimeConfig {
 }
 
 const DEFAULT_CONFIG_FILE = path.join(os.homedir(), '.config', 'pxpipe', 'config.json');
+const PROCESS_ARGV_SCRIPT_INDEX = 1;
 
 function normalizeModelsConfig(value: unknown): string | undefined {
   if (Array.isArray(value)) {
@@ -83,7 +86,7 @@ function applyConfigFileDefaults(): void {
   }
 }
 
-function parseCli(argv: string[]): RuntimeConfig {
+export function parseCli(argv: string[]): RuntimeConfig {
   // Only flags accepted are --help and --version. Anything else is an
   // error — there is exactly ONE way to run pxpipe and the dashboard
   // exposes every metric the operator might want to inspect.
@@ -110,7 +113,7 @@ function parseCli(argv: string[]): RuntimeConfig {
     host: process.env.HOST?.trim() || '127.0.0.1',
     upstream: process.env.ANTHROPIC_UPSTREAM ?? sharedUpstream ?? 'https://api.anthropic.com',
     openAIUpstream: process.env.OPENAI_UPSTREAM ?? sharedUpstream ?? 'https://api.openai.com',
-    openAIApiKey: process.env.OPENAI_API_KEY,
+    openAIApiKey: resolveOpenAIApiKey(),
     provider: parseProvider(process.env.PXPIPE_PROVIDER),
     gatewayBaseUrl: process.env.PXPIPE_GATEWAY_BASE_URL,
     gatewayHeaders: parseGatewayHeaders(process.env.PXPIPE_GATEWAY_HEADERS),
@@ -156,6 +159,8 @@ Environment:
   OPENAI_UPSTREAM         OpenAI API base; overrides PXPIPE_UPSTREAM
                            (default https://api.openai.com)
   OPENAI_API_KEY          optional OpenAI key override; otherwise forwarded
+                          or read from Codex ChatGPT auth when available
+  PXPIPE_CODEX_AUTH_FILE  Codex auth path (default ~/.codex/auth.json)
   PXPIPE_PROVIDER         optional: 'cloudflare-ai-gateway' — route both API
                           families through one gateway base URL
   PXPIPE_GATEWAY_BASE_URL gateway base URL (required with PXPIPE_PROVIDER)
@@ -1105,7 +1110,14 @@ async function main(): Promise<void> {
   process.on('SIGTERM', () => shutdown('SIGTERM'));
 }
 
-main().catch((err) => {
-  console.error('[pxpipe] fatal:', err);
-  process.exit(1);
-});
+function isDirectCliEntrypoint(): boolean {
+  const script = process.argv[PROCESS_ARGV_SCRIPT_INDEX];
+  return script !== undefined && import.meta.url === pathToFileURL(script).href;
+}
+
+if (isDirectCliEntrypoint()) {
+  main().catch((err) => {
+    console.error('[pxpipe] fatal:', err);
+    process.exit(1);
+  });
+}

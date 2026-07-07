@@ -33,6 +33,11 @@ export interface ProxyConfig {
   transform?: TransformOptions | (() => TransformOptions);
   /** Called after every request — useful for logging / metrics in the host. */
   onRequest?: (event: ProxyEvent) => void | Promise<void>;
+  /** Capture a gzipped sample of the request body on 4xx responses, surfaced on
+   *  ProxyEvent.reqBodyGz (the Node host then writes it to events.jsonl or a
+   *  sidecar file). Off by default so request/message content is never logged;
+   *  opt in only for 4xx debugging. */
+  capture4xxBody?: boolean;
 }
 
 export interface ProxyEvent {
@@ -630,7 +635,7 @@ export function createProxy(config: ProxyConfig = {}) {
       // Gzip body lazily (only on 4xx). Async IIFE keeps fire() synchronous.
       const finalize = async (): Promise<void> => {
         let reqBodyGz: Uint8Array | undefined;
-        if (is4xx && reqBodyBytes && reqBodyBytes.byteLength > 0) {
+        if (is4xx && config.capture4xxBody && reqBodyBytes && reqBodyBytes.byteLength > 0) {
           try {
             reqBodyGz = await gzipBytes(reqBodyBytes);
           } catch {

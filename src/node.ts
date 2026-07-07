@@ -167,6 +167,9 @@ Environment:
   PXPIPE_LOG              JSONL events path (default ~/.pxpipe/events.jsonl)
   PXPIPE_DUMP_DIR         debug: write every rendered PNG here (what the model
                           sees); off unless set. Compress arm only.
+  PXPIPE_CAPTURE_4XX_BODY debug: set to 1 to log a gzipped sample of the request
+                          body on 4xx (events.jsonl / sidecar). Off by default —
+                          request/message content is not logged unless you opt in.
 
 Use with Claude Code:
   ANTHROPIC_BASE_URL=http://127.0.0.1:47821 claude
@@ -932,6 +935,9 @@ async function main(): Promise<void> {
     upstream: opts.upstream,
     openAIUpstream: opts.openAIUpstream,
     openAIApiKey: opts.openAIApiKey,
+    // Off by default so request/message content is never logged. Opt into a
+    // gzipped 4xx request-body sample (events.jsonl / sidecar) for debugging.
+    capture4xxBody: process.env.PXPIPE_CAPTURE_4XX_BODY === '1',
     // Per-request transform options:
     //   1. Runtime kill switch — when the dashboard "passthrough" toggle
     //      is off, force compress=false so /v1/messages forwards

@@ -621,11 +621,18 @@ export interface TransformInfo {
 function extractSystemText(sys: SystemField | undefined): { text: string; kept: SystemField } {
   if (sys == null) return { text: '', kept: [] };
   if (typeof sys === 'string') return { text: sys, kept: '' };
+  const hasCacheControlledText = sys.some(
+    (block) => block && block.type === 'text' && block.cache_control !== undefined,
+  );
   const textParts: string[] = [];
   const kept: SystemField = [];
   for (const block of sys) {
     if (block && typeof block === 'object' && block.type === 'text') {
-      textParts.push(block.text);
+      if (!hasCacheControlledText || block.cache_control !== undefined) {
+        textParts.push(block.text);
+      } else {
+        kept.push(block);
+      }
     } else {
       kept.push(block);
     }

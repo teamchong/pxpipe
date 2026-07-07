@@ -171,7 +171,9 @@ Three kinds of *input* blocks, each behind a profitability gate:
    ~6k chars of token-dense content
 2. older collapsed history: turns behind the live tail get re-rendered as
    image pages, recent turns always stay text
-3. the static system prompt + tool docs slab
+3. the static cacheable system prompt + tool docs slab; appended non-cacheable
+   system blocks stay live text so host custom instructions keep system-level
+   salience
 
 Everything else passes through byte-identical: your messages, recent turns,
 the model's output (it is the response, the proxy never touches it), sparse

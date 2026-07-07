@@ -140,4 +140,23 @@ describe('defer_loading tools pass through the tool rewrite', () => {
     expect(info.deferredToolsSkipped).toBeUndefined();
     expect(out.tools[0].description).toContain('## Tool: bash');
   });
+
+  it('stays byte-identical when every tool is deferred and the request falls below the compression gate', async () => {
+    // Tiny system prompt + all-deferred tools -> toolDocsText stays empty and
+    // combinedRaw lands under minCompressChars, taking the below_min_chars
+    // early return (before req.tools = toolsRewritten runs). The passthrough
+    // this suite verifies elsewhere must still hold on that path.
+    const req = {
+      model: 'claude-3-5-sonnet',
+      system: 'hi',
+      tools: [searchTool, deferredTool],
+      messages: [{ role: 'user', content: 'hello' }],
+    };
+    const reqBytes = enc.encode(JSON.stringify(req));
+    const { body, info } = await transformRequest(reqBytes, {});
+    expect(info.compressed).toBe(false);
+    expect(dec.decode(body)).toBe(dec.decode(reqBytes));
+    const out = parse(body);
+    expect(out.tools).toEqual([searchTool, deferredTool]);
+  });
 });

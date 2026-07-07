@@ -55,6 +55,22 @@ normally — pxpipe compresses the *request* only, never the model's output.
 Recent turns stay text; the system prompt, tool docs, and older bulk history
 are imaged.
 
+## Offline export (no proxy)
+
+You can render text, files, or diffs to PNG pages without running the proxy or
+connecting Claude Code:
+
+```bash
+pxpipe export src/
+cat prompt.txt | pxpipe export --stdin
+pxpipe export --git
+```
+
+The command writes an output folder containing `page-*.png`, `factsheet.txt`,
+`manifest.json`, and `prompt.txt`. Upload the PNG pages and paste the prompt
+into image-upload clients such as Cursor when you want dense visual context
+without running the proxy.
+
 ## The honest part
 
 - **It is lossy.** Exact 12-char hex strings in dense imaged content:

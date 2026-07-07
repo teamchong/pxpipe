@@ -55,6 +55,30 @@ normally — pxpipe compresses the *request* only, never the model's output.
 Recent turns stay text; the system prompt, tool docs, and older bulk history
 are imaged.
 
+## Use with Claude clients
+
+Start the proxy in one terminal, then point the client at it.
+
+Claude Code CLI on macOS/Linux:
+
+```bash
+npx pxpipe-proxy
+ANTHROPIC_BASE_URL=http://127.0.0.1:47821 claude
+```
+
+Claude Code CLI on Windows PowerShell:
+
+```powershell
+npx pxpipe-proxy
+$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:47821"
+claude
+```
+
+Claude Desktop can use the same `ANTHROPIC_BASE_URL` environment variable for
+its bundled Claude Code runtime. Start `pxpipe` first, then launch Claude
+Desktop from an environment where `ANTHROPIC_BASE_URL` is set to
+`http://127.0.0.1:47821`.
+
 ## The honest part
 
 - **It is lossy.** Exact 12-char hex strings in dense imaged content:

@@ -1823,6 +1823,9 @@ export async function transformRequest(
       // server-side; there is nothing to compress). Mirrors the OpenAI-path
       // guard (openai.ts isFunctionTool).
       if (t.type !== undefined && t.type !== 'custom') return t;
+      // Anthropic excludes deferred tool definitions from model context until
+      // selected by tool search; imaging their docs would defeat that behavior.
+      if ((t as ToolDef & { defer_loading?: boolean }).defer_loading === true) return t;
       docs.push(renderToolDoc(t));
       // tools[] keeps the annotation-STRIPPED schema: structure (type/properties/
       // required/enum/items) stays for Anthropic's tool-use validator — a bare

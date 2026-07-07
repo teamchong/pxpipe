@@ -744,6 +744,51 @@ describe('transform', () => {
     expect(refHeader).toContain("this user's local proxy");
   });
 
+  it('never rewrites native server-side tools (versioned `type`), only stubs custom ones', async () => {
+    // Regression for the 2026-07-05 incident: Anthropic's native tools (advisor,
+    // web_search, computer, bash, text_editor, ...) are versioned by `type` and
+    // their API schema rejects a `description` field on the tool entry outright
+    // — 400 invalid_request_error: "tools.N.advisor_20260301.description: Extra
+    // inputs are not permitted". Reproduced 4/4 on claude-fable-5 because the
+    // old code unconditionally overwrote every tools[] entry's description with
+    // the "Full docs: see ..." stub, native tools included. Native-typed entries
+    // must pass through byte-identical (no description added, no schema touched,
+    // no doc pulled into the imaged reference); ordinary custom tools keep the
+    // existing stub-and-image behavior.
+    const nativeTool = { type: 'advisor_20260301', name: 'advisor' };
+    const req = JSON.stringify({
+      model: 'claude-3-5-sonnet',
+      messages: [{ role: 'user', content: 'hi' }],
+      system: 'x'.repeat(30000),
+      tools: [
+        nativeTool,
+        {
+          name: 'BigTool',
+          description: 'A very long tool description. '.repeat(500),
+          input_schema: { type: 'object', properties: { x: { type: 'string' } } },
+        },
+      ],
+    });
+    const bytes = new TextEncoder().encode(req);
+    const { body, info } = await transformRequest(bytes);
+    expect(info.compressed).toBe(true);
+    expect(info.toolDocsChars).toBeGreaterThan(0);
+
+    const out = JSON.parse(new TextDecoder().decode(body));
+    // The native tool entry is untouched: no description key was added, no
+    // input_schema key was added, and the object is deep-equal to the original.
+    expect(out.tools[0]).toEqual(nativeTool);
+    expect(Object.keys(out.tools[0]).sort()).toEqual(['name', 'type']);
+    // The custom tool still gets the usual stub-and-image treatment.
+    expect(out.tools[1].name).toBe('BigTool');
+    expect(out.tools[1].description).toContain('"## Tool: BigTool"');
+    // The native tool never had docs to relocate — it must not appear in the
+    // imaged Tool Reference at all.
+    const imgSrc = info.imageSourceText ?? '';
+    expect(imgSrc).toContain('## Tool: BigTool');
+    expect(imgSrc).not.toContain('## Tool: advisor');
+  });
+
   it('ships annotation-stripped schemas in tools[], full schema in the imaged reference', async () => {
     // History: a bare `{type:'object'}` stub caused validator 400s; a text
     // reference paid the annotations at text rates. Current contract: tools[]

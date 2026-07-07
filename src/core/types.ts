@@ -53,6 +53,10 @@ export interface ToolDef {
   description?: string;
   input_schema?: unknown;
   cache_control?: CacheControl;
+  /** Anthropic server-side tools (e.g. `advisor_20260301`, `web_search_20250305`,
+   *  `computer_20250124`) set this to a versioned type string fixed by their own
+   *  API schema. Absent, or `'custom'`, on ordinary client-defined tools. */
+  type?: string;
 }
 
 export type SystemField = string | Array<TextBlock | ImageBlock>;

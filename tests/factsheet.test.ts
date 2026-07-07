@@ -22,6 +22,23 @@ describe('factsheet extraction', () => {
     expect(toks).toContain('97.82');
   });
 
+  it('captures issue 55 exact-token classes for transactional text', () => {
+    const replyTo = 'ops.reply+invoice-55@example.co.uk';
+    const iban = 'UA383220010000026008';
+    const invoiceAmount = '$14,360';
+    const text = [
+      `reply-to ${replyTo}`,
+      `settle IBAN ${iban}`,
+      `invoice total ${invoiceAmount}, due today`,
+    ].join('\n');
+
+    const toks = extractFactSheetTokens(text);
+
+    expect(toks).toContain(replyTo);
+    expect(toks).toContain(iban);
+    expect(toks).toContain(invoiceAmount);
+  });
+
   it('drops substrings of longer kept tokens', () => {
     const toks = extractFactSheetTokens('see https://github.com/o/r/pull/9 in repo');
     // The bare /github.com path must collapse into the full URL.

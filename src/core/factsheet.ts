@@ -19,7 +19,10 @@
 const PATTERNS: readonly RegExp[] = [
   /\b[A-Z][A-Z0-9_]{2,}=[^\s)"'<>]+/g, // semantic LABEL=value pair (preserve association)
   /\bhttps?:\/\/[^\s)"'<>]+/g, // URLs
+  /\b[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+\b/g, // email address
   /\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b/g, // UUID
+  /\b[A-Z]{2}\d{2}[A-Z0-9]{8,30}\b/g, // IBAN-like account string
+  /(?:[$€£¥]|(?:USD|EUR|GBP|CAD|AUD|CHF|JPY))\d(?:[\d,_]*\d)?(?:\.\d{2})?\b/g, // currency amount
   /(?:[\w@~+-]+)?(?:\/[\w.@+-]+)+\.[A-Za-z]\w{0,8}\b/g, // path with a file extension (multi-dot ok: .test.ts)
   /\/[\w.@+-]+(?:\/[\w.@+-]+)+\/?/g, // dir path (>=2 segments)
   /\b(?=[0-9a-f]*\d)[0-9a-f]{7,40}\b/g, // git sha / long hex (must contain a digit)
@@ -56,6 +59,9 @@ const MAX_CHUNK = 512; // whitespace-free chunks longer than this are blobs (bas
  *  identifiers outrank long URLs when the budget is tight. Pure + total → deterministic →
  *  cache-stable. Tiers: 0 = protect always, 1 = paths/versions/misc, 2 = URLs (cap + last). */
 const SHAPE_UUID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+const SHAPE_EMAIL = /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$/;
+const SHAPE_IBAN = /^[A-Z]{2}\d{2}[A-Z0-9]{8,30}$/;
+const SHAPE_CURRENCY = /^(?:[$€£¥]|(?:USD|EUR|GBP|CAD|AUD|CHF|JPY))\d(?:[\d,_]*\d)?(?:\.\d{2})?$/;
 const SHAPE_HEX = /^(?=[0-9a-f]*\d)[0-9a-f]{7,40}$/; // git sha / opaque hex
 const SHAPE_CONST = /^[A-Z][A-Z0-9]{2,}(?:_[A-Z0-9]+)+$/; // CONST_IDS / env vars
 const SHAPE_TICKET = /^(?=[A-Z0-9-]*\d)[A-Z][A-Z0-9]+(?:-[A-Z0-9]+)+$/; // PROJ-1482 / CVE-2024-30078
@@ -71,6 +77,9 @@ function priorityTier(tok: string): 0 | 1 | 2 {
     SHAPE_ASSIGNMENT.test(tok) ||
     SHAPE_HEX.test(tok) ||
     SHAPE_UUID.test(tok) ||
+    SHAPE_EMAIL.test(tok) ||
+    SHAPE_IBAN.test(tok) ||
+    SHAPE_CURRENCY.test(tok) ||
     SHAPE_CONST.test(tok) ||
     SHAPE_TICKET.test(tok) ||
     SHAPE_FLAG.test(tok) ||

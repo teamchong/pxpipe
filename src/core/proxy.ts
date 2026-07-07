@@ -593,6 +593,36 @@ export function parseGatewayHeaders(spec: string | undefined): Record<string, st
   return out;
 }
 
+/**
+ * Forward to upstream with bounded retry on transport-level failures.
+ *
+ * Large opus/sonnet passthrough bodies intermittently fail with undici
+ * "fetch failed" — a transient connection drop, observed as fast-fail
+ * (~509–1578 ms, median 544 ms) on 450–830k-token bodies (61× opus on
+ * 2026-07-06). `fetch` only throws on transport errors; HTTP 4xx/5xx return
+ * normally and are NOT retried. Retry is safe only when the caller passes a
+ * reusable body (Uint8Array) — the caller signals this via `maxAttempts > 1`
+ * (streams are single-use, so the stream path passes `maxAttempts: 1`).
+ */
+export async function fetchUpstreamWithRetry(
+  url: string,
+  init: RequestInit,
+  opts: { maxAttempts: number; backoffMs?: (attempt: number) => number; fetchImpl?: typeof fetch },
+): Promise<{ res?: Response; error?: Error & { cause?: unknown } }> {
+  const f = opts.fetchImpl ?? fetch;
+  const backoff = opts.backoffMs ?? ((attempt: number) => 150 * attempt);
+  let lastErr: Error & { cause?: unknown } = new Error('no attempt made');
+  for (let attempt = 1; attempt <= opts.maxAttempts; attempt++) {
+    try {
+      return { res: await f(url, init) };
+    } catch (e) {
+      lastErr = e as Error & { cause?: unknown };
+      if (attempt < opts.maxAttempts) await new Promise((r) => setTimeout(r, backoff(attempt)));
+    }
+  }
+  return { error: lastErr };
+}
+
 /** Build the proxy fetch handler. */
 export function createProxy(config: ProxyConfig = {}) {
   const routes = resolveUpstreams(config);
@@ -794,22 +824,38 @@ export function createProxy(config: ProxyConfig = {}) {
     // `/google-ai-studio/*`, etc. exactly as the client sent them.
     const outPath = isOpenAIPath && routes.stripOpenAIV1 ? path.replace(/^\/v1(?=\/)/, '') : path;
     const upstreamUrl = upstreamBase + outPath;
-    let upstreamRes: Response;
-    try {
-      upstreamRes = await fetch(upstreamUrl, {
+    // Retry transient transport failures only when the body is a reusable buffer
+    // (Uint8Array). A ReadableStream is single-use — half-consumed on a failed
+    // attempt — so the stream path must not retry (maxAttempts: 1).
+    const bodyRetryable = !(bodyOut instanceof ReadableStream);
+    const { res: fetchedRes, error: fetchErr } = await fetchUpstreamWithRetry(
+      upstreamUrl,
+      {
         method: req.method,
         headers: outHeaders,
         body: bodyOut,
         // duplex is required by spec when sending a stream as body
         ...(bodyOut instanceof ReadableStream ? { duplex: 'half' } : {}),
-      } as RequestInit);
-    } catch (e) {
-      fire(502, info, `upstream_error: ${(e as Error).message}`);
+      } as RequestInit,
+      { maxAttempts: bodyRetryable ? 3 : 1 },
+    );
+    if (fetchErr || !fetchedRes) {
+      const causeMsg =
+        fetchErr?.cause instanceof Error ? fetchErr.cause.message
+        : fetchErr?.cause !== undefined ? String(fetchErr.cause) : '';
+      fire(
+        502,
+        info,
+        `upstream_error: ${fetchErr?.message ?? 'unknown'}` +
+          (causeMsg ? ` (cause: ${causeMsg})` : '') +
+          (bodyRetryable ? ` [${3} attempts]` : ''),
+      );
       return new Response(JSON.stringify({ error: 'pxpipe upstream unreachable' }), {
         status: 502,
         headers: { 'content-type': 'application/json' },
       });
     }
+    const upstreamRes: Response = fetchedRes;
 
     const firstByteMs = Date.now() - t0;
 

@@ -19,7 +19,9 @@ await mkdir(OUT, { recursive: true });
 
 const tsc = spawnSync('pnpm', ['exec', 'tsc', '-p', 'tsconfig.json'], {
   stdio: 'inherit',
-  shell: false,
+  // shell:true so Windows can invoke pnpm.cmd (a batch shim) — spawn without a
+  // shell fails ENOENT on Windows. Args are static, so shell concatenation is safe.
+  shell: true,
 });
 if (tsc.status !== 0) process.exit(tsc.status ?? 1);
 console.log('✓ emitted dist/ library modules + declarations');

@@ -476,11 +476,13 @@ describe('proxy usage extraction', () => {
     return new Uint8Array(await new Response(stream).arrayBuffer());
   }
 
-  it('captures the FULL gzipped transformed body on 4xx + sets reqBodySha8', async () => {
+  it('captures the FULL gzipped transformed body on 4xx (opt-in) + sets reqBodySha8', async () => {
     // Pair with errorBody so a future debugger can reconstruct
     // "we sent X, Anthropic said Y" from the JSONL alone. We gzip the body
     // so even a 170 KiB transformed payload fits inline once base64'd
     // (typical PNG-heavy bodies compress to <10% of source).
+    // captureErrorReqBody is off by default (privacy, issue #69); this test
+    // opts in explicitly.
     const restore = mockUpstream(
       () =>
         new Response(JSON.stringify({ error: { type: 'bad' } }), {
@@ -492,6 +494,7 @@ describe('proxy usage extraction', () => {
     let captured: ProxyEvent | undefined;
     const proxy = createProxy({
       transform: {},
+      captureErrorReqBody: true,
       onRequest: (e) => {
         captured = e;
       },
@@ -526,6 +529,42 @@ describe('proxy usage extraction', () => {
     const parsed = JSON.parse(decoded);
     expect(parsed.model).toBe('claude-3-5-haiku-latest');
     expect(parsed.messages[0].role).toBe('user');
+  });
+
+  it('does NOT capture the 4xx request body by default (privacy, issue #69)', async () => {
+    // Request bodies hold full prompts + any secrets in context, so raw-body
+    // capture is opt-in only. errorBody (the upstream error) still lands.
+    const restore = mockUpstream(
+      () =>
+        new Response(JSON.stringify({ error: { type: 'bad' } }), {
+          status: 400,
+          headers: { 'content-type': 'application/json' },
+        }),
+    );
+
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      transform: {},
+      onRequest: (e) => {
+        captured = e;
+      },
+    });
+
+    const res = await proxy(
+      new Request('http://localhost/v1/messages', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: SAMPLE_REQ_BODY,
+      }),
+    );
+    await res.text();
+    await new Promise((r) => setTimeout(r, 20));
+    restore();
+
+    expect(captured!.status).toBe(400);
+    expect(captured!.reqBodySha8).toMatch(/^[0-9a-f]{8}$/); // hash still lands
+    expect(captured!.reqBodyGz).toBeUndefined(); // but not the raw body
+    expect(captured!.errorBody).toBeDefined(); // upstream error still captured
   });
 
   it('does NOT gzip the request body on 2xx (but still sets reqBodySha8)', async () => {

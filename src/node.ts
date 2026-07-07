@@ -49,6 +49,9 @@ interface RuntimeConfig {
   gatewayBaseUrl?: string;
   gatewayHeaders?: Record<string, string>;
   eventsFile: string;
+  /** Persist 4xx request bodies to disk for debugging. Off unless
+   *  PXPIPE_DEBUG_CAPTURE_4XX=1. */
+  captureErrorReqBody: boolean;
 }
 
 const DEFAULT_CONFIG_FILE = path.join(os.homedir(), '.config', 'pxpipe', 'config.json');
@@ -117,6 +120,9 @@ function parseCli(argv: string[]): RuntimeConfig {
     eventsFile:
       process.env.PXPIPE_LOG ??
       path.join(os.homedir(), '.pxpipe', 'events.jsonl'),
+    // Off by default: 4xx request bodies hold full prompts + any secrets in
+    // context. Opt in for debugging only. (issue #69)
+    captureErrorReqBody: process.env.PXPIPE_DEBUG_CAPTURE_4XX === '1',
   };
 }
 
@@ -167,6 +173,9 @@ Environment:
   PXPIPE_LOG              JSONL events path (default ~/.pxpipe/events.jsonl)
   PXPIPE_DUMP_DIR         debug: write every rendered PNG here (what the model
                           sees); off unless set. Compress arm only.
+  PXPIPE_DEBUG_CAPTURE_4XX  debug: set to 1 to persist full 4xx request bodies
+                          (prompts + any secrets in context) to disk. Off by
+                          default; on-disk telemetry keeps only hashes.
 
 Use with Claude Code:
   ANTHROPIC_BASE_URL=http://127.0.0.1:47821 claude
@@ -932,6 +941,7 @@ async function main(): Promise<void> {
     upstream: opts.upstream,
     openAIUpstream: opts.openAIUpstream,
     openAIApiKey: opts.openAIApiKey,
+    captureErrorReqBody: opts.captureErrorReqBody,
     // Per-request transform options:
     //   1. Runtime kill switch — when the dashboard "passthrough" toggle
     //      is off, force compress=false so /v1/messages forwards
@@ -1072,6 +1082,12 @@ async function main(): Promise<void> {
     console.log(`[pxpipe] openai upstream → ${routes.openai}`);
     console.log(`[pxpipe] tracking events → ${opts.eventsFile}`);
     console.log(`[pxpipe] dashboard → http://127.0.0.1:${opts.port}/`);
+    if (opts.captureErrorReqBody) {
+      console.warn(
+        `[pxpipe] PXPIPE_DEBUG_CAPTURE_4XX=1 — persisting full 4xx request bodies ` +
+          `(prompts + any secrets in context) to ${bodySidecarDir}. Debugging only.`,
+      );
+    }
   });
 
   // server.close() only stops accepting new connections and waits for open

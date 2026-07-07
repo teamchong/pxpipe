@@ -134,8 +134,10 @@ const DEFAULTS: Required<TransformOptions> = {
   minToolResultChars: 6000,
   // system field rejects images (400 system.N.type: Input should be 'text') —
   // images always go into the first user message.
-  // 313 cols × 5 px + 8 px pad = 1573 px slab width (under 2000 px ceiling).
-  cols: 313,
+  // 312 cols × 5 px + 8 px pad = 1568 px slab width — exactly the API's long-edge
+  // bound (313 cols = 1573 px triggers a 0.997× resample, blurring every glyph;
+  // see DEFAULT_COLS in render.ts).
+  cols: 312,
   maxImagesPerToolResult: 10,
   charsPerToken: 4,
   historyAmortizationHorizon: 1,

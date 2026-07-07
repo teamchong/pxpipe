@@ -105,6 +105,15 @@ export interface FactSheetEntry {
  * deduped by offset so a token is never double-counted.
  */
 export function extractFactSheetEntries(text: string): FactSheetEntry[] {
+  return extractFactSheetEntriesWithDrop(text).entries;
+}
+
+/** Single-page extraction that ALSO reports how many extracted identifiers were
+ *  evicted by the MAX_TOKENS budget (or the URL cap). `factSheetText` uses this so
+ *  the caption can honestly signal truncation instead of presenting a silently
+ *  clipped list as a complete one (multi-specialist debate 2026-07-07). The public
+ *  `extractFactSheetEntries` returns only `.entries`, so existing callers are unchanged. */
+export function extractFactSheetEntriesWithDrop(text: string): { entries: FactSheetEntry[]; dropped: number } {
   const scan = text.length > MAX_SCAN ? text.slice(0, MAX_SCAN) : text;
   const counts = new Map<string, number>();
   for (const chunk of scan.split(/\s+/)) {
@@ -147,7 +156,13 @@ export function extractFactSheetEntries(text: string): FactSheetEntry[] {
     if (tier === 2 && urls++ >= MAX_URLS) continue;
     kept.push(t);
   }
-  return kept.map((t) => ({ token: t, count: counts.get(t) ?? 1 }));
+  // dropped = extracted-and-deduped identifiers that did NOT make the caption
+  // (budget-evicted or URL-capped). Deterministic pure function of the block →
+  // the honesty marker built from it stays cache-stable across turns.
+  return {
+    entries: kept.map((t) => ({ token: t, count: counts.get(t) ?? 1 })),
+    dropped: ranked.length - kept.length,
+  };
 }
 
 /**
@@ -221,15 +236,25 @@ export function factSheetTextFromTokens(tokens: string[]): string {
 }
 
 /** Build the one-line fact-sheet string from token+count entries. Byte-identical to
- *  `factSheetTextFromTokens` when no token repeats, so existing sheets stay cache-stable. */
-export function factSheetTextFromEntries(entries: readonly FactSheetEntry[]): string {
+ *  `factSheetTextFromTokens` when no token repeats AND nothing was dropped, so existing
+ *  sheets stay cache-stable. When `dropped > 0`, an honest omission marker is appended:
+ *  the OPEN string frames the list as an authoritative identifier index ("quote these
+ *  verbatim"), so a silently-clipped list reads as complete and makes the model
+ *  confidently confabulate the missing token (multi-specialist debate 2026-07-07). The
+ *  marker's count is a deterministic function of the block, so the caption stays
+ *  cache-stable across turns. */
+export function factSheetTextFromEntries(entries: readonly FactSheetEntry[], dropped = 0): string {
   if (entries.length === 0) return '';
   const anyRepeat = entries.some((e) => e.count >= 2);
   const body = entries.map((e) => (e.count >= 2 ? `${e.token} ×${e.count}` : e.token)).join(' · ');
-  return (anyRepeat ? OPEN_COUNTS : OPEN) + body + ']';
+  const omission = dropped > 0
+    ? ` … (+${dropped} more identifiers omitted from this list — it is NOT complete; do not guess any identifier not shown here)`
+    : '';
+  return (anyRepeat ? OPEN_COUNTS : OPEN) + body + omission + ']';
 }
 
 /** One-line fact-sheet string for `text`, or `''` when nothing notable was found. */
 export function factSheetText(text: string): string {
-  return factSheetTextFromEntries(extractFactSheetEntries(text));
+  const { entries, dropped } = extractFactSheetEntriesWithDrop(text);
+  return factSheetTextFromEntries(entries, dropped);
 }

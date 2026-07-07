@@ -120,3 +120,32 @@ describe('ticket-style codes and occurrence counts', () => {
     expect(hit!.count).toBe(5);
   });
 });
+
+// Honesty fix (multi-specialist debate 2026-07-07): the caption OPEN string reads
+// as a CLOSED, authoritative identifier index ("quote these verbatim"), but the
+// MAX_TOKENS=64 budget silently evicts the excess on dense blocks — the exact
+// condition that manufactures confident wrong-precision answers (the model treats
+// the list as complete and confabulates the missing token). The caption must admit
+// when it is truncated.
+describe('factsheet caption honesty (omission marker)', () => {
+  it('marks omission when the budget evicts tokens on a dense block', () => {
+    // 100 distinct hex ids >> MAX_TOKENS=64, so >=36 are evicted.
+    const text = Array.from({ length: 100 }, (_, i) =>
+      `cache key ${(0xe8d4a51000 + i).toString(16)} ok`,
+    ).join('\n');
+    const sheet = factSheetText(text);
+    expect(sheet).not.toBe('');
+    // Must carry an explicit omission signal with a count, not present a closed list.
+    expect(sheet).toMatch(/\+\d+ more/);
+    // The count must be honest: at least (100 - 64) = 36 omitted.
+    const m = sheet.match(/\+(\d+) more/);
+    expect(Number(m![1])).toBeGreaterThanOrEqual(36);
+  });
+
+  it('is byte-identical to the old caption when nothing is evicted (cache-stable common case)', () => {
+    // Few tokens, well under budget -> no marker, so existing dense-prefix caches never bust.
+    const sheet = factSheetText('commit 9d121ac on port 47821 in src/net/pool.ts');
+    expect(sheet).not.toMatch(/\+\d+ more/);
+    expect(sheet.endsWith(']')).toBe(true);
+  });
+});

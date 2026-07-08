@@ -360,6 +360,7 @@ numbers with an n or they get cut.
 Third-party projects listed here are not maintained or supported by pxpipe.
 
 - [pxpipe-windows](https://github.com/DivyeshPatro/pxpipe-windows) — Windows support for `pxpipe mitm` (node-forge CA in place of openssl, Task Scheduler autostart).
+- [OmniGlyph](https://github.com/diegosouzapw/OmniGlyph) — A community-maintained project derived from pxpipe and used by [OmniRoute](https://github.com/diegosouzapw/OmniRoute).
 
 ## License
 

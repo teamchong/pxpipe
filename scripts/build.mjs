@@ -17,9 +17,12 @@ const OUT = 'dist';
 if (existsSync(OUT)) await rm(OUT, { recursive: true, force: true });
 await mkdir(OUT, { recursive: true });
 
+// shell:true so Windows resolves `pnpm` to `pnpm.cmd`. Node's spawn without a
+// shell only launches bare executables (not .cmd/.bat shims), so on Windows
+// this call fails with ENOENT and the build aborts as if tsc had errored.
 const tsc = spawnSync('pnpm', ['exec', 'tsc', '-p', 'tsconfig.json'], {
   stdio: 'inherit',
-  shell: false,
+  shell: true,
 });
 if (tsc.status !== 0) process.exit(tsc.status ?? 1);
 console.log('✓ emitted dist/ library modules + declarations');

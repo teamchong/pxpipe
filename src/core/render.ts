@@ -40,6 +40,11 @@ export const DENSE_CONTENT_COLS = 312;
 /** Bare 5×8 cell (no padding). A/B showed 5×8 beats 7×10 on dense JSON (4/5 vs 3/5 reads, 42% fewer tokens).
  *  Revert to {cellWBonus:2, cellHBonus:2} if misread rates rise. */
 export const DENSE_RENDER_STYLE: RenderStyle = { cellWBonus: 0, cellHBonus: 0, aa: true };
+/** B5 tiered-fidelity "fresh" preset: the padded 7×10 cell from the pre-5×8-win era. More
+ *  pixels/char than DENSE_RENDER_STYLE (no eval claims it reads *better* post-reflow — see the
+ *  comment above), but it's the only structurally different, still-legible style on hand, so
+ *  it's reserved for the newest history segment where the pixel cost is smallest anyway. */
+export const READABLE_RENDER_STYLE: RenderStyle = { cellWBonus: 2, cellHBonus: 2, aa: true };
 /** Default columns for the static slab. 312 × 5 px + 8 px pad = 1568 px — exactly the API's
  *  long-edge bound (313 cols = 1573 px would trigger a 0.997× resample, blurring every glyph). */
 const DEFAULT_COLS = 312;
@@ -349,8 +354,8 @@ function splitWrappedLinesIntoReadablePages(
   return pages.length > 0 ? pages : [[]];
 }
 
-function readableLinesPerColumn(cols: number): number {
-  return Math.max(1, Math.floor(READABLE_CHARS_PER_IMAGE / Math.max(1, cols)));
+function readableLinesPerColumn(cols: number, maxCharsPerImage: number = READABLE_CHARS_PER_IMAGE): number {
+  return Math.max(1, Math.floor(maxCharsPerImage / Math.max(1, cols)));
 }
 
 /**
@@ -739,7 +744,7 @@ export async function renderTextToPngs(
 const GUTTER_CELLS = 4;
 // Width hard-capped at the API's long-edge bound: anything wider is resampled server-side
 // (measured 2026-07-01: fit-within 1568-edge AND ~1.15 MP, then ≈px/750 billing).
-const MAX_WIDTH_PX = 1568;
+export const MAX_WIDTH_PX = 1568;
 
 const GUTTER_DIVIDER_INK = 64; // pre-invert → 191 post-invert: light gray column separator
 const GUTTER_DIVIDER_INSET_PX = 2; // keep divider clear of padding rows
@@ -829,22 +834,29 @@ async function renderMultiColChunkFromLines(
 }
 
 /** Split text into N multi-column PNGs. numCols <= 1 delegates to renderTextToPngs
- *  for byte-identical output (determinism/cache_control preserved when flag is off). */
+ *  for byte-identical output (determinism/cache_control preserved when flag is off).
+ *  `maxCharsPerImage`/`maxHeightPx` default to the pre-existing hardcoded constants, so every
+ *  caller passing the original 3 args (library.ts, transform.ts, the reflow wrapper below) is
+ *  byte-for-byte unaffected — only `renderDensePages`'s fidelity-aware call site (B5/B8) passes
+ *  its own resolved budget, so a non-default `fidelity`/`maxHeightPx`/`maxCharsPerImage` combo
+ *  is actually honored when the multi-column path is taken, not silently dropped. */
 export async function renderTextToPngsMultiCol(
   text: string,
   cols: number = DEFAULT_COLS,
   numCols: number = 2,
+  maxCharsPerImage: number = READABLE_CHARS_PER_IMAGE,
+  maxHeightPx: number = MAX_HEIGHT_PX,
 ): Promise<RenderedImage[]> {
-  if (numCols <= 1) return renderTextToPngs(text, cols);
+  if (numCols <= 1) return renderTextToPngs(text, cols, {}, maxHeightPx);
   if (multiColWidth(cols, numCols) > MAX_WIDTH_PX) {
     // Clamp to widest fitting count rather than throw (bad CLI flag recovery).
     numCols = maxFittingCols(cols);
-    if (numCols <= 1) return renderTextToPngs(text, cols);
+    if (numCols <= 1) return renderTextToPngs(text, cols, {}, maxHeightPx);
   }
 
   const lines = wrapLines(text, cols);
-  const hardLinesPerImg = Math.max(1, Math.floor((MAX_HEIGHT_PX - 2 * PAD_Y) / CELL_H));
-  const linesPerImg = Math.min(hardLinesPerImg, readableLinesPerColumn(cols));
+  const hardLinesPerImg = Math.max(1, Math.floor((maxHeightPx - 2 * PAD_Y) / CELL_H));
+  const linesPerImg = Math.min(hardLinesPerImg, readableLinesPerColumn(cols, maxCharsPerImage));
   const linesPerImage = linesPerImg * numCols;
 
   // Total source codepoints; assigned to the last image to ensure counts sum exactly.
@@ -856,7 +868,7 @@ export async function renderTextToPngsMultiCol(
   const pages = splitWrappedLinesIntoReadablePages(
     lines,
     linesPerImage,
-    READABLE_CHARS_PER_IMAGE * Math.max(1, numCols | 0),
+    maxCharsPerImage * Math.max(1, numCols | 0),
   );
   for (let i = 0; i < pages.length; i++) {
     const slice = pages[i]!;
@@ -886,25 +898,159 @@ export async function renderTextToPngsReflowMultiCol(
   return renderTextToPngsMultiCol(packed ?? text, cols, numCols);
 }
 
+// --- B5: tiered fidelity (age-based render density) -----------------------
+//
+// Older history segments are less likely to be read verbatim again, so they can afford a
+// denser (smaller-footprint) render than the freshest segment. `FidelityTier` names a point on
+// that scale; `renderDensePages`'s default (`fidelity` unset) resolves to 'aged' — bit-identical
+// to the pre-existing DENSE_CONTENT_COLS/DENSE_CONTENT_CHARS_PER_IMAGE/DENSE_RENDER_STYLE trio,
+// so every caller that doesn't opt in is byte-for-byte unaffected (tests/tiered-fidelity.test.ts
+// asserts this). Choosing *which* tier a given segment gets (by actual age/position in history)
+// is deliberately NOT this module's job — that decision lives in history.ts's collapse loop,
+// which doesn't call this dead-code (zero-caller) entry point yet. This just builds the presets.
+export type FidelityTier = 'fresh' | 'aged' | 'stale';
+
+interface FidelityPreset {
+  readonly cols: number;
+  readonly maxCharsPerImage: number;
+  readonly style: RenderStyle;
+}
+
+/** Re-derive a cols cap that exactly fills MAX_WIDTH_PX at a given cell width — the same
+ *  derivation the top-of-file comment documents for DEFAULT_COLS/DENSE_CONTENT_COLS (312 cols ×
+ *  5 px/cell + 8 px pad = 1568 px), generalized to a bigger cell so 'fresh' also lands exactly on
+ *  the API's long-edge bound instead of one column short (wasted pixels) or one over (resampled
+ *  blurry, per the calibration note above `MAX_HEIGHT_PX`). */
+function fitColsToWidthCap(cellWBonus: number): number {
+  const cellW = ATLAS_CELL_W + Math.max(0, cellWBonus | 0);
+  return Math.max(1, Math.floor((MAX_WIDTH_PX - 2 * PAD_X) / cellW));
+}
+
+const FIDELITY_PRESETS: Readonly<Record<FidelityTier, FidelityPreset>> = {
+  // Newest segment: bigger, more legible cell. Costs more pixels/char than 'aged' (see
+  // tests/tiered-fidelity.test.ts monotonicity case) — acceptable because it's reserved for
+  // the smallest (freshest) slice of history.
+  fresh: {
+    cols: fitColsToWidthCap(READABLE_RENDER_STYLE.cellWBonus ?? 0),
+    maxCharsPerImage: READABLE_CHARS_PER_IMAGE,
+    style: READABLE_RENDER_STYLE,
+  },
+  // Today's existing default, unchanged: bare 5×8 cell, full 312-col width, AA on.
+  aged: {
+    cols: DENSE_CONTENT_COLS,
+    maxCharsPerImage: DENSE_CONTENT_CHARS_PER_IMAGE,
+    style: DENSE_RENDER_STYLE,
+  },
+  // Oldest segment. The bare 5×8 cell is already the pixel-area floor (there is no smaller
+  // atlas glyph to fall back to), so 'stale' can't shrink the canvas any further than 'aged' —
+  // it only drops AA (marginally smaller compressed PNG bytes; pixel area, and therefore the
+  // Anthropic token-billing area, is identical to 'aged'). Real further pixel minimization is
+  // B8's numCols search below (`minimizePixels`), which is independent of the fidelity tier.
+  stale: {
+    cols: DENSE_CONTENT_COLS,
+    maxCharsPerImage: DENSE_CONTENT_CHARS_PER_IMAGE,
+    style: { cellWBonus: 0, cellHBonus: 0, aa: false },
+  },
+};
+
+const DEFAULT_FIDELITY_TIER: FidelityTier = 'aged';
+
+// --- B8: pixel-minimizing column count -------------------------------------
+//
+// Local mirror of transform.ts's `imageTokensForRows` (transform.ts:242) page-splitting
+// geometry, computed in raw PIXELS rather than Anthropic tokens: candidates are only compared
+// against each other, so the ANTHROPIC_PIXELS_PER_TOKEN division (a constant scale factor) is
+// unnecessary for picking an argmin, and duplicating it here would just be one more place a
+// billing-formula change has to be kept in sync. Deliberately NOT imported from transform.ts —
+// owned-files boundary for this task — but built from the same exported geometry primitives
+// (multiColWidth, CELL_H, PAD_X/Y) the real renderer uses, so it can't silently drift from what
+// renderTextToPngsMultiCol / renderTextToPngsWithCharLimit actually encode.
+
+/** Total pixel area of the image set produced by packing `totalLines` wrapped lines at
+ *  (`cols`, `numCols`) — mirrors renderMultiColChunkFromLines / renderChunkToPng's page-split
+ *  math (linesPerImg cap from maxHeightPx and maxCharsPerImage) without doing any rendering. */
+function estimateMultiColPixelCost(
+  totalLines: number,
+  cols: number,
+  numCols: number,
+  maxCharsPerImage: number,
+  maxHeightPx: number,
+): number {
+  if (totalLines <= 0) return 0;
+  const n = Math.max(1, numCols | 0);
+  const width = multiColWidth(cols, n);
+  const hardLinesPerImg = Math.max(1, Math.floor((maxHeightPx - 2 * PAD_Y) / CELL_H));
+  const readableLinesPerCol = Math.max(1, Math.floor(maxCharsPerImage / Math.max(1, cols)));
+  const linesPerImgPerCol = Math.min(hardLinesPerImg, readableLinesPerCol);
+  const linesPerImage = linesPerImgPerCol * n;
+  const imagesNeeded = Math.max(1, Math.ceil(totalLines / linesPerImage));
+  const fullImages = Math.max(0, imagesNeeded - 1);
+  const linesInLast = totalLines - fullImages * linesPerImage;
+  // Column-major layout: column 0 fills to linesPerImgPerCol before column 1 starts, so the
+  // last image's pixel HEIGHT is driven by min(linesInLast, linesPerImgPerCol), not by how many
+  // of the numCols columns actually ended up with content — trailing empty columns still cost
+  // their full share of WIDTH (that's exactly the waste `chooseNumColsForPixelCost` avoids).
+  const rowsInLast = Math.min(Math.max(1, linesInLast), linesPerImgPerCol);
+  const fullImageHeight = 2 * PAD_Y + linesPerImgPerCol * CELL_H;
+  const lastImageHeight = 2 * PAD_Y + rowsInLast * CELL_H;
+  return fullImages * width * fullImageHeight + width * lastImageHeight;
+}
+
+/** Argmin search over numCols = 1..maxFittingCols(cols) by total pixel cost. Replaces the
+ *  greedy "always use the max columns that fit" choice: greedy isn't always optimal because a
+ *  wide-but-mostly-empty trailing column in the last image can cost more width than the extra
+ *  column saves in image count (see tests/tiered-fidelity.test.ts fixture (d)). Linear scan is
+ *  fine — maxFittingCols is a handful at most (MAX_WIDTH_PX / (cols × CELL_W)). */
+function chooseNumColsForPixelCost(
+  totalLines: number,
+  cols: number,
+  maxCharsPerImage: number,
+  maxHeightPx: number,
+): number {
+  const upper = Math.max(1, maxFittingCols(cols));
+  let best = 1;
+  let bestCost = estimateMultiColPixelCost(totalLines, cols, 1, maxCharsPerImage, maxHeightPx);
+  for (let n = 2; n <= upper; n++) {
+    const cost = estimateMultiColPixelCost(totalLines, cols, n, maxCharsPerImage, maxHeightPx);
+    if (cost < bestCost) {
+      bestCost = cost;
+      best = n;
+    }
+  }
+  return best;
+}
+
 export interface RenderDensePagesOptions {
-  /** Wrap-width cap in cols. Default DENSE_CONTENT_COLS (384). */
+  /** Wrap-width cap in cols. Default: the resolved fidelity preset's cols (DENSE_CONTENT_COLS,
+   *  312, when `fidelity` is unset). */
   readonly cols?: number;
   /** Shrink the canvas to the widest actual line (default true). `false` keeps the full
    *  `cols` width — the proxy's eval-backed full-canvas / slab behavior. */
   readonly shrink?: boolean;
-  /** Columns to pack side-by-side. `'auto'` (default) packs as many as fit the width cap;
-   *  a number forces that count. Collapses to 1 when the canvas shrinks below the cap. */
+  /** Columns to pack side-by-side. `'auto'` (default) packs columns per `minimizePixels`
+   *  (greedy max-that-fits, or the pixel-cost argmin); a number forces that count. Collapses to
+   *  1 when the canvas shrinks below the cap. */
   readonly multiCol?: number | 'auto';
   /** Reflow (minify + join hard newlines with ↵) before rendering. Default false. Callers
    *  that pre-reflow (the proxy's maybeReflow / history lockstep) pass false; `pxpipe export`
    *  passes true so short lines pack into full-width rows. */
   readonly reflow?: boolean;
-  /** Max source chars per page. Default DENSE_CONTENT_CHARS_PER_IMAGE. */
+  /** Max source chars per page. Default: the resolved fidelity preset's budget
+   *  (DENSE_CONTENT_CHARS_PER_IMAGE when `fidelity` is unset). */
   readonly maxCharsPerImage?: number;
-  /** Render style. Default DENSE_RENDER_STYLE. */
+  /** Render style. Default: the resolved fidelity preset's style (DENSE_RENDER_STYLE when
+   *  `fidelity` is unset). */
   readonly style?: RenderStyle;
   /** Max page height in px. Default MAX_HEIGHT_PX. */
   readonly maxHeightPx?: number;
+  /** B5: age-based fidelity preset selecting cols/maxCharsPerImage/style together. Unset (the
+   *  default) resolves to 'aged', bit-identical to pre-existing behavior. Explicit `cols` /
+   *  `maxCharsPerImage` / `style` above still override the preset's corresponding field. */
+  readonly fidelity?: FidelityTier;
+  /** B8: when `multiCol` is 'auto'/unset, replace the greedy max-columns-that-fit choice with
+   *  an argmin pixel-cost search (`chooseNumColsForPixelCost`). Default false = today's greedy
+   *  `maxFittingCols` behavior. */
+  readonly minimizePixels?: boolean;
 }
 
 /**
@@ -922,23 +1068,32 @@ export interface RenderDensePagesOptions {
  * in lockstep with the text and renders with `colorByRole`, which code export has no concept
  * of — wiring slots through this public surface would bloat it for one internal caller. It
  * still shares the underlying `reflow()` + `renderTextToPngsWithCharLimit` primitives.
+ *
+ * `opts.fidelity` (B5) and `opts.minimizePixels` (B8) are both opt-in and both default to
+ * today's exact behavior — see FIDELITY_PRESETS / chooseNumColsForPixelCost above.
  */
 export async function renderDensePages(
   text: string,
   opts: RenderDensePagesOptions = {},
 ): Promise<RenderedImage[]> {
+  const preset = FIDELITY_PRESETS[opts.fidelity ?? DEFAULT_FIDELITY_TIER];
   const source = opts.reflow ? reflow(text) ?? text : text;
-  const maxCols = Math.max(1, (opts.cols ?? DENSE_CONTENT_COLS) | 0);
+  const maxCols = Math.max(1, (opts.cols ?? preset.cols) | 0);
   const cols = opts.shrink === false ? maxCols : measureContentCols(source, maxCols);
-  const requestedCols =
-    opts.multiCol === undefined || opts.multiCol === 'auto'
-      ? Math.max(1, maxFittingCols(cols))
-      : Math.max(1, opts.multiCol | 0);
-  const numCols = cols < maxCols ? 1 : requestedCols;
-  const style = opts.style ?? DENSE_RENDER_STYLE;
-  const maxChars = opts.maxCharsPerImage ?? DENSE_CONTENT_CHARS_PER_IMAGE;
+  const style = opts.style ?? preset.style;
+  const maxChars = opts.maxCharsPerImage ?? preset.maxCharsPerImage;
   const maxHeightPx = opts.maxHeightPx ?? MAX_HEIGHT_PX;
+  let requestedCols: number;
+  if (opts.multiCol === undefined || opts.multiCol === 'auto') {
+    requestedCols =
+      opts.minimizePixels === true
+        ? chooseNumColsForPixelCost(wrapLines(source, cols).length, cols, maxChars, maxHeightPx)
+        : Math.max(1, maxFittingCols(cols));
+  } else {
+    requestedCols = Math.max(1, opts.multiCol | 0);
+  }
+  const numCols = cols < maxCols ? 1 : requestedCols;
   return numCols > 1
-    ? renderTextToPngsMultiCol(source, cols, numCols)
+    ? renderTextToPngsMultiCol(source, cols, numCols, maxChars, maxHeightPx)
     : renderTextToPngsWithCharLimit(source, cols, maxChars, style, maxHeightPx);
 }

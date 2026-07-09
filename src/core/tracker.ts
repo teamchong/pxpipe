@@ -142,6 +142,16 @@ export interface TrackEvent {
   /** Probe outcome. Dashboards must only attribute "$ saved" to rows where status === 'ok'. */
   baseline_probe_status?: 'ok' | 'partial' | 'failed';
 
+  /** D11: true when this request was sampled for the passive POST-transform count_tokens
+   *  probe (PXPIPE_PROBE_RATE). Present whenever sampled, regardless of probe success —
+   *  lets the dashboard measure the observed sampling rate independent of probe failures. */
+  probe_sampled?: boolean;
+  /** D11: count_tokens' estimate on the POST-transform (compressed) body, for a sampled
+   *  request only. Compare against `input_tokens` (the real, free number from usage) to
+   *  calibrate the estimate — this is NOT part of the cost/savings rollup, calibration only.
+   *  Absent when the probe failed or wasn't sampled. */
+  probe_post_tokens?: number;
+
   // Errors:
   error?: string;
   /** First ~2 KiB of the upstream 4xx response body. */
@@ -321,6 +331,10 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
   if (ev.stopReason) {
     out.stop_reason = ev.stopReason;
     if (SAFETY_STOP_REASONS.has(ev.stopReason)) out.safety_flagged = true;
+  }
+  if (ev.probe) {
+    out.probe_sampled = true;
+    if (typeof ev.probe.postTokens === 'number') out.probe_post_tokens = ev.probe.postTokens;
   }
   return out;
 }

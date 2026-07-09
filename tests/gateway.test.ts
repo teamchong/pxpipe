@@ -22,6 +22,15 @@ describe('resolveUpstreams', () => {
     });
   });
 
+  it('can strip /v1 for direct OpenAI-family upstreams', () => {
+    expect(resolveUpstreams({ openAIUpstream: 'https://chatgpt.test/codex/', openAIStripV1: true }))
+      .toEqual({
+        anthropic: 'https://api.anthropic.com',
+        openai: 'https://chatgpt.test/codex',
+        stripOpenAIV1: true,
+      });
+  });
+
   it('derives both family routes from one gateway base', () => {
     expect(resolveUpstreams({ provider: 'cloudflare-ai-gateway', gatewayBaseUrl: FAKE_BASE + '/' }))
       .toEqual({
@@ -126,6 +135,23 @@ describe('gateway end-to-end routing (stubbed fetch)', () => {
       }),
     );
     expect(cap.url).toBe(`${FAKE_BASE}/openai/responses`);
+  });
+
+  it('routes OpenAI /v1/responses to a direct stripped upstream when configured', async () => {
+    const cap: { url?: string; headers?: Headers } = {};
+    stubFetch(cap);
+    await createProxy({
+      openAIUpstream: 'https://chatgpt.test/backend-api/codex',
+      openAIStripV1: true,
+    })(
+      new Request('http://localhost/v1/responses?client_version=0.143.0', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: 'Bearer fake-chatgpt-token' },
+        body: JSON.stringify({ model: 'gpt-fake', input: 'hi' }),
+      }),
+    );
+    expect(cap.url).toBe('https://chatgpt.test/backend-api/codex/responses?client_version=0.143.0');
+    expect(cap.headers?.get('authorization')).toBe('Bearer fake-chatgpt-token');
   });
 
   it('passes unrecognized Anthropic-family paths through untouched', async () => {

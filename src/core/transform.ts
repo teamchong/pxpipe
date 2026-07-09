@@ -48,7 +48,7 @@ function factSheetTextTracked(info: TransformInfo, text: string): string {
 import { stripSchemaDescriptions, schemaHasStructure } from './schema-strip.js';
 import { bytesToBase64 } from './png.js';
 import { cachedRender } from './render-cache.js';
-import { collapseHistory, HISTORY_SYNTHETIC_INTRO } from './history.js';
+import { collapseHistory, HISTORY_DEFAULTS, HISTORY_SYNTHETIC_INTRO } from './history.js';
 import type { GptHistoryOptions } from './openai-history.js';
 import { CACHE_CREATE_RATE, CACHE_READ_RATE } from './baseline.js';
 
@@ -151,6 +151,17 @@ export interface TransformOptions {
    *  otherwise preserves caller markers verbatim. Only markers pxpipe already
    *  relocates are touched; caller markers left in place are never rewritten. */
   cacheTtl1h?: boolean;
+  /** E15 (2026-07-07): the last K conversation turns (= messages, counting
+   *  from the tail) NEVER get imaged — they always ride as plain text, no
+   *  matter what phase 5a/5b/6 would otherwise do. The slab-bearing first
+   *  user message is always exempt (it's imaged unconditionally by design;
+   *  see phase 5a). Default 4 — matches `HISTORY_DEFAULTS.keepTail` in
+   *  history.ts, i.e. "a turn" is one message. A hard assertion after all
+   *  compression phases re-scans the guarded window and fails OPEN (full
+   *  byte-identical passthrough, `info.reason = 'last_turns_guard'`) if an
+   *  image landed there anyway — same fail-open shape as `passthroughGuard`.
+   *  Set to 0 to disable (guard window becomes empty). */
+  guardLastTurns?: number;
 }
 
 const DEFAULTS: Required<TransformOptions> = {
@@ -178,6 +189,7 @@ const DEFAULTS: Required<TransformOptions> = {
   emitRecoverable: false,
   passthroughGuard: () => false,
   cacheTtl1h: false,
+  guardLastTurns: 4,
   // GPT-only knobs; the Anthropic transform ignores them but Required<> needs them.
   collapseHistory: true,
   gptHistory: {},
@@ -461,7 +473,7 @@ export function isCompressionProfitableAmortized(
 /** Increment a passthrough-reason counter on `info`. Lazily allocates `passthroughReasons`. */
 function bumpPassthrough(
   info: TransformInfo,
-  reason: 'below_threshold' | 'not_profitable' | 'kept_sharp',
+  reason: 'below_threshold' | 'not_profitable' | 'kept_sharp' | 'guard_last_turns',
 ): void {
   if (!info.passthroughReasons) info.passthroughReasons = {};
   info.passthroughReasons[reason] = (info.passthroughReasons[reason] ?? 0) + 1;
@@ -478,6 +490,64 @@ function callerKeepsSharp(
   } catch {
     return false;
   }
+}
+
+/** E15: first message index a `guardLastTurns` window must protect — i.e. the
+ *  window is `messages[result..]`. Recomputed fresh against whatever array is
+ *  passed (original pre-phase-6, or the post-collapse array), which is what
+ *  lets the SAME helper serve both the phase-5b prevention check (pre-collapse
+ *  indices) and the final backstop assertion (post-collapse indices): a window
+ *  that reaches into a collapsed/imaged history chunk naturally shows up as
+ *  `result` landing at or before that chunk's synthetic message once the array
+ *  has shrunk.
+ *
+ *  The slab-bearing first user message is always exempt — phase 5a images it
+ *  unconditionally by design (the static system-prompt slab), so counting it
+ *  as a guard violation would make the guard misfire on every short
+ *  conversation (where the opening turn IS one of the last K messages). */
+function lastTurnsGuardFrom(messages: Message[], guardLastTurns: number): number {
+  const k = Number.isFinite(guardLastTurns) ? Math.max(0, Math.floor(guardLastTurns)) : 4;
+  const tailStart = Math.max(0, messages.length - k);
+  const slabAnchorIdx = messages.findIndex((m) => m.role === 'user');
+  return Math.max(tailStart, slabAnchorIdx >= 0 ? slabAnchorIdx + 1 : 0);
+}
+
+/** True if any message at/after `fromIdx` carries an image block — either a
+ *  top-level content block or one nested inside a `tool_result.content[]`
+ *  array. Used by the E15 backstop: the guarded window must be 100% text. */
+function rangeHasImageBlock(messages: Message[], fromIdx: number): boolean {
+  for (let i = Math.max(0, fromIdx); i < messages.length; i++) {
+    const content = messages[i]!.content;
+    if (!Array.isArray(content)) continue;
+    for (const blk of content) {
+      if (!blk || typeof blk !== 'object') continue;
+      const t = (blk as { type?: string }).type;
+      if (t === 'image') return true;
+      if (t === 'tool_result') {
+        const inner = (blk as ToolResultBlock).content;
+        if (Array.isArray(inner)) {
+          for (const sub of inner) {
+            if (sub && typeof sub === 'object' && (sub as { type?: string }).type === 'image') {
+              return true;
+            }
+          }
+        }
+      }
+    }
+  }
+  return false;
+}
+
+/** E15: fail-open log line for a `guardLastTurns` violation. This should never
+ *  fire in practice — the phase 5b skip + history keepTail floor above are
+ *  meant to make the guarded window unreachable — so a hit here means some
+ *  phase forgot the exclusion and needs a look. */
+function logLastTurnsGuardViolation(guardLastTurns: number): void {
+  console.error(
+    `[pxpipe] last_turns_guard violation: an image landed within the last ` +
+    `${guardLastTurns} configured turn(s) of the conversation. Failing open — ` +
+    'returning the original request unmodified for this call.',
+  );
 }
 
 /** Logical bucket for per-gate-call char attribution. Used by the rolling-cpt
@@ -582,7 +652,14 @@ export interface TransformInfo {
   /** Top dropped codepoints by frequency (`U+HHHH` → count), at most 20 entries. */
   droppedCodepointsTop?: Record<string, number>;
   /** Why blocks passed through without compression. Only present when count > 0. */
-  passthroughReasons?: { below_threshold?: number; not_profitable?: number; kept_sharp?: number };
+  passthroughReasons?: {
+    below_threshold?: number;
+    not_profitable?: number;
+    kept_sharp?: number;
+    /** E15: block belonged to a message inside the `guardLastTurns` window
+     *  (last-K-turns) and was left as text unconditionally, never gated. */
+    guard_last_turns?: number;
+  };
   /** Slab gate diagnostics — imageTokens, textTokens, burn terms, and verdict.
    *  Lets hosts measure flap-prevention efficacy and tune amortization horizon. */
   gateEval?: {
@@ -1484,7 +1561,15 @@ async function runHistoryCollapseAndFinalize(
     const { messages: newMessages, info: histInfo } = await collapseHistory(
       req.messages,
       historyProfitable,
-      { cols: o.cols, protectedPrefix: 0, reflow: o.reflow },
+      {
+        cols: o.cols,
+        protectedPrefix: 0,
+        reflow: o.reflow,
+        // E15: never let history collapse fold more of the tail away than
+        // guardLastTurns allows — floored at history's own default so a
+        // guardLastTurns SMALLER than 4 doesn't loosen existing behavior.
+        keepTail: Math.max(HISTORY_DEFAULTS.keepTail, o.guardLastTurns),
+      },
     );
     if (histInfo.collapsedTurns > 0) {
       req.messages = newMessages;
@@ -1507,7 +1592,18 @@ async function runHistoryCollapseAndFinalize(
       info.historyTextChars = histInfo.collapsedChars;
       info.historyImageSha = await historyImageSha8(newMessages);
       bumpBucket(info, 'history', histInfo.collapsedChars);
-      collapsedFlag = true;
+      // E15 backstop: history collapse just folded part of the conversation
+      // into an imaged synthetic message. This early-exit path (slab below
+      // minCompressChars / not profitable) is the ONLY way history collapse
+      // can run without the main path's own backstop below ever executing —
+      // it returns straight from here — so it needs its own check.
+      const guardFromEarly = lastTurnsGuardFrom(req.messages, o.guardLastTurns);
+      if (rangeHasImageBlock(req.messages, guardFromEarly)) {
+        logLastTurnsGuardViolation(o.guardLastTurns);
+        info.reason = 'last_turns_guard';
+      } else {
+        collapsedFlag = true;
+      }
     } else if (histInfo.reason) {
       info.historyReason = histInfo.reason;
     }
@@ -1975,13 +2071,26 @@ export async function transformRequest(
 
     // 5b. Compress tool_result content across ALL user messages.
     if (o.compressToolResults) {
-      for (const msg of req.messages ?? []) {
+      // E15: messages at/after this index are inside the guardLastTurns
+      // window — their tool_results NEVER get imaged (see lastTurnsGuardFrom).
+      // Computed once, pre-collapse, against the still-original message array.
+      const guardFrom5b = lastTurnsGuardFrom(req.messages ?? [], o.guardLastTurns);
+      const msgs5b = req.messages ?? [];
+      for (let msgIdx = 0; msgIdx < msgs5b.length; msgIdx++) {
+        const msg = msgs5b[msgIdx]!;
         if (msg.role !== 'user' || !Array.isArray(msg.content)) continue;
         const rewritten: ContentBlock[] = [];
         let changed = false;
         for (const blk of msg.content) {
           if (blk && (blk as ToolResultBlock).type === 'tool_result') {
             const tr = blk as ToolResultBlock;
+            // E15 guard: this message is within the protected tail window —
+            // leave every tool_result on it byte-identical, no gating at all.
+            if (msgIdx >= guardFrom5b) {
+              bumpPassthrough(info, 'guard_last_turns');
+              rewritten.push(blk);
+              continue;
+            }
             // Anthropic rejects images inside is_error tool_results — leave alone.
             if (tr.is_error === true) {
               rewritten.push(blk);
@@ -2154,7 +2263,16 @@ export async function transformRequest(
     const { messages: newMessages, info: histInfo } = await collapseHistory(
       req.messages,
       historyProfitable,
-      { cols: o.cols, protectedPrefix: slabAnchorIdx >= 0 ? slabAnchorIdx + 1 : 0, reflow: o.reflow },
+      {
+        cols: o.cols,
+        protectedPrefix: slabAnchorIdx >= 0 ? slabAnchorIdx + 1 : 0,
+        reflow: o.reflow,
+        // E15: floor history's own keepTail at guardLastTurns so the tail
+        // window collapseHistory protects is never narrower than the guard
+        // — otherwise a guardLastTurns > 4 would rely entirely on the
+        // backstop assertion below, forcing a full passthrough every time.
+        keepTail: Math.max(HISTORY_DEFAULTS.keepTail, o.guardLastTurns),
+      },
     );
     if (histInfo.collapsedTurns > 0) {
       req.messages = newMessages;
@@ -2224,6 +2342,24 @@ export async function transformRequest(
       msgs[i] = { ...m, content: [...content, { type: 'text' as const, text: wrappedEnvText }] };
       info.envRelocatedChars = wrappedEnvText.length;
       break;
+    }
+  }
+
+  // E15 (2026-07-07): last-K-turns guard backstop. Phases 5b (tool_result
+  // skip) and 6 (history keepTail floor) already avoid imaging the guarded
+  // window — this is the load-bearing check that catches anything that
+  // slipped through anyway (a future phase forgetting the exclusion, a
+  // gate-geometry edge case, etc.). Recomputed against the FINAL req.messages
+  // (post history-collapse, indices may have shifted) so a guardLastTurns
+  // window that reaches into a collapsed/imaged history chunk is still
+  // caught. Fail-open: exactly the same shape as callerGuardsPassthrough
+  // above — return the ORIGINAL, byte-identical `body`, never `outBody`.
+  {
+    const guardFrom = lastTurnsGuardFrom(req.messages ?? [], o.guardLastTurns);
+    if (rangeHasImageBlock(req.messages ?? [], guardFrom)) {
+      logLastTurnsGuardViolation(o.guardLastTurns);
+      info.reason = 'last_turns_guard';
+      return { body, info };
     }
   }
 

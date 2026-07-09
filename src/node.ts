@@ -44,6 +44,7 @@ interface RuntimeConfig {
   host: string;
   upstream: string;
   openAIUpstream: string;
+  openAIStripV1: boolean;
   openAIApiKey?: string;
   provider?: 'cloudflare-ai-gateway';
   gatewayBaseUrl?: string;
@@ -110,6 +111,7 @@ function parseCli(argv: string[]): RuntimeConfig {
     host: process.env.HOST?.trim() || '127.0.0.1',
     upstream: process.env.ANTHROPIC_UPSTREAM ?? sharedUpstream ?? 'https://api.anthropic.com',
     openAIUpstream: process.env.OPENAI_UPSTREAM ?? sharedUpstream ?? 'https://api.openai.com',
+    openAIStripV1: isEnvTruthy(process.env.OPENAI_STRIP_V1 ?? process.env.PXPIPE_OPENAI_STRIP_V1),
     openAIApiKey: process.env.OPENAI_API_KEY,
     provider: parseProvider(process.env.PXPIPE_PROVIDER),
     gatewayBaseUrl: process.env.PXPIPE_GATEWAY_BASE_URL,
@@ -125,6 +127,10 @@ function parseProvider(v: string | undefined): 'cloudflare-ai-gateway' | undefin
   if (v === 'cloudflare-ai-gateway') return v;
   console.error(`[pxpipe] unknown PXPIPE_PROVIDER: ${v}`);
   process.exit(2);
+}
+
+function isEnvTruthy(v: string | undefined): boolean {
+  return v === '1' || v?.toLowerCase() === 'true';
 }
 
 function printHelp(): void {
@@ -155,6 +161,8 @@ Environment:
                            (default https://api.anthropic.com)
   OPENAI_UPSTREAM         OpenAI API base; overrides PXPIPE_UPSTREAM
                            (default https://api.openai.com)
+  OPENAI_STRIP_V1         1/true = strip leading /v1 from OpenAI-family paths
+                          before forwarding (for ChatGPT Codex backend)
   OPENAI_API_KEY          optional OpenAI key override; otherwise forwarded
   PXPIPE_PROVIDER         optional: 'cloudflare-ai-gateway' — route both API
                           families through one gateway base URL
@@ -950,6 +958,7 @@ async function main(): Promise<void> {
     gatewayHeaders: opts.gatewayHeaders,
     upstream: opts.upstream,
     openAIUpstream: opts.openAIUpstream,
+    openAIStripV1: opts.openAIStripV1,
     openAIApiKey: opts.openAIApiKey,
     // Per-request transform options:
     //   1. Runtime kill switch — when the dashboard "passthrough" toggle

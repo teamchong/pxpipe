@@ -119,3 +119,90 @@ export function shouldTransformAnthropicMessages(
   }
   return { eligible: true, reason: 'eligible' };
 }
+
+// --- C9+C10: coverage routing (heavy one-off vs. light repeatable) ---------
+//
+// `shouldTransformAnthropicMessages` above answers "is pxpipe allowed to touch
+// this request at all" (model/method/path/empty-body gating). The functions
+// below answer a narrower, additive question for a request that already
+// passed that gate: is this a "heavy" one-off analysis (today's full
+// compression is the right call) or a "light" small request that is part of
+// an established, repeatable session (where the caller already manages its
+// own `cache_control` breakpoints and re-rendering the image would just
+// bust a prefix that was about to be reused)? See docs/ROUTING.md for the
+// full decision table and rationale. Pure, read-only, and NOT wired into
+// `proxy.ts` yet — same status as `shouldTransformAnthropicMessages` itself
+// (exported for callers/tests; live wiring is a separate, non-owned change).
+
+/** Routing outcome for `classifyRequestWeight`. */
+export type PxpipeRequestWeightTier = 'heavy' | 'light';
+
+export type PxpipeRequestWeightReason =
+  | 'large_body'
+  | 'stable_prefix_established'
+  | 'small_repeated_turn'
+  | 'insufficient_signal';
+
+export interface PxpipeRequestWeightInput extends PxpipeApplicabilityInput {
+  /** Turn count (`messages.length`). Cheap proxy for "is this an established
+   *  multi-turn session, or a cold first shot" — counting array length needs
+   *  no block-content parsing. */
+  readonly messageCount?: number | null;
+  /** `cache_control` marker count already present in the INCOMING (pre-transform)
+   *  body — see `countCacheControlMarkers` in measurement.ts. A caller that
+   *  already places its own breakpoints is signalling the session expects
+   *  prefix reuse across turns. */
+  readonly existingCacheControlMarkers?: number | null;
+}
+
+export interface PxpipeRequestWeightResult {
+  readonly tier: PxpipeRequestWeightTier;
+  readonly reason: PxpipeRequestWeightReason;
+}
+
+/** Body at/above this size is routed 'heavy' regardless of other signals: at
+ *  this size the one-request compression win dominates any hypothetical cache
+ *  reuse, and (per the recon brief) large jumps are typically one-off document
+ *  dumps / analyses, not steady-state conversation turns. See docs/ROUTING.md. */
+export const HEAVY_BODY_BYTES_THRESHOLD = 200_000;
+
+/** Body at/below this size is cheap enough that forcing a re-render is not
+ *  worth disturbing an established cache prefix. See docs/ROUTING.md. */
+export const LIGHT_BODY_BYTES_THRESHOLD = 32_000;
+
+/** Minimum turn count to call a session "established" when no explicit
+ *  `cache_control` marker count is available. See docs/ROUTING.md. */
+export const LIGHT_MIN_MESSAGE_COUNT = 2;
+
+/**
+ * Classifies an already-eligible request as 'heavy' (full compression, today's
+ * unconditional behavior) or 'light' (small + repeatable — respect the
+ * caller's existing cache breakpoints instead of re-rendering). Uses only
+ * cheap PRE-transform signals (`bodyBytes`, `messageCount`,
+ * `existingCacheControlMarkers`): richer signals like `TransformInfo.staticChars`
+ * / `dynamicChars` only exist AFTER the transform has already run, so they
+ * can't gate the transform itself. Additive and read-only — does not change
+ * `shouldTransformAnthropicMessages` or any existing exported behavior.
+ * Missing/ambiguous signals default to 'heavy' (today's behavior, unaffected).
+ */
+export function classifyRequestWeight(
+  input: PxpipeRequestWeightInput,
+): PxpipeRequestWeightResult {
+  const bodyBytes = input.bodyBytes ?? null;
+  const messageCount = input.messageCount ?? null;
+  const markers = input.existingCacheControlMarkers ?? null;
+
+  if (bodyBytes !== null && bodyBytes >= HEAVY_BODY_BYTES_THRESHOLD) {
+    return { tier: 'heavy', reason: 'large_body' };
+  }
+  if (markers !== null && markers > 0 && (bodyBytes === null || bodyBytes <= LIGHT_BODY_BYTES_THRESHOLD)) {
+    return { tier: 'light', reason: 'stable_prefix_established' };
+  }
+  if (
+    bodyBytes !== null && bodyBytes <= LIGHT_BODY_BYTES_THRESHOLD
+    && messageCount !== null && messageCount >= LIGHT_MIN_MESSAGE_COUNT
+  ) {
+    return { tier: 'light', reason: 'small_repeated_turn' };
+  }
+  return { tier: 'heavy', reason: 'insufficient_signal' };
+}

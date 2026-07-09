@@ -22,6 +22,8 @@ export interface Env {
   /** Optional override — if set, replaces whatever x-api-key the client sent. */
   ANTHROPIC_API_KEY?: string;
   OPENAI_UPSTREAM?: string;
+  OPENAI_STRIP_V1?: string;
+  PXPIPE_OPENAI_STRIP_V1?: string;
   /** Optional override — if set, replaces whatever Authorization the client sent. */
   OPENAI_API_KEY?: string;
   COMPRESS?: string;
@@ -124,6 +126,7 @@ export default {
       upstream: env.ANTHROPIC_UPSTREAM ?? sharedUpstream ?? 'https://api.anthropic.com',
       apiKey: env.ANTHROPIC_API_KEY,
       openAIUpstream: env.OPENAI_UPSTREAM ?? sharedUpstream ?? 'https://api.openai.com',
+      openAIStripV1: truthy(env.OPENAI_STRIP_V1 ?? env.PXPIPE_OPENAI_STRIP_V1, false),
       openAIApiKey: env.OPENAI_API_KEY,
       transform,
       onRequest: (e) => {

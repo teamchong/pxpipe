@@ -10,6 +10,7 @@ import {
   buildBaselineCountTokensBody,
   buildCacheablePrefixCountTokensBody,
 } from './measurement.js';
+import { probeRateFromEnv, shouldSample, runPostTransformProbe } from './probe.js';
 import type { Usage } from './types.js';
 
 export interface ProxyConfig {
@@ -26,6 +27,8 @@ export interface ProxyConfig {
   apiKey?: string;
   /** OpenAI API base for GPT chat completions, no trailing slash. */
   openAIUpstream?: string;
+  /** Strip a leading `/v1` from OpenAI-family paths before forwarding. */
+  openAIStripV1?: boolean;
   /** Override or supply an OpenAI API key. If unset, we forward Authorization. */
   openAIApiKey?: string;
   /** Pass a function to inject dynamic values per-request (e.g. live charsPerToken);
@@ -66,6 +69,12 @@ export interface ProxyEvent {
   /** Ground-truth char counts from the response stream, independent of usage.output_tokens.
    *  Absent when the body couldn't be scanned (5xx, unknown content-type). See OutputMeasurement. */
   measurement?: OutputMeasurement;
+  /** D11: passive POST-transform count_tokens probe, present only on requests sampled per
+   *  PXPIPE_PROBE_RATE (default 0 = off). postTokens is null when the probe itself failed
+   *  (upstream error, unbuildable body) — presence of this field, not its value, means
+   *  "this request was sampled". Calibration only: real post-transform tokens already
+   *  arrive free in `usage.input_tokens`; downstream compares the two. */
+  probe?: { postTokens: number | null };
 }
 
 /** Max chars of 4xx error body captured on ProxyEvent — enough for Anthropic's full error JSON. */
@@ -529,11 +538,15 @@ function isCanonicalOpenAIPath(pathname: string, headers: Headers, hasOpenAIKey:
 
 /** POST /v1/messages/count_tokens with the given body. Returns the upstream's
  *  `input_tokens` number or null on any failure. count_tokens is documented
- *  as a free endpoint (no input-token billing) — we use it once per request
- *  on the PRE-COMPRESSION body to get the ground-truth baseline. Actual
- *  post-compression tokens already come back free in the /v1/messages usage
- *  block (input_tokens + cache_create + cache_read), so no second probe. */
-async function countTokensUpstream(
+ *  as a free endpoint (no input-token billing) — we use it on the
+ *  PRE-COMPRESSION body on every request to get the ground-truth baseline.
+ *  Actual post-compression tokens already come back free in the /v1/messages
+ *  usage block (input_tokens + cache_create + cache_read), so there's no
+ *  per-request need for a second probe on the transformed body — D11
+ *  (see probe.ts) reuses this same function for an opt-in, sampled
+ *  POST-transform probe purely to calibrate count_tokens' estimate against
+ *  that real number. */
+export async function countTokensUpstream(
   countTokensUrl: string,
   body: Uint8Array,
   headers: Headers,
@@ -570,7 +583,7 @@ export function resolveUpstreams(config: ProxyConfig): {
   return {
     anthropic: (config.upstream ?? DEFAULT_UPSTREAM).replace(/\/+$/, ''),
     openai: (config.openAIUpstream ?? DEFAULT_OPENAI_UPSTREAM).replace(/\/+$/, ''),
-    stripOpenAIV1: false,
+    stripOpenAIV1: config.openAIStripV1 ?? false,
   };
 }
 
@@ -700,6 +713,17 @@ export function createProxy(config: ProxyConfig = {}) {
             info.baselineProbeStatus = 'ok';
           }
         }
+        // D11: await the sampled post-transform probe (if this request was sampled) so its
+        // result lands on the same event row. Any throw here is a defensive backstop only —
+        // runPostTransformProbe already never throws — a probe outage must never break tracking.
+        let probe: { postTokens: number | null } | undefined;
+        if (probePromise) {
+          try {
+            probe = { postTokens: await probePromise };
+          } catch {
+            probe = { postTokens: null };
+          }
+        }
         await config.onRequest?.({
           method: req.method,
           path: url.pathname,
@@ -715,6 +739,7 @@ export function createProxy(config: ProxyConfig = {}) {
           reqBodyGz,
           measurement,
           stopReason,
+          probe,
         });
       };
       void finalize();
@@ -745,6 +770,9 @@ export function createProxy(config: ProxyConfig = {}) {
     let baselinePromise: Promise<number | null> | undefined;
     let baselineCacheablePromise: Promise<number | null> | undefined;
     let baselineStatusApplies = false;
+    // D11: sampled POST-transform count_tokens probe (PXPIPE_PROBE_RATE, default 0/off).
+    // Calibration only — never gates baselineStatusApplies, never blocks the response.
+    let probePromise: Promise<number | null> | undefined;
 
     if (isMessages || isOpenAIChat || isOpenAIResponses) {
       const bodyIn = new Uint8Array(await req.arrayBuffer());
@@ -799,6 +827,18 @@ export function createProxy(config: ProxyConfig = {}) {
                 ctCacheableBody,
                 new Headers(ctHeaders),
               );
+            }
+            // D11: on a sampled slice of traffic, fire a second count_tokens probe on the
+            // POST-transform body (r.body) — purely to calibrate the estimate against the
+            // real usage.input_tokens that comes back free with the main response.
+            // Fire-and-forget: never awaited before the main forward/response.
+            if (shouldSample(probeRateFromEnv())) {
+              probePromise = runPostTransformProbe({
+                ctUrl,
+                ctHeaders: new Headers(ctHeaders),
+                postBody: r.body,
+                countTokensFn: countTokensUpstream,
+              });
             }
           }
         }

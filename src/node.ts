@@ -253,12 +253,30 @@ function isConnectionAbort(err: unknown): boolean {
     causeMessage.includes('other side closed');
 }
 
-async function waitForDrain(out: ServerResponse): Promise<void> {
-  const event = await Promise.race([
-    once(out, 'drain').then(() => 'drain'),
-    once(out, 'close').then(() => 'close'),
-  ]);
-  if (event === 'close') throw new Error('client response closed');
+function waitForDrain(out: ServerResponse): Promise<void> {
+  // Do NOT use Promise.race([once(out,'drain'), once(out,'close')]): the losing
+  // once() never detaches its listener, and events.once() also attaches an
+  // implicit 'error' listener. On a long streamed response every backpressure
+  // cycle would then leak one 'close' + one 'error' listener on the same
+  // ServerResponse, triggering MaxListenersExceededWarning, unbounded heap
+  // growth, and eventually a silent OOM exit of the proxy. Manage the listeners
+  // manually and remove both on whichever event fires first.
+  return new Promise<void>((resolve, reject) => {
+    const cleanup = () => {
+      out.off('drain', onDrain);
+      out.off('close', onClose);
+    };
+    const onDrain = () => {
+      cleanup();
+      resolve();
+    };
+    const onClose = () => {
+      cleanup();
+      reject(new Error('client response closed'));
+    };
+    out.once('drain', onDrain);
+    out.once('close', onClose);
+  });
 }
 
 async function writeWebResponse(res: Response, out: ServerResponse): Promise<void> {

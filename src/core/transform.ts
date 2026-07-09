@@ -47,7 +47,8 @@ function factSheetTextTracked(info: TransformInfo, text: string): string {
 }
 import { stripSchemaDescriptions, schemaHasStructure } from './schema-strip.js';
 import { bytesToBase64 } from './png.js';
-import { collapseHistory, HISTORY_SYNTHETIC_INTRO } from './history.js';
+import { cachedRender } from './render-cache.js';
+import { collapseHistory, HISTORY_DEFAULTS, HISTORY_SYNTHETIC_INTRO } from './history.js';
 import type { GptHistoryOptions } from './openai-history.js';
 import { CACHE_CREATE_RATE, CACHE_READ_RATE } from './baseline.js';
 
@@ -131,6 +132,36 @@ export interface TransformOptions {
    *  for every block rendered to images. Off by default (entries inflate `info`;
    *  only a stateful harness can use them). */
   emitRecoverable?: boolean;
+  /** Host-side session guard (refusal kill-switch, E13 2026-07-07). Called once
+   *  per request with the session fingerprints; returning `true` forces a full
+   *  passthrough for this request (info.passthroughReason='session_guard') — no
+   *  slab, reminder, tool_result, or history compression. The Node host wires
+   *  this to a refusal counter keyed by firstUserSha8, so a session whose
+   *  compressed requests tripped the safety classifier stops being compressed.
+   *  A throwing or non-boolean guard is treated as `false` (compress as usual). */
+  passthroughGuard?: (ids: {
+    firstUserSha8?: string;
+    claudeMdSha8?: string;
+  }) => boolean;
+  /** Upgrade cache breakpoints pxpipe MOVES (slab anchor, relocated history
+   *  anchor) from the default 5-minute TTL to 1-hour (`cache_control.ttl='1h'`).
+   *  1h writes bill at 2× base (vs 1.25×) but survive the >5-minute think/AFK
+   *  gaps real interactive sessions have, converting repeat cache_create into
+   *  0.1× cache_read. Opt-in (PXPIPE_CACHE_TTL_1H=1); default off — pxpipe
+   *  otherwise preserves caller markers verbatim. Only markers pxpipe already
+   *  relocates are touched; caller markers left in place are never rewritten. */
+  cacheTtl1h?: boolean;
+  /** E15 (2026-07-07): the last K conversation turns (= messages, counting
+   *  from the tail) NEVER get imaged — they always ride as plain text, no
+   *  matter what phase 5a/5b/6 would otherwise do. The slab-bearing first
+   *  user message is always exempt (it's imaged unconditionally by design;
+   *  see phase 5a). Default 4 — matches `HISTORY_DEFAULTS.keepTail` in
+   *  history.ts, i.e. "a turn" is one message. A hard assertion after all
+   *  compression phases re-scans the guarded window and fails OPEN (full
+   *  byte-identical passthrough, `info.reason = 'last_turns_guard'`) if an
+   *  image landed there anyway — same fail-open shape as `passthroughGuard`.
+   *  Set to 0 to disable (guard window becomes empty). */
+  guardLastTurns?: number;
 }
 
 const DEFAULTS: Required<TransformOptions> = {
@@ -156,6 +187,9 @@ const DEFAULTS: Required<TransformOptions> = {
   reflow: true,
   keepSharp: () => false,
   emitRecoverable: false,
+  passthroughGuard: () => false,
+  cacheTtl1h: false,
+  guardLastTurns: 4,
   // GPT-only knobs; the Anthropic transform ignores them but Required<> needs them.
   collapseHistory: true,
   gptHistory: {},
@@ -439,7 +473,7 @@ export function isCompressionProfitableAmortized(
 /** Increment a passthrough-reason counter on `info`. Lazily allocates `passthroughReasons`. */
 function bumpPassthrough(
   info: TransformInfo,
-  reason: 'below_threshold' | 'not_profitable' | 'kept_sharp',
+  reason: 'below_threshold' | 'not_profitable' | 'kept_sharp' | 'guard_last_turns',
 ): void {
   if (!info.passthroughReasons) info.passthroughReasons = {};
   info.passthroughReasons[reason] = (info.passthroughReasons[reason] ?? 0) + 1;
@@ -456,6 +490,64 @@ function callerKeepsSharp(
   } catch {
     return false;
   }
+}
+
+/** E15: first message index a `guardLastTurns` window must protect — i.e. the
+ *  window is `messages[result..]`. Recomputed fresh against whatever array is
+ *  passed (original pre-phase-6, or the post-collapse array), which is what
+ *  lets the SAME helper serve both the phase-5b prevention check (pre-collapse
+ *  indices) and the final backstop assertion (post-collapse indices): a window
+ *  that reaches into a collapsed/imaged history chunk naturally shows up as
+ *  `result` landing at or before that chunk's synthetic message once the array
+ *  has shrunk.
+ *
+ *  The slab-bearing first user message is always exempt — phase 5a images it
+ *  unconditionally by design (the static system-prompt slab), so counting it
+ *  as a guard violation would make the guard misfire on every short
+ *  conversation (where the opening turn IS one of the last K messages). */
+function lastTurnsGuardFrom(messages: Message[], guardLastTurns: number): number {
+  const k = Number.isFinite(guardLastTurns) ? Math.max(0, Math.floor(guardLastTurns)) : 4;
+  const tailStart = Math.max(0, messages.length - k);
+  const slabAnchorIdx = messages.findIndex((m) => m.role === 'user');
+  return Math.max(tailStart, slabAnchorIdx >= 0 ? slabAnchorIdx + 1 : 0);
+}
+
+/** True if any message at/after `fromIdx` carries an image block — either a
+ *  top-level content block or one nested inside a `tool_result.content[]`
+ *  array. Used by the E15 backstop: the guarded window must be 100% text. */
+function rangeHasImageBlock(messages: Message[], fromIdx: number): boolean {
+  for (let i = Math.max(0, fromIdx); i < messages.length; i++) {
+    const content = messages[i]!.content;
+    if (!Array.isArray(content)) continue;
+    for (const blk of content) {
+      if (!blk || typeof blk !== 'object') continue;
+      const t = (blk as { type?: string }).type;
+      if (t === 'image') return true;
+      if (t === 'tool_result') {
+        const inner = (blk as ToolResultBlock).content;
+        if (Array.isArray(inner)) {
+          for (const sub of inner) {
+            if (sub && typeof sub === 'object' && (sub as { type?: string }).type === 'image') {
+              return true;
+            }
+          }
+        }
+      }
+    }
+  }
+  return false;
+}
+
+/** E15: fail-open log line for a `guardLastTurns` violation. This should never
+ *  fire in practice — the phase 5b skip + history keepTail floor above are
+ *  meant to make the guarded window unreachable — so a hit here means some
+ *  phase forgot the exclusion and needs a look. */
+function logLastTurnsGuardViolation(guardLastTurns: number): void {
+  console.error(
+    `[pxpipe] last_turns_guard violation: an image landed within the last ` +
+    `${guardLastTurns} configured turn(s) of the conversation. Failing open — ` +
+    'returning the original request unmodified for this call.',
+  );
 }
 
 /** Logical bucket for per-gate-call char attribution. Used by the rolling-cpt
@@ -560,7 +652,14 @@ export interface TransformInfo {
   /** Top dropped codepoints by frequency (`U+HHHH` → count), at most 20 entries. */
   droppedCodepointsTop?: Record<string, number>;
   /** Why blocks passed through without compression. Only present when count > 0. */
-  passthroughReasons?: { below_threshold?: number; not_profitable?: number; kept_sharp?: number };
+  passthroughReasons?: {
+    below_threshold?: number;
+    not_profitable?: number;
+    kept_sharp?: number;
+    /** E15: block belonged to a message inside the `guardLastTurns` window
+     *  (last-K-turns) and was left as text unconditionally, never gated. */
+    guard_last_turns?: number;
+  };
   /** Slab gate diagnostics — imageTokens, textTokens, burn terms, and verdict.
    *  Lets hosts measure flap-prevention efficacy and tune amortization horizon. */
   gateEval?: {
@@ -579,6 +678,16 @@ export interface TransformInfo {
   historyTextChars?: number;
   /** Blocks pinned as text by the caller's `keepSharp` predicate this request. */
   keptSharpBlocks?: number;
+  /** Render calls served from the content-addressed PNG cache this request
+   *  (see render-cache.ts). High values on long sessions = append-only frozen
+   *  chunks + static slab reused instead of re-rendered (pure latency win;
+   *  output bytes are identical by construction). */
+  renderCacheHits?: number;
+  /** Set when a compressed non-streaming request returned stop_reason:'refusal'
+   *  and the proxy transparently re-sent the ORIGINAL untransformed body (E13).
+   *  The event row reflects the retry response; scorers must not count such a
+   *  row as a compression win. */
+  refusalRetried?: boolean;
   /** Imaged live-region blocks with original text + provenance, when `emitRecoverable`. */
   recoverable?: RecoverableBlock[];
   /** Σ tier0Dropped across every fact-sheet caption built this request (slab, reminders,
@@ -849,7 +958,12 @@ async function historyImageSha8(
  * Pure relocation: it acts only when a slab image already carries the anchor, so
  * the total marker count never increases (pxpipe never *adds* — only moves).
  */
-function relocateAnchorToHistoryImage(messages: Message[] | undefined, anchorOrdinal?: number): void {
+function relocateAnchorToHistoryImage(
+  messages: Message[] | undefined,
+  anchorOrdinal?: number,
+  /** Upgrade the relocated marker to 1h TTL (see TransformOptions.cacheTtl1h). */
+  ttl1h = false,
+): void {
   if (!Array.isArray(messages)) return;
 
   // The synthetic history message is identified by its banner text block.
@@ -896,7 +1010,7 @@ function relocateAnchorToHistoryImage(messages: Message[] | undefined, anchorOrd
   }
   if (!slabAnchor) return; // nothing to relocate → never add a marker
 
-  historyImg.cache_control = slabAnchor.cache_control;
+  historyImg.cache_control = withCacheTtl(slabAnchor.cache_control, ttl1h);
   delete slabAnchor.cache_control;
 }
 
@@ -1058,6 +1172,29 @@ function renderToolDoc(t: ToolDef): string {
     parts.push('```json\n' + JSON.stringify(t.input_schema) + '\n```');
   }
   return parts.join('\n');
+}
+
+/** Apply the opt-in 1h TTL upgrade to a cache_control marker pxpipe is about to
+ *  MOVE onto an image block. Only touches `{type:'ephemeral'}` markers; any other
+ *  shape passes through verbatim. See TransformOptions.cacheTtl1h. */
+function withCacheTtl<T>(cc: T, enable: boolean): T {
+  if (!enable || !cc || typeof cc !== 'object') return cc;
+  const c = cc as { type?: string; ttl?: string };
+  if (c.type !== 'ephemeral') return cc;
+  return { ...c, ttl: '1h' } as T;
+}
+
+/** Invoke `passthroughGuard` defensively; throw or non-`true` means "compress as usual". */
+function callerGuardsPassthrough(
+  fn: ((ids: { firstUserSha8?: string; claudeMdSha8?: string }) => boolean) | undefined,
+  ids: { firstUserSha8?: string; claudeMdSha8?: string },
+): boolean {
+  if (typeof fn !== 'function') return false;
+  try {
+    return fn(ids) === true;
+  } catch {
+    return false;
+  }
 }
 
 function makeImageBlock(pngB64: string, _ephemeral = false): ImageBlock {
@@ -1327,18 +1464,27 @@ export async function textToImageBlocks(
   droppedCodepoints: Map<number, number>;
   /** Σ width×height — caller accumulates into `info.imagePixels` for px/token regression. */
   pixels: number;
+  /** True when the PNGs came from the content-addressed render cache (render-cache.ts). */
+  cacheHit: boolean;
 }> {
   // Shrink before the numCols branch so gate and renderer see the same canvas width.
   // If shrinkage drops below the full width, stay single-col (avoid wasting a divider column).
   const effectiveCols = shrinkWidth ? shrinkColsToContent(text, cols) : cols;
   const effectiveNumCols = effectiveCols < cols ? 1 : numCols;
-  const imgs =
-    effectiveNumCols > 1
-      ? await renderTextToPngsMultiCol(text, effectiveCols, effectiveNumCols)
-      // Single-col dense: shrink the 384-col base to content so the renderer matches the
-      // gate (denseGateGeometry uses DENSE_CONTENT_COLS, priced via shrinkColsToContent).
-      // Was hard-coded to DENSE_CONTENT_COLS, which threw away the shrink the gate assumed.
-      : await renderTextToPngsWithCharLimit(text, shrinkColsToContent(text, DENSE_CONTENT_COLS), DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_RENDER_STYLE);
+  // Memoized by content hash (render-cache.ts): frozen history chunks and other
+  // byte-stable regions re-render identical text every turn, so their PNGs are
+  // pure re-computation. Key = raw inputs (they fully determine the derived
+  // effectiveCols/effectiveNumCols and the branch below).
+  const { imgs, hit: cacheHit } = await cachedRender(
+    ['ttib', cols, numCols, shrinkWidth ? 1 : 0, text],
+    async () =>
+      effectiveNumCols > 1
+        ? renderTextToPngsMultiCol(text, effectiveCols, effectiveNumCols)
+        // Single-col dense: shrink the 384-col base to content so the renderer matches the
+        // gate (denseGateGeometry uses DENSE_CONTENT_COLS, priced via shrinkColsToContent).
+        // Was hard-coded to DENSE_CONTENT_COLS, which threw away the shrink the gate assumed.
+        : renderTextToPngsWithCharLimit(text, shrinkColsToContent(text, DENSE_CONTENT_COLS), DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_RENDER_STYLE),
+  );
   let droppedChars = 0;
   let pixels = 0;
   const droppedCodepoints = new Map<number, number>();
@@ -1358,6 +1504,7 @@ export async function textToImageBlocks(
     droppedChars,
     droppedCodepoints,
     pixels,
+    cacheHit,
   };
 }
 
@@ -1414,7 +1561,15 @@ async function runHistoryCollapseAndFinalize(
     const { messages: newMessages, info: histInfo } = await collapseHistory(
       req.messages,
       historyProfitable,
-      { cols: o.cols, protectedPrefix: 0, reflow: o.reflow },
+      {
+        cols: o.cols,
+        protectedPrefix: 0,
+        reflow: o.reflow,
+        // E15: never let history collapse fold more of the tail away than
+        // guardLastTurns allows — floored at history's own default so a
+        // guardLastTurns SMALLER than 4 doesn't loosen existing behavior.
+        keepTail: Math.max(HISTORY_DEFAULTS.keepTail, o.guardLastTurns),
+      },
     );
     if (histInfo.collapsedTurns > 0) {
       req.messages = newMessages;
@@ -1437,7 +1592,18 @@ async function runHistoryCollapseAndFinalize(
       info.historyTextChars = histInfo.collapsedChars;
       info.historyImageSha = await historyImageSha8(newMessages);
       bumpBucket(info, 'history', histInfo.collapsedChars);
-      collapsedFlag = true;
+      // E15 backstop: history collapse just folded part of the conversation
+      // into an imaged synthetic message. This early-exit path (slab below
+      // minCompressChars / not profitable) is the ONLY way history collapse
+      // can run without the main path's own backstop below ever executing —
+      // it returns straight from here — so it needs its own check.
+      const guardFromEarly = lastTurnsGuardFrom(req.messages, o.guardLastTurns);
+      if (rangeHasImageBlock(req.messages, guardFromEarly)) {
+        logLastTurnsGuardViolation(o.guardLastTurns);
+        info.reason = 'last_turns_guard';
+      } else {
+        collapsedFlag = true;
+      }
     } else if (histInfo.reason) {
       info.historyReason = histInfo.reason;
     }
@@ -1535,6 +1701,19 @@ export async function transformRequest(
   if (claudeMdSha) info.claudeMdSha8 = claudeMdSha;
   if (firstUserSha) info.firstUserSha8 = firstUserSha;
 
+  // E13 refusal kill-switch: the Node host counts refusals per session and can
+  // veto compression for the rest of that session. Full passthrough — original
+  // bytes out, zero mutation — so a safety-classifier trip never repeats.
+  if (
+    callerGuardsPassthrough(o.passthroughGuard, {
+      firstUserSha8: firstUserSha,
+      claudeMdSha8: claudeMdSha,
+    })
+  ) {
+    info.reason = 'session_guard';
+    return { body, info };
+  }
+
   // Canary: slab tags whose content churns within a session bust the image
   // cache every turn — report them regardless of the hardcoded lists.
   if (staticTagContents.size > 0) {
@@ -1557,6 +1736,18 @@ export async function transformRequest(
   if (o.compressTools && Array.isArray(req.tools) && req.tools.length > 0) {
     const docs: string[] = [];
     toolsRewritten = req.tools.map((t) => {
+      // Native server-side tools (`advisor_20260301`, `web_search_20250305`,
+      // `computer_20250124`, `bash_20250124`, `text_editor_20250429`, ...) carry
+      // a versioned `type` fixed by Anthropic's own API schema, which rejects a
+      // `description` field on that tool entry outright (400 invalid_request_error:
+      // "tools.N.<type>.description: Extra inputs are not permitted" — reproduced
+      // 4/4 on claude-fable-5, 2026-07-05). Only the default 'custom' shape (no
+      // `type`, or `type: 'custom'`) accepts a description/input_schema rewrite.
+      // Pass anything else through byte-identical: it never had docs to relocate,
+      // so there's nothing to move into the imaged Tool Reference either.
+      if (typeof t.type === 'string' && t.type !== 'custom') {
+        return t;
+      }
       docs.push(renderToolDoc(t));
       // tools[] keeps the annotation-STRIPPED schema: structure (type/properties/
       // required/enum/items) stays for Anthropic's tool-use validator — a bare
@@ -1711,10 +1902,16 @@ export async function transformRequest(
   // single-modal framing keeps encoder in image-reading mode for both header + content).
   // Header text is continuous prose (no hard \n) so the renderer soft-wraps densely.
   // 3. Render to PNGs at slabCols width (banner sets natural floor).
-  const images =
-    numCols > 1
-      ? await renderTextToPngsMultiCol(combinedWithHeader, slabCols, numCols)
-      : await renderTextToPngs(combinedWithHeader, slabCols);
+  // Memoized: the slab is byte-stable across turns by design, so after turn 1
+  // this is a pure cache hit for the rest of the session (D12 latency win).
+  const { imgs: images, hit: slabRenderHit } = await cachedRender(
+    ['slab', slabCols, numCols, combinedWithHeader],
+    async () =>
+      numCols > 1
+        ? renderTextToPngsMultiCol(combinedWithHeader, slabCols, numCols)
+        : renderTextToPngs(combinedWithHeader, slabCols),
+  );
+  if (slabRenderHit) info.renderCacheHits = (info.renderCacheHits ?? 0) + 1;
   const imageBlocks: ImageBlock[] = [];
   for (let i = 0; i < images.length; i++) {
     const img = images[i]!;
@@ -1728,7 +1925,7 @@ export async function transformRequest(
     const imageBlock = makeImageBlock(b64, i === images.length - 1);
     imageBlocks.push(
       i === images.length - 1 && systemStaticCacheControl !== undefined
-        ? { ...imageBlock, cache_control: systemStaticCacheControl }
+        ? { ...imageBlock, cache_control: withCacheTtl(systemStaticCacheControl, o.cacheTtl1h) }
         : imageBlock,
     );
   }
@@ -1827,8 +2024,9 @@ export async function transformRequest(
             processedExisting.push(blk);
             continue;
           }
-          const { blocks: imgs, pngs: rawPngs, dims: rawDims, droppedChars, droppedCodepoints: dcp, pixels } =
+          const { blocks: imgs, pngs: rawPngs, dims: rawDims, droppedChars, droppedCodepoints: dcp, pixels, cacheHit } =
             await textToImageBlocks(reminderText, o.cols, numCols);
+          if (cacheHit) info.renderCacheHits = (info.renderCacheHits ?? 0) + 1;
           (info.imagePngs ??= []).push(...rawPngs);
           (info.imageDims ??= []).push(...rawDims);
           const srcCacheControl = (blk as { cache_control?: unknown }).cache_control;
@@ -1873,13 +2071,26 @@ export async function transformRequest(
 
     // 5b. Compress tool_result content across ALL user messages.
     if (o.compressToolResults) {
-      for (const msg of req.messages ?? []) {
+      // E15: messages at/after this index are inside the guardLastTurns
+      // window — their tool_results NEVER get imaged (see lastTurnsGuardFrom).
+      // Computed once, pre-collapse, against the still-original message array.
+      const guardFrom5b = lastTurnsGuardFrom(req.messages ?? [], o.guardLastTurns);
+      const msgs5b = req.messages ?? [];
+      for (let msgIdx = 0; msgIdx < msgs5b.length; msgIdx++) {
+        const msg = msgs5b[msgIdx]!;
         if (msg.role !== 'user' || !Array.isArray(msg.content)) continue;
         const rewritten: ContentBlock[] = [];
         let changed = false;
         for (const blk of msg.content) {
           if (blk && (blk as ToolResultBlock).type === 'tool_result') {
             const tr = blk as ToolResultBlock;
+            // E15 guard: this message is within the protected tail window —
+            // leave every tool_result on it byte-identical, no gating at all.
+            if (msgIdx >= guardFrom5b) {
+              bumpPassthrough(info, 'guard_last_turns');
+              rewritten.push(blk);
+              continue;
+            }
             // Anthropic rejects images inside is_error tool_results — leave alone.
             if (tr.is_error === true) {
               rewritten.push(blk);
@@ -1910,8 +2121,9 @@ export async function transformRequest(
                   info.truncatedToolResults = (info.truncatedToolResults ?? 0) + 1;
                   info.omittedChars = (info.omittedChars ?? 0) + paged.omittedChars;
                 }
-                const { blocks: imgs, pngs: rawPngs, dims: rawDims, droppedChars, droppedCodepoints: dcp, pixels } =
+                const { blocks: imgs, pngs: rawPngs, dims: rawDims, droppedChars, droppedCodepoints: dcp, pixels, cacheHit } =
                   await textToImageBlocks(paged.text, o.cols, numCols);
+                if (cacheHit) info.renderCacheHits = (info.renderCacheHits ?? 0) + 1;
                 (info.imagePngs ??= []).push(...rawPngs);
                 (info.imageDims ??= []).push(...rawDims);
                 for (const img of imgs) info.imageBytes += approxBlockBytes(img);
@@ -1976,8 +2188,9 @@ export async function transformRequest(
                   info.truncatedToolResults = (info.truncatedToolResults ?? 0) + 1;
                   info.omittedChars = (info.omittedChars ?? 0) + paged.omittedChars;
                 }
-                const { blocks: imgs, pngs: rawPngs, dims: rawDims, droppedChars, droppedCodepoints: dcp, pixels } =
+                const { blocks: imgs, pngs: rawPngs, dims: rawDims, droppedChars, droppedCodepoints: dcp, pixels, cacheHit } =
                   await textToImageBlocks(paged.text, o.cols, numCols);
+                if (cacheHit) info.renderCacheHits = (info.renderCacheHits ?? 0) + 1;
                 (info.imagePngs ??= []).push(...rawPngs);
                 (info.imageDims ??= []).push(...rawDims);
                 const srcCacheControl = (ib as { cache_control?: unknown }).cache_control;
@@ -2050,7 +2263,16 @@ export async function transformRequest(
     const { messages: newMessages, info: histInfo } = await collapseHistory(
       req.messages,
       historyProfitable,
-      { cols: o.cols, protectedPrefix: slabAnchorIdx >= 0 ? slabAnchorIdx + 1 : 0, reflow: o.reflow },
+      {
+        cols: o.cols,
+        protectedPrefix: slabAnchorIdx >= 0 ? slabAnchorIdx + 1 : 0,
+        reflow: o.reflow,
+        // E15: floor history's own keepTail at guardLastTurns so the tail
+        // window collapseHistory protects is never narrower than the guard
+        // — otherwise a guardLastTurns > 4 would rely entirely on the
+        // backstop assertion below, forcing a full passthrough every time.
+        keepTail: Math.max(HISTORY_DEFAULTS.keepTail, o.guardLastTurns),
+      },
     );
     if (histInfo.collapsedTurns > 0) {
       req.messages = newMessages;
@@ -2084,7 +2306,7 @@ export async function transformRequest(
       // one-time full-prefix rewrite (~53k tokens/session). Leave the anchor on
       // the byte-stable slab image until a frozen chunk exists to pin to.
       if (histInfo.carryOverImageOrdinal !== undefined) {
-        relocateAnchorToHistoryImage(req.messages, histInfo.carryOverImageOrdinal);
+        relocateAnchorToHistoryImage(req.messages, histInfo.carryOverImageOrdinal, o.cacheTtl1h);
       }
     } else if (histInfo.reason) {
       info.historyReason = histInfo.reason;
@@ -2120,6 +2342,24 @@ export async function transformRequest(
       msgs[i] = { ...m, content: [...content, { type: 'text' as const, text: wrappedEnvText }] };
       info.envRelocatedChars = wrappedEnvText.length;
       break;
+    }
+  }
+
+  // E15 (2026-07-07): last-K-turns guard backstop. Phases 5b (tool_result
+  // skip) and 6 (history keepTail floor) already avoid imaging the guarded
+  // window — this is the load-bearing check that catches anything that
+  // slipped through anyway (a future phase forgetting the exclusion, a
+  // gate-geometry edge case, etc.). Recomputed against the FINAL req.messages
+  // (post history-collapse, indices may have shifted) so a guardLastTurns
+  // window that reaches into a collapsed/imaged history chunk is still
+  // caught. Fail-open: exactly the same shape as callerGuardsPassthrough
+  // above — return the ORIGINAL, byte-identical `body`, never `outBody`.
+  {
+    const guardFrom = lastTurnsGuardFrom(req.messages ?? [], o.guardLastTurns);
+    if (rangeHasImageBlock(req.messages ?? [], guardFrom)) {
+      logLastTurnsGuardViolation(o.guardLastTurns);
+      info.reason = 'last_turns_guard';
+      return { body, info };
     }
   }
 

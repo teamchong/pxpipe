@@ -369,6 +369,16 @@ for (let idx = 0; idx < blocks.length; idx++) {
   });
 }
 
+// Hard-fail: a run that scored zero blocks must never look like success.
+// (2026-07-10: silent `spawn python3 ENOENT` produced empty results + exit 0,
+// which masqueraded as a passing live matrix downstream.)
+if (results.length === 0) {
+  console.error(
+    `[L1] FATAL: 0/${blocks.length} blocks scored — every variant failed (see ERROR lines above).`,
+  );
+  process.exit(1);
+}
+
 // ---------------------------------------------------------------------------
 // Aggregate (per variant)
 // ---------------------------------------------------------------------------

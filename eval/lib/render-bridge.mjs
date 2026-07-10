@@ -16,7 +16,7 @@
 import { createRequire } from 'node:module';
 import { existsSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..', '..');
@@ -32,8 +32,11 @@ if (!existsSync(RENDER_PATH)) {
   );
 }
 
-const renderModule = await import(RENDER_PATH);
-const pngModule    = await import(PNG_PATH);
+// pathToFileURL: on Windows a bare absolute path ("D:\...") is rejected by
+// the ESM loader (ERR_UNSUPPORTED_ESM_URL_SCHEME) — dynamic import() needs
+// a proper file:// URL on every platform.
+const renderModule = await import(pathToFileURL(RENDER_PATH).href);
+const pngModule    = await import(pathToFileURL(PNG_PATH).href);
 
 export const {
   renderTextToPngs,

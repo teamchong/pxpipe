@@ -28,9 +28,11 @@ ENV passes straight through (harness owns ANTHROPIC_BASE_URL / proxy on-off).
 ARGV is `claude -p`-style; -p / --output-format / --strict-mcp-config /
 --no-session-persistence are absorbed. Prompt = positional arg, else stdin.
 """
-import sys, os, time, json, re
+import sys, os, time, json, re, shutil, subprocess
 
 CLAUDE = os.environ.get("CCI_CLAUDE_BIN", os.path.expanduser("~/.claude/local/claude"))
+if not os.path.exists(CLAUDE):
+    CLAUDE = shutil.which("claude") or CLAUDE
 TIMEOUT = float(os.environ.get("CCI_TIMEOUT", "300"))
 READY_TIMEOUT = float(os.environ.get("CCI_READY_TIMEOUT", "60"))
 QUIET_S = float(os.environ.get("CCI_QUIET_S", "4.0"))
@@ -102,17 +104,33 @@ def parse_context(text):
         if name.lower() in ("total cost",):
             continue
         out["breakdown"][name] = {"tokens": pnum(m.group(2)), "pct": float(m.group(3))}
+    # Fallback (Claude Code >= 2.1.x): the "N / M tokens" header is gone from
+    # /context; derive usage from the category breakdown instead. Used tokens =
+    # sum of everything except free/reserved buffers; max = sum of all rows.
+    if out["tokens"] is None and out["breakdown"]:
+        skip = ("free space", "autocompact buffer")
+        used = sum(v["tokens"] for k, v in out["breakdown"].items()
+                   if k.lower() not in skip)
+        total = sum(v["tokens"] for v in out["breakdown"].values())
+        if used > 0:
+            out["tokens"] = used
+            out["max"] = total or None
+            if total:
+                out["pct"] = round(100.0 * used / total, 1)
     return out
 
 
 def extract_reply(lines):
-    """Reply = the last assistant bullet block (lines under a leading '⏺')."""
+    """Reply = the last assistant bullet block (lines under a leading '⏺'/'●').
+
+    Claude Code renders the assistant bullet as '⏺' (U+23FA) on some builds
+    and '●' (U+25CF) on others (observed on Windows v2.1.206)."""
     out = []; cap = False
     for t in lines:
         s = t.strip()
-        if s.startswith("⏺"):
+        if s.startswith("⏺") or s.startswith("●"):
             cap = True
-            out = [s.lstrip("⏺").strip()]
+            out = [s.lstrip("⏺●").strip()]
         elif cap:
             if (not s) or s.startswith("❯") or s.startswith("✻") \
                     or s.startswith("⎿") or "bypass permissions" in s \
@@ -122,11 +140,73 @@ def extract_reply(lines):
     return "\n".join(x for x in out if x).strip()
 
 
+class _WinChild:
+    """Minimal pexpect.spawn-alike backed by pywinpty (ConPTY). Windows only.
+
+    Exposes exactly the surface main() uses: read_nonblocking / send /
+    sendcontrol / close, raising pexpect.TIMEOUT / pexpect.EOF so feed()
+    stays platform-agnostic.
+    """
+
+    def __init__(self, cmd, args, cwd, env, dimensions, timeout):
+        import pexpect
+        from winpty import PTY
+        self._pexpect = pexpect
+        rows, cols = dimensions
+        exe = shutil.which(cmd) or cmd
+        low = exe.lower()
+        if low.endswith((".cmd", ".bat")):
+            appname = os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe")
+            argv = ["/c", exe] + list(args)
+        elif low.endswith((".js", ".mjs", ".cjs")):
+            appname = shutil.which("node")
+            argv = [exe] + list(args)
+        else:
+            appname = exe
+            argv = list(args)
+        self._pty = PTY(cols, rows)
+        envblock = "\0".join("%s=%s" % (k, v) for k, v in env.items()) + "\0"
+        self._pty.spawn(appname, cmdline=" " + subprocess.list2cmdline(argv),
+                        cwd=cwd, env=envblock)
+
+    def read_nonblocking(self, size=65536, timeout=0.3):
+        end = time.time() + max(timeout or 0, 0)
+        while True:
+            # pywinpty 3.x: read() takes only `blocking` (internal chunk size).
+            data = self._pty.read(blocking=False)
+            if data:
+                return data
+            if self._pty.iseof() or not self._pty.isalive():
+                raise self._pexpect.EOF("child EOF")
+            if time.time() >= end:
+                raise self._pexpect.TIMEOUT("no data in %ss" % timeout)
+            time.sleep(0.05)
+
+    def send(self, s):
+        self._pty.write(s)
+
+    def sendcontrol(self, ch):
+        self._pty.write(chr(ord(ch.lower()) - ord("a") + 1))
+
+    def close(self, force=False):
+        try:
+            pid = getattr(self._pty, "pid", None)
+            if force and pid:
+                subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                               capture_output=True)
+        except Exception:
+            pass
+        self._pty = None
+
+
 def main():
     try:
         import pexpect, pyte
+        if os.name == "nt":
+            import winpty  # noqa: F401  (ConPTY backend for _WinChild)
     except ImportError as e:
-        sys.stderr.write("cci: missing dependency (%s). Install: pip install pexpect pyte\n" % e)
+        sys.stderr.write("cci: missing dependency (%s). Install: pip install pexpect pyte%s\n"
+                         % (e, " pywinpty" if os.name == "nt" else ""))
         sys.exit(3)
     model, output_format, allowed, prompt = parse_argv(sys.argv[1:])
     if not prompt:
@@ -148,9 +228,13 @@ def main():
 
     screen = pyte.Screen(COLS, ROWS)
     stream = pyte.Stream(screen)
-    child = pexpect.spawn(CLAUDE, args, cwd=os.getcwd(), env=env,
-                          encoding="utf-8", codec_errors="replace",
+    if os.name == "nt":
+        child = _WinChild(CLAUDE, args, cwd=os.getcwd(), env=env,
                           dimensions=(ROWS, COLS), timeout=TIMEOUT)
+    else:
+        child = pexpect.spawn(CLAUDE, args, cwd=os.getcwd(), env=env,
+                              encoding="utf-8", codec_errors="replace",
+                              dimensions=(ROWS, COLS), timeout=TIMEOUT)
 
     def feed(slice_s=0.3):
         try:

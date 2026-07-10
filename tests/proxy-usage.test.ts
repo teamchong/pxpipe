@@ -523,7 +523,13 @@ describe('proxy usage extraction', () => {
       }),
     );
     await res.text();
-    await new Promise((r) => setTimeout(r, 20));
+    // The gzip capture lands asynchronously after the response. Under
+    // full-suite CPU contention a fixed 20 ms sleep is flaky (observed
+    // ~50% fail rate on 2026-07-10), so poll up to 2 s instead — the fast
+    // path still completes in a single 20 ms tick.
+    for (let i = 0; i < 100 && !captured?.reqBodyGz; i++) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
     restore();
 
     expect(captured).toBeDefined();

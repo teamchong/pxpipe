@@ -42,7 +42,8 @@ const CLAUDE_BIN = join(homedir(), '.claude', 'local', 'claude');
 
 // Interactive shim: drives the real TUI (Max auth) instead of headless `claude -p`.
 const CCI_PY = join(dirname(fileURLToPath(import.meta.url)), 'cci.py');
-const PYTHON = process.env.CCI_PYTHON || 'python3';
+const PYTHON = process.env.CCI_PYTHON
+  || (process.platform === 'win32' ? 'python' : 'python3');
 
 /**
  * Map any model string to a CLI alias so the CLI always resolves the latest

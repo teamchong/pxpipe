@@ -15,11 +15,11 @@ to re-read that text in token form — Anthropic prompt-caches it, and image
 blocks OCR cleanly at small font sizes. So pxpipe pulls the static prefix
 out of the JSON body, renders it as one or more grayscale PNG image blocks,
 and pins a single `cache_control` breakpoint on the last image. Anthropic
-charges roughly `ceil(W*H/750)` tokens per image; a full static-slab page is
-1573×1280, so each slab tile costs ~2684 tokens regardless of how much text it
-carries. A 68K-token static slab collapses to ~3.5K image tokens on the first
-turn and to a cache-read (billed at 0.10×) on every subsequent turn. The
-trade is real text tokens for a few image tokens we cache once.
+charges roughly `ceil(W*H/750)` tokens per image; the current Anthropic profile
+caps pages at 1568×728 so rasterized pixels survive the provider's resize. A
+large static slab becomes a small set of image pages on the first turn and a
+cache-read (billed at 0.10×) on subsequent turns. The trade is real text tokens
+for image tokens cached under the same stable prefix.
 
 ## 2. The static / dynamic split
 
@@ -258,24 +258,20 @@ The `1.25` and `0.10` multipliers match Anthropic's published cache pricing
 for Opus: writing to the cache costs 1.25× the per-token input rate; reading
 from the cache costs 0.10×.
 
-**Per-call baseline cost** — what the *same* call would have billed if we had
-NOT compressed:
+**Per-call baseline cost** — what the same call would have billed if it had not
+been compressed. The implementation uses the actual baseline probe and observed
+cache state; it does not multiply image count by a fixed historical canvas:
 
 ```
-text_tokens_we_removed = origChars / 4              # ~4 chars per token, rough
-image_tokens_we_added  = imageCount * 4761          # dense 1928×1928 ≈ 4761 tokens (slab ~2684)
-extra_text_baseline    = max(0, text_tokens_we_removed - image_tokens_we_added)
-
-# cache_create dominates the first turn; bias the baseline toward 1.25 in
-# that regime. Otherwise assume a fully warm cache (0.10).
-cache_total = cache_create + cache_read
-baseline_rate = cache_create > 0
-              ? (cache_create / cache_total) * 1.25 + (1 - cache_create / cache_total) * 0.10
-              : 0.10
-
-baseline = effective + extra_text_baseline * baseline_rate
-saved    = baseline - effective
+baseline_raw = count_tokens(original_request)
+baseline_eff = price(baseline_raw, observed_cache_state)
+actual_eff   = price(actual_usage, observed_cache_state)
+saved        = baseline_eff - actual_eff
 ```
+
+On OpenAI-shaped rows, response usage supplies `cached_tokens`; pxpipe records
+actual image tokens from real dimensions and the o200k text value of the
+replaced content. Rates and render geometry are selected by exact model id.
 
 The dashboard's "tokens saved" and "$ saved" cards (and
 `pxpipe stats` for the offline aggregate) both surface these numbers.

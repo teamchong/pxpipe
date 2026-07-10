@@ -96,7 +96,7 @@ const slab = (n: number) =>
 
 const gptBody = (sysChars: number) =>
   JSON.stringify({
-    model: 'gpt-5.6',
+    model: 'gpt-5.6-sol',
     messages: [
       { role: 'system', content: slab(sysChars) },
       { role: 'user', content: 'hello' },

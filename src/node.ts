@@ -161,7 +161,7 @@ Environment:
   PXPIPE_GATEWAY_BASE_URL gateway base URL (required with PXPIPE_PROVIDER)
   PXPIPE_GATEWAY_HEADERS  extra upstream headers: JSON object or k=v;k2=v2
   PXPIPE_MODELS           comma-separated model bases to image (Claude/GPT/Grok);
-                          default claude-fable-5,gpt-5.6 (Opus/GPT-5.5/Grok opt-in);
+                          default claude-fable-5 (Sol/Opus/GPT-5.5/Grok opt-in);
                           off disables
   PXPIPE_CONFIG           JSON config path (default ~/.config/pxpipe/config.json)
                           supports {"models": [...]} or {"models": "off"}

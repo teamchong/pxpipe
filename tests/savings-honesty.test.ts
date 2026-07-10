@@ -27,7 +27,7 @@ import {
   openAICacheReadRate,
 } from '../src/core/openai-savings.js';
 
-const GPT = 'gpt-5.6';
+const GPT = 'gpt-5.6-sol';
 
 // ===========================================================================
 describe('GPT savings honesty (vs the real o200k cached-rate model)', () => {
@@ -160,7 +160,7 @@ describe('per-model pricing is applied correctly (Fable vs Opus vs GPT)', () => 
     // Both bill cache reads at 0.1x. Pricing an unrelated GPT row at the
     // aggressive 0.1x would overstate its cache savings, so the fallback stays
     // 0.5x. The gate keeps families from bleeding each other's rates.
-    expect(openAICacheReadRate('gpt-5.6')).toBe(0.1);
+    expect(openAICacheReadRate('gpt-5.6-sol')).toBe(0.1);
     expect(openAICacheReadRate('gpt-5.5')).toBe(0.1);
     // claude models arrive here through the bridge and must use Anthropic's rate.
     expect(openAICacheReadRate('claude-opus-4-8')).toBe(0.1);
@@ -174,6 +174,6 @@ describe('per-model pricing is applied correctly (Fable vs Opus vs GPT)', () => 
     // Guard against a refactor that unifies them: they are the same number today
     // for different reasons (GPT cached-input vs Anthropic cache_read). If one
     // provider changes, only its own constant should move.
-    expect(openAICacheReadRate('gpt-5.6')).toBe(CACHE_READ_RATE);
+    expect(openAICacheReadRate('gpt-5.6-sol')).toBe(CACHE_READ_RATE);
   });
 });

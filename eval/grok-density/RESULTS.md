@@ -1,14 +1,14 @@
 # Grok density / image-recall sweep — results
 
-Live run of `run.mjs`, 2026-07-09. Model: `grok-4.5`. Geometry: default
-Responses-path profile (`stripCols=152`, `maxHeightPx=1932`, vision tile
-`85/170`). `results.json` is this run.
+Live run of `run.mjs`, 2026-07-09. Model: `grok-4.5`. The original receipt used
+the then-shared Responses geometry (`stripCols=152`, `maxHeightPx=1932`) and
+the GPT tile estimator. `results.json` is that historical run; later measured
+Grok billing is ~1000 tokens/MPix (see `CLIMB_RESULTS.md`).
 
 ## Question
 
-Prior recall work covered Fable 5 and Opus 4.8. Grok is already imaging on the
-Responses path under the unmatched-model fallback profile. Does it read
-production-density images well enough, or does it need a lower-density profile?
+Prior recall work covered Fable 5 and Opus 4.8. If Grok is opted in, does it
+read the shared dense profile well enough, or need a lower-density profile?
 
 ## Exact-string recall
 
@@ -31,8 +31,8 @@ production-density images well enough, or does it need a lower-density profile?
 nibble). Gist + guard ok.
 
 **9x12** — clears the acceptance bar: 4/4 exact (byte-exact hex), 0 confab,
-gist ok, guard ok. Savings collapse to ~5% under the current tile cost model
-because the taller page bills more vision tokens.
+gist ok, guard ok. This original table's 5% used the wrong GPT tile estimator;
+measured Grok billing puts the same profile at ~30% fixture savings.
 
 ## Verdict
 
@@ -42,11 +42,9 @@ because the taller page bills more vision tokens.
   strings. Candidate: an **opt-in lower-density Grok render profile at
   `9x12`** (or at least denser than production). **Not** a silent default
   change, and **not** a `DEFAULT_MODEL_BASES` change.
-- Current unmatched-model vision profile (`tile 85/170`, 152 cols, 1932 px
-  height) is only a cost/geometry fallback. It does not measure Grok
-  readability. A real Grok profile should encode both:
-  1. render density that clears exact recall (`9x12` candidate)
-  2. vision billing numbers once Grok's real image-token formula is known
+- The built-in opt-in Grok profile now encodes effective 9×12 / 84 columns and
+  measured ~1000 tokens/MPix billing. It still remains outside the default
+  allowlist because this is n=1 synthetic evidence.
 - n=1 per cell (harness design). Re-run before baking a production profile.
 
 ## How this was run

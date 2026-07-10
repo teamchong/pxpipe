@@ -1,157 +1,98 @@
-# How pxpipe sizes a rendered image — rules, reasons, and history
+# How pxpipe sizes rendered images
 
-This documents *why* a pxpipe PNG has the dimensions it does. It exists because
-the sizing looks arbitrary until you know what was tried and rejected. If you're
-tempted to "make it square" or "shrink to the text," read the history first —
-both were considered, and one was built and reverted.
+Image geometry is selected by the exact model id. `/v1/responses` is only a
+wire protocol: Claude, GPT, and Grok on that path do not share a renderer.
 
-## TL;DR — current behavior
+## Current behavior
 
-A rendered page is a **fixed-width, variable-height** image. It is **not
-deliberately squared** and **never shrunk horizontally to fit short lines**.
+A page is profile-width and variable-height. It is never padded to a square.
 
-- **Width is constant per path**, set by the column count, not by content:
-  `width = 2·PAD_X + cols·CELL_W`. The static slab renders at `DEFAULT_COLS=313`
-  → `8 + 313·5 = 1573px`; dense tool/history pages render at
-  `DENSE_CONTENT_COLS=384` → `8 + 384·5 = 1928px`.
-- **Height grows to fit the lines on the page**, capped, then pages:
-  `height = 2·PAD_Y + nLines·CELL_H` → `8 + 8·nLines`.
-- **Vertical cap → paging**: `maxLines = floor((MAX_HEIGHT_PX − 2·PAD_Y) / CELL_H)`
-  `= floor(1924/8) = 240` lines. Overflow goes to the next image, it does not
-  grow the canvas. A *full dense* page is `1928 × 1928` (≈square only because
-  384 cols ≈ 240 rows at the 5×8 cell — not deliberately squared); a *full slab*
-  page is `1573 × 1280` (~159 rows, READABLE-bound below the 240 cap); a
-  *partial* page (small tool_result, last page) is wide-and-short, e.g. `1928 × 160`.
+```text
+cellWidth  = atlasWidth  + cellWBonus
+cellHeight = atlasHeight + cellHBonus
+width      = 2 * PAD_X + columns * cellWidth
+height     = 2 * PAD_Y + usedRows * cellHeight
+```
 
-This `~1932×1932` ceiling is the largest page Fable / Opus 4.8 accept without a
-server-side resize. Those models take up to **2576 px** on the long edge, but a
-request with **>20 images** (pxpipe always sends many) is held to the stricter
-**≤2000 px/side** rule, and `1928×1928` = `69×69` = **4761 visual tokens**, just
-under the **4784**-token per-image cap. Going bigger gets the request *rejected*,
-not downscaled.
+Width may shrink to the widest rendered line, capped by the profile. Height
+grows with content until the profile cap, then overflow becomes another page.
 
-Source of truth: `renderChunkToPng` in `src/core/render.ts` (the `width` /
-`height` lines), constants `PAD_X=PAD_Y=4`, `CELL_W=5`, `CELL_H=8` (the "5×8
-cell"), `DEFAULT_COLS=313`, `DENSE_CONTENT_COLS=384`, `MAX_HEIGHT_PX=1932`,
-`READABLE_CHARS_PER_IMAGE=50000`, `DENSE_CONTENT_CHARS_PER_IMAGE=92160`.
+| model rule | atlas / effective cell | columns | full width | max height |
+|---|---|---:|---:|---:|
+| Claude / Anthropic | Spleen + Unifont, 5×8 | 312 | 1568 px | 728 px |
+| opt-in `gpt-5.6-sol` | JetBrains Mono 10 + Unifont fallback, 6×11 | 126 | 764 px | 1932 px |
+| opt-in Grok | Spleen + Unifont, effective 9×12 | 84 | 764 px | 1932 px |
+| other OpenAI fallback | Spleen + Unifont, 5×8 | 152 | 768 px | 1932 px |
 
-## The cell
+Complete profile values and evidence are in
+[`MODEL_RENDER_PROFILES.md`](MODEL_RENDER_PROFILES.md).
 
-Each character occupies a **5px wide × 8px tall** cell (`ATLAS_CELL_W=5`,
-`ATLAS_CELL_H=8` in `src/core/atlas.ts`). The atlas is a prebaked glyph sheet;
-text is rendered white-on-black then inverted to black-on-white. The cell was
-**7×10 originally** and shrunk to 5×8 — smaller cell, same legibility on the
-target model, more chars per pixel.
+The Sol row is the **currently configured** geometry, not a successful recall
+claim. Paid raw-image calls tested both that 6×11 row and the old 5×8/152-column
+fallback: each returned 0/4 exact identifiers with four confabulations; 5×8 also
+missed gist. Sol is consequently opt-in. The effective 9×12/84-column Sol
+candidate is local-only pending a model call. See
+[`eval/sol-profile/RESULTS.md`](../eval/sol-profile/RESULTS.md).
 
-## Why full width, not shrink-to-content
+## Provider boundaries
 
-`shrinkColsToContent` (`src/core/render.ts`) still exists but is a **no-op** — it
-returns `cols` unchanged. Its docstring records the policy:
+Anthropic resizes images to fit both a 1568px long edge and roughly 1.15MP.
+The 1568×728 Claude page stays inside both bounds, so rasterized glyphs reach
+the vision encoder without the old 0.555× resample.
 
-> *Always render at full canvas width — no shrink-to-content. Maximum chars per
-> page = maximum image-token savings on dense content, and the unused canvas
-> tail is just whitespace (cheap to encode).*
+OpenAI-shaped profiles use portrait strips at or below the 768px short-side
+floor and a 1932px height cap. GPT 5.6 Sol's 126×6+8 and Grok's 84×9+8 both
+produce 764px full-width strips.
 
-The reasoning:
+## Font and Unicode
 
-1. **The only content pxpipe images is dense content** (it passes a
-   profitability gate; sparse/short-line content is left as text). After
-   `reflow` packs that content into full-width rows, the longest line is already
-   ~`cols`, so there is *nothing left to shrink*. Width-shrink only helps
-   short-line content — which never reaches the renderer.
-2. **Simplicity + prediction parity.** The cost gate has to predict image tokens
-   before rendering. A fixed width makes prediction trivial and exact; a
-   content-dependent width forced the gate to re-derive the canvas size (see the
-   "hoist width-shrink before gate" commit below) for no real-world gain.
+Atlases are generated at build time; runtime never loads font files. The compact
+JetBrains atlas contains common code/Latin/symbol ranges. Missing codepoints
+fall back to the full Spleen/Unifont atlas, preserving multilingual rendering.
 
-## Why not "square with max width"
+Spacing, anti-aliasing, grid, color cycle, and newline-marker style are all part
+of the model profile. The same style object is used for static slabs and history.
 
-Anthropic bills images by **pixel area** (≈ `w·h/750`), not by the longest edge.
-So a square is not cheaper than a wide-short image of the same area — what
-minimizes cost is the *tightest bounding box around the text*, and for dense
-reflowed content that box is exactly "full width × just enough rows," which is
-what we render. We never *pad* to a square: a full dense page lands at
-`1928×1928` only because 384 cols and 240 rows are equal pixel extents at the
-5×8 cell — it's the max-chars-per-page point (the ~1932² token ceiling), not an
-aspect-ratio target, and a partial page stays wide-and-short. Aspect ratio is a
-non-goal; **chars-per-pixel** is the goal, achieved by filling every row to
-`cols` and paging vertically.
+## Gate parity
 
-## Two render paths
+The profitability gate resolves the same profile as the renderer and derives:
 
-- **tool_result / history images**: single-column at `DENSE_CONTENT_COLS=384`
-  (1928px wide), paged at the 240-line cap → full pages are `1928×1928`
-  (~92k chars each).
-- **system-slab image**: single-column at `DEFAULT_COLS=313` (1573px wide),
-  READABLE-bound to ~159 rows (~50k chars → `1573×1280`). Kept on a path that
-  *can* use multi-column packing (`shrinkWidth=false`), but multi-col is
-  **disabled by default** (`multiCol: 1`) because at 313 cols a single column
-  already holds ~50k chars/page and multi-col adds OCR column-ordering risk
-  without meaningful savings.
+- cell width and height
+- content-width shrink
+- rows per page
+- page count
+- per-image token cost
 
-So in practice everything is single-column full-width today; the multi-col code
-is retained for backward compat.
+Changing cell spacing or font therefore cannot leave cost prediction on a
+hardcoded 5×8 canvas. Claude uses the Anthropic pixel formula with a conservative
+margin, GPT uses model-specific tile/patch pricing, and Grok uses the measured
+tokens-per-megapixel rate.
 
-## Billing model (and an unresolved gap)
+## Why not square pages
 
-- **Anthropic's documented formula**: `tokens ≈ (w·h) / 750`.
-- **The gate's constant**: `src/core/transform.ts` anchors per-image cost on an
-  *empirical* figure (~2500 tok for a 508×1559 canvas, i.e. claiming the doc
-  formula underpredicts billing by ~2.4×). That measurement is from an earlier
-  cell/column regime.
-- **A fresh regression** on production `~/.pxpipe/events.jsonl` (2-var OLS,
-  `tokens ≈ a·text_chars + b·image_pixels`, N≈1.5k cold-miss events) gives
-  **~907 pixels/token** and **~1.8 chars/token** for text — i.e. *much* closer
-  to the doc's 750 than to the gate's stale ~312 px/tok.
+Billing follows pixel area or patches/tiles, not visual symmetry. Padding a
+portrait or short final page to a square adds cost without adding information.
+The target is readable characters per billed pixel under each provider's resize
+contract, not a preferred aspect ratio.
 
-These disagree by ~3×. The gate is therefore likely **pessimistic** about image
-cost on current traffic (it may pass up profitable compressions). Re-grounding
-`TOKENS_PER_IMAGE` from a fresh regression is an open task — the data is in the
-event log (`image_pixels` next to `input_tokens + cache_create_tokens` on
-cold-miss rows). Don't trust any single hardcoded image-cost constant without
-re-checking it against the log.
+## Measurement history
 
-## How sizing decisions are/were measured
+| date | change | finding |
+|---|---|---|
+| 2026-05-21 | R3 reflow | recovered line-end dead space by marking hard newlines with `↵` |
+| 2026-05-22 | grayscale atlas + L1/L2 harness | measured style and instruction-band effects |
+| 2026-06-09 | Fable-only 5×8 scope | Fable read dense cells better than Opus |
+| 2026-06-17 | ~1932px experiment | fewer pages, later shown to be server-resampled on Anthropic |
+| 2026-07-01 | Claude 1568×728 clamp | made billed pixels survive Anthropic preprocessing |
+| 2026-07-09 | exact-model profiles | separated Claude, GPT 5.6 Sol, and opt-in Grok geometry/style |
 
-- **L1 OCR eval** (`eval/eval-l1-ocr.mjs`): per-character read accuracy across
-  render styles (cell size, reflow on/off, instruction placement, grayscale).
-  This is what gated reflow and the in-image instruction banner.
-- **L2 session eval** (`eval/eval-l2-session.mjs`): comprehension over whole
-  imaged sessions.
-- **events.jsonl regression**: the real per-pixel/per-char billing fit above.
-- **glyph-matrix** (`eval/glyph-matrix/`, PAUSED): a per-character confusion
-  matrix across render styles, to find a zero-cost style that lowers read error
-  so the gate can compress harder at the same fidelity. Paused because the
-  reader model (Fable 5) is offline.
+Older benchmark receipts retain their historical geometry; do not rewrite those
+numbers as if they were generated by the current profile.
 
-## History (oldest → newest)
+## Changing a profile
 
-The sizing converged through measured iteration, not a single design. Key commits:
-
-| date | commit | change | why |
-|---|---|---|---|
-| 2026-05-21 | `38e852a` | add **R3 reflow** (recover line-end dead margin, ~29% glyph fill → dense) | rows were mostly empty; pack them |
-| 2026-05-22 | `fbf32bb` | **pack reflow across newlines** + grayscale atlas + build **L1/L2 eval harness** | measure read fidelity of the packing |
-| 2026-05-22 | `ea68340` | **in-image instruction banner** variant | L1 eval: **+1.04pp** char accuracy vs baseline |
-| 2026-05-22 | `dca7807` | pack header prose to full row width, drop spurious ↵ markers | tidy reflow output |
-| 2026-05-22 | `a9b0996` | docs: cell is now **5×8** (was 7×10) | denser cell |
-| 2026-05-23 | `1afaa6c` | content-aware image cost + **width-shrinking** (WIP) | *tried* shrink-to-content |
-| 2026-05-23 | `414f4bf` | hoist width-shrink before the cost gate so prediction matches render | make shrink predictable |
-| 2026-05-25 | `3c8716c` | **full-canvas single-column rendering, 50k chars/page** — `shrinkColsToContent` becomes a **no-op** | shrink gave no gain on dense content; full width packs more |
-| 2026-05-25 | `bb8e0d8` | **page** dense tool/history images | enforce the 195-line cap, split overflow |
-| 2026-05-26 | `28bc65c` | reduce dense page size | tuning |
-| 2026-06-09 | `cdfc99d` | drop Opus, **Fable-5 only**; dense render on bare 5×8 cell | Opus misread ~7% of renders |
-| 2026-06-17 | (this change) | raise page ceiling to **~1932×1932**: `MAX_HEIGHT_PX=1932`, dense pages `DENSE_CONTENT_COLS=384` / `92160` chars; row cap follows each call's char budget | Fable/Opus 4.8 accept ≤2000px & ≤4784 tok/image (not the old 1568 limit); baseline left ~3× headroom unused → bigger pages = fewer image blocks at the same 5×8 legibility |
-
-The arc: **reflow** to stop wasting rows → **eval harness** to prove the packing
-is still readable → **width-shrink** experiment → **reverted** to full-canvas
-two days later because dense content already fills the width → **paging** for the
-height cap → **model scope narrowed** to the reader that hits 100% on the cell.
-
-## If you want to change the sizing
-
-1. Add a style variant to the L1 OCR eval and measure char accuracy first.
-2. Check the cost side against `events.jsonl` (don't trust the hardcoded
-   per-image constant — see the gap above).
-3. Remember the gate must be able to *predict* the size cheaply; content-dependent
-   geometry is what got width-shrink reverted.
+1. Add or re-run a reader-specific recall/style harness.
+2. Measure the provider's real image-token accounting.
+3. Keep the strip inside its no-resize boundary.
+4. Test slab, history, gate, and cache determinism together.
+5. Do not generalize one variant's result to sibling model ids.

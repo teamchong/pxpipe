@@ -16,7 +16,7 @@ measured per-request against a free `count_tokens` counterfactual in
 
 This is what the model sees instead of text:
 
-![example: a real `transformRequest` output: system prompt + tool docs reflowed into one dense 1573×1248 page, instruction banner on top, ↵ marking original newlines](https://raw.githubusercontent.com/teamchong/pxpipe/main/docs/assets/example-render.png)
+![example: a real `transformRequest` output: system prompt + tool docs reflowed into one dense page, instruction banner on top, ↵ marking original newlines](https://raw.githubusercontent.com/teamchong/pxpipe/main/docs/assets/example-render.png)
 
 *~48k chars of system prompt + tool docs: ≈25k tokens as text, ≈2.7k image
 tokens as this page. Real pipeline output; the model reads renders like this
@@ -83,16 +83,28 @@ are imaged.
   re-sends the full transcript as plain text each turn is in the same high-
   savings class as Claude Code. Details and measured splits:
   [docs/CACHING_AND_SAVINGS.md](docs/CACHING_AND_SAVINGS.md#openai-responses-path-codex-and-friends).
-- **Model scope:** default `PXPIPE_MODELS=claude-fable-5,gpt-5.6`. Opus
-  4.7/4.8, GPT 5.5, and **Grok** are opt-in only (dashboard chips or
-  `PXPIPE_MODELS`) — not good enough as silent defaults for imaged context.
+- **Model scope:** default `PXPIPE_MODELS=claude-fable-5`. Sol, Opus 4.7/4.8,
+  GPT 5.5, and **Grok** are opt-in only (dashboard chips or `PXPIPE_MODELS`) —
+  not good enough as silent defaults for imaged context. The exact Sol id still
+  matters when opted in: sibling variants such as `gpt-5.6-terra` do not inherit
+  Sol's allowlist or render profile.
   `PXPIPE_MODELS=off` disables imaging. Everything else passes through
   byte-identical. On the GPT path, tool definitions stay native JSON and no
   Anthropic `cache_control` markers are used.
-- **Grok (opt-in): production 5×8 + factsheet.** Off by default. Pure-image
-  exact OCR at 5×8 fails (0/4 IDs). Image+factsheet clears exact IDs at ~70%
-  fixture savings; looser pure-image packing only ~30%. If you opt in, keep
-  density and rely on the fact-sheet — do not inflate cell bonuses.
+- **Per-model rendering:** opt-in `gpt-5.6-sol` currently uses a 126-column,
+  6×11 JetBrains Mono profile; Claude keeps its 312-column 5×8 Spleen profile. These
+  are selected by exact model id, including history pages and profitability
+  math. **Sol recall caveat:** raw-image calls scored 0/4 exact with four
+  inventions at both current 6×11 and old shared 5×8; 6×11 passed gist/guard,
+  while 5×8 also missed gist. Production's verbatim fact-sheet remains a text
+  fallback for extracted identifiers. An effective 9×12 Sol retune is rendered
+  but not yet model-tested, so the current Sol geometry is operational—not
+  recall-validated. [Sol receipts](eval/sol-profile/RESULTS.md) and
+  [profile evidence](docs/MODEL_RENDER_PROFILES.md).
+- **Grok (opt-in): measured 9×12 + factsheet.** Off by default. Pure-image
+  exact OCR at 5×8 fails (0/4 IDs); the densest tested pure-image arm that
+  cleared 4/4 with zero confabulation was effective 9×12 / 84 columns at ~30%
+  fixture savings. The fact-sheet remains attached as defense in depth.
   [eval/grok-density/FACTSHEET_RESULTS.md](eval/grok-density/FACTSHEET_RESULTS.md).
 
 ## Benchmarks (reproducible)
@@ -121,15 +133,15 @@ evals.)
 ## How it works
 
 ```
-tool_result string ──► wrap at 1928px-wide columns ──► pack ~92,000 chars/page ──► PNG[]
+model id ──► render profile ──► wrap/reflow bulk context ──► PNG[] + exact-token factsheet
 ```
 
 The proxy intercepts `/v1/messages`, rewrites eligible bulk into image
 blocks, splices them back cache-friendly (static prefix preserved, prompt
-caching keeps working), and forwards. A 1928×1928 image costs ≈4,761 vision
-tokens and holds ≈92,000 chars, so text wins only above ~19 chars/token —
-Claude Code traffic runs ~1.91 (N=391). A per-request estimator decides;
-sparse prose stays text. Events log to `~/.pxpipe/events.jsonl`.
+caching keeps working), and forwards. Claude uses 1568×728 pages; GPT 5.6 Sol
+uses 764px-wide portrait strips; opt-in Grok uses effective 9×12 cells. A
+per-request estimator uses that same resolved profile, so sparse prose stays
+text. Events log to `~/.pxpipe/events.jsonl`.
 
 ## Library use (no proxy)
 
@@ -191,10 +203,11 @@ Three kinds of *input* blocks, each behind a profitability gate:
 Everything else passes through byte-identical: your messages, recent turns,
 the model's output (it is the response, the proxy never touches it), sparse
 prose, and anything too small to win. Models outside the allowlist pass
-through entirely — the default scope is Fable 5 and GPT 5.6 only. Opus 4.8
-and GPT 5.5 read imaged content measurably worse (FINDINGS.md 2026-06-16),
-so they are deliberately opt-in via the dashboard or `PXPIPE_MODELS`, never
-silently imaged.
+through entirely — the built-in default scope is Fable 5 only. Sol, Opus 4.8,
+GPT 5.5, and Grok are deliberately opt-in via the dashboard or
+`PXPIPE_MODELS`, never silently imaged. Sol joined that list after both its
+6×11 profile and the old shared 5×8 profile scored 0/4 exact with four
+confabulations in direct raw-image calls.
 
 **Has it ever failed for real, outside the benchmarks?**
 Yes, once in weeks of daily use: the model recalled a person's name from

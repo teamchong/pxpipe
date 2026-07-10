@@ -257,8 +257,20 @@ Measured on local `/v1/responses` rows (same endpoint, different models):
 | grok | high on warm multi-turn | **collapsed** after ↵ gate fix | ~**35%** on collapsed Responses rows (n=35 post-fix); fixture image+factsheet ~70% |
 | gpt-5 | ~73% | often | ~34% overall; ~42% on collapsed warm rows |
 
-Grok render contract: production **5×8** images + factsheet (not looser cells).
-See [eval/grok-density/FACTSHEET_RESULTS.md](../eval/grok-density/FACTSHEET_RESULTS.md).
+Render profiles are selected by exact model id, not by the shared Responses
+path. Opt-in `gpt-5.6-sol` uses 126 columns with a 6×11 JetBrains Mono atlas;
+Claude uses 312 columns with the 5×8 Spleen atlas. Grok remains opt-in and uses the
+densest tested exact-safe image arm, effective **9×12** / 84 columns, plus the
+factsheet. See [eval/grok-density/RESULTS.md](../eval/grok-density/RESULTS.md)
+and [FACTSHEET_RESULTS.md](../eval/grok-density/FACTSHEET_RESULTS.md).
+
+Those profile and savings numbers are not recall evidence. The Sol raw-image
+pilot separately tested both 6×11/126 and old 5×8/152: each scored 0/4 exact
+with four confabulations, and 5×8 also missed gist. Sol is therefore off by
+default; production's fact-sheet remains an important exact-token fallback for
+operators who explicitly opt in. The locally rendered Sol 9×12 retune remains
+untested. See
+[`eval/sol-profile/RESULTS.md`](../eval/sol-profile/RESULTS.md).
 
 So "Codex shows 1% on Opus" is not "Codex unsupported." It is "this session's
 prompt was already ~98% cached text, history collapse did not fire, and only
@@ -284,4 +296,3 @@ allowlisted, etc.) correctly show `—`. Path selects the accounting shape
    only the slab (or nothing) was imaged.
 4. Do not compare a Claude Code session's 70% to a warm Codex session's 1%
    as a regression. Different wire, different uncached bulk.
-

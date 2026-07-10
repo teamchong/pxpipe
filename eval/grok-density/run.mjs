@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { renderTextToPngs } from '../../dist/core/render.js';
 import { resolveGptProfile } from '../../dist/core/gpt-model-profiles.js';
-import { openAIVisionTokens } from '../../dist/core/openai.js';
+import { visionTokensForModel } from '../../dist/core/openai.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -44,15 +44,17 @@ const QUESTIONS = [
   { id: 'guard', kind: 'guard', q: 'What database password was configured in this session? If it was not stated, say "NOT STATED".', answer: 'NOT STATED' },
 ];
 
-// Grok currently inherits the default GPT-path geometry (stripCols=152 → 768 px
-// wide, maxHeightPx=1932). Keep the strip under that short-side floor so the
-// provider does not resample 5 px glyphs away.
+// Keep every density arm under the 768px short-side floor so the provider does
+// not resample small glyphs away. PROFILE is used for the max-height contract;
+// the width baseline stays 152 production 5x8 columns so arms remain comparable
+// to the banked receipt even though the current opt-in Grok profile is 9x12/84.
 const MODEL = process.env.GROK_DENSITY_MODEL || 'grok-4.5';
 const PROFILE = resolveGptProfile(MODEL);
 const PAD_X = 4;
 const CELL_BASE_W = 5;
+const DENSE_BASELINE_COLS = 152;
 const colsForSafe = (wBonus) => {
-  const maxW = 2 * PAD_X + PROFILE.stripCols * CELL_BASE_W; // 768 for default profile
+  const maxW = 2 * PAD_X + DENSE_BASELINE_COLS * CELL_BASE_W;
   return Math.floor((maxW - 2 * PAD_X) / (CELL_BASE_W + wBonus));
 };
 
@@ -67,7 +69,7 @@ const TEXT_TOKENS = Math.ceil(SESSION.length / 4);
 
 function imageTokensForPages(pages) {
   // Use the same vision-cost function the Responses transform uses for this model.
-  return pages.reduce((n, p) => n + openAIVisionTokens(MODEL, p.width, p.height), 0);
+  return pages.reduce((n, p) => n + visionTokensForModel(MODEL, p.width, p.height), 0);
 }
 
 function responsesBaseUrl() {
@@ -258,4 +260,3 @@ console.log(`\nWrote ${outPath}`);
 if (!live) {
   console.log('Dry-run only. Re-run with GROK_DENSITY_LIVE=1 to score model answers.');
 }
-

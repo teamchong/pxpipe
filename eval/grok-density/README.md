@@ -1,9 +1,8 @@
 # Grok density / image-recall sweep
 
 **Question:** prior pxpipe recall work covered Fable 5, Opus 4.8, and GPT notes.
-Grok is imaging in production through the OpenAI Responses path, but it has no
-measured profile. Does Grok read production-density images well enough, or does
-it need a lower-density / different strip geometry profile?
+If Grok is explicitly enabled on the OpenAI Responses path, does it read the
+shared dense profile, or does it need lower-density geometry?
 
 This harness answers that with a measurement. It does **not** change production
 defaults. A Grok profile should only be added if the numbers clear the bar
@@ -14,9 +13,7 @@ below.
 For each render **variant** (cell size) it:
 
 1. Renders one synthetic session transcript to PNG(s) with the production
-   renderer, using the OpenAI-path page geometry Grok actually sees today
-   (strip capped at 768 px wide / 1932 px tall — the default GPT-profile
-   geometry that unmatched models, including Grok, currently inherit).
+   renderer, capped at 768 px wide / 1932 px tall.
 2. Asks the model a fixed battery of questions against the image(s).
 3. Scores exact recall, gist, confabulation guard, and refusal.
 
@@ -79,16 +76,15 @@ Responses path with different page geometry and vision billing, so it needs
 its own client and cost accounting. Shared pieces (fixture, scoring rules)
 mirror the Opus harness on purpose so results are comparable.
 
-## Production contract (image + factsheet)
+## Factsheet arm
 
-Density sweeps above measure **pure image** reading. Production Grok does not
-rely on that for exact IDs: the Responses transform attaches a verbatim
-fact-sheet next to the 5×8 images. Live proof that image-only fails and
-image+factsheet clears the Opus exact bar:
+Density sweeps above measure **pure image** reading. The Responses transform
+also attaches a verbatim fact-sheet. The factsheet harness proves that it
+rescues this fixture at 5×8, but not that every real token shape is covered.
+The built-in opt-in profile therefore uses effective 9×12 and the factsheet:
 
 ```bash
 GROK_DENSITY_LIVE=1 node eval/grok-density/factsheet-vs-image.mjs
 ```
 
 See [FACTSHEET_RESULTS.md](./FACTSHEET_RESULTS.md).
-

@@ -531,6 +531,13 @@ describe('exportImageTokens model routing', () => {
     expect(gpTokens).toBeGreaterThan(0);
   });
 
+  it('uses measured Grok pixel pricing instead of the GPT fallback', () => {
+    expect(exportImageTokens('grok-4.5', 768, 360)).toBe(Math.ceil((768 * 360) / 1000));
+    expect(exportImageTokens('grok-4.5', 768, 360)).not.toBe(
+      exportImageTokens('gpt-4o', 768, 360),
+    );
+  });
+
   it('Claude image tokens are substantially higher than GPT for the same full-page image', () => {
     // The issue was a ~7x underestimate when using GPT formula for Claude.
     // Verify the ratio is at least 5x so the fix is clearly meaningful.

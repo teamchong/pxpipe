@@ -24,17 +24,19 @@ function baseModelId(model: string): string {
 /** Dashboard runtime override; null = fall back to PXPIPE_MODELS env / built-in default. In-memory only. */
 let runtimeModelBases: readonly string[] | null = null;
 
-/** Built-in default scope when PXPIPE_MODELS is unset: Fable 5 (Claude) plus
- *  GPT 5.6. Everything else is opt-in via dashboard chips or PXPIPE_MODELS:
+/** Built-in default scope when PXPIPE_MODELS is unset: Fable 5 only.
+ *  Everything else is opt-in via dashboard chips or PXPIPE_MODELS:
  *  - Opus 4.7/4.8 — worse at reading imaged content (FINDINGS.md 2026-06-16:
  *    Opus 4.8 ~2pp arithmetic, 6/15 dense-hex vs Fable 100/100).
  *  - GPT 5.5 — degrades on imaged history/context.
- *  - Grok — pure-image exact OCR fails at production 5×8 (0/4 IDs); image+
- *    factsheet recovers exact IDs but the family is not default-quality for
- *    pxpipe yet (eval/grok-density/FACTSHEET_RESULTS.md). Keep off until that
- *    changes.
- *  Silently imaging weak readers is the wrong default. */
-const DEFAULT_MODEL_BASES = ['claude-fable-5', 'gpt-5.6'];
+ *  - GPT 5.6 Sol — direct raw-image calls at both its 6×11 profile and the
+ *    old shared 5×8 profile scored 0/4 exact with four confabulations. Its
+ *    exact model profile remains available for explicit opt-in and retuning.
+ *  - Grok — shared 5×8 pure-image exact recall failed 0/4 with silent
+ *    confabulation. Effective 9×12 and a factsheet each rescued one synthetic
+ *    fixture, but neither has representative-workload evidence yet.
+ *  Silently imaging weak or unvalidated readers is the wrong default. */
+const DEFAULT_MODEL_BASES = ['claude-fable-5'];
 
 function falsey(v: string): boolean {
   return /^(0|false|no|off|none)$/i.test(v.trim());
@@ -42,9 +44,9 @@ function falsey(v: string): boolean {
 
 /** PXPIPE_MODELS env / built-in default, ignoring the runtime override. One CSV
  *  controls every family (Claude + GPT). Resolution (read per-call so scope flips LIVE):
- *  - unset or empty        → built-in default (Fable 5 + GPT 5.6)
+ *  - unset or empty        → built-in default (Fable 5 only)
  *  - `off`/`0`/`false`/... → compress nothing
- *  - CSV of model bases    → exactly those families (e.g. `claude-fable-5,gpt-5.6`) */
+ *  - CSV of model bases    → exactly those families (e.g. `claude-fable-5,gpt-5.6-sol`) */
 function envOrDefaultBases(): string[] {
   // Edge-safe: `process` is undefined off-Node; `typeof` avoids a ReferenceError.
   const raw = typeof process !== 'undefined' ? process.env?.PXPIPE_MODELS : undefined;

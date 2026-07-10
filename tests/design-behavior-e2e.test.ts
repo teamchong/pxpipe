@@ -18,8 +18,21 @@
  *
  * Run just this file:  pnpm vitest run tests/design-behavior-e2e.test.ts
  */
-import { describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createProxy } from '../src/core/proxy.js';
+
+// These proxy-contract tests deliberately exercise the opt-in Sol transform.
+// Snapshot the developer shell so the suite is deterministic now that Sol is
+// intentionally absent from the built-in default scope.
+let ambientPxpipeModels: string | undefined;
+beforeAll(() => {
+  ambientPxpipeModels = process.env.PXPIPE_MODELS;
+  process.env.PXPIPE_MODELS = 'claude-fable-5,gpt-5.6-sol';
+});
+afterAll(() => {
+  if (ambientPxpipeModels === undefined) delete process.env.PXPIPE_MODELS;
+  else process.env.PXPIPE_MODELS = ambientPxpipeModels;
+});
 
 function fakeUpstream() {
   const main: string[] = [];
@@ -190,7 +203,7 @@ describe('design: RECENT REQUEST stays legible (GPT)', () => {
     const out = await drive(
       '/v1/chat/completions',
       JSON.stringify({
-        model: 'gpt-5.6',
+        model: 'gpt-5.6-sol',
         messages: [{ role: 'system', content: 'SYS ' + big(60_000) }, ...turns],
       }),
     );

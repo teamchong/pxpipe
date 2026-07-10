@@ -3,17 +3,16 @@
  *
  * One place to retune when a new model ships with different image tokenization,
  * a different downscale threshold (max safe portrait-strip width), or a different
- * max image height. Every built-in profile is BEHAVIOR-IDENTICAL to the old
- * hardcoded `resolveVisionCost` + `GPT_STRIP_COLS` + `MAX_HEIGHT_PX`, so existing
- * cost numbers (1190 / 1445 / 2372 / 1464 / 630 …) are unchanged.
+ * max image height. Unknown models preserve the conservative legacy fallback;
+ * named profiles may deliberately select different fonts and geometry.
  *
  * Retune without a code change via the PXPIPE_GPT_PROFILES env var (JSON map of
  * model-id PREFIX -> partial profile; longest matching prefix wins, checked
  * BEFORE the built-in table). Partial fields fall back to the built-in match, so
  * you can override just one knob:
  *
- *   PXPIPE_GPT_PROFILES='{"gpt-5.6":{"vision":{"regime":"patch","multiplier":1,"patchCap":12000},"stripCols":200,"maxHeightPx":2400}}'
- *   PXPIPE_GPT_PROFILES='{"gpt-5.6":{"stripCols":176}}'   # widen only
+ *   PXPIPE_GPT_PROFILES='{"gpt-5.6-sol":{"vision":{"regime":"patch","multiplier":1,"patchCap":12000},"stripCols":120,"maxHeightPx":1900}}'
+ *   PXPIPE_GPT_PROFILES='{"gpt-5.6-sol":{"style":{"grid":true,"gridCols":4}}}'
  */
 
 /**
@@ -26,7 +25,9 @@
  */
 import {
   MAX_HEIGHT_PX as ANTHROPIC_MAX_HEIGHT_PX,
-  DENSE_CONTENT_COLS as ANTHROPIC_STRIP_COLS,
+  ANTHROPIC_SLAB_COLS as ANTHROPIC_STRIP_COLS,
+  DEFAULT_RENDER_FONT,
+  type RenderFont,
 } from './render.js';
 
 export const GPT_MAX_HEIGHT_PX = 1932;
@@ -37,27 +38,37 @@ export type GptVisionCost =
   | { regime: 'patch'; multiplier: number; patchCap: number };
 
 export interface GptRenderStyle {
+  /** Rasterized font atlas. */
+  font: RenderFont;
   /** Extra px beside the 5px glyph (cell width = 5 + this). */
-  cellWBonus?: number;
+  cellWBonus: number;
   /** Extra px above the 8px glyph (cell height = 8 + this). */
-  cellHBonus?: number;
+  cellHBonus: number;
   /** Grayscale AA atlas. Default true for production dense pages. */
-  aa?: boolean;
+  aa: boolean;
+  /** Faint cell guides. */
+  grid: boolean;
+  /** Vertical guide cadence when grid is enabled. */
+  gridCols: number;
+  /** Per-glyph color cycle. */
+  colorCycle: boolean;
+  /** Horizontal scale for the hard-newline marker. */
+  markerScale: number;
+  /** Render hard-newline markers in red. */
+  markerRed: boolean;
 }
 
 export interface GptModelProfile {
   /** How OpenAI bills the rendered images as input tokens. */
   vision: GptVisionCost;
-  /** Max portrait-strip width in COLUMNS before the API downscales (destroying
-   *  5px glyphs). 152 cols x 5px + 8px pad = 768px = OpenAI's shortest-side floor. */
+  /** Max portrait-strip width in columns. Combined with `style`, this must stay
+   *  at or below the provider's no-resize pixel width. */
   stripCols: number;
   /** Max rendered image height in px. Threaded into the renderer so the gate's
    *  cost estimate and the actual page split agree. */
   maxHeightPx: number;
-  /** Glyph density / spacing. Omitted fields fall through to renderer defaults
-   *  (production 5x8: cellWBonus=0, cellHBonus=0, aa=true). Models that confabulate
-   *  exact strings at production density set larger bonuses here. */
-  style?: GptRenderStyle;
+  /** Complete model-specific font, cell spacing, color, and marker style. */
+  style: GptRenderStyle;
 }
 
 /** Default downscale-safe strip width (768px). Exported as the global cols default. */
@@ -65,6 +76,17 @@ export const DEFAULT_GPT_STRIP_COLS = 152;
 
 const C = DEFAULT_GPT_STRIP_COLS;
 const H = GPT_MAX_HEIGHT_PX;
+const BASE_STYLE: GptRenderStyle = {
+  font: DEFAULT_RENDER_FONT,
+  cellWBonus: 0,
+  cellHBonus: 0,
+  aa: true,
+  grid: false,
+  gridCols: 0,
+  colorCycle: false,
+  markerScale: 1,
+  markerRed: false,
+};
 
 /**
  * Conservative fallback for unrecognized models: tile 85/170 over-states cost,
@@ -74,7 +96,16 @@ export const DEFAULT_GPT_PROFILE: GptModelProfile = {
   vision: { regime: 'tile', base: 85, perTile: 170 },
   stripCols: C,
   maxHeightPx: H,
-  style: { cellWBonus: 0, cellHBonus: 0, aa: true },
+  style: BASE_STYLE,
+};
+
+const GPT56_SOL_PROFILE: GptModelProfile = {
+  vision: { regime: 'patch', multiplier: 1, patchCap: 10000 },
+  stripCols: 126,
+  maxHeightPx: H,
+  // Separate atlas selected by model id. Cell remains within OpenAI's 768px
+  // short-side floor (126 cols x 6px + padding = 764px).
+  style: { ...BASE_STYLE, font: 'jetbrains-mono-10' },
 };
 
 interface ProfileRule {
@@ -95,33 +126,34 @@ const BUILTIN_RULES: ProfileRule[] = [
   // nano patch models: ceil(patches * 2.46), cap 1536
   {
     test: (m) => isMiniNanoPatch(m) && /nano/.test(m),
-    profile: { vision: { regime: 'patch', multiplier: 2.46, patchCap: 1536 }, stripCols: C, maxHeightPx: H },
+    profile: { vision: { regime: 'patch', multiplier: 2.46, patchCap: 1536 }, stripCols: C, maxHeightPx: H, style: BASE_STYLE },
   },
   // mini / o4-mini patch models: ceil(patches * 1.62), cap 1536
   {
     test: (m) => isMiniNanoPatch(m) && !/nano/.test(m),
-    profile: { vision: { regime: 'patch', multiplier: 1.62, patchCap: 1536 }, stripCols: C, maxHeightPx: H },
+    profile: { vision: { regime: 'patch', multiplier: 1.62, patchCap: 1536 }, stripCols: C, maxHeightPx: H, style: BASE_STYLE },
   },
-  // gpt-5.6 flagship — EXPLICIT slot so the day-one retune is one line (or one env
-  // var). Identical to the generic 5.x rule below until the real numbers land.
+  // Exact Sol variant observed on production traffic. Do not match bare 5.6 or
+  // sibling variants (for example gpt-5.6-terra): model-specific visual tuning
+  // must not leak across variants merely because they share a version number.
   {
-    test: (m) => /^gpt-5\.6/.test(m),
-    profile: { vision: { regime: 'patch', multiplier: 1, patchCap: 10000 }, stripCols: C, maxHeightPx: H },
+    test: (m) => m === 'gpt-5.6-sol' || m.startsWith('gpt-5.6-sol-'),
+    profile: GPT56_SOL_PROFILE,
   },
   // 5.x flagship (gpt-5.4/5.5/…, no -mini/-nano): patch, multiplier 1, detail:original cap
   {
     test: (m) => /^gpt-5\.\d/.test(m),
-    profile: { vision: { regime: 'patch', multiplier: 1, patchCap: 10000 }, stripCols: C, maxHeightPx: H },
+    profile: { vision: { regime: 'patch', multiplier: 1, patchCap: 10000 }, stripCols: C, maxHeightPx: H, style: BASE_STYLE },
   },
   // gpt-5 / gpt-5-chat-latest: tile 70/140
   {
     test: (m) => /^gpt-5/.test(m),
-    profile: { vision: { regime: 'tile', base: 70, perTile: 140 }, stripCols: C, maxHeightPx: H },
+    profile: { vision: { regime: 'tile', base: 70, perTile: 140 }, stripCols: C, maxHeightPx: H, style: BASE_STYLE },
   },
   // o1 / o3 reasoning: tile 75/150
   {
     test: (m) => /^o[13]/.test(m),
-    profile: { vision: { regime: 'tile', base: 75, perTile: 150 }, stripCols: C, maxHeightPx: H },
+    profile: { vision: { regime: 'tile', base: 75, perTile: 150 }, stripCols: C, maxHeightPx: H, style: BASE_STYLE },
   },
 
   // Claude on the Responses path (Codex-style clients). Selection is by model
@@ -137,15 +169,15 @@ const BUILTIN_RULES: ProfileRule[] = [
       vision: { regime: 'tile', base: 85, perTile: 170 },
       stripCols: ANTHROPIC_STRIP_COLS,
       maxHeightPx: ANTHROPIC_MAX_HEIGHT_PX,
-      style: { cellWBonus: 0, cellHBonus: 0, aa: true },
+      style: { ...BASE_STYLE },
     },
   },
 
-  // Grok (Responses path). Production 5x8 packing maximizes pixel savings
-  // (measured ~1000 image tok/MPix). Exact-ID OCR is weak at that density, so
-  // the Responses transform keeps a verbatim fact-sheet of paths/hex/ports/
-  // camelCase ids next to the image (see factsheet.ts). Do NOT inflate cell
-  // bonuses here just to pass OCR tests — that trades away the savings.
+  // Grok (Responses path). Live climb 2026-07-09 on grok-4.5: 5x8 and 7x10
+  // confabulate exact IDs; effective 9x12 (Spleen 5x8 + 4px spacing) is the
+  // densest measured arm that reached 4/4 exact, 0 confab, gist+guard ok. The
+  // fact-sheet still rides beside images as defense in depth. Grok remains
+  // opt-in only; this profile applies only after an operator enables it.
   {
     test: (m) => /^grok-/.test(m),
     profile: {
@@ -153,9 +185,9 @@ const BUILTIN_RULES: ProfileRule[] = [
       // measured pixel model. Keep a conservative tile placeholder for tools
       // that only read the profile struct.
       vision: { regime: 'tile', base: 85, perTile: 170 },
-      stripCols: C,
+      stripCols: 84,
       maxHeightPx: H,
-      style: { cellWBonus: 0, cellHBonus: 0, aa: true },
+      style: { ...BASE_STYLE, cellWBonus: 4, cellHBonus: 4 },
     },
   },
 ];
@@ -184,6 +216,14 @@ function posInt(v: unknown, fallback: number): number {
   return Number.isFinite(v) && (v as number) > 0 ? Math.floor(v as number) : fallback;
 }
 
+function nonNegativeInt(v: unknown, fallback: number): number {
+  return Number.isFinite(v) && (v as number) >= 0 ? Math.floor(v as number) : fallback;
+}
+
+function renderFont(v: unknown, fallback: RenderFont): RenderFont {
+  return v === 'spleen-5x8' || v === 'jetbrains-mono-10' ? v : fallback;
+}
+
 function parseEnvProfiles(raw: string): Map<string, GptModelProfile> {
   const out = new Map<string, GptModelProfile>();
   if (!raw) return out;
@@ -197,18 +237,27 @@ function parseEnvProfiles(raw: string): Map<string, GptModelProfile> {
   for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
     if (!v || typeof v !== 'object') continue;
     const key = k.toLowerCase();
-    const base = resolveBuiltin(key); // partial fields fall back to the built-in match
+    // An exact override key may be a prefix of the real model id. Resolve the
+    // known family explicitly so `{"gpt-5.6-sol":{...}}` inherits Sol's font
+    // and geometry even when a suffixed runtime id is expected.
+    const base = key === 'gpt-5.6-sol' ? GPT56_SOL_PROFILE : resolveBuiltin(key);
     const p = v as Partial<GptModelProfile>;
     const styleIn = (p as { style?: GptRenderStyle }).style;
-    const baseStyle = base.style ?? { cellWBonus: 0, cellHBonus: 0, aa: true };
+    const baseStyle = base.style;
     const style: GptRenderStyle = {
-      cellWBonus: styleIn && Number.isFinite(styleIn.cellWBonus as number)
-        ? Math.floor(styleIn.cellWBonus as number)
-        : baseStyle.cellWBonus,
-      cellHBonus: styleIn && Number.isFinite(styleIn.cellHBonus as number)
-        ? Math.floor(styleIn.cellHBonus as number)
-        : baseStyle.cellHBonus,
+      font: renderFont(styleIn?.font, baseStyle.font),
+      cellWBonus: nonNegativeInt(styleIn?.cellWBonus, baseStyle.cellWBonus),
+      cellHBonus: nonNegativeInt(styleIn?.cellHBonus, baseStyle.cellHBonus),
       aa: styleIn && typeof styleIn.aa === 'boolean' ? styleIn.aa : baseStyle.aa,
+      grid: styleIn && typeof styleIn.grid === 'boolean' ? styleIn.grid : baseStyle.grid,
+      gridCols: nonNegativeInt(styleIn?.gridCols, baseStyle.gridCols),
+      colorCycle: styleIn && typeof styleIn.colorCycle === 'boolean'
+        ? styleIn.colorCycle
+        : baseStyle.colorCycle,
+      markerScale: posInt(styleIn?.markerScale, baseStyle.markerScale),
+      markerRed: styleIn && typeof styleIn.markerRed === 'boolean'
+        ? styleIn.markerRed
+        : baseStyle.markerRed,
     };
     out.set(key, {
       vision: isValidVision(p.vision) ? p.vision : base.vision,
@@ -229,26 +278,10 @@ function envProfiles(): Map<string, GptModelProfile> {
   return envMap;
 }
 
-/**
- * Resolve the full rendering + vision-cost profile for a model id. Env overrides
- * (longest matching prefix) win over the built-in table; unknown models get the
- * conservative `DEFAULT_GPT_PROFILE`.
- */
-function withDefaultStyle(profile: GptModelProfile): GptModelProfile {
-  const d = DEFAULT_GPT_PROFILE.style!;
-  const st = profile.style;
-  return {
-    ...profile,
-    style: {
-      cellWBonus: st?.cellWBonus ?? d.cellWBonus,
-      cellHBonus: st?.cellHBonus ?? d.cellHBonus,
-      aa: st?.aa ?? d.aa,
-    },
-  };
-}
-
 export function resolveGptProfile(model: string | null | undefined): GptModelProfile {
-  const m = (model ?? '').toLowerCase();
+  // Match applicability.ts: bracketed transport variants (for example [1m])
+  // do not define a different visual reader profile.
+  const m = (model ?? '').toLowerCase().replace(/\[[^\]]*\]/g, '');
   const env = envProfiles();
   if (env.size > 0) {
     let best: GptModelProfile | undefined;
@@ -259,7 +292,7 @@ export function resolveGptProfile(model: string | null | undefined): GptModelPro
         bestLen = k.length;
       }
     }
-    if (best) return withDefaultStyle(best);
+    if (best) return best;
   }
-  return withDefaultStyle(resolveBuiltin(m));
+  return resolveBuiltin(m);
 }

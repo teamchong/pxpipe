@@ -32,6 +32,7 @@ import {
   DENSE_CONTENT_CHARS_PER_IMAGE,
   DENSE_CONTENT_COLS,
   DENSE_RENDER_STYLE,
+  ANTHROPIC_SLAB_COLS,
   renderTextToPngsWithCharLimit,
 } from './render.js';
 import { factSheetText } from './factsheet.js';
@@ -134,8 +135,8 @@ const DEFAULTS: Required<TransformOptions> = {
   minToolResultChars: 6000,
   // system field rejects images (400 system.N.type: Input should be 'text') —
   // images always go into the first user message.
-  // 313 cols × 5 px + 8 px pad = 1573 px slab width (under 2000 px ceiling).
-  cols: 313,
+  // 312 cols × 5 px + 8 px pad = 1568 px (Anthropic no-resize edge).
+  cols: ANTHROPIC_SLAB_COLS,
   maxImagesPerToolResult: 10,
   charsPerToken: 4,
   historyAmortizationHorizon: 1,
@@ -1097,10 +1098,12 @@ export function estimateImageCount(
   cols: number,
   numCols: number = 1,
   maxCharsPerImage: number = READABLE_CHARS_PER_IMAGE,
+  maxLinesPerColumn: number = LINES_PER_IMAGE,
 ): number {
   const n = Math.max(1, numCols | 0);
   const readableLinesPerCol = Math.max(1, Math.floor(maxCharsPerImage / Math.max(1, cols)));
-  const linesPerImage = Math.min(LINES_PER_IMAGE, readableLinesPerCol) * n;
+  const hardLinesPerCol = Math.max(1, Math.floor(maxLinesPerColumn));
+  const linesPerImage = Math.min(hardLinesPerCol, readableLinesPerCol) * n;
   const charBudget = Math.max(1, maxCharsPerImage * n);
   if (typeof textOrLen === 'number') {
     // Back-compat shim — numeric arg gets the looser chars-based estimate.

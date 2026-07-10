@@ -6,17 +6,16 @@ Fixture: same precision-critical synthetic session as the density harness
 
 ## Question
 
-Production Grok keeps **5×8** packing because pure-image exact OCR fails at
-that density. Does the shipping **image + factsheet** path clear the Opus
-exact bar without giving up density? Is a denser pure-image packing still
-worth considering?
+One candidate kept **5×8** packing and relied on an image + factsheet contract.
+Does that combination clear this fixture's exact bar? How does it compare with
+the lower-density pure-image profile?
 
 ## Results
 
 | arm | exact | confab | gist | guard | save≈ | notes |
 |-----|------:|-------:|:----:|:-----:|------:|-------|
 | `5x8_image_only` | **0/4** | **4** | ok | ok | 76% | confabulates every ID |
-| `5x8_image_plus_factsheet` | **4/4** | **0** | ok | ok | **70%** | **shipping contract** |
+| `5x8_image_plus_factsheet` | **4/4** | **0** | ok | ok | **70%** | factsheet candidate |
 | `5x8_grid_plus_factsheet` | 4/4 | 0 | ok | ok | 70% | style no worse with sheet |
 | `5x8_color_plus_factsheet` | 4/4 | 0 | ok | ok | 70% | style no worse with sheet |
 | `d4_c84_image_only` | 4/4 | 0 | ok | ok | **30%** | pure-image Opus bar, half the density win |
@@ -36,14 +35,13 @@ and history images (`src/core/openai.ts`).
 
 1. **Grok stays opt-in only** (not in `DEFAULT_MODEL_BASES`). Same bar as Opus:
    not good enough as a silent pxpipe default.
-2. **Do not change default Grok density when opted in.** 5×8 stays.
-3. **Exact IDs are a factsheet problem, not a cell-size problem** at production
-   density. Image+factsheet passes 4/4 with ~70% fixture savings; pure-image d4
-   also passes but only ~30% savings.
-4. Style knobs (grid, colorCycle) at 5×8 do not replace the factsheet for exact
-   recall; with the sheet they are fine and optional.
-5. Still open only if factsheet **coverage** misses a token class in the wild —
-   fix extractors, do not bloat cells.
+2. The factsheet rescues the four token shapes in this fixture, but n=1 cannot
+   prove extractor coverage for real sessions.
+3. The built-in opt-in profile therefore uses the independently measured
+   effective **9×12 / 84-column** arm (4/4, zero confab) and keeps the factsheet
+   as defense in depth. This is more conservative than 5×8 + factsheet.
+4. Style knobs (grid, colorCycle) at 5×8 do not replace either larger cells or
+   the factsheet for exact recall.
 
 Enable with `PXPIPE_MODELS=...,grok-4.5` or the dashboard Grok chip.
 

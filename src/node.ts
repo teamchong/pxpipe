@@ -7,6 +7,7 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { codexProfileRoute, writeCodexTelemetry } from './codex-telemetry.js';
 import { once } from 'node:events';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -1044,8 +1045,17 @@ async function main(): Promise<void> {
             return;
           }
         }
+        const profileRoute = codexProfileRoute(url.pathname, url.search);
+        if (profileRoute) req.url = profileRoute.upstreamPath;
         const webReq = toWebRequest(req);
         const webRes = await handle(webReq);
+        if (profileRoute) {
+          // Best-effort and deliberately off the response path. Only allowlisted
+          // quota metadata is persisted; bodies, request headers and auth never are.
+          void writeCodexTelemetry(profileRoute.alias, webRes).catch((err) => {
+            console.warn(`[pxpipe] codex telemetry write failed: ${(err as Error).message}`);
+          });
+        }
         await writeWebResponse(webRes, res);
       })
       .catch((err) => {

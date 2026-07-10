@@ -5,6 +5,7 @@
 import { describe, expect, it } from 'vitest';
 import { isPxpipeSupportedGptModel } from '../src/core/applicability.js';
 import { openAIVisionTokens, resolveVisionCost, transformOpenAIChatCompletions, transformOpenAIResponses } from '../src/core/openai.js';
+import { schemaAnnotationDelta } from '../src/core/schema-strip.js';
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -71,7 +72,7 @@ describe('openAIVisionTokens', () => {
 const BIG_SYSTEM = 'System instruction with lots of detail. '.repeat(500); // ~20k chars
 const BIG_TOOL_DESC = 'Tool description with lots of context. '.repeat(200); // ~8k chars
 const CHAT_TOOL_PARAMS = { type: 'object', description: 'Param root.', properties: { x: { type: 'string', description: 'x param' } } };
-const CHAT_TOOL_DOC = `## Tool: do_thing\n${BIG_TOOL_DESC}\n\`\`\`json\n${JSON.stringify(CHAT_TOOL_PARAMS)}\n\`\`\``;
+const CHAT_TOOL_DOC = `## Removed schema annotations for tool: do_thing\n${schemaAnnotationDelta(CHAT_TOOL_PARAMS).join('\n')}`;
 
 // Real `task`/`question` tools have a required parameter literally NAMED `description`
 // (others collide with `title`/`default`). The strip must drop the annotation but KEEP
@@ -91,6 +92,19 @@ const TASK_LIKE_PARAMS = {
 };
 
 describe('transformOpenAIChatCompletions (gpt-5.6)', () => {
+  it('counts pre/post native JSON in the same scope and excludes only real data-image payloads', async () => {
+    const schema = { type: 'object', properties: { image_url: { type: 'string', const: 'keep-me' } } };
+    const body = enc.encode(JSON.stringify({ model: 'gpt-5.6', messages: [
+      { role: 'system', content: BIG_SYSTEM },
+      { role: 'user', content: [{ type: 'image_url', image_url: { url: `data:image/png;base64,${'A'.repeat(100_000)}` } }] },
+    ], tools: [{ type: 'function', function: { name: 'image_contract', description: 'native', parameters: schema } }] }));
+    const out = await transformOpenAIChatCompletions(body);
+    expect(out.info.preNativeTextTokens).toBeGreaterThan(0);
+    expect(out.info.preNativeTextTokens).toBeLessThan(20_000);
+    expect(out.info.postNativeTextTokens).toBeGreaterThan(0);
+    const parsed = JSON.parse(dec.decode(out.body));
+    expect(parsed.tools[0].function.parameters.properties.image_url.const).toBe('keep-me');
+  });
   it('compresses GPT system + tool docs while preserving native tool selection metadata', async () => {
     const body = enc.encode(JSON.stringify({
       model: 'gpt-5.6',
@@ -209,7 +223,7 @@ describe('transformOpenAIChatCompletions (gpt-5.6)', () => {
 const BIG_INSTRUCTIONS = 'These are detailed instructions. '.repeat(600); // ~20k chars
 const BIG_FLAT_TOOL_DESC = 'Flat tool description with lots of context. '.repeat(200); // ~8k chars
 const RESPONSES_TOOL_PARAMS = { type: 'object', description: 'Param root.', properties: { x: { type: 'string', description: 'x param' } } };
-const RESPONSES_TOOL_DOC = `## Tool: do_thing\n${BIG_FLAT_TOOL_DESC}\n\`\`\`json\n${JSON.stringify(RESPONSES_TOOL_PARAMS)}\n\`\`\``;
+const RESPONSES_TOOL_DOC = `## Removed schema annotations for tool: do_thing\n${schemaAnnotationDelta(RESPONSES_TOOL_PARAMS).join('\n')}`;
 
 describe('transformOpenAIResponses (gpt-5.6)', () => {
   it('compresses GPT Responses instructions + tool docs while preserving native tool selection metadata', async () => {

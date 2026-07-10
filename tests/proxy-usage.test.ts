@@ -24,6 +24,24 @@ const SAMPLE_REQ_BODY = JSON.stringify({
 });
 
 describe('proxy usage extraction', () => {
+  it('emits exactly one complete success event for non-SSE', async () => {
+    const restore = mockUpstream(async () => new Response(JSON.stringify({
+      content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn',
+      usage: { input_tokens: 11, output_tokens: 2, cache_read_input_tokens: 3 },
+    }), { headers: { 'content-type': 'application/json' } }));
+    const events: ProxyEvent[] = [];
+    const proxy = createProxy({ upstream: 'http://mock', onRequest: e => events.push(e) });
+    try {
+      const res = await proxy(new Request('http://local/v1/messages', { method: 'POST',
+        headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+          model: 'claude-fable-5', messages: [{ role: 'user', content: 'x' }] }) }));
+      await res.text(); await new Promise(r => setTimeout(r, 20));
+    } finally { restore(); }
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ status: 200, client: 'claude-code',
+      protocol: 'anthropic-messages', profileVersion: 'anthropic-render-v1',
+      usage: { input_tokens: 11, output_tokens: 2, cache_read_input_tokens: 3 } });
+  });
   it('extracts usage tokens from a non-stream JSON response', async () => {
     const restore = mockUpstream(
       () =>

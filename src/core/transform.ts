@@ -613,6 +613,10 @@ export interface TransformInfo {
   /** Total TEXT chars in the outgoing body (system + messages, excluding image base64).
    *  Denominator for empirical chars-per-token regression on cold-miss events. */
   outgoingTextChars?: number;
+  /** Exact tokenizer count of the original provider JSON before imaging. */
+  preNativeTextTokens?: number;
+  /** Exact tokenizer count of outgoing provider JSON with image payload bytes excluded. */
+  postNativeTextTokens?: number;
   /** Length of the static (cacheable) slab rendered into the image. */
   staticChars: number;
   /** Length of the dynamic (per-turn) slab kept as plain text. */

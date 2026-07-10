@@ -14,6 +14,9 @@ export interface TrackEvent {
   path: string;
   /** Top-level request model when present. */
   model?: string;
+  client?: string;
+  protocol?: string;
+  profile_version?: string;
   status: number;
   duration_ms: number;
   first_byte_ms?: number;
@@ -29,6 +32,8 @@ export interface TrackEvent {
   image_bytes?: number;
   /** Total pixel area across all rendered images; pairs with cache_create_tokens for px/token regression. */
   image_pixels?: number;
+  /** Actual dimensions, retained as numbers only (never image/prompt content). */
+  image_dimensions?: Array<{ width: number; height: number }>;
   /** GPT only: vision tokens billed for rendered images. */
   image_tokens?: number;
   /** GPT only: o200k text tokens the imaged/stripped content would have cost. */
@@ -152,6 +157,27 @@ export interface TrackEvent {
    *  Absent when the probe failed or wasn't sampled. */
   probe_post_tokens?: number;
 
+  /** Mutually separate accounting views. `raw` never includes a cache credit. */
+  raw_compression?: {
+    scope: 'full_provider_json_excluding_image_payloads' | 'provider_count_tokens' | 'not_observable';
+    pre_native_text_tokens: number | null;
+    post_native_text_tokens: number | null;
+    pre_image_tokens: number;
+    post_image_tokens: number | null;
+  };
+  provider_cache?: {
+    cached_tokens: number | null;
+    cache_read_input_tokens: number | null;
+    cache_creation_input_tokens: number | null;
+    ephemeral_5m_input_tokens: number | null;
+    ephemeral_1h_input_tokens: number | null;
+  };
+  component_cost?: {
+    image_tokens: number | null;
+    fact_sheet_chars: number | null;
+    framing_pointer_guard_chars: number | null;
+  };
+
   // Errors:
   error?: string;
   /** First ~2 KiB of the upstream 4xx response body. */
@@ -187,6 +213,9 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     duration_ms: ev.durationMs,
   };
   if (ev.model) out.model = ev.model;
+  if (ev.client) out.client = ev.client;
+  if (ev.protocol) out.protocol = ev.protocol;
+  if (ev.profileVersion) out.profile_version = ev.profileVersion;
   if (ev.firstByteMs !== undefined) out.first_byte_ms = ev.firstByteMs;
   if (ev.error) out.error = ev.error;
   if (ev.errorBody) out.error_body = ev.errorBody;
@@ -212,6 +241,9 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     if (info.imageBytes !== undefined) out.image_bytes = info.imageBytes;
     if (info.imagePixels !== undefined && info.imagePixels > 0) {
       out.image_pixels = info.imagePixels;
+    }
+    if (info.imageDims?.length) {
+      out.image_dimensions = info.imageDims.map(({ width, height }) => ({ width, height }));
     }
     if (info.imageTokens !== undefined && info.imageTokens > 0) {
       out.image_tokens = info.imageTokens;
@@ -320,6 +352,31 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     if (u.server_tool_use?.web_search_requests !== undefined)
       out.web_search_requests = u.server_tool_use.web_search_requests;
   }
+  // QW01: explicit, non-overlapping accounting views. These intentionally
+  // reference the provider's original names and do not claim cache reads as
+  // raw compression savings.
+  out.raw_compression = {
+    scope: info?.preNativeTextTokens !== undefined
+      ? 'full_provider_json_excluding_image_payloads'
+      : info?.baselineTokens !== undefined ? 'provider_count_tokens' : 'not_observable',
+    pre_native_text_tokens: info?.preNativeTextTokens ?? info?.baselineTokens ?? null,
+    post_native_text_tokens: info?.postNativeTextTokens ?? ev.probe?.postTokens ?? null,
+    pre_image_tokens: 0,
+    post_image_tokens: info?.imageTokens ?? null,
+  };
+  out.provider_cache = {
+    cached_tokens: u?.cached_tokens ?? null,
+    cache_read_input_tokens: u?.cache_read_input_tokens ?? null,
+    cache_creation_input_tokens: u?.cache_creation_input_tokens ?? null,
+    ephemeral_5m_input_tokens: u?.cache_creation?.ephemeral_5m_input_tokens ?? null,
+    ephemeral_1h_input_tokens: u?.cache_creation?.ephemeral_1h_input_tokens ?? null,
+  };
+  out.component_cost = {
+    image_tokens: info?.imageTokens ?? null,
+    // No dedicated counters exist yet; never relabel broader fields.
+    fact_sheet_chars: null,
+    framing_pointer_guard_chars: null,
+  };
   const m = ev.measurement;
   if (m) {
     if (m.textChars > 0) out.text_chars_measured = m.textChars;

@@ -27,7 +27,7 @@ import {
   type TransformInfo,
   type TransformOptions,
 } from './transform.js';
-import { stripSchemaDescriptions } from './schema-strip.js';
+import { schemaAnnotationDelta, stripSchemaDescriptions } from './schema-strip.js';
 import {
   planGptCollapse,
   responsesItemsToTurns,
@@ -324,20 +324,14 @@ function isFlatFunctionTool(tool: unknown): tool is ResponsesFlatTool {
  *  (Contrast transform.ts renderToolDoc: text reference → prose only.) */
 function renderToolDoc(tool: OpenAIFunctionTool): string {
   const f = tool.function;
-  const parts = [`## Tool: ${f.name ?? '?'}`];
-  if (typeof f.description === 'string' && f.description.length > 0) parts.push(f.description);
-  if (f.parameters !== undefined) {
-    parts.push('```json\n' + JSON.stringify(f.parameters) + '\n```');
-  }
+  const delta = schemaAnnotationDelta(f.parameters);
+  const parts = delta.length ? [`## Removed schema annotations for tool: ${f.name ?? '?'}`, ...delta] : [];
   return parts.join('\n');
 }
 
 function renderFlatToolDoc(tool: ResponsesFlatTool): string {
-  const parts = [`## Tool: ${tool.name ?? '?'}`];
-  if (typeof tool.description === 'string' && tool.description.length > 0) parts.push(tool.description);
-  if (tool.parameters !== undefined) {
-    parts.push('```json\n' + JSON.stringify(tool.parameters) + '\n```');
-  }
+  const delta = schemaAnnotationDelta(tool.parameters);
+  const parts = delta.length ? [`## Removed schema annotations for tool: ${tool.name ?? '?'}`, ...delta] : [];
   return parts.join('\n');
 }
 
@@ -474,7 +468,16 @@ function evalOpenAIGate(
   const estImages = estimateImageCount(renderedText, cols, 1);
   const perStrip = openAIVisionTokens(model, stripW, resolveGptProfile(model).maxHeightPx);
   const imageTokens = estImages * perStrip;
-  const textTokens = renderedText.length / charsPerToken;
+  // Exact tokenizer measurement; charsPerToken is retained in the signature for
+  // API compatibility with existing callers/options but is not used for GPT.
+  void charsPerToken;
+  const textTokens = gptTextTokens(renderedText);
+  return { imageTokens, textTokens, profitable: imageTokens < textTokens };
+}
+
+function evalRenderedOpenAIGate(model: string, renderedText: string, images: RenderedImage[]) {
+  const imageTokens = gptImageTokens(model, images);
+  const textTokens = gptTextTokens(renderedText);
   return { imageTokens, textTokens, profitable: imageTokens < textTokens };
 }
 
@@ -505,6 +508,19 @@ function gptTextTokens(text: string): number {
   } catch {
     return 0;
   }
+}
+
+/** Count provider-native JSON text while excluding base64 image payload bytes. */
+function gptNativeJsonTokens(value: unknown): number {
+  return gptTextTokens(JSON.stringify(value, (key, v) => {
+    if (key !== 'image_url') return v;
+    if (typeof v === 'string' && v.startsWith('data:image/')) return '[image-payload]';
+    if (v && typeof v === 'object' && typeof (v as { url?: unknown }).url === 'string'
+      && ((v as { url: string }).url.startsWith('data:image/'))) {
+      return { ...(v as Record<string, unknown>), url: '[image-payload]' };
+    }
+    return v;
+  }));
 }
 
 /** Vision-token cost of the rendered images, summed over their real dims —
@@ -609,6 +625,7 @@ export async function transformOpenAIChatCompletions(
     info.reason = `parse_error: ${(e as Error).message}`;
     return { body, info };
   }
+  info.preNativeTextTokens = gptNativeJsonTokens(req);
   if (!Array.isArray(req.messages)) {
     info.reason = 'parse_error: messages must be an array';
     return { body, info };
@@ -660,7 +677,10 @@ export async function transformOpenAIChatCompletions(
   const renderedText = header + combined;
   const cols = Math.min(shrinkColsToContent(renderedText, o.cols), resolveGptProfile(req.model).stripCols);
 
-  const gate = evalOpenAIGate(req.model, renderedText, cols, o.charsPerToken);
+  // Render before deciding so partial last pages are priced at their real height
+  // and patch grid rather than as a hypothetical full page.
+  const images = await renderTextToPngs(renderedText, cols, {}, resolveGptProfile(req.model).maxHeightPx);
+  const gate = evalRenderedOpenAIGate(req.model, renderedText, images);
   info.gateEval = {
     site: 'slab',
     imageTokens: gate.imageTokens,
@@ -675,7 +695,6 @@ export async function transformOpenAIChatCompletions(
     return { body, info };
   }
 
-  const images = await renderTextToPngs(renderedText, cols, {}, resolveGptProfile(req.model).maxHeightPx);
   if (images.length === 0) {
     info.reason = 'render_empty';
     return { body, info };
@@ -730,8 +749,10 @@ export async function transformOpenAIChatCompletions(
   // remains collapsible history instead of looking like the live request.
   if (o.collapseHistory) {
     const turns = chatMessagesToTurns(req.messages);
-    const profitable = (text: string, cols: number) =>
-      evalOpenAIGate(req.model, text, cols, o.charsPerToken).profitable;
+    const profitable = (text: string, cols: number, rendered?: readonly RenderedImage[]) =>
+      rendered
+        ? evalRenderedOpenAIGate(req.model, text, [...rendered]).profitable
+        : evalOpenAIGate(req.model, text, cols, o.charsPerToken).profitable;
     const plan = await planGptCollapse(turns, firstUserIdx + 1, profitable, {
       ...o.gptHistory,
       reflow: o.reflow,
@@ -772,6 +793,7 @@ export async function transformOpenAIChatCompletions(
 
   if (rewrittenTools !== undefined) req.tools = rewrittenTools;
   info.outgoingTextChars = countOutgoingTextChars(req);
+  info.postNativeTextTokens = gptNativeJsonTokens(req);
   info.compressed = true;
   return { body: new TextEncoder().encode(JSON.stringify(req)), info };
 }
@@ -794,6 +816,7 @@ export async function transformOpenAIResponses(
     info.reason = `parse_error: ${(e as Error).message}`;
     return { body, info };
   }
+  info.preNativeTextTokens = gptNativeJsonTokens(req);
 
   // Normalize input to an array; preserve original string for wrap-back if needed.
   const inputWasString = typeof req.input === 'string';
@@ -867,7 +890,8 @@ export async function transformOpenAIResponses(
   const renderedText = header + combined;
   const cols = Math.min(shrinkColsToContent(renderedText, o.cols), resolveGptProfile(req.model).stripCols);
 
-  const gate = evalOpenAIGate(req.model, renderedText, cols, o.charsPerToken);
+  const images = await renderTextToPngs(renderedText, cols, {}, resolveGptProfile(req.model).maxHeightPx);
+  const gate = evalRenderedOpenAIGate(req.model, renderedText, images);
   info.gateEval = {
     site: 'slab',
     imageTokens: gate.imageTokens,
@@ -882,7 +906,6 @@ export async function transformOpenAIResponses(
     return { body, info };
   }
 
-  const images = await renderTextToPngs(renderedText, cols, {}, resolveGptProfile(req.model).maxHeightPx);
   if (images.length === 0) {
     info.reason = 'render_empty';
     return { body, info };
@@ -968,8 +991,10 @@ export async function transformOpenAIResponses(
   // Skip for bare-string input (single message, nothing to collapse).
   if (o.collapseHistory && !inputWasString) {
     const turns = responsesItemsToTurns(inputItems);
-    const profitable = (text: string, cols: number) =>
-      evalOpenAIGate(req.model, text, cols, o.charsPerToken).profitable;
+    const profitable = (text: string, cols: number, rendered?: readonly RenderedImage[]) =>
+      rendered
+        ? evalRenderedOpenAIGate(req.model, text, [...rendered]).profitable
+        : evalOpenAIGate(req.model, text, cols, o.charsPerToken).profitable;
     const plan = await planGptCollapse(turns, firstUserIdx + 1, profitable, {
       ...o.gptHistory,
       reflow: o.reflow,
@@ -1015,6 +1040,7 @@ export async function transformOpenAIResponses(
   // Regression denominator, same as the Chat path — Responses was the only
   // transform that never recorded it.
   info.outgoingTextChars = countResponsesOutgoingTextChars(req);
+  info.postNativeTextTokens = gptNativeJsonTokens(req);
   info.compressed = true;
   return { body: new TextEncoder().encode(JSON.stringify(req)), info };
 }

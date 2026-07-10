@@ -85,6 +85,18 @@ describe('planGptCollapse — gates', () => {
     expect(plan.reason).toBe('prefix_too_short');
   });
 
+  it('adaptively accepts one large completed tool output below the turn-count floor', async () => {
+    const turns: HistoryTurn[] = [
+      { text: '[tool_use read]\n{"path":"fixture.txt"}', openIds: ['c1'], closeIds: [], opaque: false },
+      { text: `[tool_result]\n${Array.from({ length: 2600 }, (_, i) => `word${i}`).join(' ')}`, openIds: [], closeIds: ['c1'], opaque: false },
+      ...plainTurns(6, 5), // protected live tail
+    ];
+    const plan = await planGptCollapse(turns, 0, yes, { collapseChunk: 0 });
+    expect(plan.reason).toBeUndefined();
+    expect(plan.images.length + plan.imagesAfter.length).toBeGreaterThan(0);
+    expect(plan.endExclusive).toBe(2);
+  });
+
   it('refuses when collapsed text is below minCollapseTokens', async () => {
     // 20 tiny turns: prefix is long enough, but the o200k token count is below
     // the 2000-token floor (gate is measured in tokens, not chars).

@@ -41,7 +41,11 @@ const GPT_HISTORY_MAX_IMAGES = 16;
 /** Break-even gate predicate, injected to avoid a circular import with openai.ts.
  *  Receives the full string (not length) so the renderer's row-aware image-count
  *  estimate sees real newlines — history text is newline-heavy. */
-export type GptProfitableFn = (text: string, cols: number) => boolean;
+export type GptProfitableFn = (
+  text: string,
+  cols: number,
+  rendered?: readonly RenderedImage[],
+) => boolean | Promise<boolean>;
 
 export interface GptHistoryOptions {
   /** Trailing items kept as live text (never collapsed). */
@@ -235,7 +239,15 @@ export async function planGptCollapse(
   };
   const pp = Math.max(0, Math.min(protectedPrefix, turns.length));
   const rawCutoff = turns.length - o.keepTail;
-  if (rawCutoff - pp < o.minCollapsePrefix) {
+  // A single completed, genuinely large tool output is independently worth
+  // collapsing. Turn-count amortisation is for small conversational turns and
+  // must not reject this common agent shape. Open calls and the live tail remain
+  // protected by rawCutoff/findClosedBoundary below.
+  const hasLargeClosedToolOutput = turns.slice(pp, Math.max(pp, rawCutoff)).some(
+    (t) => t.closeIds.length > 0 && gptCountTokens(t.text) >= o.minCollapseTokens,
+  );
+  const effectiveMinPrefix = hasLargeClosedToolOutput ? 1 : o.minCollapsePrefix;
+  if (rawCutoff - pp < effectiveMinPrefix) {
     return { ...base, reason: 'prefix_too_short' };
   }
   // Snap the cutoff down to a collapseChunk grid (relative to pp) so the image
@@ -245,7 +257,7 @@ export async function planGptCollapse(
       ? Math.min(
           rawCutoff,
           Math.max(
-            pp + o.minCollapsePrefix,
+            pp + effectiveMinPrefix,
             pp + Math.floor((rawCutoff - pp) / o.collapseChunk) * o.collapseChunk,
           ),
         )
@@ -254,7 +266,7 @@ export async function planGptCollapse(
   if (boundary < pp) {
     return { ...base, reason: 'no_closed_prefix' };
   }
-  if (boundary + 1 - pp < o.minCollapsePrefix) {
+  if (boundary + 1 - pp < effectiveMinPrefix) {
     return { ...base, reason: 'prefix_too_short' };
   }
   const rawEnd = boundary + 1;
@@ -297,11 +309,6 @@ export async function planGptCollapse(
   // (newline-heavy transcripts otherwise burn a full row per short line and
   // show no ↵). `text` itself stays original — it backs the o200k baseline and
   // the chunk-snapped cache byte-stability, so it must not change shape here.
-  const safeText = neutralizeSentinel(text);
-  const renderText = o.reflow ? reflow(safeText) ?? safeText : text;
-  if (!isProfitable(renderText, o.cols)) {
-    return { ...base, reason: 'not_profitable', collapsedChars: text.length };
-  }
   // APPEND-ONLY, TOKEN-LENGTH sectioning. Cut the closed prefix [pp..rawEnd) into
   // sections of ~sectionTokens o200k tokens by walking turns from pp and sealing a
   // section each time its cumulative token count crosses the target. A sealed
@@ -408,6 +415,15 @@ export async function planGptCollapse(
   // The collapsed transcript / o200k baseline reflects ONLY what we imaged — the
   // pin, when consumed, is text and is excluded from the imaged baseline.
   const collapsedText = joinTurns(turns, pp, collapseEnd, pinConsumed ? pinIdx : -1);
+  const safeCollapsed = neutralizeSentinel(collapsedText);
+  const collapsedRenderText = o.reflow ? reflow(safeCollapsed) ?? safeCollapsed : collapsedText;
+  // Price the images that were actually rendered, including every partial last
+  // page and its real patch-grid dimensions. This intentionally happens after
+  // sectioning/rendering; the old pre-render full-page estimate misclassified
+  // short final pages.
+  if (!await isProfitable(collapsedRenderText, o.cols, [...imagesBefore, ...imagesAfter])) {
+    return { ...base, reason: 'not_profitable', collapsedChars: collapsedText.length };
+  }
   const droppedCodepoints = new Map<number, number>();
   let droppedChars = 0;
   for (const img of [...imagesBefore, ...imagesAfter]) {

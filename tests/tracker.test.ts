@@ -3,6 +3,28 @@ import { toTrackEvent, JsonLogTracker, noopTracker, type TrackEvent } from '../s
 import type { ProxyEvent } from '../src/core/proxy.js';
 
 describe('toTrackEvent', () => {
+  it('keeps raw compression, provider cache, and component cost separate', () => {
+    const out = toTrackEvent({
+      method: 'POST', path: '/v1/responses', model: 'gpt-5.6', status: 200,
+      durationMs: 12, client: 'codex-cli', protocol: 'openai-responses',
+      profileVersion: 'gpt-5.6-sol@1', reqBodySha8: 'deadbeef',
+      info: { compressed: true, origChars: 10, compressedChars: 10, imageCount: 1,
+        imageBytes: 20, staticChars: 10, dynamicChars: 0, dynamicBlockCount: 0,
+        baselineTokens: 120, imageTokens: 30, toolDocsChars: 7,
+        outgoingTextChars: 80, imageDims: [{ width: 100, height: 1920 }] },
+      usage: { input_tokens: 90, output_tokens: 4, cached_tokens: 20 },
+    });
+    expect(out.client).toBe('codex-cli');
+    expect(out.protocol).toBe('openai-responses');
+    expect(out.profile_version).toBe('gpt-5.6-sol@1');
+    expect(out.image_dimensions).toEqual([{ width: 100, height: 1920 }]);
+    expect(out.raw_compression).toEqual({ scope: 'provider_count_tokens', pre_native_text_tokens: 120,
+      post_native_text_tokens: null, pre_image_tokens: 0, post_image_tokens: 30 });
+    expect(out.provider_cache?.cached_tokens).toBe(20);
+    expect(out.component_cost).toEqual({ image_tokens: 30, fact_sheet_chars: null,
+      framing_pointer_guard_chars: null });
+    expect(JSON.stringify(out)).not.toContain('secret prompt');
+  });
   it('flattens ProxyEvent + TransformInfo + Usage into a single record', () => {
     const ev: ProxyEvent = {
       method: 'POST',

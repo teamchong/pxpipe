@@ -14,6 +14,8 @@ import { probeRateFromEnv, shouldSample, runPostTransformProbe } from './probe.j
 import type { Usage } from './types.js';
 
 export interface ProxyConfig {
+  /** Safe deployment labels copied to telemetry (never inferred from prompt text). */
+  telemetry?: { client?: string; profileVersion?: string };
   /** 'cloudflare-ai-gateway': routes both families through gatewayBaseUrl;
    *  OpenAI paths drop the `/v1` prefix to match gateway shape. */
   provider?: 'cloudflare-ai-gateway';
@@ -39,6 +41,10 @@ export interface ProxyConfig {
 }
 
 export interface ProxyEvent {
+  /** Safe request/deployment classification; contains no headers or prompt content. */
+  client?: string;
+  protocol?: 'anthropic-messages' | 'openai-chat' | 'openai-responses' | 'passthrough';
+  profileVersion?: string;
   method: string;
   path: string;
   /** Top-level request model when present. Used for telemetry/dashboard labels only. */
@@ -728,6 +734,13 @@ export function createProxy(config: ProxyConfig = {}) {
           method: req.method,
           path: url.pathname,
           model: requestModel,
+          client: config.telemetry?.client ?? (isMessages ? 'claude-code'
+            : (isOpenAIChat || isOpenAIResponses) ? 'codex-cli' : 'unknown'),
+          protocol: isMessages ? 'anthropic-messages'
+            : isOpenAIChat ? 'openai-chat'
+            : isOpenAIResponses ? 'openai-responses' : 'passthrough',
+          profileVersion: config.telemetry?.profileVersion ?? (isMessages
+            ? 'anthropic-render-v1' : (isOpenAIChat || isOpenAIResponses) ? 'gpt-render-v1' : 'passthrough'),
           status,
           durationMs: Date.now() - t0,
           firstByteMs,

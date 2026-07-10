@@ -148,6 +148,35 @@ export function stripSchemaDescriptions(node: unknown, depth = 0): unknown {
   return out;
 }
 
+/** Render only annotation text removed by {@link stripSchemaDescriptions}.
+ * Structural JSON is deliberately excluded: it remains provider-native and must
+ * never depend on OCR. Paths disambiguate equal descriptions without duplicating
+ * `type`, `required`, `enum`, `const`, or composition structure. */
+export function schemaAnnotationDelta(node: unknown, path = '$', depth = 0): string[] {
+  if (depth > SCHEMA_STRIP_MAX_DEPTH || !node || typeof node !== 'object') return [];
+  if (Array.isArray(node)) return node.flatMap((v, i) => schemaAnnotationDelta(v, `${path}[${i}]`, depth + 1));
+  const obj = node as Record<string, unknown>;
+  const out: string[] = [];
+  for (const [k, v] of Object.entries(obj)) {
+    const child = `${path}.${k}`;
+    if (SCHEMA_STRIP_KEYS.has(k) || (k === 'format' && typeof v === 'string' && v.length > FORMAT_MAX_LEN)) {
+      const rendered = typeof v === 'string' ? v : JSON.stringify(v);
+      if (rendered) out.push(`${path} ${k}: ${rendered}`);
+      continue;
+    }
+    if (SCHEMA_NAMED_SUBSCHEMA_KEYS.has(k) && v && typeof v === 'object' && !Array.isArray(v)) {
+      for (const [name, sub] of Object.entries(v as Record<string, unknown>)) {
+        out.push(...schemaAnnotationDelta(sub, `${child}.${name}`, depth + 1));
+      }
+    } else if (SCHEMA_COMPOSITION_KEYS.has(k) && Array.isArray(v)) {
+      out.push(...v.flatMap((sub, i) => schemaAnnotationDelta(sub, `${child}[${i}]`, depth + 1)));
+    } else if (SCHEMA_SINGLE_SUBSCHEMA_KEYS.has(k) && typeof v !== 'boolean') {
+      out.push(...schemaAnnotationDelta(v, child, depth + 1));
+    }
+  }
+  return out;
+}
+
 /** JSON Schema keys that carry a parameter *contract* (shape/values), as opposed
  *  to pure annotations. Used to decide whether a stripped schema still tells the
  *  validator anything — if none survive, the strip is not worth shipping. */

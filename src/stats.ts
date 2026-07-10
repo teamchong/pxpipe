@@ -21,6 +21,7 @@ export interface Summary {
   total: number;
   ok2xx: number;
   err4xx: number;
+  err400: number;
   err5xx: number;
   compressed: number;
   passthrough: number;
@@ -47,6 +48,20 @@ export interface Summary {
    *  be doing its job. */
   systemShaHist: Map<string, number>;
   unknownTags: Map<string, number>;
+  eventSchemaVersions: Map<string, number>;
+  tier0DroppedTotal: number;
+  tier0DroppedEvents: number;
+  omittedCharsTotal: number;
+  refusalEvents: number;
+  safetyFlaggedEvents: number;
+  baselineProbeOk: number;
+  baselineProbePartial: number;
+  baselineProbeFailed: number;
+  cachePrefixEvents: number;
+  cachePrefixShaHist: Map<string, number>;
+  routingShadowHeavy: number;
+  routingShadowLight: number;
+  routingShadowReasons: Map<string, number>;
 }
 
 export function newSummary(): Summary {
@@ -54,6 +69,7 @@ export function newSummary(): Summary {
     total: 0,
     ok2xx: 0,
     err4xx: 0,
+    err400: 0,
     err5xx: 0,
     compressed: 0,
     passthrough: 0,
@@ -71,14 +87,34 @@ export function newSummary(): Summary {
     byCwd: new Map(),
     systemShaHist: new Map(),
     unknownTags: new Map(),
+    eventSchemaVersions: new Map(),
+    tier0DroppedTotal: 0,
+    tier0DroppedEvents: 0,
+    omittedCharsTotal: 0,
+    refusalEvents: 0,
+    safetyFlaggedEvents: 0,
+    baselineProbeOk: 0,
+    baselineProbePartial: 0,
+    baselineProbeFailed: 0,
+    cachePrefixEvents: 0,
+    cachePrefixShaHist: new Map(),
+    routingShadowHeavy: 0,
+    routingShadowLight: 0,
+    routingShadowReasons: new Map(),
   };
 }
 
 export function fold(s: Summary, ev: TrackEvent): Summary {
   s.total++;
+  if (typeof ev.schema_version === 'number') {
+    const key = String(ev.schema_version);
+    s.eventSchemaVersions.set(key, (s.eventSchemaVersions.get(key) ?? 0) + 1);
+  }
   if (ev.status >= 200 && ev.status < 300) s.ok2xx++;
-  else if (ev.status >= 400 && ev.status < 500) s.err4xx++;
-  else if (ev.status >= 500) s.err5xx++;
+  else if (ev.status >= 400 && ev.status < 500) {
+    s.err4xx++;
+    if (ev.status === 400) s.err400++;
+  } else if (ev.status >= 500) s.err5xx++;
 
   if (ev.compressed === true) {
     s.compressed++;
@@ -117,6 +153,34 @@ export function fold(s: Summary, ev: TrackEvent): Summary {
 
   if (ev.system_sha8) {
     s.systemShaHist.set(ev.system_sha8, (s.systemShaHist.get(ev.system_sha8) ?? 0) + 1);
+  }
+
+  if (typeof ev.tier0_dropped_total === 'number' && ev.tier0_dropped_total > 0) {
+    s.tier0DroppedTotal += ev.tier0_dropped_total;
+    s.tier0DroppedEvents++;
+  }
+  if (typeof ev.omitted_chars === 'number' && ev.omitted_chars > 0) {
+    s.omittedCharsTotal += ev.omitted_chars;
+  }
+  if (ev.stop_reason === 'refusal') s.refusalEvents++;
+  if (ev.safety_flagged === true) s.safetyFlaggedEvents++;
+  if (ev.baseline_probe_status === 'ok') s.baselineProbeOk++;
+  else if (ev.baseline_probe_status === 'partial') s.baselineProbePartial++;
+  else if (ev.baseline_probe_status === 'failed') s.baselineProbeFailed++;
+  if (ev.cache_prefix_sha8) {
+    s.cachePrefixEvents++;
+    s.cachePrefixShaHist.set(
+      ev.cache_prefix_sha8,
+      (s.cachePrefixShaHist.get(ev.cache_prefix_sha8) ?? 0) + 1,
+    );
+  }
+  if (ev.routing_shadow_tier === 'heavy') s.routingShadowHeavy++;
+  else if (ev.routing_shadow_tier === 'light') s.routingShadowLight++;
+  if (ev.routing_shadow_reason) {
+    s.routingShadowReasons.set(
+      ev.routing_shadow_reason,
+      (s.routingShadowReasons.get(ev.routing_shadow_reason) ?? 0) + 1,
+    );
   }
 
   if (ev.unknown_static_tags) {
@@ -158,6 +222,7 @@ export function renderTextReport(s: Summary): string {
     `  2xx:          ${fmtN(s.ok2xx).padStart(8)}   ` +
       `4xx: ${fmtN(s.err4xx).padStart(6)}   5xx: ${fmtN(s.err5xx).padStart(6)}`,
   );
+  lines.push(`  400/refusal:  ${fmtN(s.err400).padStart(8)}   ${fmtN(s.refusalEvents).padStart(6)}`);
   lines.push(
     `  compressed:   ${fmtN(s.compressed).padStart(8)}  (${fmtPct(s.compressed, s.total)})`,
   );
@@ -195,6 +260,18 @@ export function renderTextReport(s: Summary): string {
   );
   lines.push(
     `  cache hit rate (by events):  ${fmtPct(s.cacheHitEvents, s.eventsWithUsage)}`,
+  );
+  lines.push(`  cache prefixes: ${fmtN(s.cachePrefixShaHist.size)} unique / ${fmtN(s.cachePrefixEvents)} events`);
+  lines.push('');
+
+  lines.push('fidelity telemetry:');
+  lines.push(`  tier0 dropped:   ${fmtN(s.tier0DroppedTotal)} across ${fmtN(s.tier0DroppedEvents)} events`);
+  lines.push(`  omitted chars:    ${fmtN(s.omittedCharsTotal)}`);
+  lines.push(
+    `  baseline probes: ok=${fmtN(s.baselineProbeOk)} partial=${fmtN(s.baselineProbePartial)} failed=${fmtN(s.baselineProbeFailed)}`,
+  );
+  lines.push(
+    `  routing shadow:  heavy=${fmtN(s.routingShadowHeavy)} light=${fmtN(s.routingShadowLight)}`,
   );
   lines.push('');
 
@@ -294,6 +371,7 @@ export function summaryToJson(s: Summary): Record<string, unknown> {
     total: s.total,
     ok2xx: s.ok2xx,
     err4xx: s.err4xx,
+    err400: s.err400,
     err5xx: s.err5xx,
     compressed: s.compressed,
     passthrough: s.passthrough,
@@ -313,5 +391,20 @@ export function summaryToJson(s: Summary): Record<string, unknown> {
     byCwd: topN(s.byCwd),
     systemShaHist: topN(s.systemShaHist),
     unknownTags: topN(s.unknownTags),
+    eventSchemaVersions: topN(s.eventSchemaVersions),
+    tier0DroppedTotal: s.tier0DroppedTotal,
+    tier0DroppedEvents: s.tier0DroppedEvents,
+    omittedCharsTotal: s.omittedCharsTotal,
+    refusalEvents: s.refusalEvents,
+    safetyFlaggedEvents: s.safetyFlaggedEvents,
+    baselineProbeOk: s.baselineProbeOk,
+    baselineProbePartial: s.baselineProbePartial,
+    baselineProbeFailed: s.baselineProbeFailed,
+    cachePrefixEvents: s.cachePrefixEvents,
+    cachePrefixUnique: s.cachePrefixShaHist.size,
+    cachePrefixTop: topN(s.cachePrefixShaHist),
+    routingShadowHeavy: s.routingShadowHeavy,
+    routingShadowLight: s.routingShadowLight,
+    routingShadowReasons: topN(s.routingShadowReasons),
   };
 }

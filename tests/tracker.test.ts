@@ -42,6 +42,7 @@ describe('toTrackEvent', () => {
     const out = toTrackEvent(ev);
     // Spot-check every category of field made it across with the right
     // snake_case names.
+    expect(out.schema_version).toBe(1);
     expect(out.method).toBe('POST');
     expect(out.path).toBe('/v1/messages');
     expect(out.model).toBe('gpt-5.5');
@@ -155,6 +156,28 @@ describe('toTrackEvent', () => {
       history: 300,
     });
     expect(out.history_text_chars).toBe(300);
+  });
+
+  it('maps C9/C10 routing shadow telemetry without implying live routing', () => {
+    const out = toTrackEvent({
+      method: 'POST',
+      path: '/v1/messages',
+      status: 200,
+      durationMs: 20,
+      routingShadow: {
+        tier: 'light',
+        reason: 'stable_prefix_established',
+        bodyBytes: 4096,
+        messageCount: 4,
+        existingCacheControlMarkers: 2,
+      },
+    });
+    expect(out.routing_shadow_tier).toBe('light');
+    expect(out.routing_shadow_reason).toBe('stable_prefix_established');
+    expect(out.routing_shadow_body_bytes).toBe(4096);
+    expect(out.routing_shadow_message_count).toBe(4);
+    expect(out.routing_shadow_cache_control_markers).toBe(2);
+    expect(out.compressed).toBeUndefined();
   });
 
   it('omits bucket_chars when no gates fired and the bucket map is empty', () => {

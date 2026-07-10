@@ -11,8 +11,11 @@ import { once } from 'node:events';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
+import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { createProxy, parseGatewayHeaders, resolveUpstreams, type ProxyConfig } from './core/proxy.js';
+import { getAllowedModelBases, getConfiguredModelBases } from './core/applicability.js';
 import {
   parseExportArgv,
   runExportCore,
@@ -31,6 +34,7 @@ import {
   dashboardPath,
   type DashboardRoute,
 } from './dashboard.js';
+import { aggregateEventsFile, renderTextReport, summaryToJson } from './stats.js';
 
 /** Runtime config. The core transform tuning comes from DEFAULTS in
  *  transform.ts; startup knobs cover deployment plus emergency GPT scope
@@ -139,6 +143,7 @@ function printHelp(): void {
 Usage:
   pxpipe                run the proxy (no flags)
   pxpipe export [...]   render files/diff to PNG pages + cost report (see pxpipe export --help)
+  pxpipe doctor [--json] inspect live /version plus local events telemetry
 
 The proxy compresses eligible tools, schemas, reminders, tool_results,
 and history; tracks events to disk; and measures real saved_pct via
@@ -146,6 +151,8 @@ and history; tracks events to disk; and measures real saved_pct via
 
 Stats, sessions, and cleanup tools live in the dashboard at
   http://127.0.0.1:<port>/  (default port 47821)
+Build/runtime fingerprint:
+  http://127.0.0.1:<port>/version
 
 Flags:
   -h, --help              show this help
@@ -180,6 +187,7 @@ Environment:
   PXPIPE_REFUSAL_TRIP     refusals on compressed requests before a session is
                           forced to passthrough (default 1; 0 disables)
   PXPIPE_RENDER_CACHE     0 = disable the content-addressed PNG render cache
+  PXPIPE_ROUTING_SHADOW   1 = log C9/C10 heavy/light decision only; routing unchanged
 
 Use with Claude Code:
   ANTHROPIC_BASE_URL=http://127.0.0.1:47821 claude
@@ -196,10 +204,106 @@ Use with OpenAI-compatible GPT clients:
 // inside its own run-script env, so for `npx pxpipe-proxy` or a global bin it is
 // undefined (or reflects the *consumer's* package), never this tool's version.
 declare const __PXPIPE_VERSION__: string | undefined;
+declare const __PXPIPE_GIT_SHA__: string | undefined;
+declare const __PXPIPE_GIT_REF__: string | undefined;
+declare const __PXPIPE_BUILD_TIME__: string | undefined;
 
 function printVersion(): void {
+  console.log(packageVersion());
+}
+
+function packageVersion(): string {
   const injected = typeof __PXPIPE_VERSION__ === 'string' ? __PXPIPE_VERSION__ : undefined;
-  console.log(injected ?? process.env.npm_package_version ?? 'unknown');
+  return injected ?? process.env.npm_package_version ?? 'unknown';
+}
+
+const runtimeGitCache = new Map<string, string | undefined>();
+
+function runtimeGit(args: readonly string[]): string | undefined {
+  const key = args.join('\0');
+  if (runtimeGitCache.has(key)) return runtimeGitCache.get(key);
+  const r = spawnSync('git', [...args], { encoding: 'utf8' });
+  const value = r.status === 0 ? (r.stdout ?? '').trim() || undefined : undefined;
+  runtimeGitCache.set(key, value);
+  return value;
+}
+
+function injectedConst(name: 'sha' | 'ref' | 'time'): string | undefined {
+  if (name === 'sha') {
+    const v = typeof __PXPIPE_GIT_SHA__ === 'string' ? __PXPIPE_GIT_SHA__ : undefined;
+    return process.env.PXPIPE_GIT_SHA || runtimeGit(['rev-parse', 'HEAD']) || v || undefined;
+  }
+  if (name === 'ref') {
+    const v = typeof __PXPIPE_GIT_REF__ === 'string' ? __PXPIPE_GIT_REF__ : undefined;
+    return process.env.PXPIPE_GIT_REF || runtimeGit(['branch', '--show-current']) || v || undefined;
+  }
+  const v = typeof __PXPIPE_BUILD_TIME__ === 'string' ? __PXPIPE_BUILD_TIME__ : undefined;
+  return v || process.env.PXPIPE_BUILD_TIME || undefined;
+}
+
+let entrySha8Cache: string | null | undefined;
+
+function entrySha8(): string | undefined {
+  if (entrySha8Cache !== undefined) return entrySha8Cache ?? undefined;
+  try {
+    const entry = fileURLToPath(import.meta.url);
+    const hash = createHash('sha256').update(fs.readFileSync(entry)).digest('hex').slice(0, 8);
+    entrySha8Cache = hash;
+    return hash;
+  } catch {
+    entrySha8Cache = null;
+    return undefined;
+  }
+}
+
+function jsonResponse(value: unknown, status = 200): Response {
+  return new Response(JSON.stringify(value, null, 2), {
+    status,
+    headers: { 'content-type': 'application/json; charset=utf-8' },
+  });
+}
+
+function buildVersionPayload(
+  opts: RuntimeConfig,
+  live?: {
+    compressionEnabled?: boolean;
+    forcePassthrough?: boolean;
+    cacheTtl1h?: boolean;
+  },
+): Record<string, unknown> {
+  return {
+    name: 'pxpipe-proxy',
+    version: packageVersion(),
+    git_sha: injectedConst('sha') ?? 'unknown',
+    git_ref: injectedConst('ref') ?? 'unknown',
+    build_time: injectedConst('time') ?? 'unknown',
+    dist_sha8: entrySha8() ?? 'unknown',
+    runtime: {
+      node: process.version,
+      platform: process.platform,
+      arch: process.arch,
+      pid: process.pid,
+      uptime_sec: Math.round(process.uptime()),
+    },
+    config: {
+      host: opts.host,
+      port: opts.port,
+      events_file: opts.eventsFile,
+      provider: opts.provider ?? 'direct',
+      openai_strip_v1: opts.openAIStripV1,
+    },
+    flags: {
+      compression_enabled: live?.compressionEnabled,
+      pxpipe_disable: live?.forcePassthrough ?? isEnvTruthy(process.env.PXPIPE_DISABLE),
+      cache_ttl_1h: live?.cacheTtl1h ?? isEnvTruthy(process.env.PXPIPE_CACHE_TTL_1H),
+      render_cache: process.env.PXPIPE_RENDER_CACHE === '0' ? false : true,
+      routing_shadow: isEnvTruthy(process.env.PXPIPE_ROUTING_SHADOW),
+      probe_rate: Number(process.env.PXPIPE_PROBE_RATE ?? 0),
+      models: getAllowedModelBases(),
+      configured_models: getConfiguredModelBases(),
+      models_env: process.env.PXPIPE_MODELS ?? 'default',
+    },
+  };
 }
 
 // ---- node:http <-> Web Request/Response bridge ---------------------------
@@ -336,6 +440,7 @@ async function dispatchDashboard(
   req: IncomingMessage,
   url: URL,
   port: number,
+  versionPayload: () => Record<string, unknown>,
 ): Promise<Response | undefined> {
   const method = req.method ?? 'GET';
   switch (route.kind) {
@@ -345,6 +450,9 @@ async function dispatchDashboard(
     case 'stats':
       if (method !== 'GET') return undefined;
       return dashboard.serveStats();
+    case 'version':
+      if (method !== 'GET') return undefined;
+      return jsonResponse(versionPayload());
     case 'recent':
       if (method !== 'GET') return undefined;
       return dashboard.serveRecent();
@@ -873,12 +981,120 @@ async function runExport(argv: string[]): Promise<void> {
   }
 }
 
+// ---- pxpipe doctor --------------------------------------------------------
+
+function doctorHelp(): void {
+  console.log(`pxpipe doctor — inspect live pxpipe + local events telemetry
+
+Usage:
+  pxpipe doctor          print a short human-readable report
+  pxpipe doctor --json   print the raw JSON payload
+
+Reads:
+  - http://<HOST>:<PORT>/version (default http://127.0.0.1:47821/version)
+  - PXPIPE_LOG or ~/.pxpipe/events.jsonl
+`);
+}
+
+async function fetchJsonWithTimeout(url: string, timeoutMs: number): Promise<unknown> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: ctrl.signal });
+    const text = await res.text();
+    if (!res.ok) {
+      return { error: `HTTP ${res.status}`, body: text.slice(0, 200) };
+    }
+    try {
+      return JSON.parse(text);
+    } catch {
+      return { error: 'non-json response', body: text.slice(0, 200) };
+    }
+  } catch (e) {
+    return { error: (e as Error).message || 'request failed' };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function displayHost(host: string): string {
+  return host.includes(':') ? `[${host}]` : host;
+}
+
+async function runDoctor(argv: string[]): Promise<void> {
+  let asJson = false;
+  for (const a of argv) {
+    if (a === '-h' || a === '--help') {
+      doctorHelp();
+      return;
+    }
+    if (a === '--json') {
+      asJson = true;
+      continue;
+    }
+    console.error(`[pxpipe doctor] unknown option: ${a}`);
+    console.error('[pxpipe doctor] run `pxpipe doctor --help` for usage');
+    process.exit(2);
+  }
+
+  const opts = parseCli([]);
+  const liveUrl = `http://${displayHost(opts.host)}:${opts.port}/version`;
+  const [live, aggregate] = await Promise.all([
+    fetchJsonWithTimeout(liveUrl, 1500),
+    aggregateEventsFile(opts.eventsFile),
+  ]);
+  const payload = {
+    local: buildVersionPayload(opts),
+    live_url: liveUrl,
+    live,
+    events: aggregate
+      ? {
+          path: opts.eventsFile,
+          parsed: aggregate.parsed,
+          dropped: aggregate.dropped,
+          summary: summaryToJson(aggregate.summary),
+        }
+      : {
+          path: opts.eventsFile,
+          error: 'no events file yet',
+        },
+  };
+
+  if (asJson) {
+    console.log(JSON.stringify(payload, null, 2));
+    return;
+  }
+
+  const liveObj = live && typeof live === 'object' ? live as Record<string, unknown> : {};
+  console.log('━━━ pxpipe doctor ━━━');
+  console.log(`local build: ${packageVersion()} ${injectedConst('sha') ?? 'unknown'} (${injectedConst('ref') ?? 'unknown'})`);
+  console.log(`entry sha8:  ${entrySha8() ?? 'unknown'}`);
+  console.log(`live:        ${liveUrl}`);
+  if ('error' in liveObj) {
+    console.log(`live status: ${(liveObj.error as string) || 'unavailable'}`);
+  } else {
+    console.log(`live build:  ${String(liveObj.version ?? 'unknown')} ${String(liveObj.git_sha ?? 'unknown')}`);
+  }
+  console.log(`events:      ${opts.eventsFile}`);
+  if (!aggregate) {
+    console.log('events status: no file yet');
+    return;
+  }
+  console.log(`events rows: ${aggregate.parsed} parsed, ${aggregate.dropped} dropped`);
+  console.log('');
+  console.log(renderTextReport(aggregate.summary));
+}
+
 // ---- main ----------------------------------------------------------------
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   if (argv[0] === 'export') {
     await runExport(argv.slice(1));
+    return; // server never starts
+  }
+  if (argv[0] === 'doctor') {
+    await runDoctor(argv.slice(1));
     return; // server never starts
   }
   // No subcommands — pxpipe is just the proxy. Stats / sessions / cleanup
@@ -1092,7 +1308,18 @@ async function main(): Promise<void> {
         const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
         const route = dashboardPath(url.pathname);
         if (route) {
-          const webRes = await dispatchDashboard(dashboard, route, req, url, opts.port);
+          const webRes = await dispatchDashboard(
+            dashboard,
+            route,
+            req,
+            url,
+            opts.port,
+            () => buildVersionPayload(opts, {
+              compressionEnabled: dashboard.getCompressionEnabled(),
+              forcePassthrough,
+              cacheTtl1h,
+            }),
+          );
           if (webRes) {
             await writeWebResponse(webRes, res);
             return;

@@ -1483,6 +1483,7 @@ function round4(n: number): number {
 export type DashboardRoute =
   | { kind: 'html' }
   | { kind: 'stats' } // /proxy-stats — legacy live counter
+  | { kind: 'version' } // /version — build/runtime fingerprint
   | { kind: 'recent' } // /proxy-recent — legacy ring buffer
   | { kind: 'png' } // /proxy-latest-png
   | { kind: 'api-sessions' } // /api/sessions.json
@@ -1496,6 +1497,7 @@ export type DashboardRoute =
 export function dashboardPath(pathname: string): DashboardRoute | null {
   if (pathname === '/' || pathname === '/dashboard') return { kind: 'html' };
   if (pathname === '/proxy-stats') return { kind: 'stats' };
+  if (pathname === '/version') return { kind: 'version' };
   if (pathname === '/proxy-recent') return { kind: 'recent' };
   if (pathname === '/proxy-latest-png') return { kind: 'png' };
   if (pathname === '/api/sessions.json') return { kind: 'api-sessions' };

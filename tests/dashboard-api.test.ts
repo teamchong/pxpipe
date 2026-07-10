@@ -70,6 +70,7 @@ describe('dashboardPath()', () => {
 
   it('matches the legacy live-poll routes', () => {
     expect(dashboardPath('/proxy-stats')?.kind).toBe('stats');
+    expect(dashboardPath('/version')?.kind).toBe('version');
     expect(dashboardPath('/proxy-recent')?.kind).toBe('recent');
     expect(dashboardPath('/proxy-latest-png')?.kind).toBe('png');
   });

@@ -5,6 +5,14 @@ describes the design for a future implementer; it does not modify
 `transform.ts`, `node.ts`, `dashboard.ts`, or `tracker.ts`. See §11 for the
 phased rollout a follow-up task should execute against this design.
 
+**Rollout gate (2026-07-10): do not implement this before telemetry proves the
+need.** The live plan is to measure `tier0_dropped_total`, omissions,
+400/refusal rows, cache-prefix stability, and the cheap per-block factsheet
+fidelity test first. Variant A (`~/.pxpipe/stash`, deterministic handle,
+`GET /stash/:id`, TTL/GC) only proceeds behind a separate flag/canary and a
+dedicated security review if those measurements show a real fidelity gap that
+factsheet captions cannot close.
+
 ## 1. Problem & scope
 
 `docs/LEGIBILITY-AUDIT-2026-07-01.md` (recommendation #4, lines 94-98) draws

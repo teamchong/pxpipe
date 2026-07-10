@@ -5,10 +5,18 @@
 
 import { transformRequest, type TransformOptions, type TransformInfo } from './transform.js';
 import { transformOpenAIChatCompletions, transformOpenAIResponses } from './openai.js';
-import { isAnthropicMessagesPath, isPxpipeSupportedGptModel, isPxpipeSupportedModel } from './applicability.js';
+import {
+  classifyRequestWeight,
+  isAnthropicMessagesPath,
+  isPxpipeSupportedGptModel,
+  isPxpipeSupportedModel,
+  type PxpipeRequestWeightReason,
+  type PxpipeRequestWeightTier,
+} from './applicability.js';
 import {
   buildBaselineCountTokensBody,
   buildCacheablePrefixCountTokensBody,
+  countCacheControlMarkers,
 } from './measurement.js';
 import { probeRateFromEnv, shouldSample, runPostTransformProbe } from './probe.js';
 import type { Usage } from './types.js';
@@ -75,6 +83,15 @@ export interface ProxyEvent {
    *  "this request was sampled". Calibration only: real post-transform tokens already
    *  arrive free in `usage.input_tokens`; downstream compares the two. */
   probe?: { postTokens: number | null };
+  /** C9/C10 shadow-only request-weight classifier. Present only when
+   *  PXPIPE_ROUTING_SHADOW=1. This never gates or rewrites the live path. */
+  routingShadow?: {
+    tier: PxpipeRequestWeightTier;
+    reason: PxpipeRequestWeightReason;
+    bodyBytes: number;
+    messageCount?: number;
+    existingCacheControlMarkers: number;
+  };
 }
 
 /** Max chars of 4xx error body captured on ProxyEvent — enough for Anthropic's full error JSON. */
@@ -89,6 +106,16 @@ function readModelField(body: Uint8Array): string | null {
     return m ? m[1]! : null;
   } catch {
     return null;
+  }
+}
+
+/** Cheap PRE-transform message count for C9/C10 shadow telemetry. */
+function readMessageCountField(body: Uint8Array): number | undefined {
+  try {
+    const obj = JSON.parse(new TextDecoder().decode(body)) as { messages?: unknown };
+    return Array.isArray(obj.messages) ? obj.messages.length : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -645,6 +672,9 @@ export function createProxy(config: ProxyConfig = {}) {
     ? (config.gatewayBaseUrl ?? '').replace(/\/+$/, '')
     : upstream;
   const gatewayHeaders = config.gatewayHeaders ?? {};
+  const routingShadowEnabled =
+    typeof process !== 'undefined' &&
+    /^(1|true|yes|on)$/i.test(process.env?.PXPIPE_ROUTING_SHADOW ?? '');
   const applyGatewayHeaders = (h: Headers): Headers => {
     for (const [k, v] of Object.entries(gatewayHeaders)) h.set(k, v);
     return h;
@@ -740,6 +770,7 @@ export function createProxy(config: ProxyConfig = {}) {
           measurement,
           stopReason,
           probe,
+          routingShadow,
         });
       };
       void finalize();
@@ -760,6 +791,7 @@ export function createProxy(config: ProxyConfig = {}) {
     let bodyOut: BodyInit | null = null;
     let info: TransformInfo | undefined;
     let requestModel: string | undefined;
+    let routingShadow: ProxyEvent['routingShadow'] | undefined;
     /** Pre-transform request bytes, kept for the E13 refusal auto-retry. */
     let originalBody: Uint8Array | undefined;
 
@@ -783,6 +815,24 @@ export function createProxy(config: ProxyConfig = {}) {
         // Fail-closed: unreadable model → no compression, not a risky guess.
         const model = readModelField(bodyIn);
         requestModel = model ?? undefined;
+        if (routingShadowEnabled && isMessages) {
+          const messageCount = readMessageCountField(bodyIn);
+          const existingCacheControlMarkers = countCacheControlMarkers(bodyIn);
+          const decision = classifyRequestWeight({
+            model,
+            method: req.method,
+            path: url.pathname,
+            bodyBytes: bodyIn.byteLength,
+            messageCount,
+            existingCacheControlMarkers,
+          });
+          routingShadow = {
+            ...decision,
+            bodyBytes: bodyIn.byteLength,
+            messageCount,
+            existingCacheControlMarkers,
+          };
+        }
         const modelOk = isMessages
           ? isPxpipeSupportedModel(model)
           : isPxpipeSupportedGptModel(model);

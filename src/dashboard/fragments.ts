@@ -659,7 +659,7 @@ export function renderStatsTableFragment(p: FullStatsPayload): string {
   const totalIn = (s.inputTokensTotal || 0) + (s.cacheCreateTokensTotal || 0) + (s.cacheReadTokensTotal || 0);
   const hitRateTok = totalIn > 0 ? ((s.cacheReadTokensTotal / totalIn) * 100).toFixed(1) + '%' : '-';
   const hitRateEv =
-    s.eventsWithBaseline > 0 ? ((s.cacheHitEvents / s.eventsWithBaseline) * 100).toFixed(1) + '%' : '-';
+    s.eventsWithUsage > 0 ? ((s.cacheHitEvents / s.eventsWithUsage) * 100).toFixed(1) + '%' : '-';
   const charRatio =
     s.origCharsTotal > 0 ? ((s.imageBytesTotal / s.origCharsTotal) * 100).toFixed(3) + 'x' : '-';
 
@@ -670,6 +670,7 @@ export function renderStatsTableFragment(p: FullStatsPayload): string {
     `<table class="dtable"><tbody>` +
     tr('requests', numFmt(s.total)) +
     tr('2xx / 4xx / 5xx', `${numFmt(s.ok2xx)} / ${numFmt(s.err4xx)} / ${numFmt(s.err5xx)}`) +
+    tr('400 / refusal', `${numFmt(s.err400 || 0)} / ${numFmt(s.refusalEvents || 0)}`) +
     tr('compressed', numFmt(s.compressed)) +
     tr('passthrough', numFmt(s.passthrough)) +
     tr('input tokens', numFmt(s.inputTokensTotal)) +
@@ -677,6 +678,11 @@ export function renderStatsTableFragment(p: FullStatsPayload): string {
     tr('cache read', numFmt(s.cacheReadTokensTotal)) +
     tr('cache hit (by tokens)', hitRateTok) +
     tr('cache hit (by events)', hitRateEv) +
+    tr('cache prefixes', `${numFmt(s.cachePrefixUnique || 0)} unique / ${numFmt(s.cachePrefixEvents || 0)} events`) +
+    tr('tier0 dropped', `${numFmt(s.tier0DroppedTotal || 0)} / ${numFmt(s.tier0DroppedEvents || 0)} events`) +
+    tr('omitted chars', numFmt(s.omittedCharsTotal || 0)) +
+    tr('baseline probes', `${numFmt(s.baselineProbeOk || 0)} ok / ${numFmt(s.baselineProbePartial || 0)} partial / ${numFmt(s.baselineProbeFailed || 0)} failed`) +
+    tr('routing shadow', `${numFmt(s.routingShadowHeavy || 0)} heavy / ${numFmt(s.routingShadowLight || 0)} light`) +
     tr('original chars', numFmt(s.origCharsTotal)) +
     tr('image bytes', numFmt(s.imageBytesTotal)) +
     tr('bytes / char', charRatio) +

@@ -94,6 +94,13 @@ describe('ticket-style codes and occurrence counts', () => {
     expect(factSheetText(text)).not.toContain('×');
   });
 
+  it('marks listed values as high-confidence and tells the model to abstain instead of guessing', () => {
+    const sheet = factSheetText('commit 9d121ac on port 47821');
+    expect(sheet).toContain('listed values are high-confidence text');
+    expect(sheet).toContain('say it is not visible');
+    expect(sheet).toContain('do not guess');
+  });
+
   it('never double-counts one span matched by two patterns', () => {
     // 1.2.3 is hit by the version pattern; its 1.2 substring by decimal — offset dedup
     // plus substring-collapse must leave a single un-annotated v1.2.3-style entry.
@@ -138,6 +145,8 @@ describe('factsheet caption honesty (omission marker)', () => {
     expect(sheet).not.toBe('');
     // Must carry an explicit omission signal with a count, not present a closed list.
     expect(sheet).toMatch(/\+\d+ more/);
+    expect(sheet).toContain('it is NOT complete');
+    expect(sheet).toContain('unlisted exact values are unknown');
     // The count must be honest: at least (260 - 192) = 68 omitted.
     const m = sheet.match(/\+(\d+) more/);
     expect(Number(m![1])).toBeGreaterThanOrEqual(68);

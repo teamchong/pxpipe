@@ -21,16 +21,16 @@ contributor sees it as a conscious, scoped exception, not a relitigation.
 
 ---
 
-## 1. Status: additive, not wired into the live path
+## 1. Status: additive, shadow-only in the live path
 
 `classifyRequestWeight` is a pure, read-only function. Like
-`shouldTransformAnthropicMessages` in the same file, it is **not called from
-`src/core/proxy.ts`** — the proxy still does its own inline
-model/path/method check (proxy.ts ~L758) and always runs the same
-unconditional full-compression transform for anything that passes it. Wiring
-this classifier into the live request path is a separate change, owned by
-whichever task touches `proxy.ts`/`transform.ts`. Nothing in this file changes
-existing behavior; every existing test still passes unmodified.
+`shouldTransformAnthropicMessages` in the same file, it is not allowed to make
+the live routing decision yet. `src/core/proxy.ts` calls it only when
+`PXPIPE_ROUTING_SHADOW=1`, then persists the result as
+`routing_shadow_*` telemetry in JSONL. The proxy still runs the same
+transform/upstream path it would have run with the flag off. Turning the
+classifier into an actual router is a separate, flag-gated change and must be
+justified by telemetry first.
 
 ---
 
@@ -158,8 +158,8 @@ classifyRequestWeight({ bodyBytes: 3_000, messageCount: 6, existingCacheControlM
   `minToolResultChars`, `isCompressionProfitable`, and friends in
   `transform.ts` are unchanged and still the mechanism that decides whether an
   individual block gets imaged once a request is in the `heavy` pipeline.
-- **Not wired into `proxy.ts` yet** (see §1) — this doc and its tests describe
-  the classifier in isolation; live routing behavior is unchanged until a
-  follow-up task calls it from the request path.
+- **Not a live router yet** (see §1) — it is wired only as opt-in shadow
+  telemetry. Live routing behavior is unchanged until a follow-up task uses
+  the recorded data to justify a guarded behavior flag.
 - **Not based on `TransformInfo` output fields** (see §3) — deliberately, since
   those don't exist until after the decision this function makes.

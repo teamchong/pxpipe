@@ -14,6 +14,7 @@ import {
   ROLE_PALETTE,
   CELL_H,
   CELL_W,
+  MAX_HEIGHT_PX,
 } from '../src/core/render.js';
 import { encodeGrayPng, bytesToBase64 } from '../src/core/png.js';
 import {
@@ -121,7 +122,7 @@ describe('renderer', () => {
     expect(img.png.slice(0, 8)).toEqual(
       new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
     );
-    expect(img.height).toBeLessThanOrEqual(1932);
+    expect(img.height).toBeLessThanOrEqual(MAX_HEIGHT_PX);
     expect(img.width).toBeGreaterThan(0);
   });
 
@@ -129,7 +130,7 @@ describe('renderer', () => {
     const huge = ('lorem ipsum dolor sit amet '.repeat(20) + '\n').repeat(500);
     const imgs = await renderTextToPngs(huge);
     expect(imgs.length).toBeGreaterThan(1);
-    for (const img of imgs) expect(img.height).toBeLessThanOrEqual(1932);
+    for (const img of imgs) expect(img.height).toBeLessThanOrEqual(MAX_HEIGHT_PX);
   });
 
   // ---- R2 multi-column renderer ------------------------------------------
@@ -162,8 +163,8 @@ describe('renderer', () => {
   });
 
   it('multi-col halves image count on row-heavy input', async () => {
-    // ~500 lines of narrow content. Single-col packs 240 lines/image →
-    // ~3 images. Two columns should drop that to ~2.
+    // ~500 lines of narrow content. Single-col packs 90 lines/image →
+    // ~6 images. Two columns should drop that to ~3.
     const text = ('lorem ipsum dolor sit amet\n'.repeat(500));
     const single = await renderTextToPngs(text, 100);
     const two = await renderTextToPngsMultiCol(text, 100, 2);
@@ -171,7 +172,7 @@ describe('renderer', () => {
     // Two-col image count ≤ ceil(single / 2). The +1 slack handles the
     // pathological case where the boundary lands awkwardly.
     expect(two.length).toBeLessThanOrEqual(Math.ceil(single.length / 2));
-    for (const img of two) expect(img.height).toBeLessThanOrEqual(1932);
+    for (const img of two) expect(img.height).toBeLessThanOrEqual(MAX_HEIGHT_PX);
   });
 
   it('multi-col render is deterministic (byte-identical across calls)', async () => {

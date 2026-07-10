@@ -13,6 +13,16 @@ import { spawnSync } from 'node:child_process';
 // value is fixed at build time instead.
 const pkg = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
 
+function gitValue(args, fallback = 'unknown') {
+  const r = spawnSync('git', args, { encoding: 'utf8' });
+  if (r.status !== 0) return fallback;
+  return (r.stdout ?? '').trim() || fallback;
+}
+
+const gitSha = gitValue(['rev-parse', 'HEAD']);
+const gitRef = gitValue(['branch', '--show-current']);
+const buildTime = new Date().toISOString();
+
 const OUT = 'dist';
 if (existsSync(OUT)) await rm(OUT, { recursive: true, force: true });
 await mkdir(OUT, { recursive: true });
@@ -37,7 +47,12 @@ await build({
   // Inline the package version so `pxpipe --version` is correct for global/npx
   // installs (see the note where `pkg` is read). esbuild replaces the bare
   // identifier with the string literal at every reference.
-  define: { __PXPIPE_VERSION__: JSON.stringify(pkg.version) },
+  define: {
+    __PXPIPE_VERSION__: JSON.stringify(pkg.version),
+    __PXPIPE_GIT_SHA__: JSON.stringify(gitSha),
+    __PXPIPE_GIT_REF__: JSON.stringify(gitRef),
+    __PXPIPE_BUILD_TIME__: JSON.stringify(buildTime),
+  },
   // Atlas is inlined as a base64 string in src/core/atlas.ts, so no external assets.
   external: [],
   banner: { js: '#!/usr/bin/env node' },

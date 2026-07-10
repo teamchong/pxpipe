@@ -7,8 +7,12 @@
 import type { ProxyEvent } from './proxy.js';
 import { bytesToBase64 } from './png.js';
 
+/** Current persisted event schema. Adding fields is non-breaking for readers. */
+export const TRACK_EVENT_SCHEMA_VERSION = 1;
+
 /** Flat record persisted per request. Adding a field is non-breaking for readers. */
 export interface TrackEvent {
+  schema_version?: number;
   ts: string;
   method: string;
   path: string;
@@ -152,6 +156,14 @@ export interface TrackEvent {
    *  Absent when the probe failed or wasn't sampled. */
   probe_post_tokens?: number;
 
+  /** C9/C10 shadow-only request-weight classifier. Present only when
+   *  PXPIPE_ROUTING_SHADOW=1; live routing/compression is unchanged. */
+  routing_shadow_tier?: 'heavy' | 'light';
+  routing_shadow_reason?: string;
+  routing_shadow_body_bytes?: number;
+  routing_shadow_message_count?: number;
+  routing_shadow_cache_control_markers?: number;
+
   // Errors:
   error?: string;
   /** First ~2 KiB of the upstream 4xx response body. */
@@ -180,6 +192,7 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
   const env = info?.env;
   const u = ev.usage;
   const out: TrackEvent = {
+    schema_version: TRACK_EVENT_SCHEMA_VERSION,
     ts: new Date().toISOString(),
     method: ev.method,
     path: ev.path,
@@ -335,6 +348,15 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
   if (ev.probe) {
     out.probe_sampled = true;
     if (typeof ev.probe.postTokens === 'number') out.probe_post_tokens = ev.probe.postTokens;
+  }
+  if (ev.routingShadow) {
+    out.routing_shadow_tier = ev.routingShadow.tier;
+    out.routing_shadow_reason = ev.routingShadow.reason;
+    out.routing_shadow_body_bytes = ev.routingShadow.bodyBytes;
+    if (ev.routingShadow.messageCount !== undefined) {
+      out.routing_shadow_message_count = ev.routingShadow.messageCount;
+    }
+    out.routing_shadow_cache_control_markers = ev.routingShadow.existingCacheControlMarkers;
   }
   return out;
 }

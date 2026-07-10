@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { newSummary, fold, renderTextReport } from '../src/stats.js';
+import { newSummary, fold, renderTextReport, summaryToJson } from '../src/stats.js';
 import type { TrackEvent } from '../src/core/tracker.js';
 
 function ev(partial: Partial<TrackEvent>): TrackEvent {
@@ -103,6 +103,56 @@ describe('stats aggregator', () => {
     fold(s, ev({}));
     expect(s.unknownTags.get('recent_files')).toBe(2);
     expect(s.unknownTags.get('todo_list')).toBe(1);
+  });
+
+  it('aggregates rollout telemetry counters', () => {
+    const s = newSummary();
+    fold(
+      s,
+      ev({
+        schema_version: 1,
+        status: 400,
+        stop_reason: 'refusal',
+        safety_flagged: true,
+        tier0_dropped_total: 7,
+        omitted_chars: 123,
+        baseline_probe_status: 'partial',
+        cache_prefix_sha8: 'abc12345',
+        routing_shadow_tier: 'light',
+        routing_shadow_reason: 'stable_prefix_established',
+      }),
+    );
+    fold(
+      s,
+      ev({
+        schema_version: 1,
+        status: 200,
+        baseline_probe_status: 'ok',
+        cache_prefix_sha8: 'abc12345',
+        routing_shadow_tier: 'heavy',
+        routing_shadow_reason: 'large_body',
+      }),
+    );
+    fold(s, ev({ status: 200, baseline_probe_status: 'failed', cache_prefix_sha8: 'def67890' }));
+
+    expect(s.err400).toBe(1);
+    expect(s.refusalEvents).toBe(1);
+    expect(s.safetyFlaggedEvents).toBe(1);
+    expect(s.tier0DroppedTotal).toBe(7);
+    expect(s.tier0DroppedEvents).toBe(1);
+    expect(s.omittedCharsTotal).toBe(123);
+    expect(s.baselineProbeOk).toBe(1);
+    expect(s.baselineProbePartial).toBe(1);
+    expect(s.baselineProbeFailed).toBe(1);
+    expect(s.cachePrefixEvents).toBe(3);
+    expect(s.cachePrefixShaHist.size).toBe(2);
+    expect(s.routingShadowLight).toBe(1);
+    expect(s.routingShadowHeavy).toBe(1);
+    expect(s.routingShadowReasons.get('stable_prefix_established')).toBe(1);
+
+    const json = summaryToJson(s);
+    expect(json.cachePrefixUnique).toBe(2);
+    expect(json.routingShadowLight).toBe(1);
   });
 
   it('renders a non-empty text report for a populated summary', () => {

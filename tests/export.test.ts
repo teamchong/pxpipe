@@ -500,9 +500,11 @@ describe('runExportCore integration', () => {
 // ---------------------------------------------------------------------------
 
 describe('exportImageTokens model routing', () => {
-  // Dense export page: width = 2*4 + 384*5 = 1928 px, height = MAX_HEIGHT_PX = 1932 px
-  const W = 1928;
-  const H = 1932;
+  // Deliberately large cross-provider fixture. Current pxpipe pages are
+  // 1568x728; this larger arbitrary image keeps the GPT-vs-Claude formula
+  // split obvious without pretending it is production geometry.
+  const W = 4096;
+  const H = 4096;
 
   it('returns Anthropic-formula tokens for claude-sonnet-4-5', () => {
     // Anthropic formula: ceil(W*H/750 * 1.10)
@@ -522,11 +524,11 @@ describe('exportImageTokens model routing', () => {
   });
 
   it('returns GPT (OpenAI tile) tokens for gpt-4o', () => {
-    // OpenAI tile formula is much cheaper for this image size (~765 vs ~5464)
+    // OpenAI tile formula is much cheaper for this image size.
     const gpTokens = exportImageTokens('gpt-4o', W, H);
     const claudeTokens = exportImageTokens('claude-sonnet-4-5', W, H);
-    // GPT-4o tile formula for 1928x1932 px: scaled to 768x769, 2x2 tiles
-    // = 85 + 170*4 = 765 tokens — far less than Anthropic's ~5464
+    // GPT-4o tile formula: scaled to 768x768, 2x2 tiles
+    // = 85 + 170*4 = 765 tokens — far less than Anthropic's area formula.
     expect(gpTokens).toBeLessThan(claudeTokens);
     expect(gpTokens).toBeGreaterThan(0);
   });

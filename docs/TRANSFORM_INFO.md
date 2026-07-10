@@ -263,7 +263,7 @@ NOT compressed:
 
 ```
 text_tokens_we_removed = origChars / 4              # ~4 chars per token, rough
-image_tokens_we_added  = imageCount * 4761          # dense 1928×1928 ≈ 4761 tokens (slab ~2684)
+image_tokens_we_added  = Σ ceil(width*height/750*1.10) # full 1568×728 page ≈ 1675 tokens
 extra_text_baseline    = max(0, text_tokens_we_removed - image_tokens_we_added)
 
 # cache_create dominates the first turn; bias the baseline toward 1.25 in

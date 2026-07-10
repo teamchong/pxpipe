@@ -248,11 +248,11 @@ export function extractFactSheetEntriesAllPages(
 }
 
 const OPEN =
-  '[Exact identifiers from the rendered context above (paths, ids, versions, numbers) — quote these verbatim instead of transcribing them from the image: ';
+  '[Exact identifiers from the rendered context above (paths, ids, versions, numbers) — quote these verbatim instead of transcribing them from the image: listed values are high-confidence text; if an exact value is not listed and not clearly readable in the image, say it is not visible; do not guess: ';
 /** Variant used when at least one token repeats — explains the ×N annotation so the
  *  model can answer tally questions from the sheet instead of counting glyph rows. */
 const OPEN_COUNTS =
-  '[Exact identifiers from the rendered context above (paths, ids, versions, numbers) — quote these verbatim instead of transcribing them from the image; ×N marks a token that occurs N times within the imaged content: ';
+  '[Exact identifiers from the rendered context above (paths, ids, versions, numbers) — quote these verbatim instead of transcribing them from the image; ×N marks a token that occurs N times within the imaged content: listed values are high-confidence text; if an exact value is not listed and not clearly readable in the image, say it is not visible; do not guess: ';
 
 /** Build the one-line fact-sheet string from a pre-extracted token list. */
 export function factSheetTextFromTokens(tokens: string[]): string {
@@ -272,7 +272,7 @@ export function factSheetTextFromEntries(entries: readonly FactSheetEntry[], dro
   const anyRepeat = entries.some((e) => e.count >= 2);
   const body = entries.map((e) => (e.count >= 2 ? `${e.token} ×${e.count}` : e.token)).join(' · ');
   const omission = dropped > 0
-    ? ` … (+${dropped} more identifiers omitted from this list — it is NOT complete; do not guess any identifier not shown here)`
+    ? ` … (+${dropped} more identifiers omitted from this list — it is NOT complete; unlisted exact values are unknown unless clearly readable in the image; do not guess any identifier not shown here)`
     : '';
   return (anyRepeat ? OPEN_COUNTS : OPEN) + body + omission + ']';
 }

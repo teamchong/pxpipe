@@ -133,6 +133,72 @@ describe('proxy usage extraction', () => {
     ).toBe(true);
   });
 
+  it('records C9/C10 routing shadow telemetry only when explicitly enabled', async () => {
+    const prev = process.env.PXPIPE_ROUTING_SHADOW;
+    process.env.PXPIPE_ROUTING_SHADOW = '1';
+    const restore = mockUpstream(async (req) => {
+      const url = new URL(req.url);
+      if (url.pathname.endsWith('/count_tokens')) {
+        return new Response(JSON.stringify({ input_tokens: 10 }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response(
+        JSON.stringify({
+          id: 'msg_1',
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'text', text: 'hello' }],
+          usage: { input_tokens: 10, output_tokens: 2, cache_read_input_tokens: 0 },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    });
+
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      upstream: 'http://mock',
+      transform: {},
+      onRequest: (e) => {
+        captured = e;
+      },
+    });
+
+    try {
+      const reqBody = JSON.stringify({
+        model: 'claude-fable-5',
+        max_tokens: 1,
+        system: [{ type: 'text', text: 'short', cache_control: { type: 'ephemeral' } }],
+        messages: [
+          { role: 'user', content: 'hi' },
+          { role: 'assistant', content: 'ok' },
+        ],
+      });
+      const res = await proxy(
+        new Request('http://localhost/v1/messages', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-api-key': 'sk-test' },
+          body: reqBody,
+        }),
+      );
+      await res.text();
+      await new Promise((r) => setTimeout(r, 20));
+    } finally {
+      restore();
+      if (prev === undefined) delete process.env.PXPIPE_ROUTING_SHADOW;
+      else process.env.PXPIPE_ROUTING_SHADOW = prev;
+    }
+
+    expect(captured?.status).toBe(200);
+    expect(captured?.routingShadow).toMatchObject({
+      tier: 'light',
+      reason: 'stable_prefix_established',
+      messageCount: 2,
+      existingCacheControlMarkers: 1,
+    });
+  });
+
   it('routes GPT 5.6 chat completions to OpenAI, transforms once, and normalizes usage', async () => {
     const upstreamRequests: Request[] = [];
     const restore = mockUpstream(async (req) => {

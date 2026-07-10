@@ -28,6 +28,7 @@ import {
   DENSE_CONTENT_CHARS_PER_IMAGE,
   DENSE_CONTENT_COLS,
   DENSE_RENDER_STYLE,
+  MAX_HEIGHT_PX,
   READABLE_CHARS_PER_IMAGE,
   renderTextToPngsWithCharLimit,
 } from '../src/core/render.js';
@@ -115,7 +116,7 @@ describe('dense readable render profile', () => {
     );
     for (const img of imgs) {
       expect(img.width).toBeLessThanOrEqual(2000);
-      expect(img.height).toBeLessThanOrEqual(1932);
+      expect(img.height).toBeLessThanOrEqual(MAX_HEIGHT_PX);
     }
   });
 });

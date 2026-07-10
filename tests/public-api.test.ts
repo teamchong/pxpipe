@@ -281,6 +281,38 @@ describe('public library API', () => {
     expect(transformed.cache.markerCount).toBe(0);
   });
 
+  it('preserves the exact Claude Code OAuth identity as the first system block', async () => {
+    const identity = "You are Claude Code, Anthropic's official CLI for Claude.";
+    const body = enc.encode(JSON.stringify({
+      model: 'claude-fable-5',
+      system: [
+        { type: 'text', text: identity },
+        {
+          type: 'text',
+          text: 'Detailed Claude Code operating instructions. '.repeat(1200),
+          cache_control: { type: 'ephemeral' },
+        },
+      ],
+      tools: [{
+        name: 'read_file',
+        description: 'Read a file from disk. '.repeat(200),
+        input_schema: { type: 'object', properties: { path: { type: 'string' } } },
+      }],
+      messages: [{ role: 'user', content: 'hello' }],
+    }));
+
+    const transformed = await transformAnthropicMessages({ body, model: 'claude-fable-5' });
+    expect(transformed.applied).toBe(true);
+    expect(transformed.info.imageCount).toBeGreaterThan(0);
+
+    const out = JSON.parse(dec.decode(transformed.body)) as {
+      system?: Array<{ type: string; text?: string; cache_control?: unknown }>;
+    };
+    expect(out.system?.[0]).toEqual({ type: 'text', text: identity });
+    expect(out.system?.[0]?.cache_control).toBeUndefined();
+    expect(transformed.info.imageSourceText).not.toContain(identity);
+  });
+
   it('transforms GPT 5.5 chat completions using OpenAI image_url blocks', async () => {
     const body = enc.encode(JSON.stringify({
       model: 'gpt-5.5',

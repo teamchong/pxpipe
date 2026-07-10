@@ -151,6 +151,14 @@ const DEFAULTS: Required<TransformOptions> = {
   gptHistory: {},
 };
 
+/**
+ * Subscription OAuth requests are classified as Claude Code traffic only when
+ * this exact identity remains the first, separate top-level system block.
+ * Never render it into an image or concatenate other text into its block.
+ */
+export const CLAUDE_CODE_OAUTH_IDENTITY =
+  "You are Claude Code, Anthropic's official CLI for Claude.";
+
 // --- per-block break-even check ---
 //
 // Image token cost is computed from pixel area (Anthropic formula: w×h/750,
@@ -1492,13 +1500,13 @@ export async function transformRequest(
   // Pull the volatile `# Environment` markdown section out BEFORE the
   // static/dynamic split so per-session git state never reaches the slab image.
   const { kept: envMarkdown, body: sysBody } = stripMarkdownEnvSection(sysBodyWithEnv);
-  const {
-    staticText,
-    dynamicText,
-    blockCount: dynBlocks,
-    unknownTags,
-    staticTagContents,
-  } = splitStaticDynamic(sysBody);
+  const splitSystem = splitStaticDynamic(sysBody);
+  let staticText = splitSystem.staticText;
+  const { dynamicText, blockCount: dynBlocks, unknownTags, staticTagContents } = splitSystem;
+  const preserveClaudeCodeIdentity = staticText.startsWith(CLAUDE_CODE_OAUTH_IDENTITY);
+  if (preserveClaudeCodeIdentity) {
+    staticText = staticText.slice(CLAUDE_CODE_OAUTH_IDENTITY.length).replace(/^\s+/, '');
+  }
   info.staticChars = staticText.length;
   info.dynamicChars = dynamicText.length + envMarkdown.length;
   info.dynamicBlockCount = dynBlocks;
@@ -1749,6 +1757,9 @@ export async function transformRequest(
   // Images go into first user message — system field rejects images (400 system.N.type).
   {
     const sysTail: SystemField = [];
+    if (preserveClaudeCodeIdentity) {
+      sysTail.push({ type: 'text', text: CLAUDE_CODE_OAUTH_IDENTITY });
+    }
     // billingLine is session-stable (warm reads through the anchored prefix
     // confirm it; a per-turn value here would zero every cache read).
     if (billingLine) sysTail.push({ type: 'text', text: billingLine });

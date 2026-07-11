@@ -32,9 +32,10 @@ import {
   DENSE_CONTENT_CHARS_PER_IMAGE,
   DENSE_CONTENT_COLS,
   DENSE_RENDER_STYLE,
+  ANTHROPIC_SLAB_COLS,
   renderTextToPngsWithCharLimit,
 } from './render.js';
-import { factSheetText } from './factsheet.js';
+import { appendIdsBlock, factSheetText } from './factsheet.js';
 import { extractExactTokens, hasSecret, redactSecrets } from './exact-token-extractor.js';
 import { stripSchemaDescriptions, schemaHasStructure } from './schema-strip.js';
 import { bytesToBase64 } from './png.js';
@@ -152,8 +153,8 @@ const DEFAULTS: Required<TransformOptions> = {
   minToolResultChars: 6000,
   // system field rejects images (400 system.N.type: Input should be 'text') —
   // images always go into the first user message.
-  // 313 cols × 5 px + 8 px pad = 1573 px slab width (under 2000 px ceiling).
-  cols: 313,
+  // 312 cols × 5 px + 8 px pad = 1568 px (Anthropic no-resize edge).
+  cols: ANTHROPIC_SLAB_COLS,
   maxImagesPerToolResult: 10,
   charsPerToken: 4,
   historyAmortizationHorizon: 1,
@@ -701,6 +702,12 @@ const DYNAMIC_BLOCK_TAGS = [
 const KNOWN_STATIC_TAGS = [
   // Claude Code
   'types',
+  // Nested under <available_skills> (static for a session; churn still observed)
+  'skill',
+  'name',
+  'description',
+  'location',
+  'available_references',
   // opencode (codex system prompts have no tag-shaped blocks)
   'example',
   'available_skills',
@@ -1100,19 +1107,23 @@ function lineRows(line: string, cols: number): number {
   return Math.max(1, Math.ceil(line.length / cols));
 }
 
-/** Visual row count after soft-wrap at `cols`. Both `\n` and the ↵ sentinel
- *  end a row; ↵ occupies a cell on the line it terminates. */
-function countVisualRows(text: string, cols: number): number {
+/** Visual row count after soft-wrap at `cols`.
+ *
+ *  Only hard `\n` starts a new row. The reflow ↵ sentinel is an inline glyph
+ *  (see wrapLines in render.ts: "never forces a row break"), so packing many
+ *  original newlines into one soft-wrapped stream must NOT inflate the row
+ *  count. Treating ↵ as a break overstated image pages ~6× on reflowed
+ *  history and flipped profitable collapses to not_profitable. */
+export function countVisualRows(text: string, cols: number): number {
   let rows = 0;
   let lineStart = 0;
   const len = text.length;
   for (let i = 0; i <= len; i++) {
     const cc = i < len ? text.charCodeAt(i) : -1;
-    const isSentinel = cc === 0x21b5 /* ↵ */;
-    if (i === len || cc === 10 /* \n */ || isSentinel) {
-      // ↵ renders as a glyph on the line it ends — count it in the length.
-      const lineLen = (isSentinel ? i + 1 : i) - lineStart;
-      rows += Math.max(1, Math.ceil(lineLen / cols));
+    if (i === len || cc === 10 /* \n */) {
+      const lineLen = i - lineStart;
+      // Empty line (consecutive \n) still costs one visual row.
+      rows += lineLen === 0 ? 1 : Math.ceil(lineLen / Math.max(1, cols));
       lineStart = i + 1;
     }
   }
@@ -1131,10 +1142,12 @@ export function estimateImageCount(
   cols: number,
   numCols: number = 1,
   maxCharsPerImage: number = READABLE_CHARS_PER_IMAGE,
+  maxLinesPerColumn: number = LINES_PER_IMAGE,
 ): number {
   const n = Math.max(1, numCols | 0);
   const readableLinesPerCol = Math.max(1, Math.floor(maxCharsPerImage / Math.max(1, cols)));
-  const linesPerImage = Math.min(LINES_PER_IMAGE, readableLinesPerCol) * n;
+  const hardLinesPerCol = Math.max(1, Math.floor(maxLinesPerColumn));
+  const linesPerImage = Math.min(hardLinesPerCol, readableLinesPerCol) * n;
   const charBudget = Math.max(1, maxCharsPerImage * n);
   if (typeof textOrLen === 'number') {
     // Back-compat shim — numeric arg gets the looser chars-based estimate.
@@ -1352,15 +1365,17 @@ export async function textToImageBlocks(
 }> {
   // Shrink before the numCols branch so gate and renderer see the same canvas width.
   // If shrinkage drops below the full width, stay single-col (avoid wasting a divider column).
-  const effectiveCols = shrinkWidth ? shrinkColsToContent(text, cols) : cols;
+  // IDS block: isolate precision tokens on their own rows (universal pure-image hex aid).
+  const renderText = appendIdsBlock(text);
+  const effectiveCols = shrinkWidth ? shrinkColsToContent(renderText, cols) : cols;
   const effectiveNumCols = effectiveCols < cols ? 1 : numCols;
   const imgs =
     effectiveNumCols > 1
-      ? await renderTextToPngsMultiCol(text, effectiveCols, effectiveNumCols)
+      ? await renderTextToPngsMultiCol(renderText, effectiveCols, effectiveNumCols)
       // Single-col dense: shrink the 384-col base to content so the renderer matches the
       // gate (denseGateGeometry uses DENSE_CONTENT_COLS, priced via shrinkColsToContent).
       // Was hard-coded to DENSE_CONTENT_COLS, which threw away the shrink the gate assumed.
-      : await renderTextToPngsWithCharLimit(text, shrinkColsToContent(text, DENSE_CONTENT_COLS), DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_RENDER_STYLE);
+      : await renderTextToPngsWithCharLimit(renderText, shrinkColsToContent(renderText, DENSE_CONTENT_COLS), DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_RENDER_STYLE);
   let droppedChars = 0;
   let pixels = 0;
   const droppedCodepoints = new Map<number, number>();
@@ -1720,7 +1735,8 @@ export async function transformRequest(
     columnNoteImg +
     reflowNoteImg +
     '\n====================== BEGIN RENDERED CONTEXT ======================\n';
-  const combinedWithHeader = imageInstructionHeader + combined;
+  // IDS block on the imaged slab (same pure-image isolation as Grok/GPT).
+  const combinedWithHeader = appendIdsBlock(imageInstructionHeader + combined);
   // Shrink the canvas to the longest actual line in what we'll *render*,
   // so the gate's prediction and the renderer's output agree at the smallest
   // legible width. The banner above sets the natural floor — no separate

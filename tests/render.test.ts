@@ -12,6 +12,8 @@ import {
   SLOT_MARK_USER,
   SLOT_MARK_ASSISTANT,
   ROLE_PALETTE,
+  renderCellHeight,
+  renderCellWidth,
   CELL_H,
   CELL_W,
 } from '../src/core/render.js';
@@ -41,6 +43,31 @@ import {
   BELOW_MIN_CHARS_BORDERLINE,
   synthesizeText,
 } from './fixtures/real-shapes.js';
+
+describe('model-selectable font atlases', () => {
+  it('uses the JetBrains Mono 10 cell geometry without changing the default atlas', async () => {
+    expect(renderCellWidth({ aa: true })).toBe(5);
+    expect(renderCellHeight({ aa: true })).toBe(8);
+    expect(renderCellWidth({ font: 'jetbrains-mono-10', aa: true })).toBe(6);
+    expect(renderCellHeight({ font: 'jetbrains-mono-10', aa: true })).toBe(11);
+
+    const text = 'tokenLedgerShard a3f9c1e0b7d2';
+    const defaultImg = await renderChunkToPng(text, 40, { aa: true });
+    const solImg = await renderChunkToPng(text, 40, { font: 'jetbrains-mono-10', aa: true });
+    expect(defaultImg.width).toBe(208);
+    expect(solImg.width).toBe(248);
+    expect(solImg.height).toBeGreaterThan(defaultImg.height);
+    expect(Buffer.from(solImg.png)).not.toEqual(Buffer.from(defaultImg.png));
+  });
+
+  it('falls back to the full Spleen/Unifont atlas for Unicode outside the compact Sol atlas', async () => {
+    const img = await renderChunkToPng('한글 test', 20, {
+      font: 'jetbrains-mono-10',
+      aa: true,
+    });
+    expect(img.droppedChars).toBe(0);
+  });
+});
 
 describe('compactSlabWhitespace', () => {
   it('returns empty string unchanged', () => {
@@ -1518,6 +1545,30 @@ describe('transform', () => {
     );
     const { info } = await transformRequest(body);
     // <types> is known-static; it should NOT show up as an unknown tag.
+    expect(info.unknownStaticTags).toBeUndefined();
+  });
+
+  it('does not flag nested skill-catalogue tags (name/description/location/skill)', async () => {
+    // Nested under <available_skills>; static for a session, churn still observed.
+    const sys =
+      'claude.md\n'.repeat(400) +
+      '<available_skills>\n' +
+      '<skill>\n' +
+      '<name>demo-skill</name>\n' +
+      '<description>Do the demo thing</description>\n' +
+      '<location>~/.claude/skills/demo/SKILL.md</location>\n' +
+      '</skill>\n' +
+      '</available_skills>\n' +
+      '<available_references>\nref-a\n</available_references>\n' +
+      '<env>\nWorking directory: /tmp\n</env>';
+    const body = new TextEncoder().encode(
+      JSON.stringify({
+        model: 'claude',
+        messages: [{ role: 'user', content: 'hi' }],
+        system: sys,
+      }),
+    );
+    const { info } = await transformRequest(body);
     expect(info.unknownStaticTags).toBeUndefined();
   });
 

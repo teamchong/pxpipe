@@ -21,8 +21,17 @@
  * HistoryTurn list and the planner/renderer are shared.
  */
 
-import { renderTextToPngs, reflow, neutralizeSentinel, type RenderedImage } from './render.js';
-import { GPT_MAX_HEIGHT_PX } from './gpt-model-profiles.js';
+import {
+  renderTextToPngs,
+  reflow,
+
+  neutralizeSentinel,
+  type RenderedImage,
+  type RenderStyle,
+} from './render.js';
+import { appendIdsBlock } from './factsheet.js';
+
+import { DEFAULT_GPT_PROFILE, GPT_MAX_HEIGHT_PX } from './gpt-model-profiles.js';
 import { countTokens as o200kCountTokens } from 'gpt-tokenizer/encoding/o200k_base';
 
 /** Portrait-strip width for GPT history images. Mirrors GPT_STRIP_COLS in
@@ -80,6 +89,8 @@ export interface GptHistoryOptions {
   /** Max rendered image height in px (per-model; from the GPT profile). Threaded
    *  into renderTextToPngs so history pages split at the same height the gate prices. */
   maxHeightPx: number;
+  /** Glyph density from the model profile. Empty = production 5x8. */
+  style: RenderStyle;
   /** Hard cap on GPT history image count. This is a TRUE cap, not a threshold:
    *  collapse the oldest completed sections until the next section would exceed
    *  the cap, then leave the remaining history as ordinary text. Prevents 80+
@@ -92,6 +103,8 @@ export interface GptHistoryOptions {
    *  The returned `text` (o200k baseline + cache byte-stability) stays the
    *  ORIGINAL, un-reflowed transcript. */
   reflow: boolean;
+  /** Append IDS block for pure-image exact recall (isolated ID rows). Default on. */
+  idsBlock: boolean;
 }
 
 export const GPT_HISTORY_DEFAULTS: GptHistoryOptions = {
@@ -105,8 +118,10 @@ export const GPT_HISTORY_DEFAULTS: GptHistoryOptions = {
   // GPT path: OpenAI's resize bounds (2048-bbox / 768 short side) permit the tall
   // strip — do NOT re-link to render.ts MAX_HEIGHT_PX (Anthropic's 1568/1.15 MP clamp).
   maxHeightPx: GPT_MAX_HEIGHT_PX,
+  style: DEFAULT_GPT_PROFILE.style,
   maxImages: GPT_HISTORY_MAX_IMAGES,
   reflow: true,
+  idsBlock: true,
 };
 
 /** One conversation item lowered to a renderable unit. */
@@ -298,7 +313,8 @@ export async function planGptCollapse(
   // show no ↵). `text` itself stays original — it backs the o200k baseline and
   // the chunk-snapped cache byte-stability, so it must not change shape here.
   const safeText = neutralizeSentinel(text);
-  const renderText = o.reflow ? reflow(safeText) ?? safeText : text;
+  let renderText = o.reflow ? reflow(safeText) ?? safeText : text;
+  if (o.idsBlock) renderText = appendIdsBlock(renderText);
   if (!isProfitable(renderText, o.cols)) {
     return { ...base, reason: 'not_profitable', collapsedChars: text.length };
   }
@@ -376,11 +392,12 @@ export async function planGptCollapse(
     const sectionText = joinTurns(turns, s, e, -1);
     if (!sectionText || sectionText.length === 0) continue;
     const safeSection = neutralizeSentinel(sectionText);
-    const sectionRender = o.reflow ? reflow(safeSection) ?? safeSection : sectionText;
+    let sectionRender = o.reflow ? reflow(safeSection) ?? safeSection : sectionText;
+    if (o.idsBlock) sectionRender = appendIdsBlock(sectionRender);
     // Readable portrait strips (≤768px wide) — legible to OpenAI vision, same as
     // the static slab. renderTextToPngs caps each PNG at MAX_HEIGHT_PX so a tall
     // section pages into N images, all still well under the 10,000-patch budget.
-    const sectionImgs = await renderTextToPngs(sectionRender, o.cols, {}, o.maxHeightPx);
+    const sectionImgs = await renderTextToPngs(sectionRender, o.cols, o.style ?? {}, o.maxHeightPx);
     if (imgCount + sectionImgs.length > maxImages) {
       // TRUE cap: keep the sections already selected, leave this and every later
       // section (and the pin, if not yet reached) as normal text in the remainder.

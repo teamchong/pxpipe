@@ -531,6 +531,13 @@ describe('exportImageTokens model routing', () => {
     expect(gpTokens).toBeGreaterThan(0);
   });
 
+  it('uses measured Grok pixel pricing instead of the GPT fallback', () => {
+    expect(exportImageTokens('grok-4.5', 768, 360)).toBe(Math.ceil((768 * 360) / 1000));
+    expect(exportImageTokens('grok-4.5', 768, 360)).not.toBe(
+      exportImageTokens('gpt-4o', 768, 360),
+    );
+  });
+
   it('Claude image tokens are substantially higher than GPT for the same full-page image', () => {
     // The issue was a ~7x underestimate when using GPT formula for Claude.
     // Verify the ratio is at least 5x so the fix is clearly meaningful.
@@ -626,7 +633,7 @@ describe('factsheet dropped count surfacing', () => {
     expect(tr.factsheetItemCount + tr.factsheetDropped).toBeGreaterThanOrEqual(tr.factsheetItemCount);
   });
 
-  it('extractFactSheetTokensAllPages reports dropped > 0 when unique identifiers across pages exceed 64', () => {
+  it('extractFactSheetTokensAllPages reports dropped > 0 when unique identifiers across pages exceed the factsheet budget', () => {
     // Place 60 unique paths on "page 1" and 60 different unique paths on "page 2".
     // Each page is < 92,160 chars so extractFactSheetTokens won't hit MAX_SCAN.
     // Each page contributes up to 64 tokens; cross-page merge gives >64 → some dropped.
@@ -641,8 +648,8 @@ describe('factsheet dropped count surfacing', () => {
     const fullText = page1 + pad1 + page2;
 
     const { kept, dropped } = extractFactSheetTokensAllPages(fullText, DENSE_CONTENT_CHARS_PER_IMAGE);
-    // At most 64 kept; with 60 from page 1 + some from page 2 the total should exceed 64
-    expect(kept.length).toBeLessThanOrEqual(64);
+    // At most MAX_TOKENS kept; with many from page 1 + some from page 2 the total should exceed the factsheet budget
+    expect(kept.length).toBeLessThanOrEqual(96);
     expect(dropped).toBeGreaterThan(0);
   });
 });

@@ -24,13 +24,19 @@ function baseModelId(model: string): string {
 /** Dashboard runtime override; null = fall back to PXPIPE_MODELS env / built-in default. In-memory only. */
 let runtimeModelBases: readonly string[] | null = null;
 
-/** Built-in default scope when PXPIPE_MODELS is unset: Fable 5 (Claude) plus
- *  GPT 5.6. GPT 5.5 and Opus 4.8 are intentionally off — same pipeline but
- *  measurably worse at reading imaged content (FINDINGS.md 2026-06-16: Opus 4.8
- *  ~2pp arithmetic, 6/15 dense-hex recall vs Fable's 100/100; GPT 5.5 likewise
- *  degrades on imaged history/context) — so silently imaging them is the wrong
- *  default. Both stay opt-in via the dashboard chips or PXPIPE_MODELS. */
-const DEFAULT_MODEL_BASES = ['claude-fable-5', 'gpt-5.6'];
+/** Built-in default scope when PXPIPE_MODELS is unset: Fable 5 only.
+ *  Everything else is opt-in via dashboard chips or PXPIPE_MODELS:
+ *  - Opus 4.7/4.8 — worse at reading imaged content (FINDINGS.md 2026-06-16:
+ *    Opus 4.8 ~2pp arithmetic, 6/15 dense-hex vs Fable 100/100).
+ *  - GPT 5.5 — degrades on imaged history/context.
+ *  - GPT 5.6 Sol — direct raw-image calls at both its 6×11 profile and the
+ *    old shared 5×8 profile scored 0/4 exact with four confabulations. Its
+ *    exact model profile remains available for explicit opt-in and retuning.
+ *  - Grok 4.5 — packing + factsheet works for exact IDs, but pure-image is
+ *    not Fable-level and the full quality suite is incomplete. Opt-in only
+ *    until multi-seed + novel arithmetic clear a Fable-class bar.
+ *  Silently imaging weak or unvalidated readers is the wrong default. */
+const DEFAULT_MODEL_BASES = ['claude-fable-5'];
 
 function falsey(v: string): boolean {
   return /^(0|false|no|off|none)$/i.test(v.trim());
@@ -38,9 +44,9 @@ function falsey(v: string): boolean {
 
 /** PXPIPE_MODELS env / built-in default, ignoring the runtime override. One CSV
  *  controls every family (Claude + GPT). Resolution (read per-call so scope flips LIVE):
- *  - unset or empty        → built-in default (Fable 5 + GPT 5.6)
+ *  - unset or empty        → built-in default (Fable 5 only)
  *  - `off`/`0`/`false`/... → compress nothing
- *  - CSV of model bases    → exactly those families (e.g. `claude-fable-5,gpt-5.6`) */
+ *  - CSV of model bases    → exactly those families (e.g. `claude-fable-5,gpt-5.6-sol`) */
 function envOrDefaultBases(): string[] {
   // Edge-safe: `process` is undefined off-Node; `typeof` avoids a ReferenceError.
   const raw = typeof process !== 'undefined' ? process.env?.PXPIPE_MODELS : undefined;
@@ -90,13 +96,25 @@ export function isPxpipeSupportedGptModel(model: string | null | undefined): boo
   return isAllowed(model);
 }
 
+/** Canonical set of Anthropic Messages routes pxpipe transforms. Shared with
+ *  createProxy (src/core/proxy.ts) so the public applicability helper and the
+ *  proxy router can never disagree on which paths are eligible — they did: the
+ *  proxy accepts /anthropic/messages, but the helper's old `endsWith` check
+ *  rejected it (and would have wrongly accepted /foo/v1/messages). Exact matches
+ *  only, so /v1/messages/count_tokens stays unsupported. */
+export function isAnthropicMessagesPath(pathname: string): boolean {
+  return pathname === '/v1/messages'
+    || pathname === '/anthropic/v1/messages'
+    || pathname === '/anthropic/messages';
+}
+
 export function shouldTransformAnthropicMessages(
   input: PxpipeApplicabilityInput,
 ): { eligible: boolean; reason: PxpipeApplicabilityReason } {
   if (input.method !== undefined && input.method !== null && input.method.toUpperCase() !== 'POST') {
     return { eligible: false, reason: 'unsupported_method' };
   }
-  if (input.path !== undefined && input.path !== null && !input.path.endsWith('/v1/messages')) {
+  if (input.path !== undefined && input.path !== null && !isAnthropicMessagesPath(input.path)) {
     return { eligible: false, reason: 'unsupported_path' };
   }
   if (input.bodyBytes !== undefined && input.bodyBytes !== null && input.bodyBytes <= 0) {

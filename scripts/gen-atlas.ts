@@ -26,21 +26,40 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 const ROOT = resolve(import.meta.dirname, '..');
-const PRIMARY_FONT_PATH = resolve(ROOT, 'assets/Spleen-5x8.otb');
-const FALLBACK_FONT_PATH = resolve(ROOT, 'assets/Unifont-16.0.04.otf');
-const OUT_PATH = resolve(ROOT, 'src/core/atlas.ts');
+const PRIMARY_FONT_PATH = resolve(
+  ROOT,
+  process.env.ATLAS_PRIMARY_FONT ?? 'assets/Spleen-5x8.otb',
+);
+const FALLBACK_FONT_PATH = resolve(
+  ROOT,
+  process.env.ATLAS_FALLBACK_FONT ?? 'assets/Unifont-16.0.04.otf',
+);
+// Eval sweeps may write outside src/core without touching production atlases.
+const OUT_PATH = resolve(ROOT, process.env.ATLAS_OUT ?? 'src/core/atlas.ts');
 
 /** When ATLAS_GRAY=1, write a separate grayscale atlas to atlas-gray.ts instead
  *  of the production 1-bit atlas. The production atlas is never touched. */
 const GRAY_MODE = process.env['ATLAS_GRAY'] === '1';
-const OUT_PATH_GRAY = resolve(ROOT, 'src/core/atlas-gray.ts');
+const OUT_PATH_GRAY = resolve(
+  ROOT,
+  process.env.ATLAS_OUT_GRAY ?? 'src/core/atlas-gray.ts',
+);
 
-const PRIMARY_FONT_FAMILY = 'Spleen';
-const FALLBACK_FONT_FAMILY = 'Unifont';
-const PRIMARY_FONT_PX = 8;
-const FALLBACK_FONT_PX = 8;
-const FONT_FAMILY_LABEL = 'Spleen 5x8 ASCII + Unifont 8px fallback';
-const PROFILE = (process.env.ATLAS_PROFILE ?? 'full-bmp') as 'practical' | 'full-bmp';
+const PRIMARY_FONT_FAMILY = process.env.ATLAS_PRIMARY_FAMILY ?? 'Spleen';
+const FALLBACK_FONT_FAMILY = process.env.ATLAS_FALLBACK_FAMILY ?? 'Unifont';
+const PRIMARY_FONT_PX = Number(process.env.ATLAS_PRIMARY_PX ?? 8);
+const FALLBACK_FONT_PX = Number(process.env.ATLAS_FALLBACK_PX ?? PRIMARY_FONT_PX);
+const FONT_FAMILY_LABEL =
+  process.env.ATLAS_LABEL ??
+  `${PRIMARY_FONT_FAMILY} ${PRIMARY_FONT_PX}px + ${FALLBACK_FONT_FAMILY} ${FALLBACK_FONT_PX}px fallback`;
+const PRIMARY_FONT_LABEL = process.env.ATLAS_PRIMARY_FONT ?? 'assets/Spleen-5x8.otb';
+const FALLBACK_FONT_LABEL = process.env.ATLAS_FALLBACK_FONT ?? 'assets/Unifont-16.0.04.otf';
+const PROFILE = (process.env.ATLAS_PROFILE ?? 'full-bmp') as
+  | 'practical'
+  | 'full-bmp'
+  | 'ascii';
+// Eval-only: allow non-5x8 cells when generating alternate fonts/sizes.
+const ALLOW_ANY_CELL = process.env.ATLAS_ALLOW_ANY_CELL === '1';
 
 /** Codepoint blocks included in each profile. */
 const PRACTICAL_RANGES: ReadonlyArray<readonly [number, number, string]> = [
@@ -72,7 +91,20 @@ const HANGUL: ReadonlyArray<readonly [number, number, string]> = [
   [0xac00, 0xd7af, 'Hangul Syllables'],
 ];
 
-const RANGES = PROFILE === 'full-bmp' ? [...PRACTICAL_RANGES, ...HANGUL] : PRACTICAL_RANGES;
+const ASCII_RANGES: ReadonlyArray<readonly [number, number, string]> = [
+  [0x0020, 0x007e, 'ASCII printable'],
+  [0x00a0, 0x00ff, 'Latin-1 Supplement'],
+  [0x2190, 0x21ff, 'Arrows'],
+  [0x2200, 0x22ff, 'Mathematical Operators'],
+  [0x2500, 0x259f, 'Box Drawing + Block Elements'],
+];
+
+const RANGES =
+  PROFILE === 'full-bmp'
+    ? [...PRACTICAL_RANGES, ...HANGUL]
+    : PROFILE === 'ascii'
+      ? ASCII_RANGES
+      : PRACTICAL_RANGES;
 
 // --- Register fonts --------------------------------------------------------
 GlobalFonts.register(readFileSync(PRIMARY_FONT_PATH), PRIMARY_FONT_FAMILY);
@@ -114,10 +146,16 @@ const ascent = Math.ceil(maxAscent); // 7 for Spleen/Unifont 8px
 const descent = Math.ceil(maxDescent); // 1 for Spleen/Unifont 8px
 const cellH = ascent + descent; // 8
 
-if (cellW !== 5 || cellH !== 8) {
+if (!ALLOW_ANY_CELL && (cellW !== 5 || cellH !== 8)) {
   throw new Error(
     `[gen-atlas] Spleen 5x8 invariant drifted: got cell=${cellW}×${cellH} ` +
       `(asc=${ascent} desc=${descent}). Refusing to silently change density.`,
+  );
+}
+if (ALLOW_ANY_CELL) {
+  console.log(
+    `[gen-atlas] ATLAS_ALLOW_ANY_CELL=1: accepting cell=${cellW}×${cellH} ` +
+      `(asc=${ascent} desc=${descent})`,
   );
 }
 
@@ -145,6 +183,8 @@ interface Found {
 function sourceForCodepoint(cp: number): 'primary' | 'fallback' {
   // Code-font-first means the exact ASCII/code glyphs that dominate Claude
   // Code prompts use Spleen. Unicode punctuation/symbols/CJK keep Unifont.
+  // ATLAS_PRIMARY_ONLY=1 forces a single face (eval mono fonts).
+  if (process.env.ATLAS_PRIMARY_ONLY === '1') return 'primary';
   if (cp >= 0x20 && cp <= 0x7e) return 'primary';
   return 'fallback';
 }
@@ -185,14 +225,14 @@ for (const [lo, hi, label] of RANGES) {
     `[gen-atlas]   ${label.padEnd(48)} ` +
       `U+${lo.toString(16).padStart(4, '0').toUpperCase()}..` +
       `U+${hi.toString(16).padStart(4, '0').toUpperCase()}  ` +
-      `kept ${kept}/${hi - lo + 1} (spleen=${primary}, unifont=${fallback})`,
+      `kept ${kept}/${hi - lo + 1} (primary=${primary}, fallback=${fallback})`,
   );
 }
 
 found.sort((a, b) => a.cp - b.cp);
 const wideCount = found.filter((f) => f.wide).length;
 const primaryCount = found.filter((f) => f.source === 'primary').length;
-console.log(`[gen-atlas] total glyphs: ${found.length} (${wideCount} wide, ${primaryCount} Spleen primary)`);
+console.log(`[gen-atlas] total glyphs: ${found.length} (${wideCount} wide, ${primaryCount} primary)`);
 
 // --- Rasterize glyphs ------------------------------------------------------
 const contexts = {
@@ -289,9 +329,9 @@ if (GRAY_MODE) {
 
   const grayBanner = `// AUTO-GENERATED by scripts/gen-atlas.ts (ATLAS_GRAY=1) — DO NOT EDIT.
 // Regenerate with: ATLAS_GRAY=1 npx tsx scripts/gen-atlas.ts
-// EVAL-ONLY artifact: this file is NOT imported by the production render path.
-// Source fonts: assets/Spleen-5x8.otb @ ${PRIMARY_FONT_PX}px for ASCII/code; assets/Unifont-16.0.04.otf @ ${FALLBACK_FONT_PX}px fallback (profile: ${PROFILE})
-// Glyphs: ${found.length} codepoints (${wideCount} wide, ${primaryCount} Spleen primary)
+// Grayscale companion atlas; imported when RenderStyle.aa is true.
+// Source fonts: ${PRIMARY_FONT_LABEL} @ ${PRIMARY_FONT_PX}px primary; ${FALLBACK_FONT_LABEL} @ ${FALLBACK_FONT_PX}px fallback (profile: ${PROFILE})
+// Glyphs: ${found.length} codepoints (${wideCount} wide, ${primaryCount} primary)
 // Pixel format: 1 coverage byte per pixel (0-255), raw R-channel from anti-aliased canvas.
 // ATLAS_GRAY_OFFSETS are BYTE offsets (not bit offsets like ATLAS_OFFSETS).
 `;
@@ -409,8 +449,8 @@ const banner = `// AUTO-GENERATED by scripts/gen-atlas.ts — DO NOT EDIT.
 // Regenerate with: pnpm run build:atlas
 //   (or ATLAS_PROFILE=practical pnpm run build:atlas to drop Hangul for
 //    Workers free-tier deployments under the 1 MB compressed-bundle cap)
-// Source fonts: assets/Spleen-5x8.otb @ ${PRIMARY_FONT_PX}px for ASCII/code; assets/Unifont-16.0.04.otf @ ${FALLBACK_FONT_PX}px fallback (profile: ${PROFILE})
-// Glyphs: ${found.length} codepoints (${wideCount} wide, ${primaryCount} Spleen primary)
+// Source fonts: ${PRIMARY_FONT_LABEL} @ ${PRIMARY_FONT_PX}px primary; ${FALLBACK_FONT_LABEL} @ ${FALLBACK_FONT_PX}px fallback (profile: ${PROFILE})
+// Glyphs: ${found.length} codepoints (${wideCount} wide, ${primaryCount} primary)
 `;
 
 const body = `

@@ -108,7 +108,9 @@ export default {
       // (e.g. MIN_TOOL_RESULT_CHARS=200 to skip absurdly small dumps).
       minReminderChars: env.MIN_REMINDER_CHARS ? Number(env.MIN_REMINDER_CHARS) : 0,
       minToolResultChars: env.MIN_TOOL_RESULT_CHARS ? Number(env.MIN_TOOL_RESULT_CHARS) : 0,
-      cols: env.COLS ? Number(env.COLS) : 100,
+      // Omit by default so OpenAI-shaped requests use their exact model profile;
+      // COLS remains an explicit operator override for every family.
+      ...(env.COLS ? { cols: Number(env.COLS) } : {}),
       // R2 multi-column ON (2 cols) — single-col drops below break-even on
       // real tool-doc slabs. Override via MULTI_COL=1 if OCR misreads layout.
       multiCol: env.MULTI_COL ? Math.max(1, Number(env.MULTI_COL) | 0) : 2,

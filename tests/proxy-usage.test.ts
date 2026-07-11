@@ -1,5 +1,18 @@
-import { describe, it, expect } from 'vitest';
+import { afterAll, beforeAll, describe, it, expect } from 'vitest';
 import { createProxy, type ProxyEvent } from '../src/core/proxy.js';
+
+// These proxy-contract tests deliberately exercise the opt-in Sol transform.
+// Snapshot the developer shell so the suite is deterministic now that Sol is
+// intentionally absent from the built-in default scope.
+let ambientPxpipeModels: string | undefined;
+beforeAll(() => {
+  ambientPxpipeModels = process.env.PXPIPE_MODELS;
+  process.env.PXPIPE_MODELS = 'claude-fable-5,gpt-5.6-sol';
+});
+afterAll(() => {
+  if (ambientPxpipeModels === undefined) delete process.env.PXPIPE_MODELS;
+  else process.env.PXPIPE_MODELS = ambientPxpipeModels;
+});
 
 /** Tiny in-process mock upstream — accepts any request and returns whatever
  *  the test fixture configured. Lets us assert that the proxy correctly
@@ -133,7 +146,7 @@ describe('proxy usage extraction', () => {
     ).toBe(true);
   });
 
-  it('routes GPT 5.6 chat completions to OpenAI, transforms once, and normalizes usage', async () => {
+  it('routes GPT 5.6 Sol chat completions to OpenAI, transforms once, and normalizes usage', async () => {
     const upstreamRequests: Request[] = [];
     const restore = mockUpstream(async (req) => {
       upstreamRequests.push(req.clone());
@@ -159,7 +172,7 @@ describe('proxy usage extraction', () => {
     });
 
     const reqBody = JSON.stringify({
-      model: 'gpt-5.6',
+      model: 'gpt-5.6-sol',
       messages: [
         { role: 'system', content: 'System instruction. '.repeat(900) },
         { role: 'user', content: 'hi' },
@@ -220,7 +233,7 @@ describe('proxy usage extraction', () => {
     });
 
     const reqBody = JSON.stringify({
-      model: 'gpt-5.6',
+      model: 'gpt-5.6-sol',
       messages: [
         { role: 'system', content: 'System instruction. '.repeat(900) },
         { role: 'user', content: 'hi' },
@@ -271,7 +284,7 @@ describe('proxy usage extraction', () => {
     });
 
     const reqBody = JSON.stringify({
-      model: 'gpt-5.6',
+      model: 'gpt-5.6-sol',
       instructions: 'System instruction. '.repeat(900),
       input: [{ role: 'user', content: 'hi' }],
     });
@@ -293,7 +306,7 @@ describe('proxy usage extraction', () => {
     const sent = JSON.parse(await upstreamRequests[0]!.text()) as any;
     const firstUser = sent.input.find((m: any) => m.role === 'user');
     expect(firstUser.content[0].type).toBe('input_image');
-    expect(captured?.model).toBe('gpt-5.6');
+    expect(captured?.model).toBe('gpt-5.6-sol');
     expect(captured?.info?.compressed).toBe(true);
     expect(captured?.info?.firstUserSha8).toMatch(/^[0-9a-f]{8}$/);
   });

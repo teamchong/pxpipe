@@ -8,6 +8,7 @@
 import {
   ATLAS_CELL_W,
   ATLAS_CELL_H,
+  ATLAS_ASCENT,
   ATLAS_PIXELS,
   ATLAS_OFFSETS,
   ATLAS_WIDE_FLAGS,
@@ -16,12 +17,127 @@ import {
 import {
   ATLAS_GRAY_CELL_W,
   ATLAS_GRAY_CELL_H,
+  ATLAS_GRAY_ASCENT,
   ATLAS_GRAY_PIXELS,
   ATLAS_GRAY_OFFSETS,
   ATLAS_GRAY_WIDE_FLAGS,
   atlasGrayRank,
 } from './atlas-gray.js';
+import {
+  ATLAS_CELL_W as JBM10_CELL_W,
+  ATLAS_CELL_H as JBM10_CELL_H,
+  ATLAS_ASCENT as JBM10_ASCENT,
+  ATLAS_PIXELS as JBM10_PIXELS,
+  ATLAS_OFFSETS as JBM10_OFFSETS,
+  ATLAS_WIDE_FLAGS as JBM10_WIDE_FLAGS,
+  atlasRank as jbMono10Rank,
+} from './atlas-jbmono10.js';
+import {
+  ATLAS_GRAY_CELL_W as JBM10_GRAY_CELL_W,
+  ATLAS_GRAY_CELL_H as JBM10_GRAY_CELL_H,
+  ATLAS_GRAY_ASCENT as JBM10_GRAY_ASCENT,
+  ATLAS_GRAY_PIXELS as JBM10_GRAY_PIXELS,
+  ATLAS_GRAY_OFFSETS as JBM10_GRAY_OFFSETS,
+  ATLAS_GRAY_WIDE_FLAGS as JBM10_GRAY_WIDE_FLAGS,
+  atlasGrayRank as jbMono10GrayRank,
+} from './atlas-gray-jbmono10.js';
 import { encodeGrayPng, encodeRgbPng } from './png.js';
+
+export type RenderFont = 'spleen-5x8' | 'jetbrains-mono-10';
+export const DEFAULT_RENDER_FONT: RenderFont = 'spleen-5x8';
+
+interface BitAtlas {
+  cellW: number;
+  cellH: number;
+  ascent: number;
+  pixels: Uint8Array;
+  offsets: Uint32Array;
+  wideFlags: Uint8Array;
+  rank: (codepoint: number) => number;
+}
+
+interface GrayAtlas {
+  cellW: number;
+  cellH: number;
+  ascent: number;
+  pixels: Uint8Array;
+  offsets: Uint32Array;
+  wideFlags: Uint8Array;
+  rank: (codepoint: number) => number;
+}
+
+interface AtlasSet {
+  bit: BitAtlas;
+  gray: GrayAtlas;
+}
+
+const DEFAULT_ATLAS: AtlasSet = {
+  bit: {
+    cellW: ATLAS_CELL_W,
+    cellH: ATLAS_CELL_H,
+    ascent: ATLAS_ASCENT,
+    pixels: ATLAS_PIXELS,
+    offsets: ATLAS_OFFSETS,
+    wideFlags: ATLAS_WIDE_FLAGS,
+    rank: atlasRank,
+  },
+  gray: {
+    cellW: ATLAS_GRAY_CELL_W,
+    cellH: ATLAS_GRAY_CELL_H,
+    ascent: ATLAS_GRAY_ASCENT,
+    pixels: ATLAS_GRAY_PIXELS,
+    offsets: ATLAS_GRAY_OFFSETS,
+    wideFlags: ATLAS_GRAY_WIDE_FLAGS,
+    rank: atlasGrayRank,
+  },
+};
+
+const JBM10_ATLAS: AtlasSet = {
+  bit: {
+    cellW: JBM10_CELL_W,
+    cellH: JBM10_CELL_H,
+    ascent: JBM10_ASCENT,
+    pixels: JBM10_PIXELS,
+    offsets: JBM10_OFFSETS,
+    wideFlags: JBM10_WIDE_FLAGS,
+    rank: jbMono10Rank,
+  },
+  gray: {
+    cellW: JBM10_GRAY_CELL_W,
+    cellH: JBM10_GRAY_CELL_H,
+    ascent: JBM10_GRAY_ASCENT,
+    pixels: JBM10_GRAY_PIXELS,
+    offsets: JBM10_GRAY_OFFSETS,
+    wideFlags: JBM10_GRAY_WIDE_FLAGS,
+    rank: jbMono10GrayRank,
+  },
+};
+
+function atlasSet(font: RenderFont | undefined): AtlasSet {
+  return font === 'jetbrains-mono-10' ? JBM10_ATLAS : DEFAULT_ATLAS;
+}
+
+function bitGlyph(codepoint: number, font: RenderFont | undefined): { atlas: BitAtlas; rank: number } | null {
+  const selected = atlasSet(font).bit;
+  const rank = selected.rank(codepoint);
+  if (rank >= 0) return { atlas: selected, rank };
+  if (selected !== DEFAULT_ATLAS.bit) {
+    const fallbackRank = DEFAULT_ATLAS.bit.rank(codepoint);
+    if (fallbackRank >= 0) return { atlas: DEFAULT_ATLAS.bit, rank: fallbackRank };
+  }
+  return null;
+}
+
+function grayGlyph(codepoint: number, font: RenderFont | undefined): { atlas: GrayAtlas; rank: number } | null {
+  const selected = atlasSet(font).gray;
+  const rank = selected.rank(codepoint);
+  if (rank >= 0) return { atlas: selected, rank };
+  if (selected !== DEFAULT_ATLAS.gray) {
+    const fallbackRank = DEFAULT_ATLAS.gray.rank(codepoint);
+    if (fallbackRank >= 0) return { atlas: DEFAULT_ATLAS.gray, rank: fallbackRank };
+  }
+  return null;
+}
 
 /** Page-height ceiling. Measured (2026-07-01, count_tokens sweep, claude-sonnet-4-5 — see
  *  /tmp/pxexp/LEVER1-findings.md): the API downscales any image to fit BOTH long-edge ≤1568
@@ -40,9 +156,11 @@ export const DENSE_CONTENT_COLS = 312;
 /** Bare 5×8 cell (no padding). A/B showed 5×8 beats 7×10 on dense JSON (4/5 vs 3/5 reads, 42% fewer tokens).
  *  Revert to {cellWBonus:2, cellHBonus:2} if misread rates rise. */
 export const DENSE_RENDER_STYLE: RenderStyle = { cellWBonus: 0, cellHBonus: 0, aa: true };
+/** Anthropic static slab uses the same measured 312-column no-resize geometry. */
+export const ANTHROPIC_SLAB_COLS = DENSE_CONTENT_COLS;
 /** Default columns for the static slab. 312 × 5 px + 8 px pad = 1568 px — exactly the API's
  *  long-edge bound (313 cols = 1573 px would trigger a 0.997× resample, blurring every glyph). */
-const DEFAULT_COLS = 312;
+const DEFAULT_COLS = ANTHROPIC_SLAB_COLS;
 /** Horizontal padding (left + right each), px. Exported for transform.ts token-cost math. */
 export const PAD_X = 4;
 /** Vertical padding (top + bottom each), px. Exported for transform.ts token-cost math. */
@@ -72,6 +190,8 @@ export interface RenderedImage {
 /** Optional render-time styling. All fields unset = production default 5×8 cell.
  *  Eval harness overrides per variant to A/B cell sizes and structure aids. */
 export interface RenderStyle {
+  /** Rasterized font atlas. Alternate atlases fall back to Spleen/Unifont for missing Unicode. */
+  font?: RenderFont;
   /** Draw faint grey grid rules onto background pixels (zero pixel cost). */
   grid?: boolean;
   /** Draw a vertical grid rule every N columns. 0/unset = row rules only. */
@@ -84,25 +204,65 @@ export interface RenderStyle {
   cellHBonus?: number;
   /** Extra blank columns beside the 5px glyph (cell width = 5 + this). Negative overlaps glyphs. Unset = DEFAULT_CELL_W_BONUS. */
   cellWBonus?: number;
-  /** Use the AA grayscale atlas (atlas-gray.ts). EVAL-ONLY; default 1-bit path is unchanged. */
+  /** Use the AA grayscale companion atlas. */
   aa?: boolean;
   /** Cycle palette colors per glyph for per-character boundary cues. Forces RGB output. Composes with aa. */
   colorCycle?: boolean;
   /** Tint only the structural <user>/<assistant> boundary tags (body stays black)
    *  so speakers are scannable without recoloring content. Forces RGB. Composes with aa. */
   colorByRole?: boolean;
+  /** Morphological ink dilate radius in pixels (pre-invert). Thickens glyphs without
+   *  changing cell pitch — pure-image OCR aid at fixed 5×8 density. 0/unset = off. */
+  inkDilate?: number;
+  /** Dilate axis: 'both' (default), 'x', or 'y'. Prefer 'y' at 5×8 so neighbors do not merge. */
+  inkDilateAxis?: 'both' | 'x' | 'y';
+  /** Post-blit polarity. Default true = black ink on white (production). false keeps
+   *  white ink on black (pre-invert canvas). Fixed cell pitch. */
+  invert?: boolean;
+  /**
+   * Tint ink by character class (digit / UPPER / lower / other) for OCR disambiguation
+   * of confusable pairs like 0/O/o. Forces RGB. Composes with aa. Mutually exclusive
+   * intent with colorCycle (if both set, colorByClass wins).
+   */
+  colorByClass?: boolean;
+  /**
+   * Paint a 1px class micro-mark in the cell margin after each glyph blit:
+   * digit → bottom-left, UPPER → top-right, lower/other → none.
+   * Separates 0/O/o without changing cell pitch. Works with gray or RGB output.
+   */
+  classTick?: boolean;
+  /**
+   * Post-invert paper gray (0–255). Default 255 = pure white. Mid-light values
+   * (e.g. 230–240) reduce glare and lift faint grid rules without changing cell pitch.
+   * Applied after invert; ink stays near-black via linear remap onto the paper.
+   */
+  paperGray?: number;
+}
+
+export function renderCellWidth(style: RenderStyle = {}): number {
+  const atlas = style.aa === true ? atlasSet(style.font).gray : atlasSet(style.font).bit;
+  return Math.max(1, atlas.cellW + Math.floor(style.cellWBonus ?? DEFAULT_CELL_W_BONUS));
+}
+
+export function renderCellHeight(style: RenderStyle = {}): number {
+  const atlas = style.aa === true ? atlasSet(style.font).gray : atlasSet(style.font).bit;
+  return atlas.cellH + Math.max(0, Math.floor(style.cellHBonus ?? DEFAULT_CELL_H_BONUS));
 }
 
 // --- column-aware wrapping -------------------------------------------------
 
 /** Visual width of a codepoint in cells (1 = Latin, 2 = East Asian Wide).
  *  Missing codepoints advance 1 cell so wrap math stays stable. */
-function cellsFor(codepoint: number, markerScale: number = 1): number {
+function cellsFor(
+  codepoint: number,
+  markerScale: number = 1,
+  font: RenderFont = DEFAULT_RENDER_FONT,
+): number {
   // Enlarged ↵ occupies markerScale cells of wrap budget instead of 1.
   if (codepoint === NL_SENTINEL_CP && markerScale > 1) return markerScale;
-  const rank = atlasRank(codepoint);
-  if (rank < 0) return 1;
-  return ATLAS_WIDE_FLAGS[rank] === 1 ? 2 : 1;
+  const glyph = bitGlyph(codepoint, font);
+  if (!glyph) return 1;
+  return glyph.atlas.wideFlags[glyph.rank] === 1 ? 2 : 1;
 }
 
 const TAB_WIDTH = 4; // standard 4-space tab stops (logs, code, tool output are all 4-oriented)
@@ -160,6 +320,62 @@ export const ROLE_PALETTE: [number, number, number][] = [
 ];
 const ROLE_SLOT_USER = 1;
 const ROLE_SLOT_ASSISTANT = 2;
+
+/** colorByClass palette, indexed by slot-1: digit / UPPER / lower / other. */
+export const CLASS_PALETTE: [number, number, number][] = [
+  [20, 40, 160],   // 1: digit 0-9 — blue (0 ≠ O/o)
+  [150, 20, 20],   // 2: UPPER A-Z — red (O ≠ 0/o)
+  [20, 110, 40],   // 3: lower a-z — green (o ≠ 0/O)
+  [20, 20, 20],    // 4: other / punctuation — near-black
+];
+const CLASS_SLOT_DIGIT = 1;
+const CLASS_SLOT_UPPER = 2;
+const CLASS_SLOT_LOWER = 3;
+const CLASS_SLOT_OTHER = 4;
+
+function classSlotForCodepoint(cp: number): number {
+  if (cp >= 0x30 && cp <= 0x39) return CLASS_SLOT_DIGIT; // 0-9
+  if (cp >= 0x41 && cp <= 0x5a) return CLASS_SLOT_UPPER; // A-Z
+  if (cp >= 0x61 && cp <= 0x7a) return CLASS_SLOT_LOWER; // a-z
+  return CLASS_SLOT_OTHER;
+}
+
+/** 1px class micro-marks in cell margins (pre-invert ink = 255). */
+function paintClassTick(
+  fb: Uint8Array,
+  fbW: number,
+  fbH: number,
+  baseX: number,
+  baseY: number,
+  cellW: number,
+  cellH: number,
+  codepoint: number,
+  colorMask: Uint8Array | null,
+  colorSlot: number,
+): void {
+  const slot = classSlotForCodepoint(codepoint);
+  // digit → BL, UPPER → TR; lower/other unmarked
+  let ox: number;
+  let oy: number;
+  if (slot === CLASS_SLOT_DIGIT) {
+    ox = 0;
+    oy = Math.max(0, cellH - 1);
+  } else if (slot === CLASS_SLOT_UPPER) {
+    ox = Math.max(0, cellW - 1);
+    oy = 0;
+  } else {
+    return;
+  }
+  const px = baseX + ox;
+  const py = baseY + oy;
+  if (px < 0 || py < 0 || px >= fbW || py >= fbH) return;
+  const idx = py * fbW + px;
+  // only mark background so we don't erase glyph strokes
+  if (fb[idx]! === 0) {
+    fb[idx] = 255;
+    if (colorMask && colorSlot > 0) colorMask[idx] = colorSlot;
+  }
+}
 
 /**
  * Slot markers for the parallel "slot string" — the structure-through mechanism
@@ -251,21 +467,30 @@ export function expandTabsInLine(line: string): string {
 }
 
 /** Visual width of a line in cells. Wide CJK = 2; enlarged ↵ = markerScale. */
-export function measureLineCols(line: string, markerScale: number = 1): number {
+export function measureLineCols(
+  line: string,
+  markerScale: number = 1,
+  font: RenderFont = DEFAULT_RENDER_FONT,
+): number {
   let w = 0;
-  for (const ch of line) w += cellsFor(ch.codePointAt(0)!, markerScale);
+  for (const ch of line) w += cellsFor(ch.codePointAt(0)!, markerScale, font);
   return w;
 }
 
 /** Always renders at full canvas width. Signature kept for transform.ts compatibility; returns cols unchanged. */
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
-export function shrinkColsToContent(text: string, cols: number, markerScale: number = 1): number {
+export function shrinkColsToContent(
+  text: string,
+  cols: number,
+  markerScale: number = 1,
+  font: RenderFont = DEFAULT_RENDER_FONT,
+): number {
   // Real content-width measurement — delegates to measureContentCols (was historically a
   // no-op stub). The proxy's cost gate AND renderer both call this, so sizing the canvas to
   // the widest line here makes the proxy match the SDK/export path (renderTextToImages),
   // which already uses measureContentCols. Never narrows below the widest line ⇒ row count
   // (and thus image/paging count) is unchanged; only the canvas WIDTH (pixel cost) drops.
-  return measureContentCols(text, cols, markerScale);
+  return measureContentCols(text, cols, markerScale, font);
 }
 
 /**
@@ -276,13 +501,18 @@ export function shrinkColsToContent(text: string, cols: number, markerScale: num
  * deterministic width → cache-prefix-safe. Tabs are expanded so the measured width
  * matches what the renderer actually lays out.
  */
-export function measureContentCols(text: string, maxCols: number, markerScale: number = 1): number {
+export function measureContentCols(
+  text: string,
+  maxCols: number,
+  markerScale: number = 1,
+  font: RenderFont = DEFAULT_RENDER_FONT,
+): number {
   const cap = Math.max(1, maxCols | 0);
   let widest = 1;
   let start = 0;
   for (let i = 0; i <= text.length; i++) {
     if (i === text.length || text[i] === '\n') {
-      const w = measureLineCols(expandTabsInLine(text.slice(start, i)), markerScale);
+      const w = measureLineCols(expandTabsInLine(text.slice(start, i)), markerScale, font);
       if (w > widest) widest = w;
       if (widest >= cap) return cap;
       start = i + 1;
@@ -291,7 +521,12 @@ export function measureContentCols(text: string, maxCols: number, markerScale: n
   return Math.min(cap, widest);
 }
 
-export function wrapLines(text: string, cols: number, markerScale: number = 1): string[] {
+export function wrapLines(
+  text: string,
+  cols: number,
+  markerScale: number = 1,
+  font: RenderFont = DEFAULT_RENDER_FONT,
+): string[] {
   const out: string[] = [];
   const minified = minifyForRender(text);
   for (const rawWithTabs of minified.split('\n')) {
@@ -306,7 +541,7 @@ export function wrapLines(text: string, cols: number, markerScale: number = 1): 
     // ↵ is treated as an inline glyph — it never forces a row break.
     for (const ch of raw) {
       const cp = ch.codePointAt(0)!;
-      const w = cellsFor(cp, markerScale);
+      const w = cellsFor(cp, markerScale, font);
       if (curCols + w > cols) {
         out.push(cur);
         cur = ch;
@@ -363,20 +598,23 @@ function blitGlyph(
   x: number,
   y: number,
   codepoint: number,
+  font: RenderFont = DEFAULT_RENDER_FONT,
   markerMask: Uint8Array | null = null,
 ): number {
-  const rank = atlasRank(codepoint);
-  if (rank < 0) return 0;
-  const wide = ATLAS_WIDE_FLAGS[rank] === 1;
-  const srcW = wide ? 2 * ATLAS_CELL_W : ATLAS_CELL_W;
+  const glyph = bitGlyph(codepoint, font);
+  if (!glyph) return 0;
+  const { atlas, rank } = glyph;
+  const wide = atlas.wideFlags[rank] === 1;
+  const srcW = wide ? 2 * atlas.cellW : atlas.cellW;
   // ATLAS_OFFSETS is a bit offset (MSB-first packing). Pixel (gx,gy): byte = bitIdx>>>3, bit = 7-(bitIdx&7).
-  const srcOff = ATLAS_OFFSETS[rank]!;
-  for (let gy = 0; gy < ATLAS_CELL_H; gy++) {
-    const dstRow = (y + gy) * fbW + x;
+  const srcOff = atlas.offsets[rank]!;
+  const yOffset = atlasSet(font).bit.ascent - atlas.ascent;
+  for (let gy = 0; gy < atlas.cellH; gy++) {
+    const dstRow = (y + yOffset + gy) * fbW + x;
     const bitRowStart = srcOff + gy * srcW;
     for (let gx = 0; gx < srcW; gx++) {
       const bitIdx = bitRowStart + gx;
-      const byte = ATLAS_PIXELS[bitIdx >>> 3]!;
+      const byte = atlas.pixels[bitIdx >>> 3]!;
       const bit = (byte >>> (7 - (bitIdx & 7))) & 1;
       if (bit) {
         fb[dstRow + gx] = 255; // glyphs never overlap in grid layout; set unconditionally
@@ -397,18 +635,21 @@ function blitGlyphGray(
   x: number,
   y: number,
   codepoint: number,
+  font: RenderFont = DEFAULT_RENDER_FONT,
 ): number {
-  const rank = atlasGrayRank(codepoint);
-  if (rank < 0) return 0;
-  const wide = ATLAS_GRAY_WIDE_FLAGS[rank] === 1;
-  const srcW = wide ? 2 * ATLAS_GRAY_CELL_W : ATLAS_GRAY_CELL_W;
+  const glyph = grayGlyph(codepoint, font);
+  if (!glyph) return 0;
+  const { atlas, rank } = glyph;
+  const wide = atlas.wideFlags[rank] === 1;
+  const srcW = wide ? 2 * atlas.cellW : atlas.cellW;
   // ATLAS_GRAY_OFFSETS is a byte offset (1 byte/pixel, unlike the bit-packed 1-bit atlas).
-  const srcOff = ATLAS_GRAY_OFFSETS[rank]!;
-  for (let gy = 0; gy < ATLAS_GRAY_CELL_H; gy++) {
-    const dstRow = (y + gy) * fbW + x;
+  const srcOff = atlas.offsets[rank]!;
+  const yOffset = atlasSet(font).gray.ascent - atlas.ascent;
+  for (let gy = 0; gy < atlas.cellH; gy++) {
+    const dstRow = (y + yOffset + gy) * fbW + x;
     const srcRow = srcOff + gy * srcW;
     for (let gx = 0; gx < srcW; gx++) {
-      const coverage = ATLAS_GRAY_PIXELS[srcRow + gx]!;
+      const coverage = atlas.pixels[srcRow + gx]!;
       if (coverage > 0) {
         const idx = dstRow + gx;
         if (coverage > fb[idx]!) fb[idx] = coverage;
@@ -429,19 +670,22 @@ function blitGlyphScaled(
   y: number,
   codepoint: number,
   scaleX: number,
+  font: RenderFont = DEFAULT_RENDER_FONT,
 ): number {
-  const rank = atlasRank(codepoint);
-  if (rank < 0) return 0;
-  const wide = ATLAS_WIDE_FLAGS[rank] === 1;
-  const srcW = wide ? 2 * ATLAS_CELL_W : ATLAS_CELL_W;
-  const srcOff = ATLAS_OFFSETS[rank]!;
-  for (let gy = 0; gy < ATLAS_CELL_H; gy++) {
-    const py = y + gy;
+  const glyph = bitGlyph(codepoint, font);
+  if (!glyph) return 0;
+  const { atlas, rank } = glyph;
+  const wide = atlas.wideFlags[rank] === 1;
+  const srcW = wide ? 2 * atlas.cellW : atlas.cellW;
+  const srcOff = atlas.offsets[rank]!;
+  const yOffset = atlasSet(font).bit.ascent - atlas.ascent;
+  for (let gy = 0; gy < atlas.cellH; gy++) {
+    const py = y + yOffset + gy;
     if (py >= fbH) break;
     const bitRowStart = srcOff + gy * srcW;
     for (let gx = 0; gx < srcW; gx++) {
       const bitIdx = bitRowStart + gx;
-      const byte = ATLAS_PIXELS[bitIdx >>> 3]!;
+      const byte = atlas.pixels[bitIdx >>> 3]!;
       if (((byte >>> (7 - (bitIdx & 7))) & 1) === 0) continue;
       for (let sx = 0; sx < scaleX; sx++) {
         const px = x + gx * scaleX + sx;
@@ -453,6 +697,44 @@ function blitGlyphScaled(
     }
   }
   return wide ? 2 * scaleX : scaleX;
+}
+
+/** Dilate ink on the pre-invert framebuffer (nonzero = ink). Radius is pixel
+ *  passes; keeps width/height fixed so 5×8 packing is unchanged.
+ *  axis: 'both' (4-connected), 'x' (horizontal only), 'y' (vertical only).
+ *  Vertical-only thickens strokes without merging neighboring 5px-wide glyphs. */
+function dilateInk(
+  fb: Uint8Array,
+  fbW: number,
+  fbH: number,
+  radius: number,
+  axis: 'both' | 'x' | 'y' = 'both',
+): void {
+  const r = Math.max(0, Math.floor(radius));
+  if (r <= 0) return;
+  const doX = axis === 'both' || axis === 'x';
+  const doY = axis === 'both' || axis === 'y';
+  let src = fb;
+  for (let pass = 0; pass < r; pass++) {
+    const out = new Uint8Array(src.length);
+    out.set(src);
+    for (let y = 0; y < fbH; y++) {
+      for (let x = 0; x < fbW; x++) {
+        const i = y * fbW + x;
+        if (src[i]! > 0) continue;
+        if (
+          (doX && x > 0 && src[i - 1]! > 0) ||
+          (doX && x + 1 < fbW && src[i + 1]! > 0) ||
+          (doY && y > 0 && src[i - fbW]! > 0) ||
+          (doY && y + 1 < fbH && src[i + fbW]! > 0)
+        ) {
+          out[i] = 255;
+        }
+      }
+    }
+    src = out;
+  }
+  if (src !== fb) fb.set(src);
 }
 
 const GRID_INK = 25; // pre-invert → 230 post-invert; distinct from gutter divider (64 → 191)
@@ -497,18 +779,19 @@ export async function renderChunkToPng(
   slotText?: string,
 ): Promise<RenderedImage> {
   const useAA = style.aa === true;
-  const atlasH = useAA ? ATLAS_GRAY_CELL_H : ATLAS_CELL_H;
-  const atlasW = useAA ? ATLAS_GRAY_CELL_W : ATLAS_CELL_W;
+  const selected = atlasSet(style.font);
+  const atlasH = useAA ? selected.gray.cellH : selected.bit.cellH;
+  const atlasW = useAA ? selected.gray.cellW : selected.bit.cellW;
   const markerScale = Math.max(1, Math.floor(style.markerScale ?? 1));
-  const cellH = atlasH + Math.max(0, Math.floor(style.cellHBonus ?? DEFAULT_CELL_H_BONUS));
-  const cellW = Math.max(1, atlasW + Math.floor(style.cellWBonus ?? DEFAULT_CELL_W_BONUS));
-  const lines = wrapLines(text, cols, markerScale);
+  const cellH = renderCellHeight(style);
+  const cellW = renderCellWidth(style);
+  const lines = wrapLines(text, cols, markerScale, style.font);
   // Slot string carries role attribution by position. It is width-identical to
   // `text`, so wrapLines splits it into the exact same rows — fitSlotLines[r] aligns
   // codepoint-for-codepoint with fitLines[r]. Only built when coloring is on.
   const slotLines: string[] | null =
     style.colorByRole === true && slotText !== undefined
-      ? wrapLines(slotText, cols, markerScale)
+      ? wrapLines(slotText, cols, markerScale, style.font)
       : null;
 
   const maxLines = Math.max(1, Math.floor((maxHeightPx - 2 * PAD_Y) / cellH));
@@ -541,10 +824,11 @@ export async function renderChunkToPng(
   const markerMask: Uint8Array | null =
     style.markerRed ? new Uint8Array(width * height) : null;
   // colorMask: stores colorSlot per inked pixel (0 = background) for colorCycle / colorByRole RGB output.
-  const useColorCycle = style.colorCycle === true;
-  const useColorByRole = style.colorByRole === true;
+  const useColorByClass = style.colorByClass === true;
+  const useColorCycle = style.colorCycle === true && !useColorByClass;
+  const useColorByRole = style.colorByRole === true && !useColorByClass;
   const colorMask: Uint8Array | null =
-    (useColorCycle || useColorByRole) ? new Uint8Array(width * height) : null;
+    (useColorCycle || useColorByRole || useColorByClass) ? new Uint8Array(width * height) : null;
 
   let droppedChars = 0;
   const droppedCodepoints = new Map<number, number>();
@@ -562,12 +846,14 @@ export async function renderChunkToPng(
       const codepoint = ch.codePointAt(0)!;
       const baseX = PAD_X + col * cellW;
       const isMarker = codepoint === NL_SENTINEL_CP;
-      const colorSlot = useColorByRole
-        ? (slotRow ? slotForMarkCp(slotRow[charIdx]?.codePointAt(0)) : 0) // 0 = body (black); only tags carry a role hue
-        : (glyphIndex % GLYPH_PALETTE.length) + 1; // 0 reserved for background in colorMask
+      const colorSlot = useColorByClass
+        ? classSlotForCodepoint(codepoint)
+        : useColorByRole
+          ? (slotRow ? slotForMarkCp(slotRow[charIdx]?.codePointAt(0)) : 0) // 0 = body (black); only tags carry a role hue
+          : (glyphIndex % GLYPH_PALETTE.length) + 1; // 0 reserved for background in colorMask
       let advance: number;
       if (isMarker && markerScale > 1) {
-        advance = blitGlyphScaled(fb, markerMask, width, height, baseX, baseY, codepoint, markerScale);
+        advance = blitGlyphScaled(fb, markerMask, width, height, baseX, baseY, codepoint, markerScale, style.font);
         if (colorMask) {
           for (let gy = 0; gy < atlasH; gy++) {
             const py = baseY + gy;
@@ -581,7 +867,7 @@ export async function renderChunkToPng(
           }
         }
       } else if (useAA) {
-        advance = blitGlyphGray(fb, width, baseX, baseY, codepoint);
+        advance = blitGlyphGray(fb, width, baseX, baseY, codepoint, style.font);
         if (colorMask && advance > 0) {
           const srcW = advance * atlasW;
           for (let gy = 0; gy < atlasH; gy++) {
@@ -596,7 +882,7 @@ export async function renderChunkToPng(
           }
         }
       } else {
-        advance = blitGlyph(fb, width, baseX, baseY, codepoint, isMarker ? markerMask : null);
+        advance = blitGlyph(fb, width, baseX, baseY, codepoint, style.font, isMarker ? markerMask : null);
         if (colorMask && advance > 0) {
           const srcW = advance * atlasW;
           for (let gy = 0; gy < atlasH; gy++) {
@@ -610,6 +896,9 @@ export async function renderChunkToPng(
             }
           }
         }
+      }
+      if (style.classTick === true && advance > 0) {
+        paintClassTick(fb, width, height, baseX, baseY, cellW, cellH, codepoint, colorMask, colorSlot);
       }
       glyphIndex++;
       charIdx++;
@@ -627,24 +916,45 @@ export async function renderChunkToPng(
     drawGrid(fb, width, height, fitLines.length, Math.max(0, Math.floor(style.gridCols ?? 0)), cellH, cellW, atlasH);
   }
 
-  // Invert to black-on-white (matches Python proxy).
-  for (let i = 0; i < fb.length; i++) fb[i] = 255 - fb[i]!;
+  // Optional ink dilate (pre-invert): thickens glyphs without changing cell pitch.
+  const dilate = Math.max(0, Math.floor(style.inkDilate ?? 0));
+  if (dilate > 0) {
+    const axis = style.inkDilateAxis === 'x' || style.inkDilateAxis === 'y' ? style.inkDilateAxis : 'both';
+    dilateInk(fb, width, height, dilate, axis);
+  }
+
+  // Invert to black-on-white unless style.invert === false (white-on-black).
+  if (style.invert !== false) {
+    for (let i = 0; i < fb.length; i++) fb[i] = 255 - fb[i]!;
+  }
+
+  // Optional mid-light paper: remap pure white (255) toward paperGray while keeping
+  // black ink at 0. Linear: g' = paper * g / 255. No cell-pitch change.
+  const paper = Math.max(0, Math.min(255, Math.floor(style.paperGray ?? 255)));
+  if (paper < 255) {
+    for (let i = 0; i < fb.length; i++) {
+      const g = fb[i]!;
+      fb[i] = Math.round((paper * g) / 255);
+    }
+  }
 
   let png: Uint8Array;
   if (colorMask) {
-    // colorCycle / colorByRole: AA-blend each inked pixel onto white in its palette color. markerRed ignored.
-    const palette = useColorByRole ? ROLE_PALETTE : GLYPH_PALETTE;
+    // colorCycle / colorByRole / colorByClass: AA-blend ink onto paper in palette color.
+    const palette = useColorByClass ? CLASS_PALETTE : useColorByRole ? ROLE_PALETTE : GLYPH_PALETTE;
     const rgb = new Uint8Array(width * height * 3);
     for (let i = 0; i < fb.length; i++) {
-      const g = fb[i]!; // post-invert: 0 = ink, 255 = background
+      const g = fb[i]!; // post-invert (+ optional paper): 0 = ink, paper = background
       const slot = colorMask[i]!;
       if (slot > 0) {
-        const coverage = 255 - g; // pre-invert coverage
+        // coverage relative to paper so AA fringes stay correct on mid-light bg
+        const coverage = paper <= 0 ? 0 : Math.round(((paper - g) * 255) / paper);
+        const cov = Math.max(0, Math.min(255, coverage));
         const [pr, pg, pb] = palette[(slot - 1) % palette.length]!;
-        // Alpha-blend: channel = 255 - coverage*(255-palette)/255
-        rgb[i * 3]     = Math.round(255 - coverage * (255 - pr!) / 255);
-        rgb[i * 3 + 1] = Math.round(255 - coverage * (255 - pg!) / 255);
-        rgb[i * 3 + 2] = Math.round(255 - coverage * (255 - pb!) / 255);
+        // Alpha-blend ink color onto paper: channel = paper - cov*(paper-palette)/255
+        rgb[i * 3]     = Math.round(paper - (cov * (paper - pr!)) / 255);
+        rgb[i * 3 + 1] = Math.round(paper - (cov * (paper - pg!)) / 255);
+        rgb[i * 3 + 2] = Math.round(paper - (cov * (paper - pb!)) / 255);
       } else {
         rgb[i * 3]     = g;
         rgb[i * 3 + 1] = g;
@@ -694,13 +1004,13 @@ export async function renderTextToPngsWithCharLimit(
   slotText?: string,
 ): Promise<RenderedImage[]> {
   const markerScale = Math.max(1, Math.floor(style.markerScale ?? 1));
-  const cellH = ATLAS_CELL_H + Math.max(0, Math.floor(style.cellHBonus ?? DEFAULT_CELL_H_BONUS));
-  const lines = wrapLines(text, cols, markerScale);
+  const cellH = renderCellHeight(style);
+  const lines = wrapLines(text, cols, markerScale, style.font);
   // Width-identical slot rows align 1:1 with `lines`; pages are contiguous slices,
   // so the same index range gives each page its slot half. Only built when coloring.
   const slotLines: string[] | null =
     style.colorByRole === true && slotText !== undefined
-      ? wrapLines(slotText, cols, markerScale)
+      ? wrapLines(slotText, cols, markerScale, style.font)
       : null;
   const hardLinesPerImg = Math.max(1, Math.floor((maxHeightPx - 2 * PAD_Y) / cellH));
   // Dense pages (DENSE_CONTENT_CHARS_PER_IMAGE) fill the full 1932 px height;

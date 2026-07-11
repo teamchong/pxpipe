@@ -18,8 +18,8 @@ import {
 // consumers import (pxpipe-proxy/transform → renderTextToImages), not the
 // internal leaf renderer.
 import { renderTextToImages } from './library.js';
-import { estimateImageCount, ANTHROPIC_PIXELS_PER_TOKEN, IMAGE_COST_SAFETY_MARGIN, REPORT_CHARS_PER_TOKEN } from './transform.js';
-import { openAIVisionTokens } from './openai.js';
+import { estimateImageCount, REPORT_CHARS_PER_TOKEN } from './transform.js';
+import { visionTokensForModel } from './openai.js';
 import {
   factSheetTextFromEntries,
   extractFactSheetTokensAllPages,
@@ -249,17 +249,12 @@ export function parseExportArgv(
  *
  * - **Claude / Anthropic models** (`model.startsWith('claude')` or
  *   `model.includes('anthropic')`): uses Anthropic's billing formula
- *   `ceil(width × height / 750 × 1.10)` (the same formula and constants as
- *   `imageTokensForRows` in transform.ts, reusing the exported
- *   `ANTHROPIC_PIXELS_PER_TOKEN` / `IMAGE_COST_SAFETY_MARGIN` consts).
- * - **GPT / o-series models**: delegates to `openAIVisionTokens` which uses the
- *   GPT-4o tile-pricing formula (85 + 170 × tiles after scaling).
+ *   `ceil(width × height / 750 × 1.10)`, matching the live transform.
+ * - **OpenAI-shaped models**: delegates to the same exact-model router as the
+ *   proxy (Grok measured pixel rate; GPT tile/patch rate).
  */
 export function exportImageTokens(model: string, width: number, height: number): number {
-  if (model.startsWith('claude') || model.includes('anthropic')) {
-    return Math.ceil((width * height / ANTHROPIC_PIXELS_PER_TOKEN) * IMAGE_COST_SAFETY_MARGIN);
-  }
-  return openAIVisionTokens(model, width, height);
+  return visionTokensForModel(model, width, height);
 }
 
 // ---------------------------------------------------------------------------

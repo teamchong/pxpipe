@@ -13,7 +13,7 @@
 
 import type { CacheControl, ContentBlock, ImageBlock, Message, TextBlock, ToolUseBlock, ToolResultBlock } from './types.js';
 import { DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_CONTENT_COLS, DENSE_RENDER_STYLE, neutralizeSentinel, reflow, renderTextToPngsWithCharLimit, roleSlotSegment, SLOT_MARK_ASSISTANT, SLOT_MARK_USER } from './render.js';
-import { factSheetText } from './factsheet.js';
+import { appendIdsBlock, factSheetText } from './factsheet.js';
 import { bytesToBase64 } from './png.js';
 
 /**
@@ -594,6 +594,18 @@ export async function collapseHistory(
       } else {
         chunkRender = safeText;
         chunkSlot = safeSlot;
+      }
+    }
+    // Universal pure-image IDS rows (hex/camel/path/port). Append the same
+    // \nIDS\n... suffix to text + slot so colorByRole wrap lines stay 1:1.
+    // appendIdsBlock trims trailing whitespace first, so do not slice by old length.
+    {
+      const withIds = appendIdsBlock(chunkRender);
+      if (withIds !== chunkRender) {
+        const idsAt = withIds.lastIndexOf('\nIDS\n');
+        const suffix = idsAt >= 0 ? withIds.slice(idsAt) : '';
+        chunkRender = withIds;
+        chunkSlot = chunkSlot.replace(/\s+$/, '') + suffix;
       }
     }
     // Use the dense readable profile (not full-canvas) to keep code/config legible.

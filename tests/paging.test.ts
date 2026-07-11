@@ -74,6 +74,16 @@ describe('estimateImageCount', () => {
     expect(estimateImageCount(READABLE_CHARS_PER_IMAGE, COLS)).toBe(1);
     expect(estimateImageCount(READABLE_CHARS_PER_IMAGE + 1, COLS)).toBe(2);
   });
+
+  it('treats reflow ↵ as an inline glyph, not a row break', () => {
+    // wrapLines packs "a↵b↵c" onto one visual row. The gate must match that;
+    // counting ↵ as a break overstates pages and blocks history collapse.
+    const reflowed = Array.from({ length: 50 }, (_, i) => `turn-${i}`).join('↵');
+    expect(estimateImageCount(reflowed, COLS)).toBe(1);
+    // Same content as real newlines still costs one row per line.
+    const raw = Array.from({ length: ROWS_PER_IMG + 1 }, (_, i) => `turn-${i}`).join('\n');
+    expect(estimateImageCount(raw, COLS)).toBe(2);
+  });
 });
 
 describe('dense readable render profile', () => {

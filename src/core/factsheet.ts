@@ -27,6 +27,10 @@ const PATTERNS: readonly RegExp[] = [
   /\b\d[\d,_]{3,}\b/g, // large / separated number
   /\b\d+\.\d+\b/g, // decimal
   /\b[A-Z][A-Z0-9]{2,}(?:_[A-Z0-9]+)+\b/g, // CONST_IDS / env var names
+  // camelCase / PascalCase with ≥1 lowercase run and ≥1 internal capital
+  // (tokenLedgerShard, getUserById). Rejects ALL-CAPS words so history markers
+  // like CURRENT/FRONTIER do not flood the sheet.
+  /\b(?:[a-z]+|[A-Z][a-z0-9]+)(?:[A-Z][a-z0-9]*)+\b/g,
   // Ticket/advisory-style codes: uppercase hyphenated with ≥1 digit (PROJ-1482,
   // CVE-2024-30078, AUDIT-ZX9). Digit lookahead is bounded → no backtracking blowup.
   /\b(?=[A-Z0-9-]{0,119}\d)[A-Z][A-Z0-9]+(?:-[A-Z0-9]+)+\b/g,
@@ -35,12 +39,14 @@ const PATTERNS: readonly RegExp[] = [
 const MIN_LEN = 3;
 const MAX_LEN = 120;
 /** Budget cap: highest-priority tokens kept first. Exported so consumers can report drops. */
-export const MAX_TOKENS = 64;
+export const MAX_TOKENS = 96;
 // At most this many URL exemplars: URLs are long, structured, low OCR-risk, and usually
 // reconstructable, so they must never crowd out short zero-redundancy tokens.
 const MAX_URLS = 8;
 const MAX_SEEN = 2048; // defensive bound on distinct tokens entering substring-collapse
 const MAX_SCAN = 262_144; // defensive input bound; tool_results are already paged
+// Match render DENSE_CONTENT_CHARS_PER_IMAGE without importing render (cycle-free).
+const FACTSHEET_PAGE_CHARS = 28_080;
 const MAX_CHUNK = 512; // whitespace-free chunks longer than this are blobs (base64, minified) — skip
 
 /** Budget priority by token SHAPE, not length — length is anti-correlated with
@@ -55,6 +61,7 @@ const SHAPE_TICKET = /^(?=[A-Z0-9-]*\d)[A-Z][A-Z0-9]+(?:-[A-Z0-9]+)+$/; // PROJ-
 const SHAPE_FLAG = /^--?[A-Za-z][\w-]+$/; // CLI flag
 const SHAPE_NUM = /^\d[\d,_]*$|^\d+\.\d+$/; // port / large or separated number / decimal
 const SHAPE_URL = /^https?:\/\//;
+const SHAPE_CAMEL = /^(?:[a-z]+|[A-Z][a-z0-9]+)(?:[A-Z][a-z0-9]*)+$/; // tokenLedgerShard / getUserById
 
 /** Lower tier = higher keep-priority. Pure function of the token → deterministic. */
 function priorityTier(tok: string): 0 | 1 | 2 {
@@ -64,7 +71,8 @@ function priorityTier(tok: string): 0 | 1 | 2 {
     SHAPE_CONST.test(tok) ||
     SHAPE_TICKET.test(tok) ||
     SHAPE_FLAG.test(tok) ||
-    SHAPE_NUM.test(tok)
+    SHAPE_NUM.test(tok) ||
+    (SHAPE_CAMEL.test(tok) && tok.length >= 8)
   ) {
     return 0;
   }
@@ -75,7 +83,7 @@ function priorityTier(tok: string): 0 | 1 | 2 {
 /**
  * Extract deduped, precision-critical tokens from `text`. Substrings of a longer kept
  * token are dropped (so `/github.com` inside the full URL, `lib/x.ts` inside
- * `src/lib/x.ts`, etc. collapse to the most specific form); the 64-token budget is then
+ * `src/lib/x.ts`, etc. collapse to the most specific form); the token budget is then
  * filled by priority tier (see `priorityTier`) so short, high-consequence tokens are never
  * evicted by long low-risk URLs.
  *
@@ -229,7 +237,63 @@ export function factSheetTextFromEntries(entries: readonly FactSheetEntry[]): st
   return (anyRepeat ? OPEN_COUNTS : OPEN) + body + ']';
 }
 
-/** One-line fact-sheet string for `text`, or `''` when nothing notable was found. */
+/** One-line fact-sheet string for `text`, or `''` when nothing notable was found.
+ *  Single path for slab, history, and tool results: page long text so early-turn
+ *  ids are not dropped by MAX_SCAN. Short text is one page (same as before). */
 export function factSheetText(text: string): string {
-  return factSheetTextFromEntries(extractFactSheetEntries(text));
+  if (!text) return '';
+  if (text.length <= MAX_SCAN) {
+    return factSheetTextFromEntries(extractFactSheetEntries(text));
+  }
+  const { kept } = extractFactSheetEntriesAllPages(text, FACTSHEET_PAGE_CHARS);
+  return factSheetTextFromEntries(kept);
+}
+
+/** Shape label for an IDS-block line (visual OCR aid, not a factsheet). */
+function idsBlockLabel(tok: string): string {
+  if (SHAPE_HEX.test(tok)) return 'hex';
+  if (SHAPE_UUID.test(tok)) return 'uuid';
+  if (SHAPE_CAMEL.test(tok) && tok.length >= 8) return 'camel';
+  if (tok.includes('/')) return 'path';
+  if (SHAPE_NUM.test(tok) && tok.length <= 8) return 'port';
+  if (SHAPE_CONST.test(tok)) return 'const';
+  if (SHAPE_FLAG.test(tok)) return 'flag';
+  if (SHAPE_TICKET.test(tok)) return 'code';
+  return 'id';
+}
+
+/**
+ * Append a short multi-line IDS block of precision-critical tokens so each ID
+ * sits on its own rendered row (pure-image OCR aid at 5×8). Deterministic.
+ * Used on every imaged path (Claude + GPT + Grok). Grok pure-image packing
+ * validated 2026-07-11 (white+ids_block 7/7 4/4); other families get the same
+ * visual isolation as defense in depth alongside the text fact-sheet.
+ * Does not replace the text fact-sheet; the IDS block is rasterized into the PNG.
+ */
+export function appendIdsBlock(text: string, maxIds = 16): string {
+  if (!text) return text;
+  if (/\nIDS\n/.test(text) || text.startsWith('IDS\n')) return text;
+  const entries =
+    text.length <= MAX_SCAN
+      ? extractFactSheetEntries(text)
+      : extractFactSheetEntriesAllPages(text, FACTSHEET_PAGE_CHARS).kept;
+  // Prefer tier-0 (hex, ports, camel, flags), then tier-1 paths — same
+  // consequence ranking as the fact-sheet budget, but keep a few paths so
+  // pure-image path probes stay visible as isolated rows.
+  const tokens: string[] = [];
+  const seen = new Set<string>();
+  const push = (t: string) => {
+    if (seen.has(t) || tokens.length >= maxIds) return;
+    seen.add(t);
+    tokens.push(t);
+  };
+  for (const { token } of entries) {
+    if (priorityTier(token) === 0) push(token);
+  }
+  for (const { token } of entries) {
+    if (priorityTier(token) === 1 && token.includes('/')) push(token);
+  }
+  if (tokens.length === 0) return text;
+  const lines = tokens.map((t) => `${idsBlockLabel(t)} ${t}`);
+  return `${text.replace(/\s+$/, '')}\nIDS\n${lines.join('\n')}\n`;
 }

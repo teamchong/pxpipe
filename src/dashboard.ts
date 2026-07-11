@@ -476,8 +476,9 @@ export class DashboardState {
    *  renders at 100/100 (no Opus read tax) with the same image billing, and
    *  the live proxy record measured ~68% real input-token savings on dense
    *  traffic — the old off-default rationale ("cache-illusory savings")
-   *  cited the superseded dead verdict. Verbatim recall is still lossy;
-   *  the dashboard toggle remains the kill switch. See FINDINGS.md. */
+   *  cited the superseded dead verdict. Grok stays opt-in until quality
+   *  matches Fable. Verbatim recall is still lossy; the dashboard toggle
+   *  remains the kill switch. See FINDINGS.md. */
   private compressionEnabled = true;
   /** Recent requests' transform breakdowns, for the Context Map panel + its
    *  history selector. In-memory ring, newest last. */

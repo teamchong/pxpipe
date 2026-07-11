@@ -1,10 +1,169 @@
 # FINDINGS — pxpipe (text→PNG token compression)
 
 **Status:** ⚠️ **VERDICT REVERSED — see correction below.** Originally ruled "dead"; live measurement shows pxpipe is a working *lossy gist-compressor* saving ~68% on real (dense) Claude Code traffic, with a known verbatim-recall gap.
-**Date:** 2026-05-28 (original) · 2026-05-29 (correction) · 2026-06-09 (Fable 5 update) · 2026-06-10 (gist-recall A/B, SWE-bench pilot) · 2026-06-12 (field observation, n=1) · 2026-06-23 (reframe: correct baseline = /compact)
-**Models tested:** `claude-opus-4-5` (original run), `claude-opus-4-8` (re-test after a model bump), `claude-fable-5` (2026-06-09)
-**Model scope (current):** Fable 5 only, enforced in library + proxy (Opus disabled 2026-06-09 — see update below).
-**Harness:** `eval/needle-haystack/` (receipts preserved from `/tmp/needle_eval`)
+**Date:** 2026-05-28 (original) · 2026-05-29 (correction) · 2026-06-09 (Fable 5 update) · 2026-06-10 (gist-recall A/B, SWE-bench pilot) · 2026-06-12 (field observation, n=1) · 2026-06-23 (reframe: correct baseline = /compact) · 2026-07-09 (GPT-5.6 Sol raw-recall pilot)
+**Models tested:** `claude-opus-4-5` (original run), `claude-opus-4-8` (re-test after a model bump), `claude-fable-5` (2026-06-09), `gpt-5.6-sol` (2026-07-09 raw-image pilot)
+**Model scope (current):** Fable 5 only, enforced in library + proxy. Sol, Opus, GPT 5.5, and Grok remain available only through explicit opt-in.
+**Harnesses:** Claude/Opus/Fable: `eval/needle-haystack/` (older receipts preserved from `/tmp/needle_eval`); Sol: `eval/sol-profile/` (raw responses and receipts committed)
+
+---
+
+## Update (2026-07-09) — GPT-5.6 Sol fails raw exact recall at both tested profiles; moved to opt-in
+
+The exact production model id is `gpt-5.6-sol`. Production telemetry showed
+that real Sol requests reached the Responses path and retained positive
+estimated savings, but token rows are not reader-quality evidence. A separate
+paid pilot therefore sent deterministic rendered terminal fixtures directly to
+the Responses endpoint with `detail: original`, bypassing pxpipe.
+
+### What was actually tested
+
+Each scored call asked, in one structured response, for four exact values
+(12-character hex, camelCase field, full path, and port), one rollout gist, and
+one deliberately unstated fact. The two profiles were real paid Sol calls:
+
+| profile | dimensions | exact | unsupported inventions | gist | unstated guard | result |
+|---|---:|---:|---:|:---:|:---:|---|
+| JetBrains Mono 10, 6×11, 126 cols | 764×1724 | **0/4** | **4** | pass | pass | **fail** |
+| old shared Spleen, 5×8, 152 cols | 768×1040 | **0/4** | **4** | fail | pass | **fail** |
+
+The 5×8 line is a model result, not a local-render inference and not a reuse of
+Grok's 5×8 result. In both Sol calls every returned hex/id/path/port was absent
+from the fixture, so the errors are classified as confabulations rather than
+single-glyph OCR substitutions.
+
+There was one additional paid setup attempt at 6×11. It returned no answer
+because all 512 output tokens were hidden reasoning tokens and ended
+`incomplete: max_output_tokens`. It counts toward spend but is excluded from
+recall scoring. The corrected scored calls used `reasoning: none`.
+
+### Honest boundary
+
+- This is one scored synthetic fixture per profile because the early-stop rule
+  halted after clear failure. It proves those calls failed the bar; it does not
+  estimate a population error rate.
+- It is **not** a direct Sol-vs-Fable comparison. Fable's evidence comes from
+  separate, larger harnesses described below.
+- Production attaches a deterministic verbatim fact-sheet for extracted paths
+  and identifiers. That text fallback can rescue covered exact strings, but it
+  does not make the raw-image result a pass.
+- A Sol-only JetBrains effective 9×12 / 84-column candidate is rendered locally
+  (two pages, 2,136 estimated image tokens, positive estimated savings) but has
+  **not** received a model call. It is geometry, not evidence.
+
+### Decision
+
+`gpt-5.6-sol` is **off by default**, under the same rule used for GPT 5.5 and
+Grok: silent image rewriting requires positive recall evidence, not merely
+positive savings. Its exact profile and suffix aliases remain available for
+explicit operator opt-in:
+
+    PXPIPE_MODELS=claude-fable-5,gpt-5.6-sol
+
+Re-enabling Sol by default requires a retuned paid arm to clear 4/4 exact, zero
+confabulations, gist, and guard with positive savings; a replicated pass on both
+fixtures is preferred before silent promotion.
+
+Receipts and every raw response:
+[`eval/sol-profile/RESULTS.md`](eval/sol-profile/RESULTS.md).
+
+---
+
+## Update (2026-07-05) — parked: verbatim misreads are capacity-bound; research documented for successors
+
+Closed out a research pass over the exotic-rendering proposal space (ViT
+patch-grid alignment, RGB channel multiplexing, QR/braille/matrix glyph
+encodings, chromatic edge fringing, background anchor grids, colored text
+lanes). None survive the constraints. Writing down why, so the next person
+starts where this stopped instead of re-deriving it. The evergreen version
+of the not-OCR and DeepSeek-OCR sections lives in `docs/NOT-OCR.md`.
+
+### The capacity argument (why no rendering trick gets to zero error)
+
+The 2026-06-16 sweep already contains the proof sketch: exact-read accuracy
+is a monotonic function of pixels-per-glyph (Opus 4.8: 10% exact at the 5×8
+production cell, 95% at 10×16, 100% at 20×32; n=20 ids/size), and the API's
+resample ceiling locks pixels-per-glyph to chars-per-image. So at any fixed
+density above the encoder's transcription capacity, some error rate is
+guaranteed. Errors can be relocated onto content the language prior repairs
+(prose), detected, or re-fetched; they cannot be eliminated by font, color,
+or layout at the same density. Where each proposal dies:
+
+| proposal | dies on |
+|---|---|
+| patch-grid-aligned fonts | server-side resample destroys pixel phase; encoder internals not public or stable |
+| QR / DataMatrix / braille / custom glyph maps | needs discrete decoding, which model vision does not do (below); exact ids already ride as text |
+| RGB page-multiplexing, color lanes, chromatic fringing | text reading is luminance-dominant; channel-separated or overlapping text is far out of training distribution |
+| font shape swaps | sweep result: confusions vanish with cell area, not glyph shape |
+
+### Model vision is not OCR (why misses are silent)
+
+An OCR engine segments glyphs, classifies each against a symbol set, and
+emits characters with confidences; it can return "unreadable". A VLM does
+none of that. The image is cut into fixed-size patches; each patch is
+projected to one continuous embedding (which is why image cost scales with
+pixel area, not content); the language model attends over those embeddings.
+No character is ever materialized as a discrete symbol anywhere in the
+stack, so there is nothing to flag low confidence on. When pixels
+underdetermine a glyph, the language prior fills the gap. That single fact
+predicts every failure signature in this file: dense prose reads fine while
+hex ids corrupt (the prior repairs prose and has no signal on hex); misses
+are confident and plausible, not garbled (Appendix B: the 6/15 semantic
+hits were all round numbers a prior would guess; the 2026-06-12 field
+misread was a plausible wrong name); accuracy falls smoothly with density
+instead of cliffing (the sweep curve). "It read the page fine" and "it
+recalled the hash wrong" are the same mechanism.
+
+### Relation to DeepSeek-OCR (Oct 2025, "Contexts Optical Compression")
+
+Same thesis, opposite mechanism, different era. DeepSeek-OCR trained a
+dedicated optical encoder (~380M) plus a ~3B decoder to compress text as
+images, reporting ~97% decoding precision below 10× compression and ~60%
+near 20×. pxpipe trains nothing; the reader is the stock production model,
+and the margin comes from the channel's real per-token density (image
+tokens are priced by pixel area; dense text packs more per token). The reason
+this repo could not have existed when that paper shipped: no production
+frontier model then read dense renders at profitable density. The sweep
+dates the crossing inside one vendor generation: Opus 4.8 reads the 5×8
+production cell at 10% exact, while Fable 5 reads production density at
+13/15 verbatim and 100/100 on novel arithmetic (N=100). The new thing is
+the capability; pxpipe is a consumer of it, and that same
+trajectory is the reason to park rather than out-engineer the encoder
+(below).
+
+### Open threads, with banked state, for whoever follows up
+
+1. **Glyph-style A/B** (`eval/glyph-matrix/`): paused; 120 pages
+   pre-rendered, 2/40 trials banked, limit-aware resume steps in
+   `HANDOFF.md`. Expected effect is modest (single-digit pp, but
+   token-cost-neutral if a style wins) given the sweep's
+   resolution-not-shape result.
+2. **Runtime canary + re-fetch**: render a short known string per page (a
+   ~30-char canary on a ~92k-char page); the consumer transcribes it;
+   mismatch means the page is treated as an erasure and re-fetched as text.
+   Converts silent misreads (2026-06-12 field observation: 2 of 3 misses
+   silent) into detected, priced retransmits. Also the precondition for
+   ever raising density safely: undetected errors force conservative
+   density, detected errors can simply be paid for.
+3. **Surrogate-reader pre-flight** (novel, untested): the proxy holds
+   ground truth for every page it renders, so a local VLM can proofread
+   each render before it ships; any span the surrogate misreads gets
+   re-rendered larger or routed to text. Go/no-go is one free experiment:
+   miss-set correlation between a local VLM and Fable on the already-banked
+   glyph-matrix pages and outs. High correlation means build it; low means
+   the idea is dead and this file says so.
+
+### Decision
+
+Park. The binding constraint improved ~4× in glyph area across one model
+generation with zero effort from this repo. Tripwire on each model release
+(~20 cheap calls):
+
+    MODEL=<id> TAG=<tag> bash eval/glyph-matrix/sweep/run_sweep.sh
+
+If a new model reads 5×8 near 100%, raise density (the savings improve for
+free). If the provider ships native optical context compression, this repo
+is superseded and can retire.
 
 ---
 

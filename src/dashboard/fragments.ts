@@ -85,8 +85,12 @@ const MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
 ];
 
 const GPT_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
-  { id: 'gpt-5.6', label: 'GPT 5.6' },
+  { id: 'gpt-5.6-sol', label: 'GPT 5.6 Sol' },
   { id: 'gpt-5.5', label: 'GPT 5.5' },
+];
+
+const GROK_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
+  { id: 'grok-4.5', label: 'Grok 4.5' },
 ];
 
 export function renderModelsFragment(
@@ -96,7 +100,7 @@ export function renderModelsFragment(
 ): string {
   const on = new Set(active);
   const labelOf = new Map(
-    [...MODEL_CATALOG, ...GPT_MODEL_CATALOG].map((m) => [m.id, m.label]),
+    [...MODEL_CATALOG, ...GPT_MODEL_CATALOG, ...GROK_MODEL_CATALOG].map((m) => [m.id, m.label]),
   );
   // Union the catalog with env-configured + active ids so PXPIPE_MODELS-enabled
   // families always show as toggles, then split by family for the two sections.
@@ -105,6 +109,7 @@ export function renderModelsFragment(
   for (const id of [
     ...MODEL_CATALOG.map((m) => m.id),
     ...GPT_MODEL_CATALOG.map((m) => m.id),
+    ...GROK_MODEL_CATALOG.map((m) => m.id),
     ...configured,
     ...active,
   ]) {
@@ -122,8 +127,13 @@ export function renderModelsFragment(
       `hx-vals='{"model":"${id}","on":${!lit}}'>${escapeHtml(label)}${lit ? ' ✓' : ''}</button>`
     );
   };
-  const claudeChips = ids.filter((id) => !id.startsWith('gpt')).map(chipFor).join('');
+  const claudeChips = ids.filter((id) => id.startsWith('claude')).map(chipFor).join('');
   const gptChips = ids.filter((id) => id.startsWith('gpt')).map(chipFor).join('');
+  const grokChips = ids.filter((id) => id.startsWith('grok')).map(chipFor).join('');
+  const otherChips = ids
+    .filter((id) => !id.startsWith('claude') && !id.startsWith('gpt') && !id.startsWith('grok'))
+    .map(chipFor)
+    .join('');
   const moot = enabled ? '' : ` <span class="hint">compression is off, so this has no effect right now</span>`;
   return (
     `<div class="models">` +
@@ -131,7 +141,13 @@ export function renderModelsFragment(
     claudeChips +
     `<span class="hint">everything else is sent as normal text · runtime only · persist with PXPIPE_MODELS</span>${moot}` +
     `</div>` +
-    `<div class="models" style="display:none">` +
+    `<div class="models">` +
+    `<span class="models-label">Image Grok models</span>` +
+    grokChips +
+    otherChips +
+    `<span class="hint">opt-in only · OpenAI Responses path · set PXPIPE_MODELS to persist</span>${moot}` +
+    `</div>` +
+    `<div class="models">` +
     `<span class="models-label">Image GPT models</span>` +
     gptChips +
     `<span class="hint">imaging only, no Anthropic cache_control · one scope for all families · set PXPIPE_MODELS (CSV of bases, or off) to persist</span>${moot}` +
@@ -211,10 +227,11 @@ function statTile(
   cls = '',
   tip = '',
 ): string {
-  const t = tip ? ` title="${escapeHtml(tip)}"` : '';
-  const q = tip ? `<span class="q">?</span>` : '';
+  const q = tip
+    ? `<span class="q" tabindex="0" aria-label="${escapeHtml(tip)}" data-tip="${escapeHtml(tip)}">?</span>`
+    : '';
   return (
-    `<div class="tile"${t}>` +
+    `<div class="tile">` +
     `<div class="tile-label">${label}${q}</div>` +
     `<div class="tile-value ${cls}">${value}</div>` +
     `<div class="tile-sub">${sub}</div>` +
@@ -814,7 +831,18 @@ const CSS = `
   .tile-sub { font-size: 11.5px; color: var(--muted); margin-top: 6px; }
   .q { display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px;
     border-radius: 50%; background: var(--surface-2); border: 1px solid var(--border-strong);
-    color: var(--muted); font-size: 9px; font-weight: 700; cursor: help; }
+    color: var(--muted); font-size: 9px; font-weight: 700; cursor: help; position: relative; outline: none; }
+  .q:hover, .q:focus-visible { color: var(--flame-ink); border-color: var(--flame); }
+  .q::after { content: attr(data-tip); position: absolute; z-index: 50; left: 50%; bottom: calc(100% + 8px);
+    width: min(280px, 75vw); transform: translate(-50%, 4px); padding: 8px 10px; border-radius: 7px;
+    background: var(--ink); color: var(--surface); box-shadow: var(--shadow); font-size: 11px; font-weight: 500;
+    line-height: 1.4; text-align: left; pointer-events: none; opacity: 0; visibility: hidden;
+    transition: opacity .12s, transform .12s, visibility .12s; }
+  .q::before { content: ''; position: absolute; z-index: 51; left: 50%; bottom: calc(100% + 3px);
+    transform: translateX(-50%); border: 5px solid transparent; border-top-color: var(--ink);
+    pointer-events: none; opacity: 0; visibility: hidden; transition: opacity .12s, visibility .12s; }
+  .q:hover::after, .q:focus-visible::after { opacity: 1; visibility: visible; transform: translate(-50%, 0); }
+  .q:hover::before, .q:focus-visible::before { opacity: 1; visibility: visible; }
 
   /* drawer */
   .drawer { margin: 0 0 14px; background: var(--surface); border: 1px solid var(--border);

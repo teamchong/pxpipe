@@ -83,27 +83,53 @@ describe('public library API', () => {
       // null clears the override → back to the Fable-only default
       setAllowedModelBases(null);
       expect(isPxpipeSupportedModel('claude-fable-5')).toBe(true);
+      expect(isPxpipeSupportedGptModel('grok-4.5')).toBe(false);
       expect(isPxpipeSupportedModel('claude-opus-4-8')).toBe(false);
     } finally {
       setAllowedModelBases(null); // never leak the override into other tests
     }
   });
 
-  it('recognizes GPT 5.6 as the default OpenAI imaging scope (5.5 opt-in)', () => {
+  it('keeps GPT 5.6 Sol off by default but preserves exact opt-in aliases', () => {
     expect(isPxpipeSupportedGptModel('gpt-5')).toBe(false);
-    // gpt-5.5 degrades on imaged context, so it is off by default now.
     expect(isPxpipeSupportedGptModel('gpt-5.5')).toBe(false);
     expect(isPxpipeSupportedGptModel('gpt-5.5-codex')).toBe(false);
-    expect(isPxpipeSupportedGptModel('gpt-5.5-2026-06-01')).toBe(false);
-    expect(isPxpipeSupportedGptModel('gpt-5.6')).toBe(true);
+    expect(isPxpipeSupportedGptModel('gpt-5.6')).toBe(false);
+    expect(isPxpipeSupportedGptModel('gpt-5.6-sol')).toBe(false);
+    expect(isPxpipeSupportedGptModel('gpt-5.6-sol-codex')).toBe(false);
+    expect(isPxpipeSupportedGptModel('gpt-5.6-terra')).toBe(false);
     expect(isPxpipeSupportedGptModel('gpt-5-mini')).toBe(false);
-    expect(isPxpipeSupportedGptModel('gpt-5.6-nano')).toBe(true);
-    expect(isPxpipeSupportedGptModel('gpt-5.6[1m]')).toBe(true);
     expect(isPxpipeSupportedGptModel('gpt-4o')).toBe(false);
-    expect(isPxpipeSupportedGptModel('gpt-50')).toBe(false);
-    expect(isPxpipeSupportedGptModel('')).toBe(false);
-    expect(isPxpipeSupportedGptModel('claude-opus-4-8')).toBe(false);
-    expect(isPxpipeSupportedGptModel(null)).toBe(false);
+
+    process.env.PXPIPE_MODELS = 'gpt-5.6-sol';
+    expect(isPxpipeSupportedGptModel('gpt-5.6-sol')).toBe(true);
+    expect(isPxpipeSupportedGptModel('gpt-5.6-sol-codex')).toBe(true);
+    expect(isPxpipeSupportedGptModel('gpt-5.6-sol[1m]')).toBe(true);
+    expect(isPxpipeSupportedGptModel('gpt-5.6-sol-codex[1m]')).toBe(true);
+    expect(isPxpipeSupportedGptModel('gpt-5.6')).toBe(false);
+    expect(isPxpipeSupportedGptModel('gpt-5.6-terra')).toBe(false);
+  });
+
+  it('keeps Grok and Sol opt-in only (off by default, like Opus)', () => {
+    // Grok packing + factsheet helps exact IDs, but pure-image is not Fable-
+    // level and the full quality suite is incomplete — opt-in only.
+    const prev = process.env.PXPIPE_MODELS;
+    try {
+      delete process.env.PXPIPE_MODELS;
+      expect(isPxpipeSupportedGptModel('grok-4.5')).toBe(false);
+      expect(isPxpipeSupportedGptModel('grok-4')).toBe(false);
+      expect(isPxpipeSupportedGptModel('grok-4.20')).toBe(false);
+      expect(getAllowedModelBases()).not.toContain('grok-4.5');
+      expect(getAllowedModelBases()).toEqual(['claude-fable-5']);
+
+      process.env.PXPIPE_MODELS = 'claude-fable-5,gpt-5.6-sol,grok-4.5';
+      expect(isPxpipeSupportedGptModel('grok-4.5')).toBe(true);
+      expect(isPxpipeSupportedGptModel('grok-4.5-fast')).toBe(true); // -suffix alias
+      expect(isPxpipeSupportedGptModel('gpt-5.6-sol')).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env.PXPIPE_MODELS;
+      else process.env.PXPIPE_MODELS = prev;
+    }
   });
 
   it('honors the single PXPIPE_MODELS scope for GPT families', () => {
@@ -112,17 +138,17 @@ describe('public library API', () => {
       // Explicit Claude-only scope disables GPT imaging.
       process.env.PXPIPE_MODELS = 'claude-fable-5';
       expect(isPxpipeSupportedGptModel('gpt-5.5')).toBe(false);
-      expect(isPxpipeSupportedGptModel('gpt-5.6')).toBe(false);
+      expect(isPxpipeSupportedGptModel('gpt-5.6-sol')).toBe(false);
 
       // Mixed CSV selects exactly those bases across families.
-      process.env.PXPIPE_MODELS = 'claude-fable-5,gpt-5.6';
+      process.env.PXPIPE_MODELS = 'claude-fable-5,gpt-5.6-sol';
       expect(isPxpipeSupportedGptModel('gpt-5.5')).toBe(false);
-      expect(isPxpipeSupportedGptModel('gpt-5.6')).toBe(true);
+      expect(isPxpipeSupportedGptModel('gpt-5.6-sol')).toBe(true);
       expect(isPxpipeSupportedModel('claude-fable-5')).toBe(true);
 
       // `off` disables everything.
       process.env.PXPIPE_MODELS = 'off';
-      expect(isPxpipeSupportedGptModel('gpt-5.6')).toBe(false);
+      expect(isPxpipeSupportedGptModel('gpt-5.6-sol')).toBe(false);
       expect(isPxpipeSupportedModel('claude-fable-5')).toBe(false);
     } finally {
       if (prev === undefined) delete process.env.PXPIPE_MODELS;
@@ -143,6 +169,16 @@ describe('public library API', () => {
       path: '/v1/messages',
       bodyBytes: 10,
     }).reason).toBe('unsupported_method');
+    // Provider-prefixed routes createProxy() also transforms must be eligible
+    // here too — the old endsWith('/v1/messages') check rejected /anthropic/messages.
+    for (const path of ['/anthropic/v1/messages', '/anthropic/messages']) {
+      expect(shouldTransformAnthropicMessages({
+        model: 'claude-fable-5',
+        method: 'POST',
+        path,
+        bodyBytes: 10,
+      })).toEqual({ eligible: true, reason: 'eligible' });
+    }
     expect(shouldTransformAnthropicMessages({
       model: 'claude-fable-5',
       method: 'POST',

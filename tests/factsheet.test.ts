@@ -4,6 +4,7 @@ import {
   extractFactSheetEntries,
   extractFactSheetEntriesAllPages,
   factSheetText,
+  appendIdsBlock,
 } from '../src/core/factsheet.js';
 
 describe('factsheet extraction', () => {
@@ -46,11 +47,11 @@ describe('factsheet extraction', () => {
 
   it('caps the token budget', () => {
     const many = Array.from({ length: 200 }, (_, i) => `/dir${i}/file${i}.ts`).join(' ');
-    expect(extractFactSheetTokens(many).length).toBeLessThanOrEqual(64);
+    expect(extractFactSheetTokens(many).length).toBeLessThanOrEqual(96);
   });
 
   it('protects short high-consequence tokens from eviction by long URLs', () => {
-    // 80 long doc-URLs (well over the 64-token budget) plus a short commit SHA and a port —
+    // 80 long doc-URLs (well over the 96-token budget) plus a short commit SHA and a port —
     // the exact shape that silently dropped the SHA a coding agent needed off the image.
     const urls = Array.from({ length: 80 }, (_, i) =>
       `https://platform.claude.com/docs/en/build-with-claude/page-${String(i).padStart(2, '0')}-guide.md`);
@@ -58,7 +59,7 @@ describe('factsheet extraction', () => {
     const toks = extractFactSheetTokens(text);
     expect(toks).toContain('9d121ac');
     expect(toks).toContain('47821');
-    expect(toks.length).toBeLessThanOrEqual(64);
+    expect(toks.length).toBeLessThanOrEqual(96);
     expect(toks.filter((t) => t.startsWith('http')).length).toBeLessThanOrEqual(8);
   });
 });
@@ -118,5 +119,67 @@ describe('ticket-style codes and occurrence counts', () => {
     const hit = kept.find((e) => e.token === 'TICK-42');
     expect(hit).toBeDefined();
     expect(hit!.count).toBe(5);
+  });
+
+  it('keeps camelCase identifiers that models confabulate off dense images', () => {
+    const sheet = factSheetText('renamed the field to tokenLedgerShard and port 47821');
+    expect(sheet).toContain('tokenLedgerShard');
+    expect(sheet).toContain('47821');
+  });
+
+
+  it('covers the Grok density-harness probes (hex/camel/path/port)', () => {
+    // Production Grok keeps 5x8 images and relies on the fact-sheet for exact
+    // IDs. If extraction drops any of these shapes, image-only confab returns.
+    const text = [
+      'token cache key is a3f9c1e0b7d2',
+      'renamed the field to tokenLedgerShard',
+      'moved the tier math into src/core/anthropic-vision.ts',
+      'Proxy stays on port 47821',
+      'CLI takes --max-visual-tokens',
+    ].join('. ');
+    const toks = extractFactSheetTokens(text);
+    for (const need of [
+      'a3f9c1e0b7d2',
+      'tokenLedgerShard',
+      'src/core/anthropic-vision.ts',
+      '47821',
+      '--max-visual-tokens',
+    ]) {
+      expect(toks, `missing ${need}`).toContain(need);
+    }
+  });
+
+});
+
+describe('appendIdsBlock (pure-image IDS rows for all models)', () => {
+  it('appends an IDS block with hex, camel, path, and port labels', () => {
+    const text = [
+      'Done. The token cache key is a3f9c1e0b7d2. I renamed the field to tokenLedgerShard',
+      'and moved the tier math into src/core/anthropic-vision.ts. Proxy stays on port 47821.',
+    ].join(' ');
+    const out = appendIdsBlock(text);
+    expect(out).toContain('\nIDS\n');
+    expect(out).toContain('hex a3f9c1e0b7d2');
+    expect(out).toContain('camel tokenLedgerShard');
+    expect(out).toContain('path src/core/anthropic-vision.ts');
+    expect(out).toContain('port 47821');
+    // original body preserved
+    expect(out.startsWith(text.trimEnd()) || out.includes('token cache key is a3f9c1e0b7d2')).toBe(true);
+  });
+
+  it('is idempotent — does not double-append', () => {
+    const text = 'key a3f9c1e0b7d2 path src/core/x.ts port 47821';
+    const once = appendIdsBlock(text);
+    expect(appendIdsBlock(once)).toBe(once);
+  });
+
+  it('is deterministic for cache stability', () => {
+    const text = 'hex a3f9c1e0b7d2 camel tokenLedgerShard path src/a/b.ts port 47821';
+    expect(appendIdsBlock(text)).toBe(appendIdsBlock(text));
+  });
+
+  it('returns the original text when nothing notable is present', () => {
+    expect(appendIdsBlock('the quick brown fox')).toBe('the quick brown fox');
   });
 });

@@ -304,14 +304,12 @@ describe('collapseHistory', () => {
     expect(info.reason).toBe('prefix_too_short');
   });
 
-  it('rejects tiny histories under the full-canvas gate', async () => {
-    // 12 micro-turns (~150 chars serialised). Under the full-canvas render
-    // policy (no shrink-to-content) the cheapest image still spends the full
-    // 1568×88 pixel band, which costs more tokens than 150 chars of text. The
-    // gate correctly refuses unprofitable compressions — pxpipe must SAVE
-    // tokens, never spend more than the text it replaces. This is a regression
-    // guard against re-introducing shrink-to-content (which traded savings for
-    // a savings illusion on sparse content).
+  it('packs micro histories via reflow so the gate can accept them', async () => {
+    // 12 micro-turns. Reflow joins hard newlines with ↵ (inline glyph), so the
+    // serialised transcript is a short strip, not 40+ nearly-empty rows. The
+    // gate must use that same row model; treating ↵ as a break used to mark
+    // this unprofitable and skip collapse. Collapse is correct when the packed
+    // image is cheaper than the text.
     const msgs: Message[] = [];
     for (let i = 0; i < 12; i++) {
       msgs.push(i % 2 === 0 ? usr(`q${i}`) : asst(`a${i}`));
@@ -321,8 +319,9 @@ describe('collapseHistory', () => {
       minCollapsePrefix: 5,
       collapseChunk: 0,
     });
-    expect(info.reason).toBe('not_profitable');
-    expect(info.collapsedTurns).toBe(0);
+    expect(info.reason).toBeUndefined();
+    expect(info.collapsedTurns).toBe(12);
+    expect(info.collapsedImages).toBeGreaterThan(0);
   });
 
   it('collapses a long all-plain conversation into one prepended user message', async () => {

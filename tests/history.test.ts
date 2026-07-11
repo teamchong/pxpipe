@@ -1104,6 +1104,50 @@ describe('collapseHistory — opening task carried verbatim from the demoted hea
     expect(pointer!.text).not.toContain('claudeMd noise');
   });
 
+  it('preserveReminderText keeps head <system-reminder> blocks verbatim, still tombstones the typed task', async () => {
+    // compressSystem=false sessions carry the operating instructions (CLAUDE.md,
+    // memory index) as TEXT reminders in the opening message — no rendered pages
+    // hold a copy, so demoting them to a preview would drop the session config.
+    const msgs: Message[] = [
+      usr([
+        { type: 'text', text: '<system-reminder>claudeMd config — must survive</system-reminder>' },
+        { type: 'text', text: TASK },
+      ]),
+    ];
+    for (let i = 1; i <= 12; i++) {
+      msgs.push(
+        i % 2 === 1
+          ? asst(`turn ${i}: ` + 'x'.repeat(2800))
+          : usr([{ type: 'text', text: `<system-reminder>nudge ${i} ` + 'x'.repeat(2800) + '</system-reminder>' }]),
+      );
+    }
+    msgs.push(usr('LIVE: you have read every file — answer now.'));
+
+    const { messages: out, info } = await collapseHistory(msgs, isCompressionProfitable, {
+      keepTail: 1,
+      minCollapsePrefix: 5,
+      cols: 100,
+      collapseChunk: 0,
+      protectedPrefix: 1,
+      preserveReminderText: true,
+    });
+
+    expect(info.reason).toBe(undefined);
+    const headText = (out[0]!.content as Array<Record<string, unknown>>).filter(
+      (c) => c.type === 'text',
+    ) as Array<{ text: string }>;
+    // Reminder block survives byte-identical; the stale typed task still demotes.
+    expect(headText[0]!.text).toBe('<system-reminder>claudeMd config — must survive</system-reminder>');
+    expect(headText[1]!.text).toContain('PRIOR CONTEXT ONLY');
+    // The verbatim pointer still carries the task (unchanged from the default path).
+    const synthText = (out[1]!.content as Array<Record<string, unknown>>).filter(
+      (c) => c.type === 'text',
+    ) as Array<{ text: string }>;
+    const pointer = synthText.find((t) => t.text.includes('Most recent collapsed user turn'));
+    expect(pointer).toBeDefined();
+    expect(pointer!.text).toContain('Reply as: balance=<n>, count=<m>, final=<n+m>.');
+  });
+
   it('elides the middle, never the tail, when the typed task exceeds the verbatim cap', async () => {
     const longTask =
       'SETUP: ' + 'a'.repeat(6000) + ' Reply as: balance=<n>, count=<m>, final=<n+m>.';

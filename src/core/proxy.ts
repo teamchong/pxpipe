@@ -593,6 +593,52 @@ export function parseGatewayHeaders(spec: string | undefined): Record<string, st
   return out;
 }
 
+export function resumableResponse(initial: Response, refetch: () => Promise<Response>, maxResumes = 2): Response {
+  if (!initial.body) return initial;
+  const replay: Uint8Array[] = [];
+  let replayBytes = 0;
+  const body = new ReadableStream<Uint8Array>({ async start(controller) {
+    let response = initial;
+    for (let resumes = 0; ; resumes++) {
+      const reader = response.body!.getReader();
+      let skip = resumes ? replayBytes : 0, checked = 0;
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) { controller.close(); return; }
+          if (!value?.byteLength) continue;
+          let offset = 0;
+          if (skip) {
+            const take = Math.min(skip, value.byteLength);
+            const expected = new Uint8Array(take);
+            let copied = 0, absolute = checked;
+            for (const chunk of replay) {
+              if (absolute >= chunk.byteLength) { absolute -= chunk.byteLength; continue; }
+              const n = Math.min(take - copied, chunk.byteLength - absolute);
+              expected.set(chunk.subarray(absolute, absolute + n), copied);
+              copied += n; absolute = 0;
+              if (copied === take) break;
+            }
+            for (let i = 0; i < take; i++) if (value[i] !== expected[i]) throw new Error('pxpipe autoresume prefix mismatch');
+            checked += take; skip -= take; offset = take;
+          }
+          if (offset < value.byteLength) {
+            const fresh = value.slice(offset);
+            replay.push(fresh); replayBytes += fresh.byteLength; controller.enqueue(fresh);
+          }
+        }
+      } catch (error) {
+        if (resumes >= maxResumes) { controller.error(error); return; }
+        response = await refetch();
+        if (!response.ok || !response.body) { controller.error(new Error(`pxpipe autoresume failed with HTTP ${response.status}`)); return; }
+      } finally { reader.releaseLock(); }
+    }
+  }});
+  const headers = new Headers(initial.headers);
+  headers.delete('content-length');
+  return new Response(body, { status: initial.status, statusText: initial.statusText, headers });
+}
+
 /** Build the proxy fetch handler. */
 export function createProxy(config: ProxyConfig = {}) {
   const routes = resolveUpstreams(config);
@@ -788,6 +834,9 @@ export function createProxy(config: ProxyConfig = {}) {
     }
 
     applyGatewayHeaders(outHeaders);
+    if (isOpenAIResponses && reqBodySha8 && !outHeaders.has('idempotency-key')) {
+      outHeaders.set('idempotency-key', `pxpipe-${reqBodySha8}`);
+    }
 
     // Gateway OpenAI routes drop the `/v1` prefix; provider-prefixed passthrough
     // routes keep their full path so ocproxy-style upstreams see `/openai/*`,
@@ -809,6 +858,12 @@ export function createProxy(config: ProxyConfig = {}) {
         status: 502,
         headers: { 'content-type': 'application/json' },
       });
+    }
+
+    const bodyRetryable = !(bodyOut instanceof ReadableStream);
+    if (isOpenAIResponses && bodyRetryable && (upstreamRes.headers.get('content-type') ?? '').includes('text/event-stream')) {
+      const retryInit = { method: req.method, headers: outHeaders, body: bodyOut } as RequestInit;
+      upstreamRes = resumableResponse(upstreamRes, () => fetch(upstreamUrl, retryInit));
     }
 
     const firstByteMs = Date.now() - t0;

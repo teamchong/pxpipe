@@ -11,7 +11,7 @@ import { once } from 'node:events';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createProxy, parseGatewayHeaders, resolveUpstreams, type ProxyConfig } from './core/proxy.js';
 import {
   parseExportArgv,
@@ -31,6 +31,120 @@ import {
   dashboardPath,
   type DashboardRoute,
 } from './dashboard.js';
+
+const nativeFetch = globalThis.fetch;
+
+/** ChatGPT's Cloudflare edge rejects Node/undici's TLS fingerprint on some
+ * Windows POPs even when OAuth headers are valid. Use the OS curl (Schannel)
+ * only for that first-party upstream. Secrets are inherited via child env,
+ * never placed in argv or on disk. The buffered response is a deliberate
+ * fail-safe until a streaming native helper is warranted. */
+export async function windowsChatGptFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  const request = input instanceof Request ? input : new Request(input, init);
+  const url = new URL(request.url);
+  if (process.platform !== 'win32' || url.hostname !== 'chatgpt.com') {
+    return nativeFetch(input, init);
+  }
+
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  const args = ['-sS', '--http1.1', '--no-buffer', '-D', '-', '-X', request.method];
+  let index = 0;
+  request.headers.forEach((value, name) => {
+    const key = `PXPIPE_CURL_HEADER_${index++}`;
+    env[key] = `${name}: ${value}`;
+    args.push('--variable', `%${key}`, '--expand-header', `{{${key}}}`);
+  });
+  const body = request.body ? Buffer.from(await request.arrayBuffer()) : undefined;
+  if (body) args.push('--data-binary', '@-');
+  args.push(request.url);
+
+  return await new Promise<Response>((resolve, reject) => {
+    const child = spawn('curl.exe', args, { env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    let pending = Buffer.alloc(0);
+    let settled = false;
+    let terminatedByUs = false;
+    let streamDone = false;
+    let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+    let stderr = '';
+    let sseTail = '';
+    const stream = new ReadableStream<Uint8Array>({
+      start(value) { controller = value; },
+      cancel() {
+        streamDone = true;
+        controller = undefined;
+        terminatedByUs = true;
+        child.kill();
+      },
+    });
+    const closeStream = () => {
+      if (streamDone) return;
+      streamDone = true;
+      const current = controller;
+      controller = undefined;
+      try { current?.close(); } catch { /* cancel/close won the race */ }
+    };
+    const enqueue = (chunk: Buffer) => {
+      if (streamDone || !controller) return;
+      try { controller.enqueue(chunk); } catch { streamDone = true; controller = undefined; }
+    };
+    const finishOnCompleted = (chunk: Buffer) => {
+      sseTail = (sseTail + chunk.toString('utf8')).slice(-64 * 1024);
+      const marker = Math.max(
+        sseTail.lastIndexOf('event: response.completed'),
+        sseTail.lastIndexOf('"type":"response.completed"'),
+      );
+      if (marker >= 0 && /\r?\n\r?\n/.test(sseTail.slice(marker))) {
+        closeStream();
+        terminatedByUs = true;
+        child.kill();
+      }
+    };
+    child.stdout.on('data', (chunk: Buffer) => {
+      if (settled) {
+        enqueue(chunk);
+        finishOnCompleted(chunk);
+        return;
+      }
+      pending = Buffer.concat([pending, chunk]);
+      const end = pending.indexOf('\r\n\r\n');
+      if (end < 0) return;
+      const lines = pending.subarray(0, end).toString('latin1').split('\r\n');
+      const status = Number(lines.shift()?.split(' ')[1] ?? 502);
+      const headers = new Headers();
+      for (const line of lines) {
+        const colon = line.indexOf(':');
+        if (colon > 0) headers.append(line.slice(0, colon), line.slice(colon + 1).trim());
+      }
+      headers.delete('content-length');
+      headers.delete('transfer-encoding');
+      settled = true;
+      resolve(new Response(stream, { status, headers }));
+      const firstBody = pending.subarray(end + 4);
+      if (firstBody.length) enqueue(firstBody);
+      finishOnCompleted(firstBody);
+      pending = Buffer.alloc(0);
+    });
+    child.stderr.on('data', (chunk: Buffer) => { stderr = (stderr + chunk.toString('utf8')).slice(-4096); });
+    child.on('error', (error) => { if (!settled) reject(error); else closeStream(); });
+    child.stdin.on('error', (error: NodeJS.ErrnoException) => {
+      if (error.code !== 'EPIPE' && !settled) reject(error);
+    });
+    child.on('close', (code, signal) => {
+      if (!settled) {
+        const detail = stderr.trim().replace(/\s+/g, ' ');
+        reject(new Error(`native ChatGPT transport failed (curl exit ${code}${signal ? `, signal ${signal}` : ''})${detail ? `: ${detail}` : ''}`));
+      } else {
+        // SIGTERM/non-zero is expected after a complete SSE frame or consumer cancellation.
+        closeStream();
+        if (!terminatedByUs && code && stderr.trim())
+          console.error(`[pxpipe] curl transport closed after headers (exit ${code}): ${stderr.trim()}`);
+      }
+    });
+    if (body) child.stdin.end(body); else child.stdin.end();
+  });
+}
+
+if (process.platform === 'win32') globalThis.fetch = windowsChatGptFetch;
 
 /** Runtime config. The core transform tuning comes from DEFAULTS in
  *  transform.ts; startup knobs cover deployment plus emergency GPT scope
@@ -185,9 +299,34 @@ Use with OpenAI-compatible GPT clients:
 // undefined (or reflects the *consumer's* package), never this tool's version.
 declare const __PXPIPE_VERSION__: string | undefined;
 
+function packageVersion(): string {
+  return typeof __PXPIPE_VERSION__ === 'string'
+    ? __PXPIPE_VERSION__
+    : process.env.npm_package_version ?? 'unknown';
+}
+
 function printVersion(): void {
-  const injected = typeof __PXPIPE_VERSION__ === 'string' ? __PXPIPE_VERSION__ : undefined;
-  console.log(injected ?? process.env.npm_package_version ?? 'unknown');
+  console.log(packageVersion());
+}
+
+/** Observability-only circuit breaker: it never rejects or alters traffic. */
+export class UpstreamDiagnostics {
+  activeRequests = 0;
+  private consecutiveFailures = 0;
+  private degradedUntil = 0;
+  constructor(
+    readonly threshold = Math.max(1, Number(process.env.PXPIPE_BREAKER_THRESHOLD ?? 5) || 5),
+    readonly cooldownMs = Math.max(0, Number(process.env.PXPIPE_BREAKER_COOLDOWN_MS ?? 30_000) || 30_000),
+    private readonly now: () => number = Date.now,
+  ) {}
+  record(status: number): void {
+    if (status >= 500) {
+      if (++this.consecutiveFailures >= this.threshold) this.degradedUntil = this.now() + this.cooldownMs;
+    } else if (status < 400) {
+      this.consecutiveFailures = 0;
+    }
+  }
+  get degraded(): boolean { return this.now() < this.degradedUntil; }
 }
 
 // ---- node:http <-> Web Request/Response bridge ---------------------------
@@ -1029,6 +1168,8 @@ async function main(): Promise<void> {
     },
   };
   const handle = createProxy(config);
+  const diagnostics = new UpstreamDiagnostics();
+  const startedAt = Date.now();
 
   const server = createServer((req, res) => {
     Promise.resolve()
@@ -1036,6 +1177,18 @@ async function main(): Promise<void> {
         // Local dashboard routes — handled BEFORE the proxy so they never hit
         // api.anthropic.com (which would 404 them).
         const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
+        if (url.pathname === '/healthz') {
+          if ((req.method ?? 'GET') !== 'GET') {
+            await writeWebResponse(new Response('method not allowed', { status: 405 }), res);
+            return;
+          }
+          await writeWebResponse(new Response(JSON.stringify({
+            name: 'pxpipe-proxy', version: packageVersion(),
+            uptime: Math.floor((Date.now() - startedAt) / 1000),
+            active_requests: diagnostics.activeRequests, degraded: diagnostics.degraded,
+          }), { headers: { 'content-type': 'application/json' } }), res);
+          return;
+        }
         const route = dashboardPath(url.pathname);
         if (route) {
           const webRes = await dispatchDashboard(dashboard, route, req, url, opts.port);
@@ -1045,8 +1198,14 @@ async function main(): Promise<void> {
           }
         }
         const webReq = toWebRequest(req);
-        const webRes = await handle(webReq);
-        await writeWebResponse(webRes, res);
+        diagnostics.activeRequests++;
+        try {
+          const webRes = await handle(webReq);
+          diagnostics.record(webRes.status);
+          await writeWebResponse(webRes, res);
+        } finally {
+          diagnostics.activeRequests--;
+        }
       })
       .catch((err) => {
         console.error('[pxpipe] handler error:', err);

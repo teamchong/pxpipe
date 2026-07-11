@@ -1,9 +1,7 @@
 import { afterAll, beforeAll, describe, it, expect } from 'vitest';
 import { createProxy, type ProxyEvent } from '../src/core/proxy.js';
 
-// These proxy-contract tests deliberately exercise the opt-in Sol transform.
-// Snapshot the developer shell so the suite is deterministic now that Sol is
-// intentionally absent from the built-in default scope.
+// Pin the model scope so these proxy-contract tests stay independent of the developer shell.
 let ambientPxpipeModels: string | undefined;
 beforeAll(() => {
   ambientPxpipeModels = process.env.PXPIPE_MODELS;
@@ -85,6 +83,35 @@ describe('proxy usage extraction', () => {
     expect(captured!.firstByteMs).toBeTypeOf('number');
   });
 
+  it('never calls Anthropic count_tokens for Sol Responses', async () => {
+    const upstreamRequests: Request[] = [];
+    const restore = mockUpstream(async (req) => {
+      upstreamRequests.push(req.clone());
+      return new Response(JSON.stringify({
+        id: 'resp_sol_1', object: 'response', status: 'completed',
+        output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ok' }] }],
+        usage: { input_tokens: 400, output_tokens: 8, input_tokens_details: { cached_tokens: 300 } },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    });
+    const proxy = createProxy({
+      openAIUpstream: 'https://api.openai.test', openAIApiKey: 'sk-test',
+      transform: { charsPerToken: 1, minCompressChars: 1 },
+    });
+    const body = JSON.stringify({
+      model: 'gpt-5.6-sol',
+      instructions: 'System instruction. '.repeat(900),
+      input: [{ role: 'user', content: 'hi' }],
+    });
+    const res = await proxy(new Request('http://localhost/v1/responses', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body,
+    }));
+    await res.text();
+    restore();
+    expect(upstreamRequests).toHaveLength(1);
+    expect(upstreamRequests[0]!.url).toBe('https://api.openai.test/v1/responses');
+    expect(upstreamRequests.some((r) => r.url.includes('/count_tokens'))).toBe(false);
+  });
+
   it('transforms OpenCode /anthropic/messages (no /v1) and records the model', async () => {
     const upstreamRequests: Request[] = [];
     const restore = mockUpstream(async (req) => {
@@ -146,6 +173,41 @@ describe('proxy usage extraction', () => {
     ).toBe(true);
   });
 
+  it('passes Claude Code Messages + Sol through without Anthropic count_tokens', async () => {
+    const upstreamRequests: Request[] = [];
+    const restore = mockUpstream(async (req) => {
+      upstreamRequests.push(req.clone());
+      return new Response(JSON.stringify({
+        id: 'msg_sol', type: 'message', role: 'assistant',
+        content: [{ type: 'text', text: 'ok' }], model: 'gpt-5.6-sol',
+        usage: { input_tokens: 120, output_tokens: 7 },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    });
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      upstream: 'http://ocproxy.test', apiKey: 'sk-test',
+      transform: { charsPerToken: 1, minCompressChars: 1 },
+      onRequest: (e) => { captured = e; },
+    });
+    const body = JSON.stringify({
+      model: 'gpt-5.6-sol', max_tokens: 16,
+      system: 'System instruction. '.repeat(900),
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    const res = await proxy(new Request('http://localhost/v1/messages', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body,
+    }));
+    await res.text();
+    await new Promise((r) => setTimeout(r, 20));
+    restore();
+    expect(upstreamRequests).toHaveLength(1);
+    expect(upstreamRequests[0]!.url).toBe('http://ocproxy.test/v1/messages');
+    expect(upstreamRequests.some((r) => r.url.includes('/count_tokens'))).toBe(false);
+    expect(JSON.parse(await upstreamRequests[0]!.text())).toEqual(JSON.parse(body));
+    expect(captured?.info?.compressed).toBe(false);
+    expect(captured?.info?.reason).toBe('unsupported_model');
+  });
+
   it('routes GPT 5.6 Sol chat completions to OpenAI, transforms once, and normalizes usage', async () => {
     const upstreamRequests: Request[] = [];
     const restore = mockUpstream(async (req) => {
@@ -198,7 +260,10 @@ describe('proxy usage extraction', () => {
     await new Promise((r) => setTimeout(r, 20));
     restore();
 
+    // OpenAI/Sol must never use Anthropic's /count_tokens endpoint. Its
+    // counterfactual is local o200k tokenization in src/core/openai.ts.
     expect(upstreamRequests).toHaveLength(1);
+    expect(upstreamRequests.some((r) => r.url.includes('/count_tokens'))).toBe(false);
     expect(upstreamRequests[0]!.url).toBe('https://api.openai.test/v1/chat/completions');
     expect(upstreamRequests[0]!.headers.get('authorization')).toBe('Bearer sk-test');
     const sent = JSON.parse(await upstreamRequests[0]!.text()) as any;

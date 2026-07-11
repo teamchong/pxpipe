@@ -4,7 +4,7 @@
  */
 
 import { transformRequest, type TransformOptions, type TransformInfo } from './transform.js';
-import { transformOpenAIChatCompletions, transformOpenAIResponses } from './openai.js';
+import { isClaudeModel, transformOpenAIChatCompletions, transformOpenAIResponses } from './openai.js';
 import { isAnthropicMessagesPath, isPxpipeSupportedGptModel, isPxpipeSupportedModel } from './applicability.js';
 import {
   buildBaselineCountTokensBody,
@@ -722,8 +722,14 @@ export function createProxy(config: ProxyConfig = {}) {
         // Fail-closed: unreadable model → no compression, not a risky guess.
         const model = readModelField(bodyIn);
         requestModel = model ?? undefined;
+        // /v1/messages is only a wire schema: Claude Code can target a non-
+        // Anthropic model (for example GPT-5.6 Sol). Do not apply Claude's
+        // renderer or Anthropic count_tokens merely because the route is
+        // Messages-shaped. Non-Anthropic Messages requests fail closed to
+        // passthrough until a model-aware Messages→Sol transform exists.
+        const messagesAnthropic = isMessages && isClaudeModel(model);
         const modelOk = isMessages
-          ? isPxpipeSupportedModel(model)
+          ? messagesAnthropic && isPxpipeSupportedModel(model)
           : isPxpipeSupportedGptModel(model);
         // Unsupported model → a true passthrough: no break-even compression
         // (a text-only model may not accept injected image blocks at all).
@@ -743,7 +749,7 @@ export function createProxy(config: ProxyConfig = {}) {
           reqBodySha8 = await sha8Bytes(r.body);
         }
 
-        if (isMessages) {
+        if (isMessages && messagesAnthropic) {
           baselineStatusApplies = true;
           // Probes fire on the ORIGINAL body before the main forward so all three overlap.
           // count_tokens is not billed; ~30-80ms latency is hidden by the main forward.

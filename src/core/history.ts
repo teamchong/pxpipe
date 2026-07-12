@@ -71,6 +71,14 @@ export interface HistoryCollapseOptions {
    *  identical — it just removes the blank-row waste. `collapsedChars` still
    *  reports the ORIGINAL transcript length. Default true. */
   reflow: boolean;
+  /** Keep `<system-reminder>` TEXT blocks in the protected head verbatim instead
+   *  of tombstoning them. Set by the transform when the session config was NOT
+   *  imaged (compressSystem=false): those blocks are the live operating
+   *  instructions (CLAUDE.md, memory index) riding as text — demoting them to a
+   *  300-char preview would drop the harness config from context. Default false
+   *  (imaged-slab sessions carry the config in the rendered pages; head text is
+   *  stale by construction). */
+  preserveReminderText: boolean;
 }
 
 export const HISTORY_DEFAULTS: HistoryCollapseOptions = {
@@ -81,6 +89,7 @@ export const HISTORY_DEFAULTS: HistoryCollapseOptions = {
   freezeChunk: 10,
   protectedPrefix: 0,
   reflow: true,
+  preserveReminderText: false,
 };
 
 /** Per-request telemetry surfaced back to TransformInfo. */
@@ -370,7 +379,10 @@ function typedUserText(content: string | ContentBlock[]): string {
  * cache_control breakpoint survive; the demotion is a pure function of the message, so
  * the protected prefix stays byte-stable across turns (one-time re-cache on deploy).
  */
-function demoteProtectedHeadText(head: Message[]): Message[] {
+function demoteProtectedHeadText(
+  head: Message[],
+  preserveReminderText = false,
+): Message[] {
   return head.map((m, idx) => {
     if (m.role !== 'user') return m;
     const tomb = (preview: string, cc?: CacheControl): TextBlock => {
@@ -409,6 +421,21 @@ function demoteProtectedHeadText(head: Message[]): Message[] {
       const blk = m.content[i]!;
       if (boundaryIdx >= 0 && i <= boundaryIdx) {
         out.push(blk); // slab images + fact-sheet + boundary: proxy scaffolding, kept verbatim
+        continue;
+      }
+      if (
+        preserveReminderText &&
+        blk &&
+        typeof blk === 'object' &&
+        (blk as { type?: string }).type === 'text' &&
+        typeof (blk as TextBlock).text === 'string' &&
+        (blk as TextBlock).text.trimStart().startsWith('<system-reminder>')
+      ) {
+        // Session config (CLAUDE.md, memory index) riding as text — e.g. with
+        // compressSystem/compressReminders off, or reminders below the size
+        // gate. Operating instructions, not a stale request: tombstoning them
+        // would drop the harness config from context. Kept byte-identical.
+        out.push(blk);
         continue;
       }
       if (blk && typeof blk === 'object' && (blk as { type?: string }).type === 'text') {
@@ -667,7 +694,10 @@ export async function collapseHistory(
   };
   // Demote stale request text in the protected head so the session's opening turn
   // can't surface as clean native text ahead of the history image and read as live.
-  const head = demoteProtectedHeadText(messages.slice(0, protectedPrefix));
+  const head = demoteProtectedHeadText(
+    messages.slice(0, protectedPrefix),
+    o.preserveReminderText,
+  );
   const tail = messages.slice(collapseLen);
   info.collapsedTurns = collapseLen - protectedPrefix;
   info.collapsedChars = text.length;

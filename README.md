@@ -326,6 +326,10 @@ the real content in the same 1M window), and whether a smaller active
 context improves long-task accuracy. Hypotheses, not claims — they ship as
 numbers with an n or they get cut.
 
+## Related projects
+
+- [pxpipe-windows](https://github.com/DivyeshPatro/pxpipe-windows) — Windows support for `pxpipe mitm` (node-forge CA in place of openssl, Task Scheduler autostart).
+
 ## License
 
 MIT.

@@ -173,6 +173,49 @@ describe('proxy usage extraction', () => {
     ).toBe(true);
   });
 
+  it('finds the model when a large field pushes it past the 8 KiB head', async () => {
+    const upstreamRequests: Request[] = [];
+    const restore = mockUpstream(async (req) => {
+      upstreamRequests.push(req.clone());
+      if (req.url.endsWith('/count_tokens')) {
+        return new Response(JSON.stringify({ input_tokens: 9000 }), {
+          status: 200, headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({
+        id: 'msg_1', type: 'message', role: 'assistant',
+        content: [{ type: 'text', text: 'hello' }],
+        usage: { input_tokens: 120, output_tokens: 7 },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    });
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      upstream: 'http://upstream.test', apiKey: 'k',
+      transform: { charsPerToken: 1, minCompressChars: 1 },
+      onRequest: (e) => { captured = e; },
+    });
+    // JSON.stringify key order follows insertion order: a >8 KiB `system`
+    // serialized ahead of `model` starves the head-only regex.
+    const body = JSON.stringify({
+      system: 'System instruction. '.repeat(900),
+      model: 'claude-fable-5',
+      max_tokens: 16,
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    const res = await proxy(new Request('http://localhost/v1/messages', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body,
+    }));
+    await res.text();
+    await new Promise((r) => setTimeout(r, 20));
+    restore();
+
+    expect(captured?.model).toBe('claude-fable-5');
+    // Supported model recognized -> compression applies instead of the
+    // unsupported_model fail-closed passthrough.
+    expect(captured?.info?.reason).not.toBe('unsupported_model');
+    expect(captured?.info?.compressed).toBe(true);
+  });
+
   it('passes Claude Code Messages + Sol through without Anthropic count_tokens', async () => {
     const upstreamRequests: Request[] = [];
     const restore = mockUpstream(async (req) => {

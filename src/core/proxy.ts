@@ -71,13 +71,20 @@ export interface ProxyEvent {
 /** Max chars of 4xx error body captured on ProxyEvent — enough for Anthropic's full error JSON. */
 const ERROR_BODY_MAX = 2048;
 
-/** Read the top-level `model` field from a /v1/messages body without parsing the full JSON.
- *  Returns null when not found — callers treat null as outside supported scope (fail-closed). */
+/** Read the top-level `model` field from a /v1/messages body.
+ *  Fast path: regex over the first 8 KiB. Fallback: full JSON parse, for bodies
+ *  that serialize a large field (e.g. `system`) ahead of `model` — otherwise a
+ *  supported model would silently fail closed into passthrough and lose
+ *  compression. Returns null when the body is unreadable or `model` is absent —
+ *  callers treat null as outside supported scope (fail-closed). */
 function readModelField(body: Uint8Array): string | null {
   try {
     const head = new TextDecoder().decode(body.subarray(0, 8192));
     const m = /"model"\s*:\s*"([^"]{1,80})"/.exec(head);
-    return m ? m[1]! : null;
+    if (m) return m[1]!;
+    const obj = JSON.parse(new TextDecoder().decode(body)) as { model?: unknown } | null;
+    const v = obj?.model;
+    return typeof v === 'string' && v.length <= 80 ? v : null;
   } catch {
     return null;
   }

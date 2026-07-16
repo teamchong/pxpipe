@@ -260,11 +260,14 @@ function waitForDrain(out: ServerResponse): Promise<void> {
   // cycle would then leak one 'close' + one 'error' listener on the same
   // ServerResponse, triggering MaxListenersExceededWarning, unbounded heap
   // growth, and eventually a silent OOM exit of the proxy. Manage the listeners
-  // manually and remove both on whichever event fires first.
+  // manually and remove all of them on whichever event fires first. 'error' must
+  // be handled too: with no 'error' listener attached, an error emitted while we
+  // wait would crash the process as an unhandled 'error' event.
   return new Promise<void>((resolve, reject) => {
     const cleanup = () => {
       out.off('drain', onDrain);
       out.off('close', onClose);
+      out.off('error', onError);
     };
     const onDrain = () => {
       cleanup();
@@ -274,8 +277,13 @@ function waitForDrain(out: ServerResponse): Promise<void> {
       cleanup();
       reject(new Error('client response closed'));
     };
+    const onError = (err: Error) => {
+      cleanup();
+      reject(err);
+    };
     out.once('drain', onDrain);
     out.once('close', onClose);
+    out.once('error', onError);
   });
 }
 

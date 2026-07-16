@@ -1807,6 +1807,15 @@ export async function transformRequest(
   if (o.compressTools && Array.isArray(req.tools) && req.tools.length > 0) {
     const docs: string[] = [];
     toolsRewritten = req.tools.map((t) => {
+      // #43: native server-side tools (versioned `type`, e.g. advisor_20260301,
+      // web_search_20250305) have a fixed API schema that rejects a `description`
+      // field on the entry ("Extra inputs are not permitted" → 400). Only
+      // client-defined tools — no `type`, or the explicit type:"custom" shape —
+      // accept description/input_schema, so everything else passes through
+      // byte-identical and stays out of the imaged reference (its docs live
+      // server-side; there is nothing to compress). Mirrors the OpenAI-path
+      // guard (openai.ts isFunctionTool).
+      if (t.type !== undefined && t.type !== 'custom') return t;
       docs.push(renderToolDoc(t));
       // tools[] keeps the annotation-STRIPPED schema: structure (type/properties/
       // required/enum/items) stays for Anthropic's tool-use validator — a bare

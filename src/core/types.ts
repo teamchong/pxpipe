@@ -49,6 +49,10 @@ export interface Message {
 }
 
 export interface ToolDef {
+  /** Absent or "custom" = client-defined tool (description/input_schema allowed).
+   *  Any other value is a native server-side tool with a fixed API schema that
+   *  rejects extra fields — pxpipe must pass those entries through untouched (#43). */
+  type?: string;
   name: string;
   description?: string;
   input_schema?: unknown;

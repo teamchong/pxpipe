@@ -898,6 +898,73 @@ describe('transform', () => {
     expect('input_schema' in out.tools[0]).toBe(false);
   });
 
+  // #43: Anthropic's native server-side tools (versioned `type`, e.g.
+  // advisor_20260301, web_search_20250305) have a fixed API schema that rejects
+  // a `description` field on the tool entry ("Extra inputs are not permitted"
+  // → 400). Only client-defined tools (no `type`, or explicit type:"custom")
+  // may be stubbed and imaged; everything else must pass through byte-identical.
+  it('passes native typed tools through untouched and keeps them out of the imaged reference (#43)', async () => {
+    const nativeAdvisor = { type: 'advisor_20260301', name: 'advisor' };
+    const nativeSearch = { type: 'web_search_20250305', name: 'web_search', max_uses: 3 };
+    const req = JSON.stringify({
+      model: 'claude-3-5-sonnet',
+      messages: [{ role: 'user', content: 'hi' }],
+      system: 'x'.repeat(30000),
+      tools: [
+        {
+          name: 'BigTool',
+          description: 'A very long tool description. '.repeat(500),
+          input_schema: { type: 'object', properties: { x: { type: 'string' } } },
+        },
+        nativeAdvisor,
+        nativeSearch,
+      ],
+    });
+    const { body, info } = await transformRequest(new TextEncoder().encode(req));
+    expect(info.compressed).toBe(true);
+    const out = JSON.parse(new TextDecoder().decode(body));
+
+    // Client tool alongside is still compressed — the guard must not disable
+    // the rewrite for the rest of the array.
+    expect(out.tools[0].description).toContain('"## Tool: BigTool"');
+
+    // Native typed entries: byte-identical passthrough. Any injected key
+    // (description, input_schema, …) is a 400 upstream.
+    expect(out.tools[1]).toEqual(nativeAdvisor);
+    expect(out.tools[2]).toEqual(nativeSearch);
+
+    // And they contribute nothing to the imaged Tool Reference — their docs
+    // live server-side; an empty "## Tool: <name>" heading is pure noise.
+    const imgSrc = info.imageSourceText ?? '';
+    expect(imgSrc).toContain('## Tool: BigTool');
+    expect(imgSrc).not.toContain('## Tool: advisor');
+    expect(imgSrc).not.toContain('## Tool: web_search');
+  });
+
+  it('still rewrites explicit type:"custom" tools (#43 guard must not over-block)', async () => {
+    const req = JSON.stringify({
+      model: 'claude-3-5-sonnet',
+      messages: [{ role: 'user', content: 'hi' }],
+      system: 'x'.repeat(30000),
+      tools: [
+        {
+          type: 'custom',
+          name: 'CustomTool',
+          description: 'A very long tool description. '.repeat(500),
+          input_schema: { type: 'object', properties: { x: { type: 'string' } } },
+        },
+      ],
+    });
+    const { body, info } = await transformRequest(new TextEncoder().encode(req));
+    expect(info.compressed).toBe(true);
+    const out = JSON.parse(new TextDecoder().decode(body));
+    // type:"custom" is the client-defined shape — it accepts description, so it
+    // gets the same stub-and-image treatment as untyped entries.
+    expect(out.tools[0].type).toBe('custom');
+    expect(out.tools[0].description).toContain('"## Tool: CustomTool"');
+    expect(info.imageSourceText ?? '').toContain('## Tool: CustomTool');
+  });
+
   // Snapshot-style tests against real-world Claude Code tool schemas.
   // These exercise the full preservation contract of stripSchemaDescriptions —
   // now used ONLY by the GPT path (tools[] ships a stripped skeleton while the

@@ -693,6 +693,24 @@ function lastStaticSystemCacheControl(sys: SystemField | undefined): TextBlock['
   return cacheControl;
 }
 
+/**
+ * pxpipe relocates caller cache_control markers onto rendered image blocks.
+ * A relocated position is never a guaranteed "global prefix": pages 1..N-1 of
+ * a slab run and other pxpipe-injected blocks carry no marker, so a relocated
+ * `scope:"global"` violates Anthropic's "every preceding block must be
+ * globally scoped" rule and the whole request 400s (#95). Downgrade to plain
+ * ephemeral by dropping `scope` — a single trailing marker is always valid for
+ * ordinary ephemeral caching. `type`/`ttl` are preserved, and markers without
+ * `scope` pass through untouched (identity, so byte-stability is unaffected).
+ */
+function demoteRelocatedCacheControl<T>(cc: T): T {
+  if (cc && typeof cc === 'object' && 'scope' in (cc as object)) {
+    const { scope: _scope, ...rest } = cc as Record<string, unknown>;
+    return rest as T;
+  }
+  return cc;
+}
+
 // Per-turn dynamic blocks injected by Claude Code. These drift turn-to-turn and
 // must not be baked into the cached image. Split out so only the stable static
 // slab (CLAUDE.md + tool docs) carries cache_control.
@@ -933,7 +951,7 @@ function relocateAnchorToHistoryImage(messages: Message[] | undefined, anchorOrd
   }
   if (!slabAnchor) return; // nothing to relocate → never add a marker
 
-  historyImg.cache_control = slabAnchor.cache_control;
+  historyImg.cache_control = demoteRelocatedCacheControl(slabAnchor.cache_control);
   delete slabAnchor.cache_control;
 }
 
@@ -1963,7 +1981,7 @@ export async function transformRequest(
     const imageBlock = makeImageBlock(b64, i === images.length - 1);
     imageBlocks.push(
       i === images.length - 1 && systemStaticCacheControl !== undefined
-        ? { ...imageBlock, cache_control: systemStaticCacheControl }
+        ? { ...imageBlock, cache_control: demoteRelocatedCacheControl(systemStaticCacheControl) }
         : imageBlock,
     );
   }
@@ -2076,7 +2094,7 @@ export async function transformRequest(
             await textToImageBlocks(reminderText, o.cols, numCols);
           (info.imagePngs ??= []).push(...rawPngs);
           (info.imageDims ??= []).push(...rawDims);
-          const srcCacheControl = (blk as { cache_control?: unknown }).cache_control;
+          const srcCacheControl = demoteRelocatedCacheControl((blk as { cache_control?: unknown }).cache_control);
           for (let i = 0; i < imgs.length; i++) {
             const img = imgs[i]!;
             const out =
@@ -2225,7 +2243,7 @@ export async function transformRequest(
                   await textToImageBlocks(paged.text, o.cols, numCols);
                 (info.imagePngs ??= []).push(...rawPngs);
                 (info.imageDims ??= []).push(...rawDims);
-                const srcCacheControl = (ib as { cache_control?: unknown }).cache_control;
+                const srcCacheControl = demoteRelocatedCacheControl((ib as { cache_control?: unknown }).cache_control);
                 for (let i = 0; i < imgs.length; i++) {
                   const img = imgs[i]!;
                   const out =

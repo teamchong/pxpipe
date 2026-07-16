@@ -152,3 +152,59 @@ describe('Anthropic cache contract — gate never produces negative savings', ()
     expect(info.collapsedImages ?? 0).toBeGreaterThanOrEqual(1);
   });
 });
+
+describe('Anthropic cache contract — #95 scope:"global" must not survive relocation', () => {
+  function emittedMarkers(req: any): any[] {
+    const out: any[] = [];
+    const visit = (blocks: unknown) => {
+      if (!Array.isArray(blocks)) return;
+      for (const b of blocks as any[]) {
+        if (b && typeof b === 'object' && b.cache_control != null) out.push(b.cache_control);
+        if (b && typeof b === 'object' && Array.isArray(b.content)) visit(b.content); // tool_result inner blocks
+      }
+    };
+    visit(req.system);
+    for (const m of req.messages ?? []) visit(m.content);
+    return out;
+  }
+
+  it('multi-page slab: relocated marker drops scope, keeps type/ttl, never adds markers', async () => {
+    const body = enc({
+      model: 'claude-3-5-sonnet',
+      system: [
+        {
+          type: 'text',
+          text: big(300_000),
+          cache_control: { type: 'ephemeral', ttl: '1h', scope: 'global' },
+        },
+      ],
+      messages: convo(15),
+    });
+    const inMarks = countCacheControlMarkers(body);
+    const { body: out } = await transformRequest(body);
+    expect(countCacheControlMarkers(out)).toBeLessThanOrEqual(inMarks);
+
+    const req = dec(out);
+    const marks = emittedMarkers(req);
+    // Pages 1..N-1 of a slab run are unmarked, so any surviving scope:"global"
+    // violates Anthropic's every-preceding-block-globally-scoped rule → 400.
+    for (const cc of marks) expect(cc.scope).toBeUndefined();
+    // The marker itself is conserved (relocated, not dropped) with type/ttl intact.
+    expect(marks.length).toBeGreaterThanOrEqual(1);
+    expect(marks).toContainEqual({ type: 'ephemeral', ttl: '1h' });
+  });
+
+  it('marker without scope passes through relocation unchanged (identity)', async () => {
+    const body = enc({
+      model: 'claude-3-5-sonnet',
+      system: [
+        { type: 'text', text: big(80_000), cache_control: { type: 'ephemeral', ttl: '1h' } },
+      ],
+      messages: convo(15),
+    });
+    const { body: out } = await transformRequest(body);
+    const marks = emittedMarkers(dec(out));
+    expect(marks).toContainEqual({ type: 'ephemeral', ttl: '1h' });
+    for (const cc of marks) expect(cc.scope).toBeUndefined();
+  });
+});

@@ -364,15 +364,24 @@ describe('renderer', () => {
     expect(img.droppedChars).toBe(0);
   });
 
-  it('treats codepoints outside the atlas as dropped (e.g. emoji)', async () => {
+  it('escapes codepoints outside the atlas instead of dropping them (e.g. emoji)', async () => {
     // 😀 is U+1F600 — Supplementary Plane, not in BMP. Even `full-bmp` profile
-    // wouldn't cover it. Renderer must advance by 1 cell and bump the counter,
-    // not crash on the surrogate pair.
+    // wouldn't cover it. It renders as the lossless ASCII escape [U+1F600]
+    // (see escapeMissingGlyphs), not as a blank cell — and must not crash on
+    // the surrogate pair.
     const img = await renderChunkToPng('hi 😀 world');
-    expect(img.droppedChars).toBe(1);
-    // charsRendered counts codepoints, NOT UTF-16 units — the emoji is one
-    // codepoint even though it occupies two UTF-16 units.
+    expect(img.droppedChars).toBe(0);
+    // charsRendered counts SOURCE codepoints, NOT UTF-16 units — the emoji is
+    // one codepoint even though it occupies two UTF-16 units.
     expect(img.charsRendered).toBe(10); // 'hi ' (3) + 😀 (1) + ' world' (6) = 10
+  });
+
+  it('treats escape-exempt invisibles as dropped with 1-cell advance (e.g. VS16)', async () => {
+    // U+FE0F (variation selector-16) is deliberately NOT escaped — it's an
+    // emoji presentation modifier, noise if spelled out. Renderer must advance
+    // by 1 cell and bump the counter.
+    const img = await renderChunkToPng('hi ️ world');
+    expect(img.droppedChars).toBe(1);
   });
 
   it('CJK characters advance two cells; mixed lines wrap correctly', async () => {
@@ -497,21 +506,21 @@ describe('renderer', () => {
   });
 
   it('droppedCodepoints map is populated correctly when drops occur', async () => {
-    // 😀 is supplementary-plane (not in atlas regardless of profile). The
-    // codepoint should appear in the map with count 1; charsRendered counts
-    // it as a single codepoint.
-    const img = await renderChunkToPng('hi 😀 there');
+    // Emoji now escape to [U+HEX] instead of dropping, so the drop path is
+    // exercised via an escape-EXEMPT codepoint: U+FE0F (variation selector).
+    // The codepoint should appear in the map with count 1.
+    const img = await renderChunkToPng('hi ️ there');
     expect(img.droppedChars).toBe(1);
     expect(img.droppedCodepoints.size).toBe(1);
-    expect(img.droppedCodepoints.get(0x1f600)).toBe(1);
+    expect(img.droppedCodepoints.get(0xfe0f)).toBe(1);
   });
 
   it('droppedCodepoints tallies repeat drops correctly', async () => {
-    // Three occurrences of the same dropped codepoint → count 3.
-    const img = await renderChunkToPng('😀😀😀');
+    // Three occurrences of the same dropped (exempt) codepoint → count 3.
+    const img = await renderChunkToPng('a️b️c️');
     expect(img.droppedChars).toBe(3);
     expect(img.droppedCodepoints.size).toBe(1);
-    expect(img.droppedCodepoints.get(0x1f600)).toBe(3);
+    expect(img.droppedCodepoints.get(0xfe0f)).toBe(3);
   });
 
   // --- Whitespace minify (HANDOFF R1) ---------------------------------------
@@ -1832,17 +1841,19 @@ describe('transform', () => {
   // capture & inspect the request body.
 
   it('populates droppedCodepointsTop when drops occur, sorted by count', async () => {
-    // System slab forces compression. The slab contains drops for two distinct
-    // supplementary-plane codepoints at different rates so we can verify the
-    // sort order.
-    const cpA = String.fromCodePoint(0x1f600); // 😀
-    const cpB = String.fromCodePoint(0x1f604); // 😄
-    const cpC = String.fromCodePoint(0x1f60a); // 😊
+    // System slab forces compression. Emoji now escape to [U+HEX] instead of
+    // dropping, so the drop path is exercised via escape-EXEMPT codepoints:
+    // plane-14 variation selectors (U+E01xx — astral, guaranteed absent from
+    // the BMP atlas, and deliberately never escaped). Three distinct
+    // codepoints at different rates so we can verify the sort order.
+    const cpA = String.fromCodePoint(0xe0100);
+    const cpB = String.fromCodePoint(0xe0104);
+    const cpC = String.fromCodePoint(0xe010a);
     const sys =
       'x'.repeat(150000) + // bulk to force compression
-      '\n' + cpA.repeat(10) +  // 10 drops of U+1F600
-      '\n' + cpB.repeat(3) +   // 3  drops of U+1F604
-      '\n' + cpC.repeat(1);    // 1  drop  of U+1F60A
+      '\n' + cpA.repeat(10) +  // 10 drops of U+E0100
+      '\n' + cpB.repeat(3) +   // 3  drops of U+E0104
+      '\n' + cpC.repeat(1);    // 1  drop  of U+E010A
     const req = JSON.stringify({
       model: 'claude-3-5-sonnet',
       messages: [{ role: 'user', content: 'hi' }],
@@ -1853,9 +1864,9 @@ describe('transform', () => {
     expect(info.droppedChars).toBeGreaterThanOrEqual(14);
     expect(info.droppedCodepointsTop).toBeDefined();
     const top = info.droppedCodepointsTop!;
-    expect(top['U+1F600']).toBe(10);
-    expect(top['U+1F604']).toBe(3);
-    expect(top['U+1F60A']).toBe(1);
+    expect(top['U+E0100']).toBe(10);
+    expect(top['U+E0104']).toBe(3);
+    expect(top['U+E010A']).toBe(1);
     // Ensure key format is the expected U+HHHH uppercase with no surprises.
     for (const k of Object.keys(top)) {
       expect(k).toMatch(/^U\+[0-9A-F]{4,}$/);
@@ -1863,7 +1874,7 @@ describe('transform', () => {
     // Sorted by count desc: iteration of object keys preserves insertion order
     // in V8/JSC, so the first key is the highest-count drop.
     const keys = Object.keys(top);
-    expect(keys[0]).toBe('U+1F600');
+    expect(keys[0]).toBe('U+E0100');
   });
 
   it('omits droppedCodepointsTop entirely when no drops occur', async () => {
@@ -1880,13 +1891,15 @@ describe('transform', () => {
   });
 
   it('caps droppedCodepointsTop at 20 entries', async () => {
-    // 25 distinct supplementary-plane codepoints, each appearing N times so
-    // we can verify the cap drops the smallest counts.
+    // 25 distinct escape-exempt codepoints (plane-14 variation selectors —
+    // astral, so guaranteed atlas misses; exempt, so guaranteed drops rather
+    // than [U+HEX] escapes), each appearing N times so we can verify the cap
+    // drops the smallest counts.
     let payload = 'x'.repeat(150000) + '\n';
     for (let i = 0; i < 25; i++) {
-      // U+1F300..U+1F318 — 25 distinct codepoints, each occurring (25 - i) times
-      // so U+1F300 occurs 25 times, U+1F318 occurs 1 time.
-      payload += String.fromCodePoint(0x1f300 + i).repeat(25 - i);
+      // U+E0100..U+E0118 — 25 distinct codepoints, each occurring (25 - i) times
+      // so U+E0100 occurs 25 times, U+E0118 occurs 1 time.
+      payload += String.fromCodePoint(0xe0100 + i).repeat(25 - i);
     }
     const req = JSON.stringify({
       model: 'claude-3-5-sonnet',
@@ -1900,11 +1913,11 @@ describe('transform', () => {
     // The 5 smallest-count codepoints (last in the input) must be dropped
     // from the top-20.
     for (let i = 20; i < 25; i++) {
-      const hex = (0x1f300 + i).toString(16).toUpperCase().padStart(4, '0');
+      const hex = (0xe0100 + i).toString(16).toUpperCase().padStart(4, '0');
       expect(top[`U+${hex}`]).toBeUndefined();
     }
     // The top entry is the most-frequent.
-    expect(top['U+1F300']).toBe(25);
+    expect(top['U+E0100']).toBe(25);
   });
 
   // --- Per-block break-even gate (URGENT slice, supersedes prior threshold tests) ---

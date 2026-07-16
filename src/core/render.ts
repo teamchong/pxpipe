@@ -445,6 +445,61 @@ export function dereflow(reflowed: string): string {
   return reflowed.split(NL_SENTINEL).join('\n');
 }
 
+// --- atlas-miss escaping -----------------------------------------------------
+//
+// Codepoints absent from the atlas used to render as blank cells (droppedChars
+// telemetry). Emoji and other astral glyphs can't be DRAWN at 5×8 px, but they
+// can be PRESERVED: substitute a deterministic textual escape (`[U+HEX]`) before
+// wrap, so the model reads the codepoint instead of a gap. Applied at the same layer
+// as tab expansion (wrapLines + measureContentCols), so wrap math and canvas
+// measurement stay consistent. Pure string→string ⇒ renders stay deterministic.
+
+/** Pure-ASCII delimiters: `🔥` → `[U+1F525]`. ASCII is the one range guaranteed
+ *  present in BOTH atlases (mathematical white brackets U+27E6/7 were tried first
+ *  and are absent from each — the "full-bmp" note on NL_SENTINEL overstates real
+ *  coverage). ASCII output also makes idempotency structural: an escaped line
+ *  contains no atlas misses, so a second pass is a no-op. `[U+…]` can collide
+ *  with literal source text discussing codepoints; the escape is for model
+ *  legibility, not machine round-trip, so the ambiguity is acceptable. */
+export const GLYPH_ESCAPE_OPEN = '[U+';
+export const GLYPH_ESCAPE_CLOSE = ']';
+
+/** Codepoints that stay DROPPED (blank cell) rather than escaped. Escaping these
+ *  would add noise, not information — they're modifiers/invisibles, not content.
+ *  C0 additionally MUST keep width-1: the parallel slot string carries \x01/\x02
+ *  role markers and \x03 neutral (see SLOT_MARK_*), and escaping them would
+ *  desync slot/text alignment and smear role hues. */
+function isEscapeExempt(cp: number): boolean {
+  if (cp < 0x20) return true; // C0 controls (slot markers; \t is expanded before we run)
+  if (cp >= 0x7f && cp <= 0x9f) return true; // DEL + C1 controls
+  if (cp >= 0x0300 && cp <= 0x036f) return true; // combining diacritics
+  if (cp === 0x200b || cp === 0x200c || cp === 0x200d || cp === 0x2060 || cp === 0xfeff)
+    return true; // zero-width / word-joiner / BOM
+  if (cp >= 0xfe00 && cp <= 0xfe0f) return true; // variation selectors (emoji presentation)
+  if (cp >= 0xe0100 && cp <= 0xe01ef) return true; // variation selectors supplement
+  return false;
+}
+
+/** Replace atlas-missing codepoints with `[U+HEX]` (uppercase hex — e.g.
+ *  🔥 → `[U+1F525]`). Lossless for non-exempt misses (hex → codepoint) and
+ *  idempotent: the escape spells only atlas-present chars, so a second pass is
+ *  a no-op. Fast path allocates nothing when every codepoint is in the atlas. */
+export function escapeMissingGlyphs(line: string): string {
+  let out: string | null = null; // lazily materialized on first miss
+  let i = 0;
+  for (const ch of line) {
+    const cp = ch.codePointAt(0)!;
+    if (atlasRank(cp) < 0 && !isEscapeExempt(cp)) {
+      if (out === null) out = line.slice(0, i);
+      out += GLYPH_ESCAPE_OPEN + cp.toString(16).toUpperCase() + GLYPH_ESCAPE_CLOSE;
+    } else if (out !== null) {
+      out += ch;
+    }
+    i += ch.length;
+  }
+  return out ?? line;
+}
+
 /** Expand \t to U+2192 → + padding to the next TAB_WIDTH stop. Visible marker lets the
  *  model distinguish indent-spaces from intentional-spaces. Wide CJK chars count as 2 cols.
  *  U+0009 is absent from the atlas (control codepoint), so without this every tab was a drop. */
@@ -512,7 +567,7 @@ export function measureContentCols(
   let start = 0;
   for (let i = 0; i <= text.length; i++) {
     if (i === text.length || text[i] === '\n') {
-      const w = measureLineCols(expandTabsInLine(text.slice(start, i)), markerScale, font);
+      const w = measureLineCols(escapeMissingGlyphs(expandTabsInLine(text.slice(start, i))), markerScale, font);
       if (w > widest) widest = w;
       if (widest >= cap) return cap;
       start = i + 1;
@@ -530,7 +585,7 @@ export function wrapLines(
   const out: string[] = [];
   const minified = minifyForRender(text);
   for (const rawWithTabs of minified.split('\n')) {
-    const raw = expandTabsInLine(rawWithTabs);
+    const raw = escapeMissingGlyphs(expandTabsInLine(rawWithTabs));
     if (raw.length === 0) {
       out.push('');
       continue;

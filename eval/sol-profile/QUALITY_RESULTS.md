@@ -11,9 +11,9 @@ adjacent text factsheet.
 | test | text | production image | notes |
 |---|---:|---:|---|
 | novel arithmetic, N=100 | 100/100 | 98/100 | pure image 96/100 |
-| gist recall | not measured | 79/93 completed | one six-probe session failed at the gateway |
-| state tracking | not measured | 18/18 | no transport errors |
-| never-stated guards | not measured | 4/15 completed confabulated | one guard shared the failed session |
+| gist recall | not measured | 83/98 | no transport errors |
+| state tracking | not measured | 17/18 | no transport errors |
+| never-stated guards | not measured | 4/16 confabulated | no transport errors |
 | dense 12-char hex | not run in this harness | 0/15 | all calls completed |
 
 Matched arithmetic usage was 5,300 text input tokens and 7,000 production-image

@@ -141,8 +141,8 @@ without running the proxy.
 - **Per-model rendering:** opt-in `gpt-5.6-sol` uses a 152-column,
   5×8 Spleen profile; Claude keeps its 312-column 5×8 Spleen profile. These
   are selected by exact model id, including history pages and profitability
-  math. **Sol quality:** production 5×8 scored 98/100 arithmetic and 79/93
-  completed gist, 18/18 state, 4/15 completed never-stated confabulations,
+  math. **Sol quality:** production 5×8 scored 98/100 arithmetic and 83/98
+  gist, 17/18 state, 4/16 never-stated confabulations,
   and 0/15 dense hex. Exact IDs therefore use the verbatim factsheet, and recent/open tool state stays native.
   [Sol receipts](eval/sol-profile/QUALITY_RESULTS.md) and
   [profile evidence](docs/MODEL_RENDER_PROFILES.md).
@@ -175,18 +175,18 @@ used for these novel-arithmetic rows.
 | novel arithmetic | `grok-4.5` | 100 | **82%** |
 | novel arithmetic | `moonshotai/kimi-k3` | 100 | **79%** |
 | gist recall A/B (decisions, values, paths, names, negations; distractors; 15k–45k char sessions) | Fable 5 | 98/arm | **98/98** |
-| same gist corpus, production images + factsheet | `gpt-5.6-sol` | 98 | **79/93 completed; 1 session error** |
+| same gist corpus, production images + factsheet | `gpt-5.6-sol` | 98 | **83/98** |
 | same gist corpus, production images + factsheet | `grok-4.5` | 98 | **83/98** |
 | state tracking (value mutated 3×, final/first/count) | Fable 5 | 18/arm | **18/18** |
-| same state-tracking corpus | `gpt-5.6-sol` | 18 | **18/18 latest** |
+| same state-tracking corpus | `gpt-5.6-sol` | 18 | **17/18** |
 | same state-tracking corpus | `grok-4.5` | 18 | **13/18** |
 | confabulation on never-stated facts (lower is better) | Fable 5 | 16/arm | **0/16** |
-| same never-stated probes (lower is better) | `gpt-5.6-sol` | 16 | **4/15 completed; 1 session error** |
+| same never-stated probes (lower is better) | `gpt-5.6-sol` | 16 | **4/16** |
 | same never-stated probes (lower is better) | `grok-4.5` | 16 | **0/16** |
 | verbatim 12-char hex, dense render | Opus | 15 | **0/15** |
 | verbatim 12-char hex, dense render | Fable 5 | 15 | **13/15** |
 | verbatim 12-char hex, same dense pages | `gpt-5.6-sol` | 15 | **0/15** |
-| verbatim 12-char hex, same dense pages | `grok-4.5` | 15 | **0/6 completed; 9 transport errors** |
+| verbatim 12-char hex, same dense pages | `grok-4.5` | 15 | **0/15** |
 
 **Harness split:** Fable/Opus quality and SWE-bench rows use **Claude**; Sol and Grok quality use
 **Codex’s Responses provider** (`OPENAI_BASE_URL`). Kimi K3
@@ -304,7 +304,7 @@ Everything else passes through byte-identical: your messages, recent turns,
 the model's output (it is the response, the proxy never touches it), sparse
 prose, and anything too small to win. Fable 5 is the only built-in default. Sol,
 Opus, GPT 5.5, and Grok remain explicit opt-ins. Sol's production 5×8 run
-scored 98/100 arithmetic, 79/93 completed gist, 18/18 state, 4/15 completed
+scored 98/100 arithmetic, 83/98 gist, 17/18 state, 4/16
 never-stated confabulations, and 0/15 dense hex. Grok scored 82/100
 arithmetic, 83/98 gist, and 13/18 state.
 

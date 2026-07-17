@@ -152,6 +152,9 @@ export async function callResponses({ model, content, maxOutputTokens, timeoutMs
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}: ${json?.error?.message || raw.slice(0, 160)}`);
     }
+    if (json.status === 'incomplete') {
+      throw new Error(`incomplete response: ${json.incomplete_details?.reason || 'unknown reason'}`);
+    }
     let text = typeof json.output_text === 'string' ? json.output_text : '';
     if (!text && Array.isArray(json.output)) {
       for (const item of json.output) {

@@ -7,7 +7,7 @@ from the model id.
 | model rule | default | cell | columns | max height | evidence |
 |---|:---:|---|---:|---:|---|
 | `claude-fable-5*` | yes | Spleen 5×8 | 312 | 728 px | established Claude suites |
-| `gpt-5.6-sol*` | opt-in | Spleen 5×8 | 152 | 1932 px | 98/100 production arithmetic; 79/93 completed gist |
+| `gpt-5.6-sol*` | opt-in | Spleen 5×8 | 152 | 1932 px | 98/100 production arithmetic; 83/98 gist |
 | `grok-*` | opt-in | Spleen 5×8 | 152 | 512 px | 82/100 arithmetic; 83/98 gist |
 | other GPT/o-series | opt-in | Spleen 5×8 | 152 | 1932 px | conservative fallback |
 

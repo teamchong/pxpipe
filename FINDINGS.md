@@ -8,17 +8,16 @@
 
 ---
 
-## Update (2026-07-11) — Sol 5×8 evaluated, remains opt-in
+## Update (2026-07-17) — Sol 5×8 evaluated, remains opt-in
 
 The exact `gpt-5.6-sol` profile now uses Spleen 5×8 at 152 columns. It remains
 an explicit opt-in. Fresh novel arithmetic scored 96/100 pure-image and 98/100
 with the production factsheet. Matched input usage was 5,300 text tokens versus
 7,000 production-image tokens, 32% more on this short workload.
 
-On the portable gist corpus, Sol scored 79/93 completed answerable probes,
-18/18 state probes, and 4/15 completed never-stated confabulations. One
-six-probe session failed at the gateway and is reported as a transport error,
-not six model misses. Dense 12-character hex recall scored 0/15.
+On the portable gist corpus, Sol scored 83/98 answerable probes, 17/18 state
+probes, and 4/16 never-stated confabulations. All sessions completed without
+transport errors. Dense 12-character hex recall scored 0/15.
 
 These results keep Sol below the Fable default bar. Native recent/open state and
 the verbatim factsheet remain required guards. Sibling `gpt-5.6-*` ids do not

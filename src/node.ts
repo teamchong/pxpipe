@@ -441,26 +441,31 @@ async function dispatchDashboard(
         dashboard.handleCompressionToggle({ enabled });
         return dashboard.serveFragment('toggle', url, port);
       }
-      // /fragments/models POSTs one chip flip: {model, on}. Server mutates the
-      // runtime compress scope and returns the re-rendered chip row.
+      // /fragments/models POSTs one chip flip {model, on}, or a whole-scope
+      // rewrite {list: "csv"} from the PXPIPE_MODELS textbox. Server mutates
+      // the runtime compress scope and returns the re-rendered rows.
       if (route.name === 'models' && method === 'POST') {
         let model = '';
         let on = false;
+        let list: string | null = null;
         try {
           const raw = await readRequestBody(req);
           try {
-            const j = JSON.parse(raw) as { model?: unknown; on?: unknown };
+            const j = JSON.parse(raw) as { model?: unknown; on?: unknown; list?: unknown };
             model = typeof j.model === 'string' ? j.model : '';
             on = j.on === true;
+            if (typeof j.list === 'string') list = j.list;
           } catch {
             const p = new URLSearchParams(raw);
             model = p.get('model') ?? '';
             on = p.get('on') === 'true';
+            list = p.get('list');
           }
         } catch {
           return new Response('bad request body', { status: 400 });
         }
-        if (model) dashboard.handleModelsToggle(model, on);
+        if (list !== null) dashboard.handleModelsSet(list);
+        else if (model) dashboard.handleModelsToggle(model, on);
         return dashboard.serveFragment('models', url, port);
       }
       if (method !== 'GET') return undefined;

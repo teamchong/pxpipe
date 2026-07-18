@@ -103,7 +103,8 @@ export function renderModelsFragment(
     [...MODEL_CATALOG, ...GPT_MODEL_CATALOG, ...GROK_MODEL_CATALOG].map((m) => [m.id, m.label]),
   );
   // Union the catalog with env-configured + active ids so PXPIPE_MODELS-enabled
-  // families always show as toggles, then split by family for the two sections.
+  // families always show as toggles, then split into two chip rows (Claude /
+  // OpenAI Responses) plus the PXPIPE_MODELS CSV textbox that mirrors the scope.
   const ids: string[] = [];
   const seen = new Set<string>();
   for (const id of [
@@ -134,23 +135,29 @@ export function renderModelsFragment(
     .filter((id) => !id.startsWith('claude') && !id.startsWith('gpt') && !id.startsWith('grok'))
     .map(chipFor)
     .join('');
-  const moot = enabled ? '' : ` <span class="hint">compression is off, so this has no effect right now</span>`;
+  const moot = enabled
+    ? ''
+    : `<div class="models"><span class="hint">compression is off — these settings have no effect right now</span></div>`;
   return (
+    moot +
     `<div class="models">` +
     `<span class="models-label">Image Claude models</span>` +
     claudeChips +
-    `<span class="hint">everything else is sent as normal text · runtime only · persist with PXPIPE_MODELS</span>${moot}` +
+    `<span class="hint">unlisted models get plain text</span>` +
     `</div>` +
     `<div class="models">` +
-    `<span class="models-label">Image Grok models</span>` +
+    `<span class="models-label">Image OpenAI Responses models</span>` +
+    gptChips +
     grokChips +
     otherChips +
-    `<span class="hint">opt-in only · OpenAI Responses path · set PXPIPE_MODELS to persist</span>${moot}` +
+    `<span class="hint">opt-in · no Anthropic cache_control</span>` +
     `</div>` +
     `<div class="models">` +
-    `<span class="models-label">Image GPT models</span>` +
-    gptChips +
-    `<span class="hint">imaging only, no Anthropic cache_control · one scope for all families · set PXPIPE_MODELS (CSV of bases, or off) to persist</span>${moot}` +
+    `<span class="models-label">PXPIPE_MODELS</span>` +
+    `<input class="models-csv" id="models-csv" type="text" name="list" ` +
+    `value="${escapeHtml(active.join(','))}" spellcheck="false" autocomplete="off" ` +
+    `hx-post="/fragments/models" hx-target="#frag-models" hx-trigger="change">` +
+    `<span class="hint">CSV of bases, or off · applies on enter/blur · export to persist</span>` +
     `</div>`
   );
 }
@@ -839,11 +846,40 @@ const CSS = `
   /* model chips */
   .models { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 0 18px; }
   .models-label { color: var(--ink-2); font-size: 12px; font-weight: 600; }
+  .models-csv { flex: 1 1 260px; min-width: 220px; color: var(--ink); background: var(--surface);
+    border: 1px solid var(--border-strong); border-radius: 6px; padding: 4px 8px;
+    font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .models-csv:focus { outline: none; border-color: var(--flame-ink); }
+  .models-routing { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 0 18px; }
+  #routing-help { border: 1px solid var(--border-strong); border-radius: 10px; background: var(--surface);
+    color: var(--ink); max-width: 600px; padding: 16px 20px; }
+  #routing-help::backdrop { background: rgba(20, 12, 6, .4); }
+  #routing-help h3 { margin: 0 0 8px; font-size: 14px; color: var(--ink); }
+  #routing-help p, #routing-help li { font-size: 12px; line-height: 1.55; color: var(--ink-2); margin: 6px 0; }
+  #routing-help ul { margin: 6px 0; padding-left: 18px; }
+  #routing-help code { font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--ink); }
+  #routing-help pre { background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px;
+    padding: 8px 10px; margin: 8px 0; overflow-x: auto;
+    font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--ink); }
   .chip { background: var(--surface); color: var(--ink-2); border: 1px solid var(--border-strong);
     border-radius: 999px; padding: 4px 12px; cursor: pointer; font: inherit; font-size: 12px; }
   .chip:hover { border-color: var(--flame); color: var(--flame-ink); }
   .chip.on { background: var(--flame-tint); color: var(--flame-ink); border-color: var(--flame);
     font-weight: 600; }
+
+  /* collapsed model-scope section (#116): the default compress scope is Fable 5
+     only, so the three family rows stay hidden until the user opts in. The
+     <details> wrapper lives in the static shell — NOT inside #frag-models —
+     because the every-2s innerHTML poll would otherwise reset its open state. */
+  .models-collapse { margin: 0 0 18px; }
+  .models-collapse .models { margin: 0 0 10px; }
+  .models-collapse .models:last-child { margin-bottom: 0; }
+  .models-summary { cursor: pointer; color: var(--ink-2); font-size: 12px; font-weight: 600;
+    margin: 0 0 8px; user-select: none; }
+  .models-summary:hover { color: var(--flame-ink); }
+  .models-warning { color: var(--ink-2); background: var(--surface); border: 1px solid var(--border-strong);
+    border-left: 3px solid var(--bad); border-radius: 8px; padding: 8px 12px; font-size: 12px;
+    margin: 0 0 12px; }
 
   /* session hero */
   #frag-session { display: block; margin-bottom: 16px; }
@@ -1145,7 +1181,32 @@ export function renderPage(port: number): string {
   </div>
 </header>
 
-<div id="frag-models" hx-get="/fragments/models" hx-trigger="load, every 2s" hx-swap="innerHTML"></div>
+<details class="models-collapse">
+  <summary class="models-summary">Image model scope <span class="hint">Fable 5 only by default · expand to experiment with other families</span></summary>
+  <div class="models-warning">⚠ Image compression is tuned for Fable 5 only — other families can use <strong>more</strong> tokens, not less. Opt in only for deliberate experiments (custom system prompt, subagent model setup, …).</div>
+  <div id="frag-models" hx-get="/fragments/models" hx-trigger="load, every 2s [!document.activeElement || document.activeElement.id !== 'models-csv']" hx-swap="innerHTML"></div>
+  <div class="models-routing"><span class="hint">imaging scope ≠ provider routing — non-Anthropic IDs also need routing env on the proxy</span> <button class="mini-btn" type="button" onclick="document.getElementById('routing-help').showModal()">routing help</button></div>
+</details>
+
+<dialog id="routing-help" onclick="if (event.target === this) this.close()">
+  <h3>Routing Claude Code to OpenAI / Cloudflare models</h3>
+  <p>Claude models use Anthropic by default. Two optional routes can run together — set on the <strong>pxpipe process</strong> (keep provider credentials out of Claude Code):</p>
+  <ul>
+    <li><code>OPENAI_MODELS</code> — exact model IDs routed to OpenAI Responses (<code>OPENAI_UPSTREAM</code> + <code>OPENAI_API_KEY</code>)</li>
+    <li><code>CLOUDFLARE_MODELS</code> — exact model IDs routed to Cloudflare's OpenAI-compatible endpoint (<code>CLOUDFLARE_ACCOUNT_ID</code> + <code>CLOUDFLARE_API_TOKEN</code>)</li>
+  </ul>
+  <p>If a model appears in both lists: <code>CLOUDFLARE_MODELS &gt; OPENAI_MODELS &gt; default routing</code>.</p>
+  <pre>OPENAI_UPSTREAM=https://api.openai.com \\
+OPENAI_API_KEY=your-openai-key \\
+OPENAI_MODELS=gpt-5.6-sol \\
+CLOUDFLARE_ACCOUNT_ID=your-account-id \\
+CLOUDFLARE_API_TOKEN=your-cloudflare-token \\
+CLOUDFLARE_MODELS=moonshotai/kimi-k3 \\
+npx pxpipe-proxy</pre>
+  <p>Non-Anthropic IDs are advertised with a <code>claude-</code> prefix because Claude Code needs a Claude-shaped ID; pxpipe strips it before forwarding. Switch to one inside Claude Code with <code>/model claude-&lt;model&gt;</code> — e.g. <code>/model claude-moonshotai/kimi-k3</code> — or launch with <code>claude --model claude-moonshotai/kimi-k3</code>. Verify discovery with <code>curl …/v1/models</code>.</p>
+  <p><code>PXPIPE_MODELS</code> above is separate: it controls image compression, not routing. Kimi K3 on Cloudflare is the only non-Anthropic model tested end to end — see <code>docs/CLAUDE_CODE_PROVIDER_ROUTING.md</code>.</p>
+  <button class="mini-btn" type="button" onclick="this.closest('dialog').close()">close</button>
+</dialog>
 
 <div id="frag-session" hx-get="/fragments/session-summary" hx-trigger="load, every 2s" hx-swap="innerHTML">
   <div class="hero hero-empty"><div class="hero-headline">Connecting…</div></div>

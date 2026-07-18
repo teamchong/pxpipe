@@ -1516,6 +1516,18 @@ export class DashboardState {
     else next.delete(model);
     setAllowedModelBases([...next]);
   }
+
+  /** POST /fragments/models with {list} — replace the WHOLE runtime compress
+   *  scope from the PXPIPE_MODELS textbox. Same CSV shape as the env var;
+   *  empty or off/false/0/no/none = compress nothing. In-memory only. */
+  handleModelsSet(csv: string): void {
+    const trimmed = csv.trim();
+    const bases =
+      !trimmed || /^(0|false|no|off|none)$/i.test(trimmed)
+        ? []
+        : trimmed.split(',').map((s) => s.trim()).filter(Boolean);
+    setAllowedModelBases(bases);
+  }
 }
 
 function jsonResponse(body: unknown, status = 200): Response {

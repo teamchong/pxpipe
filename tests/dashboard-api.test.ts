@@ -184,8 +184,11 @@ describe('serveFragment', () => {
       delete process.env.PXPIPE_MODELS;
       setAllowedModelBases(null); // reset to built-in Fable-only default
       const off = await (await dash.serveFragment('models', url, 1234)).text();
-      expect(off).toContain('Image GPT models');
+      expect(off).toContain('Image OpenAI Responses models');
       expect(off).not.toContain('<div class="models" style="display:none">');
+      // PXPIPE_MODELS textbox mirrors the live scope as CSV.
+      expect(off).toContain('name="list"');
+      expect(off).toContain('value="claude-fable-5"');
       expect(off).toContain('GPT 5.6 Sol</button>');
       expect(off).toContain('GPT 5.5</button>');
       // Sol remains available and ordered before GPT 5.5.
@@ -202,6 +205,29 @@ describe('serveFragment', () => {
       expect(onBoth).toContain('GPT 5.6 Sol ✓');
       expect(getAllowedModelBases()).toContain('gpt-5.5');
       expect(getAllowedModelBases()).toContain('gpt-5.6-sol');
+      // Chip flips are reflected back into the textbox CSV.
+      expect(onBoth).toContain('value="claude-fable-5,gpt-5.6-sol,gpt-5.5"');
+    } finally {
+      setAllowedModelBases(null);
+      if (prev === undefined) delete process.env.PXPIPE_MODELS;
+      else process.env.PXPIPE_MODELS = prev;
+    }
+  });
+
+  it('replaces the whole scope from the PXPIPE_MODELS textbox CSV', async () => {
+    const prev = process.env.PXPIPE_MODELS;
+    try {
+      delete process.env.PXPIPE_MODELS;
+      dash.handleModelsSet(' claude-fable-5 , grok-4.5 ,');
+      expect(getAllowedModelBases()).toEqual(['claude-fable-5', 'grok-4.5']);
+      const html = await (await dash.serveFragment('models', url, 1234)).text();
+      expect(html).toContain('value="claude-fable-5,grok-4.5"');
+      expect(html).toContain('Grok 4.5 ✓');
+      // Same falsey vocabulary as the env var: off/false/0 → compress nothing.
+      dash.handleModelsSet('off');
+      expect(getAllowedModelBases()).toEqual([]);
+      dash.handleModelsSet('');
+      expect(getAllowedModelBases()).toEqual([]);
     } finally {
       setAllowedModelBases(null);
       if (prev === undefined) delete process.env.PXPIPE_MODELS;

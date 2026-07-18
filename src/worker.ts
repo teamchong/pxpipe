@@ -149,7 +149,9 @@ export default {
         const tag = e.info?.compressed
           ? `compressed ${e.info.origChars}ch → ${e.info.imageCount}img/${e.info.imageBytes}B`
           : e.info?.reason
-            ? `savings:skip(${e.info.reason})`
+            ? e.info.reason === 'unsupported_model' && e.model
+              ? `skip(unsupported=${e.model})`
+              : `skip(${e.info.reason})`
             : '';
         const cacheRead = e.usage?.cache_read_input_tokens ?? 0;
         console.log(`${e.method} ${e.path} → ${e.status} (${e.durationMs}ms) ${tag} cache_read=${cacheRead}`);

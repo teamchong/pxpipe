@@ -94,6 +94,35 @@ function applyConfigFileDefaults(): void {
   }
 }
 
+/** Dashboard persistence hook: write the runtime model scope back to the
+ *  config file's `models` key so chip toggles survive a restart. Other keys
+ *  are preserved; an unreadable file is replaced rather than crashed on.
+ *  NOTE: on the next start an explicit PXPIPE_MODELS env still wins over the
+ *  persisted value (same precedence as every other config-file default). */
+function persistModelBasesToConfig(bases: readonly string[]): void {
+  const file = process.env.PXPIPE_CONFIG ?? DEFAULT_CONFIG_FILE;
+  let cfg: Record<string, unknown> = {};
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as unknown;
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      cfg = parsed as Record<string, unknown>;
+    }
+  } catch {
+    // Missing or invalid file — start fresh with just the models key.
+  }
+  // Empty array round-trips as 'off' via normalizeModelsConfig on load.
+  cfg.models = [...bases];
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    // Write-then-rename so a crash mid-write can't corrupt the config.
+    const tmp = `${file}.tmp-${process.pid}`;
+    fs.writeFileSync(tmp, `${JSON.stringify(cfg, null, 2)}\n`);
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    console.warn(`[pxpipe] could not persist model scope to ${file}: ${(e as Error).message}`);
+  }
+}
+
 function parseCli(argv: string[]): RuntimeConfig {
   // Only flags accepted are --help and --version. Anything else is an
   // error — there is exactly ONE way to run pxpipe and the dashboard
@@ -984,10 +1013,14 @@ async function main(): Promise<void> {
   // served via the route interception in front of the proxy handler. The
   // SessionsPaths handle lets the dashboard surface session/disk/stats data
   // without reaching back into module-scope globals.
-  const dashboard = new DashboardState({
-    eventsFile: opts.eventsFile,
-    sidecarDir: bodySidecarDir,
-  });
+  const dashboard = new DashboardState(
+    {
+      eventsFile: opts.eventsFile,
+      sidecarDir: bodySidecarDir,
+    },
+    undefined,
+    persistModelBasesToConfig,
+  );
   // Seed the "recent requests" table from the JSONL log so a process restart
   // doesn't reset what you can see in the UI. Best-effort; ignored on error.
   await dashboard.replay(opts.eventsFile).catch(() => {});
@@ -1049,7 +1082,9 @@ async function main(): Promise<void> {
       const tag = e.info?.compressed
         ? `compressed ${e.info.origChars}ch → ${e.info.imageCount}img/${e.info.imageBytes}B${extraTag}`
         : e.info?.reason
-          ? `savings:skip(${e.info.reason})`
+          ? e.info.reason === 'unsupported_model' && e.model
+            ? `skip(unsupported=${e.model})`
+            : `skip(${e.info.reason})`
           : '';
       const cacheRead = e.usage?.cache_read_input_tokens ?? 0;
       const inputTokens = e.usage?.input_tokens ?? 0;

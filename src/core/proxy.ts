@@ -557,6 +557,7 @@ const STRIP_REQ_HEADERS = new Set([
   'content-length', // we recompute
   'expect',
   'accept-encoding', // let upstream choose
+  'x-pxpipe-bypass', // pxpipe-only opt-out signal; never forwarded upstream
 ]);
 
 const STRIP_RES_HEADERS = new Set([
@@ -829,11 +830,18 @@ export function createProxy(config: ProxyConfig = {}) {
     };
 
     // Transform only known shapes; everything else passes through.
+    // Explicit per-request opt-out (#111): a subprocess that merely inherited
+    // ANTHROPIC_BASE_URL (e.g. a plugin's internal `claude` probe) can send
+    // `x-pxpipe-bypass: 1` — via Claude Code's ANTHROPIC_CUSTOM_HEADERS — to
+    // have its traffic forwarded byte-for-byte untouched. Routing and auth
+    // still apply; the header itself is stripped before forwarding.
+    const bypassHeader = req.headers.get('x-pxpipe-bypass');
+    const bypass = bypassHeader !== null && !/^(?:0|false|off|no)$/i.test(bypassHeader.trim());
     const providerPrefixed = isProviderPrefixedPath(url.pathname);
-    const isMessages = req.method === 'POST' && isAnthropicMessagesPath(url.pathname);
-    const isOpenAIChat = req.method === 'POST' && isOpenAIChatPath(url.pathname);
-    const isOpenAIResponses = req.method === 'POST' && isOpenAIResponsesPath(url.pathname);
-    const isGoogle = req.method === 'POST' && (
+    const isMessages = !bypass && req.method === 'POST' && isAnthropicMessagesPath(url.pathname);
+    const isOpenAIChat = !bypass && req.method === 'POST' && isOpenAIChatPath(url.pathname);
+    const isOpenAIResponses = !bypass && req.method === 'POST' && isOpenAIResponsesPath(url.pathname);
+    const isGoogle = !bypass && req.method === 'POST' && (
       url.pathname.includes('/google-ai-studio/') ||
       url.pathname.includes(':generateContent') ||
       url.pathname.includes(':streamGenerateContent')

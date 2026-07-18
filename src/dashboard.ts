@@ -518,12 +518,20 @@ export class DashboardState {
    *  the developer's actual Claude Code session files. */
   private readonly ccMapFn: () => Promise<Map<string, ClaudeCodeSessionRef>>;
 
+  /** Host-provided persistence hook for the runtime model scope. The core
+   *  override stays in-memory (Edge-safe); a Node host passes a saver that
+   *  writes the `models` key of the config file so chip toggles survive a
+   *  restart. Best-effort: failures are the hook's problem, never the API's. */
+  private readonly persistModelBases: ((bases: readonly string[]) => void) | undefined;
+
   constructor(
     paths?: SessionsPaths,
     ccMapFn?: () => Promise<Map<string, ClaudeCodeSessionRef>>,
+    persistModelBases?: (bases: readonly string[]) => void,
   ) {
     this.paths = paths;
     this.ccMapFn = ccMapFn ?? (() => claudeCodeMap());
+    this.persistModelBases = persistModelBases;
   }
 
   private totalsForModel(model: string | undefined): Totals {
@@ -1508,25 +1516,36 @@ export class DashboardState {
   }
 
   /** POST /fragments/models — add/remove ONE model (Claude or GPT) from the
-   *  runtime compress scope. In-memory only; restart resets to the PXPIPE_MODELS
-   *  env / built-in default. The model checks read this live. */
+   *  runtime compress scope. The model checks read this live. Persisted via
+   *  the host's `persistModelBases` hook when provided (Node writes the
+   *  config file); otherwise in-memory only and restart resets to the
+   *  PXPIPE_MODELS env / built-in default. */
   handleModelsToggle(model: string, on: boolean): void {
     const next = new Set(getAllowedModelBases());
     if (on) next.add(model);
     else next.delete(model);
-    setAllowedModelBases([...next]);
+    this.applyModelBases([...next]);
   }
 
   /** POST /fragments/models with {list} — replace the WHOLE runtime compress
    *  scope from the PXPIPE_MODELS textbox. Same CSV shape as the env var;
-   *  empty or off/false/0/no/none = compress nothing. In-memory only. */
+   *  empty or off/false/0/no/none = compress nothing. Persistence as above. */
   handleModelsSet(csv: string): void {
     const trimmed = csv.trim();
     const bases =
       !trimmed || /^(0|false|no|off|none)$/i.test(trimmed)
         ? []
         : trimmed.split(',').map((s) => s.trim()).filter(Boolean);
+    this.applyModelBases(bases);
+  }
+
+  private applyModelBases(bases: string[]): void {
     setAllowedModelBases(bases);
+    try {
+      this.persistModelBases?.(bases);
+    } catch {
+      // Persistence is best-effort; the live flip already took effect.
+    }
   }
 }
 

@@ -235,6 +235,43 @@ describe('serveFragment', () => {
     }
   });
 
+  it('invokes the host persistence hook on scope mutations', () => {
+    const prev = process.env.PXPIPE_MODELS;
+    try {
+      delete process.env.PXPIPE_MODELS;
+      setAllowedModelBases(null);
+      const saved: string[][] = [];
+      const persisting = new DashboardState(tmp, async () => new Map(), (bases) => {
+        saved.push([...bases]);
+      });
+
+      persisting.handleModelsToggle('gpt-5.6-sol', true);
+      expect(saved.at(-1)).toEqual(['claude-fable-5', 'gpt-5.6-sol']);
+      persisting.handleModelsSet('claude-fable-5');
+      expect(saved.at(-1)).toEqual(['claude-fable-5']);
+      // Empty scope persists too (round-trips as 'off' on load).
+      persisting.handleModelsSet('off');
+      expect(saved.at(-1)).toEqual([]);
+      expect(saved).toHaveLength(3);
+
+      // A throwing hook must not break the live flip or the endpoint.
+      const throwing = new DashboardState(tmp, async () => new Map(), () => {
+        throw new Error('disk full');
+      });
+      throwing.handleModelsToggle('gpt-5.5', true);
+      expect(getAllowedModelBases()).toContain('gpt-5.5');
+
+      // No hook (legacy/Worker host) keeps the old in-memory behavior.
+      const bare = new DashboardState(tmp, async () => new Map());
+      bare.handleModelsToggle('grok-4.5', true);
+      expect(getAllowedModelBases()).toContain('grok-4.5');
+    } finally {
+      setAllowedModelBases(null);
+      if (prev === undefined) delete process.env.PXPIPE_MODELS;
+      else process.env.PXPIPE_MODELS = prev;
+    }
+  });
+
   it('renders header + recent + stats fragments from the same payloads as JSON', async () => {
     writeEvents(tmp, [
       ev({ status: 200, model: 'gpt-5.5', compressed: true, orig_chars: 1000, image_bytes: 200 }),

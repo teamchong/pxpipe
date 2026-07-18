@@ -1043,7 +1043,9 @@ async function main(): Promise<void> {
       const extraTag = extra.length > 0 ? ` (${extra.join(' ')})` : '';
       const tag = e.info?.compressed
         ? `compressed ${e.info.origChars}ch → ${e.info.imageCount}img/${e.info.imageBytes}B${extraTag}`
-        : (e.info?.reason ?? '');
+        : e.info?.reason
+          ? `savings:skip(${e.info.reason})`
+          : '';
       const cacheRead = e.usage?.cache_read_input_tokens ?? 0;
       const inputTokens = e.usage?.input_tokens ?? 0;
       const usageTag =

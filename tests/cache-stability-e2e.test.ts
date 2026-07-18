@@ -418,18 +418,9 @@ describe('e2e cache alignment — Anthropic /v1/messages through the real proxy'
     // Regression (2026-07): the relocated block must be delimited as injected
     // context, never blended into user prose — undelimited, it can BECOME the
     // entire visible message on an empty/short user turn (observed live).
-    // #97: the delimiter must be pxpipe's OWN tag, never <system-reminder> —
-    // reusing the client's trusted tag made the relocation structurally
-    // indistinguishable from an injection attempt spoofing the system channel.
     expect(lastUserText(cap2.main[0]!.body)).toMatch(
-      /<pxpipe-relocated-context>[\s\S]*relocated by pxpipe[\s\S]*# Environment[\s\S]*<\/pxpipe-relocated-context>/,
+      /<system-reminder>[\s\S]*relocated by pxpipe[\s\S]*# Environment[\s\S]*<\/system-reminder>/,
     );
-    expect(lastUserText(cap2.main[0]!.body)).not.toContain('<system-reminder>');
-    // #97: the protocol is declared from the real system role, byte-stable
-    // across turns (cap1 ≡ cap2) so it can never perturb the cached prefix.
-    expect(sysText(cap1.main[0]!.body)).toContain('<pxpipe-relocated-context>');
-    expect(sysText(cap2.main[0]!.body)).toContain('<pxpipe-relocated-context>');
-    expect(sysText(cap1.main[0]!.body)).toBe(sysText(cap2.main[0]!.body));
   });
 
   it('ENV RELOCATION: model-identity/catalog lines are redacted from the relocated block', async () => {

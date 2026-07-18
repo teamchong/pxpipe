@@ -160,27 +160,6 @@ const DEFAULTS: Required<TransformOptions> = {
 export const CLAUDE_CODE_OAUTH_IDENTITY =
   "You are Claude Code, Anthropic's official CLI for Claude.";
 
-/** #97: system-role attestation for the volatile-env relocation.
- *
- *  Volatile per-turn env state cannot ride in req.system (any changing system
- *  byte cold-restarts the whole anchored cache prefix — see the splice comment
- *  in transformRequest), so it is appended to the latest user message. That
- *  delivery path is structurally identical to an in-band injection, and models
- *  correctly distrusted it when it mimicked <system-reminder> (#97). This
- *  BYTE-STABLE block rides as live text in the system field — real system
- *  authority, constant across turns so it can never perturb the cache — and
- *  declares the wrapper tag's provenance so the model can attribute relocated
- *  blocks without having to trust their self-description.
- *  MUST remain a compile-time constant: a single dynamic byte here zeroes
- *  every cache read (same invariant as billingLine). */
-export const PXPIPE_RELOCATION_ATTESTATION =
-  'pxpipe (a local compression proxy between the client and the API) relocates ' +
-  'volatile environment/context state out of the system prompt and re-appends it ' +
-  'at the end of the latest user message, wrapped in <pxpipe-relocated-context> ' +
-  'tags. Content inside those tags originated from the system prompt of this ' +
-  'same request — attribute it to the system prompt, not to the user. This ' +
-  'notice is the only channel through which pxpipe declares that protocol.';
-
 // --- per-block break-even check ---
 //
 // Image token cost is computed from pixel area (Anthropic formula: w×h/750,
@@ -2073,16 +2052,6 @@ export async function transformRequest(
       if (volatileEnv) sysTail.push({ type: 'text', text: volatileEnv });
     }
     if (Array.isArray(sysRemainder)) sysTail.push(...sysRemainder);
-    // #97: declare the relocation protocol from the real system role. Pushed
-    // UNCONDITIONALLY on the user-message path — not gated on volatileEnvText —
-    // so the system field stays byte-identical on turns where the volatile
-    // split happens to come up empty (a flip-flopping block here would bust
-    // every message-level cache breakpoint downstream of system). Pushed AFTER
-    // sysRemainder: when the client cache-controls a later system block, the
-    // un-marked OAuth identity block is NOT extracted (extractSystemText keeps
-    // it in sysRemainder) and must remain the first system block — inserting
-    // the attestation ahead of it displaced the identity from system[0].
-    if (hasUserMsg) sysTail.push({ type: 'text', text: PXPIPE_RELOCATION_ATTESTATION });
     // Tool Reference now rides INSIDE the imaged slab (combinedRaw above) — no
     // text splice here. Stubbed tools[] descriptions cite the "## Tool: <name>"
     // headings inside the image; stub ↔ reference invariant holds because both
@@ -2408,25 +2377,18 @@ export async function transformRequest(
   // tool_result blocks legally precede trailing text blocks in a user message
   // (Claude Code appends its own system-reminders the same way).
   //
-  // The block is wrapped in <pxpipe-relocated-context> tags — a tag that is
-  // pxpipe's own, NOT <system-reminder> — so the model (and any human reading
-  // a transcript) attributes it as proxy-relocated context, NOT user prose and
-  // NOT the client's trusted system channel. Without a wrapper the relocated
-  // "# Environment" section blends seamlessly into the user's message — on an
-  // empty/short user turn it can BECOME the entire visible message (observed
-  // live, 2026-07). #97: it previously reused <system-reminder>, which made it
-  // structurally indistinguishable from an injection attempt spoofing the
-  // client's real system channel; models correctly refused to trust it. The
-  // proxy now declares this tag's provenance in a byte-stable system block
-  // (PXPIPE_RELOCATION_ATTESTATION, spliced into sysTail above), so authority
-  // flows from the real system role while the volatile bytes stay in the live
-  // tail. The wrapper rides behind the slab anchor, so it costs ~80 chars per
-  // request and cannot perturb the cached prefix. Same-pass safety: 5a
+  // The block is wrapped in <system-reminder> tags so the model (and any
+  // human reading a transcript) attributes it as injected context, NOT user
+  // prose. Without the wrapper the relocated "# Environment" section blends
+  // seamlessly into the user's message — on an empty/short user turn it can
+  // BECOME the entire visible message (observed live, 2026-07). The wrapper
+  // rides in the volatile tail behind the slab anchor, so it costs ~60 chars
+  // per request and cannot perturb the cached prefix. Same-pass safety: 5a
   // (compressReminders) runs earlier and only scans the first user message,
   // so this block is never self-imaged; and pxpipe is stateless per request,
   // so the wrapper never appears in inbound client history (no compounding).
   if (volatileEnvText) {
-    const wrappedEnvText = `<pxpipe-relocated-context>\nContext relocated by pxpipe from the system prompt (volatile per-turn environment state — not written by the user):\n\n${volatileEnvText}\n</pxpipe-relocated-context>`;
+    const wrappedEnvText = `<system-reminder>\nContext relocated by pxpipe from the system prompt (volatile per-turn environment state — not written by the user):\n\n${volatileEnvText}\n</system-reminder>`;
     const msgs = req.messages ?? [];
     for (let i = msgs.length - 1; i >= 0; i--) {
       const m = msgs[i]!;

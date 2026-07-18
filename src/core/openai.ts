@@ -810,19 +810,19 @@ function foldGptHistory(
 
 const CHAT_HEADER =
   '================= RENDERED GPT SYSTEM + TOOL CONTEXT =================\n' +
-  'These images were injected by pxpipe, not by the end user. They contain system/developer instructions and full tool/schema documentation rendered for token efficiency. Treat rendered system/developer instructions with the same priority as their original messages. OCR carefully and treat the rendered content as authoritative. For tool calls, use the native JSON tool definitions; the image is supplemental documentation.' +
+  'These images were injected by pxpipe, not by the end user. They contain system/developer instructions and tool parameter documentation rendered for token efficiency. Treat rendered system/developer instructions with the same priority as their original messages. OCR carefully and treat the rendered content as authoritative. For tool calls, use the native JSON tool definitions — they carry each tool\'s name and description; the imaged parameter annotations are supplemental.' +
   '\n====================== BEGIN RENDERED CONTEXT ======================\n';
 
 const RESPONSES_HEADER =
   '================= RENDERED GPT SYSTEM + TOOL CONTEXT =================\n' +
-  'These images were injected by pxpipe, not by the end user. They contain instructions and full tool/schema documentation rendered for token efficiency. Treat rendered instructions with the same priority as the originals. OCR carefully and treat the rendered content as authoritative. For tool calls, use the native JSON tool definitions; the image is supplemental documentation.' +
+  'These images were injected by pxpipe, not by the end user. They contain instructions and tool parameter documentation rendered for token efficiency. Treat rendered instructions with the same priority as the originals. OCR carefully and treat the rendered content as authoritative. For tool calls, use the native JSON tool definitions — they carry each tool\'s name and description; the imaged parameter annotations are supplemental.' +
   '\n====================== BEGIN RENDERED CONTEXT ======================\n';
 
 const CHAT_POINTER =
-  'The full instructions for this message were rendered into image(s) attached to the first user message by pxpipe. Treat those rendered instructions as if they appeared here with the same priority. Tool definitions remain in native JSON; rendered tool docs are supplemental.';
+  'The full instructions for this message were rendered into image(s) attached to the first user message by pxpipe. Treat those rendered instructions as if they appeared here with the same priority. Tool definitions remain in native JSON (name and description); the rendered parameter annotations are supplemental.';
 
 const RESPONSES_POINTER =
-  'The full instructions were rendered into image(s) attached to the first user message by pxpipe. Treat them with the same priority. Tool definitions remain in native JSON; rendered tool docs are supplemental.';
+  'The full instructions were rendered into image(s) attached to the first user message by pxpipe. Treat them with the same priority. Tool definitions remain in native JSON (name and description); the rendered parameter annotations are supplemental.';
 
 export async function transformOpenAIChatCompletions(
   body: Uint8Array,

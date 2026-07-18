@@ -186,6 +186,12 @@ describe('transformOpenAIChatCompletions (gpt-5.6-sol)', () => {
     expect(result.info.imageSourceText).toContain('$.x description: "x param"');
     expect(result.info.imageSourceText).not.toContain(BIG_TOOL_DESC.slice(0, 100));
     expect(result.info.imageSourceText).not.toContain('"properties"');
+    expect(result.info.imageSourceText).not.toContain('full tool');
+    expect(result.info.imageSourceText).toContain('native JSON tool definitions');
+    expect(result.info.imageSourceText).toContain('name and description');
+    expect(typeof sysMsg.content === 'string'
+      ? sysMsg.content
+      : (sysMsg.content as Array<{ text?: string }>)[0]?.text ?? '').toContain('rendered parameter annotations are supplemental');
   });
 
   it('reflows chat static context that contains a literal newline sentinel', async () => {
@@ -338,6 +344,7 @@ describe('transformOpenAIResponses (gpt-5.6-sol)', () => {
     // instructions replaced with pointer.
     expect(out.instructions as string).toContain('rendered into image');
     expect(out.instructions as string).not.toContain('These are detailed');
+    expect(out.instructions as string).toContain('rendered parameter annotations are supplemental');
 
     // First user item gains input_image parts.
     const inputItems = out.input as Array<{ role: string; content: unknown }>;
@@ -352,6 +359,9 @@ describe('transformOpenAIResponses (gpt-5.6-sol)', () => {
     expect(tools[0]!.description).toBe(BIG_FLAT_TOOL_DESC);
     expect(tools[0]!.parameters?.description).toBeUndefined();
     expect(tools[0]!.parameters?.properties?.x?.description).toBeUndefined();
+    expect(result.info.imageSourceText).not.toContain('full tool');
+    expect(result.info.imageSourceText).toContain('native JSON tool definitions');
+    expect(result.info.imageSourceText).toContain('name and description');
   });
 
   it('reflows Responses static context that contains a literal newline sentinel', async () => {

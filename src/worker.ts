@@ -148,7 +148,9 @@ export default {
         // shows up in `wrangler tail`).
         const tag = e.info?.compressed
           ? `compressed ${e.info.origChars}ch → ${e.info.imageCount}img/${e.info.imageBytes}B`
-          : (e.info?.reason ?? '');
+          : e.info?.reason
+            ? `savings:skip(${e.info.reason})`
+            : '';
         const cacheRead = e.usage?.cache_read_input_tokens ?? 0;
         console.log(`${e.method} ${e.path} → ${e.status} (${e.durationMs}ms) ${tag} cache_read=${cacheRead}`);
 

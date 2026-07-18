@@ -424,6 +424,61 @@ describe('GPT savings split', () => {
     expect(recent.recent.at(-1)!.session_saved_so_far_delta ?? 0).toBe(0);
   });
 
+  it('uses the Anthropic 1-hour cache-write split in dashboard savings', async () => {
+    setAllowedModelBases(['claude-fable-5']);
+    dash.update({
+      method: 'POST', path: '/v1/messages', model: 'claude-fable-5-20260609', status: 200,
+      durationMs: 1,
+      usage: {
+        input_tokens: 1000,
+        output_tokens: 0,
+        cache_creation_input_tokens: 2000,
+        cache_read_input_tokens: 0,
+        cache_creation: {
+          ephemeral_5m_input_tokens: 0,
+          ephemeral_1h_input_tokens: 2000,
+        },
+      },
+      info: {
+        compressed: true,
+        baselineTokens: 10000,
+        baselineCacheableTokens: 9000,
+        baselineProbeStatus: 'ok',
+        firstUserSha8: 'onehour',
+      },
+    } as never);
+
+    const stats = (await dash.serveStats().json()) as StatsPayload;
+    expect(stats.actual_input_weighted).toBe(5000);
+    expect(stats.baseline_input_weighted).toBe(19000);
+    expect(stats.saved_input_tokens).toBe(14000);
+    expect(stats.saved_usd).toBe(0.14);
+  });
+
+  it('replay() preserves Anthropic 1-hour cache-write accounting', async () => {
+    writeEvents(tmp, [
+      ev({
+        model: 'claude-fable-5-20260609',
+        compressed: true,
+        input_tokens: 1000,
+        cache_create_tokens: 2000,
+        cache_create_5m_tokens: 0,
+        cache_create_1h_tokens: 2000,
+        baseline_tokens: 10000,
+        baseline_cacheable_tokens: 9000,
+        baseline_probe_status: 'ok',
+        first_user_sha8: 'onehour-replay',
+      }),
+    ]);
+    await dash.replay(tmp.eventsFile);
+
+    const recent = (await dash.serveRecent().json()) as RecentPayload;
+    const row = recent.recent.at(-1)!;
+    expect(row.actual_input).toBe(5000);
+    expect(row.baseline_input).toBe(19000);
+    expect(row.session_saved_so_far_delta).toBe(14000);
+  });
+
   it('replay() reconstructs GPT recent rows byte-identically to the live path', async () => {
     writeEvents(tmp, [
       ev({

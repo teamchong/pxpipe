@@ -214,6 +214,24 @@ describe('aggregateSessions', () => {
     expect(s.charsSaved).toBe(-6_775 * 4);
   });
 
+  it('excludes passthrough and failed-probe rows from session savings', async () => {
+    const measured = {
+      first_user_sha8: 'gatedrows',
+      baseline_tokens: 10_000,
+      baseline_cacheable_tokens: 9_000,
+      input_tokens: 1_000,
+      cache_create_tokens: 2_000,
+    } as const;
+    writeEvents(tmp, [
+      ev({ ...measured, compressed: false, baseline_probe_status: 'ok' }),
+      ev({ ...measured, compressed: true, baseline_probe_status: 'partial' }),
+      ev({ ...measured, compressed: true, baseline_probe_status: 'failed' }),
+    ]);
+
+    const { sessions } = await aggregateSessions(tmp);
+    expect(sessions.get('gatedrows')!.tokensSavedEst).toBe(0);
+  });
+
   it('prices text cold when the actual request has cache_read=0', async () => {
     // Turn 2 is 60s after turn 1, but cr=0 means the server did not report a
     // cache read for the actual request. The imagined text path gets the same

@@ -4,9 +4,30 @@
  * See docs/CACHING_AND_SAVINGS.md for the full derivation and audit history.
  */
 
-/** Documented Anthropic price ratios: cc_5m = 1.25×, cr = 0.1× base input. One-line change if rates change. */
+/** Documented Anthropic price ratios: cc_5m = 1.25×, cc_1h = 2×, cr = 0.1× base input. */
 export const CACHE_CREATE_RATE = 1.25;
+const CACHE_CREATE_1H_RATE = 2.0;
 export const CACHE_READ_RATE = 0.1;
+
+/** Effective cache-write rate for this request. Older usage payloads do not
+ * expose the tier split; preserve the historical/conservative 5-minute rate
+ * in that case. The text counterfactual uses the same observed tier mix as
+ * the transformed request because pxpipe relocates, rather than invents, the
+ * caller's cache-control markers. */
+function cacheCreateRate(cc: number, cc5m?: number, cc1h?: number): number {
+  if (!(cc > 0)) return CACHE_CREATE_RATE;
+  const splitReported = cc5m !== undefined || cc1h !== undefined;
+  if (!splitReported) return CACHE_CREATE_RATE;
+  const fiveMinute = Math.max(0, cc5m ?? 0);
+  const oneHour = Math.max(0, cc1h ?? 0);
+  const splitTotal = fiveMinute + oneHour;
+  if (!(splitTotal > 0)) return CACHE_CREATE_RATE;
+  // The API contract says splitTotal === cc. Normalize malformed/mismatched
+  // payloads to the aggregate so telemetry never invents extra write tokens.
+  return (
+    fiveMinute * CACHE_CREATE_RATE + oneHour * CACHE_CREATE_1H_RATE
+  ) / splitTotal;
+}
 
 /** Anthropic prompt-cache TTL (seconds). Kept for callers that display provider
  *  docs, but savings math does not use TTL to infer a hypothetical text-cache
@@ -104,22 +125,45 @@ export function computeBaselineInputEff(
   warm = false,
   prevCacheable = 0,
 ): number {
+  return computeBaselineInputEffWithCacheTier(
+    baseline, baselineCacheable, inputTokens, cc, cr, warm, prevCacheable, 0,
+  );
+}
+
+/** Tier-aware variant for internal telemetry accounting. */
+export function computeBaselineInputEffWithCacheTier(
+  baseline: number,
+  baselineCacheable: number,
+  inputTokens: number,
+  cc: number,
+  cr: number,
+  warm: boolean,
+  prevCacheable: number,
+  cacheCreate1hTokens: number,
+  cacheCreate5mTokens?: number,
+): number {
   if (baseline <= 0) return 0;
   // Probe miss: can't split prefix from tail, so credit nothing (same as actual).
-  if (baselineCacheable <= 0) return computeActualInputEff(inputTokens, cc, cr);
+  if (baselineCacheable <= 0) {
+    return computeActualInputEffWithCacheTier(
+      inputTokens, cc, cr, cacheCreate1hTokens, cacheCreate5mTokens,
+    );
+  }
   const cacheable = Math.min(baselineCacheable, baseline);
   const coldTail = baseline - cacheable;
+  const createRate = cacheCreateRate(cc, cacheCreate5mTokens, cacheCreate1hTokens);
   if (warm) {
     // Text reads the prefix it already had cached (0.10×) and creates only the
-    // growth since last turn (1.25×). Independent of the image path's cache.
+    // growth since last turn (at the observed write-tier rate). Independent of
+    // the image path's cache.
     const reused = Math.min(Math.max(prevCacheable, 0), cacheable);
     const grown = cacheable - reused;
-    return reused * CACHE_READ_RATE + grown * CACHE_CREATE_RATE + coldTail * 1.0;
+    return reused * CACHE_READ_RATE + grown * createRate + coldTail * 1.0;
   }
   // Cold (first turn / TTL expiry): no warm cache for text either, so it
   // re-creates the whole cacheable prefix at the create rate — same event the
   // imaged path pays. Removes the phantom "free read" that fabricated a loss.
-  return cacheable * CACHE_CREATE_RATE + coldTail * 1.0;
+  return cacheable * createRate + coldTail * 1.0;
 }
 
 /** Weighted input cost pxpipe actually paid this turn. */
@@ -128,5 +172,18 @@ export function computeActualInputEff(
   cc: number,
   cr: number,
 ): number {
-  return inputTokens + cc * CACHE_CREATE_RATE + cr * CACHE_READ_RATE;
+  return computeActualInputEffWithCacheTier(inputTokens, cc, cr, 0);
+}
+
+/** Tier-aware variant for internal telemetry accounting. */
+export function computeActualInputEffWithCacheTier(
+  inputTokens: number,
+  cc: number,
+  cr: number,
+  cacheCreate1hTokens: number,
+  cacheCreate5mTokens?: number,
+): number {
+  return inputTokens
+    + cc * cacheCreateRate(cc, cacheCreate5mTokens, cacheCreate1hTokens)
+    + cr * CACHE_READ_RATE;
 }

@@ -275,9 +275,9 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
     statTile(
       'Estimated saved',
       `$${(s.saved_usd ?? 0).toFixed(2)}`,
-      `at $${pa.input_per_mtok}/M input tokens`,
+      `at $${pa.input_per_mtok}/M base input price`,
       '',
-      'A rough dollar figure: saved tokens × the input price. Actual savings depend on your plan and caching — see the math drawer.',
+      'Cache-aware estimate using the server-reported 5-minute/1-hour write split when available (1.25×/2×), cache reads (0.10×), and the base input price.',
     ) +
     costTile +
     `</div>`;
@@ -285,10 +285,10 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
   // math drawer
   const savedMath =
     `<div><span class="k">formula:</span> <span class="v">saved = baseline − actual</span></div>` +
-    `<div><span class="k">weights:</span> <span class="v">input×1.0, cache_create×1.25, cache_read×0.10</span></div>` +
+    `<div><span class="k">weights:</span> <span class="v">input×1.0, cache_write_5m×1.25, cache_write_1h×2.0, cache_read×0.10</span></div>` +
     `<div class="sp"></div>` +
     mathRow('baseline', s.baseline_input_weighted, '(cache-aware: cacheable×weight + cold_tail)') +
-    mathRow('actual', s.actual_input_weighted, '(input + cc×1.25 + cr×0.10 from usage)') +
+    mathRow('actual', s.actual_input_weighted, '(input + cc_5m×1.25 + cc_1h×2.0 + cr×0.10)') +
     mathRow('saved', s.saved_input_tokens, `<span class="op">=</span> baseline − actual`) +
     `<span class="src">output excluded — identical with/without compression</span>`;
 

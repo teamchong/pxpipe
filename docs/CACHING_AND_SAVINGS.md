@@ -24,7 +24,7 @@ Pricing relative to base input rate:
 | bucket | meaning | rate |
 |---|---|---:|
 | `input_tokens` | uncached input | `1.0x` |
-| `cache_creation_input_tokens` (`cc`) | cache write | `1.25x` |
+| `cache_creation_input_tokens` (`cc`) | cache write | `1.25x` (5m) / `2x` (1h) |
 | `cache_read_input_tokens` (`cr`) | cache read | `0.1x` |
 | output | model reply | `5x` input on Fable 5 |
 
@@ -97,7 +97,7 @@ For each `/v1/messages` request, pxpipe records three measurements:
 The actual input cost is:
 
 ```text
-actual_eff = input_tokens + cc * 1.25 + cr * 0.10
+actual_eff = input_tokens + cc_5m * 1.25 + cc_1h * 2.0 + cr * 0.10
 ```
 
 The text baseline first splits the measured text tokens:
@@ -110,7 +110,7 @@ coldTail  = baseline_tokens - cacheable
 If the actual request is cold (`cr === 0`):
 
 ```text
-baseline_eff = cacheable * 1.25 + coldTail
+baseline_eff = cacheable * observed_write_rate + coldTail
 ```
 
 If the actual request is warm (`cr > 0`):
@@ -119,10 +119,10 @@ If the actual request is warm (`cr > 0`):
 reused = min(prevCacheable, cacheable)
 grown  = cacheable - reused
 
-baseline_eff = reused * 0.10 + grown * 1.25 + coldTail
+baseline_eff = reused * 0.10 + grown * observed_write_rate + coldTail
 ```
 
-`prevCacheable` is used only after `cr > 0` proves a warm read. It refines how much of the text baseline was reused vs newly grown. If there is no completed same-session prior with the same static-prefix hash, pxpipe assumes full reuse for the text baseline: `prevCacheable = cacheable`. That is conservative for savings because it makes the text baseline cheaper.
+`observed_write_rate` is the request's server-reported mix of 5-minute writes at `1.25x` and 1-hour writes at `2x`. If the API omits the tier split, pxpipe falls back to `1.25x` for backward compatibility. `prevCacheable` is used only after `cr > 0` proves a warm read. It refines how much of the text baseline was reused vs newly grown. If there is no completed same-session prior with the same static-prefix hash, pxpipe assumes full reuse for the text baseline: `prevCacheable = cacheable`. That is conservative for savings because it makes the text baseline cheaper.
 
 Replay uses request start time (`ts - duration_ms`) to avoid overlapping requests refining each other's `prevCacheable` split before the earlier request had completed.
 
@@ -190,6 +190,8 @@ Every row in `~/.pxpipe/events.jsonl` carries the fields needed to reproduce the
 - `baseline_cacheable_tokens`
 - `input_tokens`
 - `cache_create_tokens`
+- `cache_create_5m_tokens`
+- `cache_create_1h_tokens`
 - `cache_read_tokens`
 - `first_user_sha8`
 - `system_sha8`

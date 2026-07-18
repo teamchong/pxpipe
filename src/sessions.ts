@@ -30,8 +30,8 @@ import * as crypto from 'node:crypto';
 import * as readline from 'node:readline';
 import type { TrackEvent } from './core/tracker.js';
 import {
-  computeActualInputEff,
-  computeBaselineInputEff,
+  computeActualInputEffWithCacheTier,
+  computeBaselineInputEffWithCacheTier,
   deriveBaselineWarmth,
 } from './core/baseline.js';
 
@@ -179,13 +179,17 @@ export async function aggregateSessions(
     // Events missing either probe stay out of the rollup — no estimation.
     const inp = ev.input_tokens ?? 0;
     const cc = ev.cache_create_tokens ?? 0;
+    const cc5m = ev.cache_create_5m_tokens;
+    const cc1h = ev.cache_create_1h_tokens ?? 0;
     const cr = ev.cache_read_tokens ?? 0;
     const haveUsage = inp > 0 || cc > 0 || cr > 0;
     const baseline = ev.baseline_tokens;
     if (
       typeof baseline === 'number' &&
       baseline > 0 &&
-      haveUsage
+      haveUsage &&
+      ev.compressed === true &&
+      (ev.baseline_probe_status === 'ok' || ev.baseline_probe_status === undefined)
     ) {
       const cacheable = ev.baseline_cacheable_tokens ?? 0;
       const prefixSha = ev.system_sha8;
@@ -202,7 +206,7 @@ export async function aggregateSessions(
         CACHE_TTL_SEC,
         prefixSha,
       );
-      const baselineEff = computeBaselineInputEff(
+      const baselineEff = computeBaselineInputEffWithCacheTier(
         baseline,
         cacheable,
         inp,
@@ -210,8 +214,10 @@ export async function aggregateSessions(
         cr,
         warm,
         prevCacheable,
+        cc1h,
+        cc5m,
       );
-      const actualEff = computeActualInputEff(inp, cc, cr);
+      const actualEff = computeActualInputEffWithCacheTier(inp, cc, cr, cc1h, cc5m);
       const tokensSaved = baselineEff - actualEff;
       s.tokensSavedEst += Math.round(tokensSaved);
       s.charsSaved += Math.round(tokensSaved * 4);

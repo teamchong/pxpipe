@@ -1,7 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import {
   computeBaselineInputEff,
+  computeBaselineInputEffWithCacheTier,
   computeActualInputEff,
+  computeActualInputEffWithCacheTier,
   deriveBaselineWarmth,
   CACHE_CREATE_RATE,
   CACHE_READ_RATE,
@@ -66,6 +68,35 @@ describe('computeBaselineInputEff (warmth-aware)', () => {
     const cold = computeBaselineInputEff(5000, 4000, inp, cc, cr, false, 0);
     const warm = computeBaselineInputEff(5000, 4000, inp, cc, cr, true, 4000);
     expect(cold).toBeGreaterThan(warm);
+  });
+
+  it('prices server-reported 1-hour cache writes at 2x on both sides', () => {
+    const actual = computeActualInputEffWithCacheTier(1000, 4000, 0, 4000);
+    const baseline = computeBaselineInputEffWithCacheTier(5000, 4000, 1000, 4000, 0, false, 0, 4000);
+    expect(actual).toBe(1000 + 4000 * 2);
+    expect(baseline).toBe(4000 * 2 + 1000);
+  });
+
+  it('uses the observed weighted rate for mixed 5-minute and 1-hour writes', () => {
+    const actual = computeActualInputEffWithCacheTier(1000, 4000, 0, 1000, 3000);
+    const baseline = computeBaselineInputEffWithCacheTier(
+      5000, 4000, 1000, 4000, 0, false, 0, 1000, 3000,
+    );
+    expect(actual).toBe(1000 + 3000 * 1.25 + 1000 * 2);
+    expect(baseline).toBe(1000 + 4000 * ((3000 * 1.25 + 1000 * 2) / 4000));
+  });
+
+  it('preserves zero savings on a probe miss with 1-hour writes', () => {
+    const actual = computeActualInputEffWithCacheTier(1000, 4000, 0, 4000, 0);
+    const baseline = computeBaselineInputEffWithCacheTier(
+      5000, 0, 1000, 4000, 0, false, 0, 4000, 0,
+    );
+    expect(baseline).toBe(actual);
+  });
+
+  it('uses both reported tiers and normalizes a mismatched split to aggregate writes', () => {
+    const actual = computeActualInputEffWithCacheTier(0, 4000, 0, 1000, 1000);
+    expect(actual).toBe(4000 * ((1000 * 1.25 + 1000 * 2) / 2000));
   });
 });
 

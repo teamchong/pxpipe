@@ -33,8 +33,8 @@ import * as readline from 'node:readline';
 import type { ProxyEvent } from './core/proxy.js';
 import type { TrackEvent } from './core/tracker.js';
 import {
-  computeActualInputEff,
-  computeBaselineInputEff,
+  computeActualInputEffWithCacheTier,
+  computeBaselineInputEffWithCacheTier,
   deriveBaselineWarmth,
 } from './core/baseline.js';
 import {
@@ -167,10 +167,10 @@ export interface RecentRow {
  *      cache_read>0 ⇒ a warm cache existed for both paths; cache_read===0 ⇒ cold
  *      for both, so text re-creates its prefix too (no phantom warm read on a
  *      cold turn — that would fabricate a loss out of a real token win):
- *        warm:  baseline_input_eff = reused×0.10 + grown×1.25 + cold_tail×1.0
+ *        warm:  baseline_input_eff = reused×0.10 + grown×observed_create_rate + cold_tail×1.0
  *               where reused = min(prevCacheable, cacheable), grown = cacheable − reused
- *        cold:  baseline_input_eff = cacheable×1.25 + cold_tail×1.0
- *      actual_input_eff   = input + cache_create×1.25 + cache_read×0.10
+ *        cold:  baseline_input_eff = cacheable×observed_create_rate + cold_tail×1.0
+ *      actual_input_eff   = input + cache_create_5m×1.25 + cache_create_1h×2 + cache_read×0.10
  *      output_equiv       = output × 5                (input-token-equivalent at the 5× output rate)
  *      saved              = baseline_input_eff − actual_input_eff
  *      baseline_total     = baseline_input_eff + output_equiv
@@ -607,6 +607,8 @@ export class DashboardState {
     const inp = u?.input_tokens ?? 0;
     const out = u?.output_tokens ?? 0;
     const cc = u?.cache_creation_input_tokens ?? 0;
+    const cc5m = u?.cache_creation?.ephemeral_5m_input_tokens;
+    const cc1h = u?.cache_creation?.ephemeral_1h_input_tokens ?? 0;
     const cr = u?.cache_read_input_tokens ?? 0;
     const gpt = isOpenAIEvent(ev.path, ev.accountingProvider);
 
@@ -671,7 +673,9 @@ export class DashboardState {
       haveBaseline = typeof baseline === 'number' && baseline > 0 && probeOk;
 
       // Weighted INPUT cost we actually paid this turn.
-      actualInputEff = haveUsage ? computeActualInputEff(inp, cc, cr) : 0;
+      actualInputEff = haveUsage
+        ? computeActualInputEffWithCacheTier(inp, cc, cr, cc1h, cc5m)
+        : 0;
 
       // pxpipe only reduces input by imaging the static slab. An UNCOMPRESSED
       // row had its body forwarded untouched, so its unproxied counterfactual
@@ -710,7 +714,7 @@ export class DashboardState {
         prefixShaNow,
       );
       baselineInputEff = creditSaving
-        ? computeBaselineInputEff(
+        ? computeBaselineInputEffWithCacheTier(
             baseline as number,
             cacheable,
             inp,
@@ -718,6 +722,8 @@ export class DashboardState {
             cr,
             warm,
             prevCacheable,
+            cc1h,
+            cc5m,
           )
         : actualInputEff;
       // Record this completed turn's prefix size for future cr>0 split estimates.
@@ -953,6 +959,8 @@ export class DashboardState {
       const inp = t.input_tokens ?? 0;
       const out = t.output_tokens ?? 0;
       const cc = t.cache_create_tokens ?? 0;
+      const cc5m = t.cache_create_5m_tokens;
+      const cc1h = t.cache_create_1h_tokens ?? 0;
       const cr = t.cache_read_tokens ?? 0;
       const compressed = t.compressed === true;
       const gpt = isOpenAIEvent(t.path, t.accounting_provider);
@@ -1003,7 +1011,9 @@ export class DashboardState {
         const probeOk = probeStatus === 'ok'
           || (probeStatus === undefined && typeof baseline === 'number' && baseline > 0);
         haveBaseline = typeof baseline === 'number' && baseline > 0 && probeOk;
-        actualInputEff = haveUsage ? computeActualInputEff(inp, cc, cr) : 0;
+        actualInputEff = haveUsage
+          ? computeActualInputEffWithCacheTier(inp, cc, cr, cc1h, cc5m)
+          : 0;
         // Mirror update(): only credit the cache-modeled counterfactual on
         // compressed rows. Uncompressed/passthrough rows fall back to the
         // actual cost so they show zero saved (no fabricated savings).
@@ -1027,7 +1037,7 @@ export class DashboardState {
           prefixShaR,
         );
         baselineInputEff = creditSaving
-          ? computeBaselineInputEff(
+          ? computeBaselineInputEffWithCacheTier(
               baseline as number,
               cacheable,
               inp,
@@ -1035,6 +1045,8 @@ export class DashboardState {
               cr,
               warmR,
               prevCacheableR,
+              cc1h,
+              cc5m,
             )
           : actualInputEff;
         if (typeof sidR === 'string' && sidR.length > 0 && haveUsage) {

@@ -31,6 +31,7 @@ export interface StatsPayload {
   compressed_minus_passthrough_avg_usd: number;
   split_sufficient_sample: boolean;
   split_min_sample_per_bucket: number;
+  /** Cache-tier-aware input-side dollar savings. */
   saved_usd: number;
   output_weighted: number;
   baseline_token_equivalent: number;

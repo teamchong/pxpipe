@@ -249,24 +249,26 @@ function statTile(
 export function renderHeaderFragment(s: StatsPayload, port: number): string {
   const pa = s.pricing_assumptions;
 
-  // stat strip
-  const splitReady = s.split_sufficient_sample;
+  // Compare the same imaged requests on both sides. Passthrough requests are
+  // generally smaller because the profitability gate selected them, so their
+  // average is not a valid "without pxpipe" counterfactual.
   const cAvg = s.compressed_avg_usd_per_request ?? 0;
-  const pAvg = s.passthrough_avg_usd_per_request ?? 0;
-  const costTile = splitReady
+  const paidImaged = s.compressed_paid_requests ?? 0;
+  const withoutAvg = paidImaged > 0 ? cAvg + (s.saved_usd ?? 0) / paidImaged : 0;
+  const costTile = paidImaged > 0
     ? statTile(
         'Cost per request',
         `$${cAvg.toFixed(4)}`,
-        `vs $${pAvg.toFixed(4)} without pxpipe`,
-        cAvg <= pAvg ? 'pos' : 'neg',
-        'Average real cost of a request with imaging on vs off (passthrough), measured on your own traffic.',
+        `vs $${withoutAvg.toFixed(4)} without pxpipe`,
+        cAvg <= withoutAvg ? 'pos' : 'neg',
+        'Average cost of paid imaged requests versus the cache-aware text counterfactual for those same requests. Unmeasured requests are assigned zero savings.',
       )
     : statTile(
         'Cost per request',
         'collecting…',
-        `${numFmt(s.compressed_paid_requests)} imaged · ${numFmt(s.passthrough_paid_requests)} passthrough so far`,
+        'waiting for a paid imaged request',
         'muted-val',
-        `Needs at least ${s.split_min_sample_per_bucket} paid requests on each path before the comparison is trustworthy.`,
+        'The comparison appears after an imaged request returns provider usage.',
       );
 
   const strip =
@@ -306,20 +308,14 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
     mathRow('saved_usd', `$${(s.saved_usd || 0).toFixed(4)} `, `<span class="op">=</span> saved_tokens × input_rate / 1e6`) +
     `<span class="src">source: ${escapeHtml(pa.source || 'docs.anthropic.com pricing')}</span>`;
 
-  const splitMath =
-    `<div><span class="k">formula:</span> <span class="v">bucket_$ = (Σ actual_input + Σ output × ${pa.output_multiplier}) × $${pa.input_per_mtok}/Mtok</span></div>` +
-    `<div><span class="k">why:</span> <span class="v">partition the paid-rows set by which path actually ran (compressed vs passthrough). Same $/Mtok on both sides so the rate assumption cancels in the delta. Selection bias (the gate routes each turn) does NOT cancel — read with the sample counts.</span></div>` +
+  const costPerRequestMath =
+    `<div><span class="k">formula:</span> <span class="v">without_pxpipe = actual_imaged + measured_savings</span></div>` +
+    `<div><span class="k">why:</span> <span class="v">both averages cover the same paid imaged requests. Passthrough requests are not used because the profitability gate selects a different, generally smaller population.</span></div>` +
     `<div class="sp"></div>` +
-    mathRow(`compressed (n=${s.compressed_paid_requests})`, `$${(s.compressed_actual_usd || 0).toFixed(4)}`, `total · avg $${(s.compressed_avg_usd_per_request || 0).toFixed(4)}/req`) +
-    mathRow(`passthrough (n=${s.passthrough_paid_requests})`, `$${(s.passthrough_actual_usd || 0).toFixed(4)}`, `total · avg $${(s.passthrough_avg_usd_per_request || 0).toFixed(4)}/req`) +
-    mathRow(
-      'compressed − passthrough',
-      `$${(s.compressed_minus_passthrough_avg_usd || 0).toFixed(4)}/req`,
-      s.split_sufficient_sample
-        ? `(both buckets ≥ ${s.split_min_sample_per_bucket} — delta is meaningful)`
-        : `(small sample: need ≥ ${s.split_min_sample_per_bucket} per bucket; treat as noisy)`,
-    ) +
-    `<span class="src">no counterfactual, no probe gate — pure observed $/req on each path</span>`;
+    mathRow(`actual imaged (n=${paidImaged})`, `$${(s.compressed_actual_usd || 0).toFixed(4)}`, `total · avg $${cAvg.toFixed(4)}/req`) +
+    mathRow('measured savings', `$${(s.saved_usd || 0).toFixed(4)}`, 'cache-aware input-side total') +
+    mathRow('without pxpipe', `$${withoutAvg.toFixed(4)}/req`, '<span class="op">=</span> (actual imaged + measured savings) / n') +
+    `<span class="src">unmeasured imaged rows remain in n and actual cost, with zero assumed savings</span>`;
 
   const pctMath =
     `<div><span class="k">formula:</span> <span class="v">share_of_spend = saved / (all_baseline_equivalent + all_output × ${pa.output_multiplier})</span></div>` +
@@ -353,7 +349,7 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
     `<div class="math-grid">` +
     mathBlock('Input tokens saved', savedMath) +
     mathBlock('Dollars saved', usdMath) +
-    mathBlock('Compressed vs passthrough, per request', splitMath) +
+    mathBlock('Cost per imaged request', costPerRequestMath) +
     mathBlock('Share of total spend (diagnostic)', pctMath) +
     mathBlock('Token-equivalent (what the weekly cap counts)', tokeqMath) +
     `</div></details>`;

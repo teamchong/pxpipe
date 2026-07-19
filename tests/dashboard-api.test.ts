@@ -15,7 +15,7 @@ import { getAllowedModelBases, setAllowedModelBases } from '../src/core/applicab
 import type { SessionsPaths } from '../src/sessions.js';
 import type { TrackEvent } from '../src/core/tracker.js';
 import type { StatsPayload, RecentPayload } from '../src/dashboard/types.js';
-import { renderPage } from '../src/dashboard/fragments.js';
+import { renderHeaderFragment, renderPage } from '../src/dashboard/fragments.js';
 
 function makeTmp(): SessionsPaths {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pxpipe-dashapi-'));
@@ -331,6 +331,24 @@ describe('dashboard page help UI', () => {
     const html = renderPage(47821);
     expect(html).toContain('.q:hover::after, .q:focus-visible::after');
     expect(html).toContain('content: attr(data-tip)');
+  });
+
+  it('compares imaged requests with their own without-pxpipe counterfactual', () => {
+    const html = renderHeaderFragment({
+      compressed_paid_requests: 600,
+      compressed_actual_usd: 96.42,
+      compressed_avg_usd_per_request: 0.1607,
+      passthrough_paid_requests: 36,
+      passthrough_actual_usd: 2.5992,
+      passthrough_avg_usd_per_request: 0.0722,
+      saved_usd: 194.83,
+      pricing_assumptions: { input_per_mtok: 10, output_multiplier: 5 },
+    } as StatsPayload, 47821);
+
+    expect(html).toContain('$0.1607');
+    expect(html).toContain('vs $0.4854 without pxpipe');
+    expect(html).not.toContain('vs $0.0722 without pxpipe');
+    expect(html).toContain('same paid imaged requests');
   });
 });
 

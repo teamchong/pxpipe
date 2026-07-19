@@ -550,15 +550,48 @@ function statusCls(status: number): string {
  *  `kept sharp ×2 · not profitable`. Uses PASSTHROUGH_REASON_LABELS (the same
  *  source the shell logger reads) so the UI and the shell log never drift.
  *  Returns '' when nothing was passed through so callers append it blindly. */
-function passthroughReasonsHtml(pr: RecentRow['passthrough_reasons']): string {
+function passthroughReasonsHtml(
+  pr: RecentRow['passthrough_reasons'],
+  rowIsImage: boolean,
+): string {
   if (!pr) return '';
   const parts: string[] = [];
-  for (const [key, label] of PASSTHROUGH_REASON_LABELS) {
-    const n = pr[key] ?? 0;
-    if (n > 0) parts.push(`${label}${n > 1 ? ` ×${n}` : ''}`);
+
+  // The three "sent as text" gates (below_threshold, not_profitable,
+  // render_not_profitable) collapse into a single `text` chip. The old
+  // per-reason breakdown rendered next to an `image` badge as e.g.
+  // "image below threshold ×9" — read as a contradiction, since those blocks
+  // WERE text. A block routed to text is just text; the gate that decided it
+  // is tooltip detail, not a headline. Suppressed on rows whose badge is
+  // already `text`, where it would only repeat the badge.
+  const textTotal =
+    (pr.below_threshold ?? 0) + (pr.not_profitable ?? 0) + (pr.render_not_profitable ?? 0);
+  if (textTotal > 0 && !rowIsImage) {
+    const why = PASSTHROUGH_REASON_LABELS
+      .filter(([k]) => k !== 'kept_sharp' && (pr[k] ?? 0) > 0)
+      .map(([k, label]) => `${label}${(pr[k] ?? 0) > 1 ? ` ×${pr[k]}` : ''}`)
+      .join(', ');
+    parts.push(
+      `<span class="badge badge-txt" title="${escapeHtml(
+        `${textTotal} block${textTotal > 1 ? 's' : ''} sent as text (${why}) — imaging them would have cost more tokens than the text itself`,
+      )}">text</span>`,
+    );
   }
+
+  // kept_sharp is the odd one out: an image kept sharp (NOT compressed to the
+  // dense slab, NOT text). It stays visible with its count so image-quality
+  // passthrough remains legible.
+  const ks = pr.kept_sharp ?? 0;
+  if (ks > 0) {
+    parts.push(
+      `<span class="pt-reasons" title="Image kept sharp instead of compressed to the dense slab">${escapeHtml(
+        `kept sharp${ks > 1 ? ` ×${ks}` : ''}`,
+      )}</span>`,
+    );
+  }
+
   if (parts.length === 0) return '';
-  return ` <span class="pt-reasons" title="Blocks sent through as text instead of imaged, by reason">${escapeHtml(parts.join(' · '))}</span>`;
+  return ` ${parts.join(' ')}`;
 }
 
 export function renderRecentFragment(p: RecentPayload): string {
@@ -597,7 +630,7 @@ export function renderRecentFragment(p: RecentPayload): string {
             const imaged = e.cc_added
               ? `<span class="badge badge-img">image</span>`
               : `<span class="badge badge-txt">text</span>`;
-            const ptReasons = passthroughReasonsHtml(e.passthrough_reasons);
+            const ptReasons = passthroughReasonsHtml(e.passthrough_reasons, !!e.cc_added);
             return (
               `<tr>` +
               `<td class="muted">${i + 1}</td>` +

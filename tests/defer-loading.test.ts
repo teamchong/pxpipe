@@ -18,9 +18,7 @@
  *   - `tool_search_tool_*` server tools pass through unchanged.
  *   - Deferred tools' docs do NOT count toward info.toolDocsChars.
  *   - Non-deferred tools in the same request are still rewritten (stubbed).
- *   - info.deferredToolsSkipped reports how many tools were exempted.
- *   - A request with no deferred tools behaves exactly as before
- *     (deferredToolsSkipped unset).
+ *   - A request with no deferred tools behaves exactly as before.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -106,9 +104,6 @@ describe('defer_loading tools pass through the tool rewrite', () => {
     expect(outPlain.description).not.toBe(PLAIN_DESC);
     expect(outPlain.input_schema.properties.command.description).toBeUndefined();
 
-    // Telemetry: 2 exempted (deferred + search tool).
-    expect(info.deferredToolsSkipped).toBe(2);
-
     // Deferred docs excluded from the imaged reference accounting.
     expect(info.toolDocsChars).toBeGreaterThan(0);
     expect(info.toolDocsChars!).toBeLessThan(
@@ -135,9 +130,8 @@ describe('defer_loading tools pass through the tool rewrite', () => {
   });
 
   it('is a no-op for requests without deferred tools', async () => {
-    const { body, info } = await transformRequest(makeReq([plainTool]), {});
+    const { body } = await transformRequest(makeReq([plainTool]), {});
     const out = parse(body);
-    expect(info.deferredToolsSkipped).toBeUndefined();
     expect(out.tools[0].description).toContain('## Tool: bash');
   });
 

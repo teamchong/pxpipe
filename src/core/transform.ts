@@ -438,10 +438,45 @@ export function isCompressionProfitableAmortized(
 /** Increment a passthrough-reason counter on `info`. Lazily allocates `passthroughReasons`. */
 function bumpPassthrough(
   info: TransformInfo,
-  reason: 'below_threshold' | 'not_profitable' | 'kept_sharp',
+  reason: 'below_threshold' | 'not_profitable' | 'kept_sharp' | 'render_not_profitable',
 ): void {
   if (!info.passthroughReasons) info.passthroughReasons = {};
   info.passthroughReasons[reason] = (info.passthroughReasons[reason] ?? 0) + 1;
+}
+
+/** Passthrough-reason histogram shape (blocks that skipped image compression). */
+export type PassthroughReasons = {
+  below_threshold?: number;
+  not_profitable?: number;
+  kept_sharp?: number;
+  render_not_profitable?: number;
+};
+
+/** Canonical short labels for each passthrough reason, in stable display order.
+ *  Single source of truth shared by the shell logger and the dashboard so the
+ *  two never drift. */
+export const PASSTHROUGH_REASON_LABELS: ReadonlyArray<
+  readonly [keyof PassthroughReasons, string]
+> = [
+  ['kept_sharp', 'kept sharp'],
+  ['below_threshold', 'below threshold'],
+  ['not_profitable', 'not profitable'],
+  ['render_not_profitable', 'render not profitable'],
+];
+
+/** Compact plain-text render of a passthrough-reason histogram for shell logs,
+ *  e.g. `passthrough[kept_sharp×2 not_profitable×1]`. Returns '' when the
+ *  histogram is empty/absent so callers can append it unconditionally. */
+export function formatPassthroughReasons(
+  pr: PassthroughReasons | undefined,
+): string {
+  if (!pr) return '';
+  const parts: string[] = [];
+  for (const [key] of PASSTHROUGH_REASON_LABELS) {
+    const n = pr[key] ?? 0;
+    if (n > 0) parts.push(`${key}×${n}`);
+  }
+  return parts.length > 0 ? `passthrough[${parts.join(' ')}]` : '';
 }
 
 /** Invoke `keepSharp` defensively; a throw or non-`true` return means "image as usual". */
@@ -597,7 +632,7 @@ export interface TransformInfo {
   /** Top dropped codepoints by frequency (`U+HHHH` → count), at most 20 entries. */
   droppedCodepointsTop?: Record<string, number>;
   /** Why blocks passed through without compression. Only present when count > 0. */
-  passthroughReasons?: { below_threshold?: number; not_profitable?: number; kept_sharp?: number };
+  passthroughReasons?: { below_threshold?: number; not_profitable?: number; kept_sharp?: number; render_not_profitable?: number };
   /** Slab gate diagnostics — imageTokens, textTokens, burn terms, and verdict.
    *  Lets hosts measure flap-prevention efficacy and tune amortization horizon. */
   gateEval?: {
@@ -727,6 +762,15 @@ const DYNAMIC_BLOCK_TAGS = [
   'git_status',
   'directoryStructure',
   'system-reminder',
+  // Per-turn token budget reminder injected by Claude Code inside history
+  // messages: <total_tokens>N tokens left</total_tokens>. The counter changes
+  // every turn AND old values are not replaced (a new tag is appended after
+  // the previous one), so if it bakes into the imaged history the prefix
+  // cache breaks on every call (cache_read flat, cache_create climbing).
+  'total_tokens',
+  // security-guidance plugin output blocks; per-turn scan results.
+  'severity',
+  'category',
 ] as const;
 
 // Known-static slab tags — suppresses first-sighting `unknownStaticTags` noise
@@ -756,6 +800,14 @@ const KNOWN_STATIC_TAGS = [
   'outputFormatting',
   'structuredWorkflow',
   'toolUseInstructions',
+  // Claude Code Auto-mode permission classifier (stage=xml_s1/xml_s2 requests
+  // routed through the proxy): its prompt embeds XML-shaped output examples
+  // <reason>…</reason> and an allow/<block> verdict. Verified byte-stable
+  // across captures (identical cache_prefix_sha8), so static — listing them
+  // only silences the first-sighting warning; observeStaticTagChurn still
+  // flags real churn.
+  'reason',
+  'block',
 ] as const;
 
 function splitStaticDynamic(text: string): {
@@ -1614,6 +1666,24 @@ function approxBlockBytes(blk: ImageBlock): number {
   return Math.floor((b64.length * 3) / 4) - pad;
 }
 
+/** Post-render profit check. The pre-render gate estimates rows from char
+ *  counts; the actual render can still come out larger (pathological wrapping,
+ *  many short lines, unshrinkable width). Compares the EXACT patch-token cost
+ *  of the rendered pages against the text they replace, so callers can discard
+ *  the PNGs and ship the original text when imaging would cost MORE. */
+function renderedPagesProfitable(
+  dims: Array<{ width: number; height: number }>,
+  rawTextLength: number,
+  charsPerToken: number = CHARS_PER_TOKEN,
+): boolean {
+  const cpt = Number.isFinite(charsPerToken) && charsPerToken > 0
+    ? charsPerToken
+    : CHARS_PER_TOKEN;
+  let imageTokens = 0;
+  for (const d of dims) imageTokens += patchTokens(d.width, d.height);
+  return imageTokens < rawTextLength / cpt;
+}
+
 // --- main transform --------------------------------------------------------
 
 
@@ -1631,6 +1701,19 @@ async function runHistoryCollapseAndFinalize(
 ): Promise<{ body: Uint8Array; info: TransformInfo; collapsed: boolean }> {
   let collapsedFlag = false;
   if (Array.isArray(req.messages) && req.messages.length > 0) {
+    // Shape-stabilize history: Claude Code serializes the SAME past message
+    // as a bare string on one turn and as a text-block array (when it carries
+    // the cache_control breakpoint) on another. Downstream, that flip makes
+    // otherwise-identical turns differ byte-wise. Normalize every string
+    // content to the canonical block-array form so pxpipe's output shape is
+    // idempotent across turns regardless of where the caller's breakpoint sits.
+    for (const m of req.messages) {
+      if (typeof (m as { content?: unknown }).content === 'string') {
+        (m as { content: unknown }).content = [
+          { type: 'text', text: (m as { content: string }).content },
+        ];
+      }
+    }
     const historyCpt = opts.charsPerToken !== undefined
       ? o.charsPerToken
       : HISTORY_CHARS_PER_TOKEN;
@@ -1990,6 +2073,22 @@ export async function transformRequest(
     numCols > 1
       ? await renderTextToPngsMultiCol(combinedWithHeader, slabCols, numCols)
       : await renderTextToPngs(combinedWithHeader, slabCols);
+  // Post-render safety net: the gate above is an estimate; if the ACTUAL
+  // rendered pages cost more tokens than the raw slab text, ship text as-is.
+  if (!renderedPagesProfitable(
+    images.map((i) => ({ width: i.width, height: i.height })),
+    combinedRaw.length,
+    slabCpt,
+  )) {
+    info.reason = `render_not_profitable (slab=${combined.length} chars)`;
+    bumpPassthrough(info, 'render_not_profitable');
+    const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints);
+    if (finalized.collapsed) {
+      info.compressed = true;
+      return { body: finalized.body, info };
+    }
+    return { body, info };
+  }
   const imageBlocks: ImageBlock[] = [];
   for (let i = 0; i < images.length; i++) {
     const img = images[i]!;
@@ -2114,6 +2213,13 @@ export async function transformRequest(
           }
           const { blocks: imgs, pngs: rawPngs, dims: rawDims, droppedChars, droppedCodepoints: dcp, pixels } =
             await textToImageBlocks(reminderText, o.cols, numCols);
+          // Post-render safety net: if the ACTUAL rendered pages cost more
+          // tokens than the raw text they replace, ship the original text.
+          if (!renderedPagesProfitable(rawDims, reminderRaw.length, o.charsPerToken)) {
+            bumpPassthrough(info, 'render_not_profitable');
+            processedExisting.push(blk);
+            continue;
+          }
           (info.imagePngs ??= []).push(...rawPngs);
           (info.imageDims ??= []).push(...rawDims);
           const srcCacheControl = demoteRelocatedCacheControl((blk as { cache_control?: unknown }).cache_control);
@@ -2191,12 +2297,19 @@ export async function transformRequest(
               } else {
                 // Paging: truncate before render if it would blow the image cap.
                 const paged = truncateForBudget(innerR, o.maxImagesPerToolResult, denseGeo.cols, numCols, denseGeo.maxChars);
+                const { blocks: imgs, pngs: rawPngs, dims: rawDims, droppedChars, droppedCodepoints: dcp, pixels } =
+                  await textToImageBlocks(paged.text, o.cols, numCols);
+                // Post-render safety net: if the ACTUAL rendered pages cost more
+                // tokens than the raw text they replace, ship the original text.
+                if (!renderedPagesProfitable(rawDims, innerRaw.length, o.charsPerToken)) {
+                  bumpPassthrough(info, 'render_not_profitable');
+                  rewritten.push(blk);
+                  continue;
+                }
                 if (paged.truncated) {
                   info.truncatedToolResults = (info.truncatedToolResults ?? 0) + 1;
                   info.omittedChars = (info.omittedChars ?? 0) + paged.omittedChars;
                 }
-                const { blocks: imgs, pngs: rawPngs, dims: rawDims, droppedChars, droppedCodepoints: dcp, pixels } =
-                  await textToImageBlocks(paged.text, o.cols, numCols);
                 (info.imagePngs ??= []).push(...rawPngs);
                 (info.imageDims ??= []).push(...rawDims);
                 for (const img of imgs) info.imageBytes += approxBlockBytes(img);
@@ -2257,12 +2370,19 @@ export async function transformRequest(
                   continue;
                 }
                 const paged = truncateForBudget(innerTextR, o.maxImagesPerToolResult, denseGeo.cols, numCols, denseGeo.maxChars);
+                const { blocks: imgs, pngs: rawPngs, dims: rawDims, droppedChars, droppedCodepoints: dcp, pixels } =
+                  await textToImageBlocks(paged.text, o.cols, numCols);
+                // Post-render safety net: if the ACTUAL rendered pages cost more
+                // tokens than the raw text they replace, ship the original text.
+                if (!renderedPagesProfitable(rawDims, innerTextRaw.length, o.charsPerToken)) {
+                  bumpPassthrough(info, 'render_not_profitable');
+                  newInner.push(ib as TextBlock | ImageBlock);
+                  continue;
+                }
                 if (paged.truncated) {
                   info.truncatedToolResults = (info.truncatedToolResults ?? 0) + 1;
                   info.omittedChars = (info.omittedChars ?? 0) + paged.omittedChars;
                 }
-                const { blocks: imgs, pngs: rawPngs, dims: rawDims, droppedChars, droppedCodepoints: dcp, pixels } =
-                  await textToImageBlocks(paged.text, o.cols, numCols);
                 (info.imagePngs ??= []).push(...rawPngs);
                 (info.imageDims ??= []).push(...rawDims);
                 const srcCacheControl = demoteRelocatedCacheControl((ib as { cache_control?: unknown }).cache_control);

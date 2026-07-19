@@ -146,6 +146,15 @@ export interface RecentRow {
    *  ring (the id stays on the row but no longer fetches). */
   img_id?: number;
   img_ids?: number[];
+  /** Passthrough-reason histogram for this request (blocks sent through as
+   *  text instead of imaged, by reason). Drives the "Sent as" column detail
+   *  and mirrors the shell log's `passthrough[...]` tag so the two agree. */
+  passthrough_reasons?: {
+    below_threshold?: number;
+    not_profitable?: number;
+    kept_sharp?: number;
+    render_not_profitable?: number;
+  };
 }
 
 /** Aggregate over the whole session. Reset on process restart unless
@@ -924,6 +933,7 @@ export class DashboardState {
         creditSaving ? round1(baselineInputEff - actualInputEff) : undefined,
       img_id: imgId,
       img_ids: imgIds,
+      passthrough_reasons: info?.passthroughReasons,
     };
     this.recent.push(row);
     if (this.recent.length > RECENT_CAP) this.recent.splice(0, this.recent.length - RECENT_CAP);
@@ -1120,6 +1130,7 @@ export class DashboardState {
           creditSaving ? round1(baselineInputEff - actualInputEff) : undefined,
         img_id: imgId,
         img_ids: imgId !== undefined ? [imgId] : undefined,
+        passthrough_reasons: (t as { passthrough_reasons?: RecentRow['passthrough_reasons'] }).passthrough_reasons,
       };
       this.recent.push(row);
     }

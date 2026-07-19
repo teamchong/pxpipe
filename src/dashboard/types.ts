@@ -81,6 +81,15 @@ export interface RecentRow {
   session_saved_so_far_delta?: number;
   img_id?: number;
   img_ids?: number[];
+  /** Passthrough-reason histogram for this request (blocks sent through as
+   *  text instead of imaged, by reason). Drives the "Sent as" column detail
+   *  and mirrors the shell log's `passthrough[...]` tag so the two agree. */
+  passthrough_reasons?: {
+    below_threshold?: number;
+    not_profitable?: number;
+    kept_sharp?: number;
+    render_not_profitable?: number;
+  };
 }
 
 /** /api/sessions.json payload. */

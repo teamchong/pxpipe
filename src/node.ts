@@ -34,6 +34,7 @@ import {
   dashboardPath,
   type DashboardRoute,
 } from './dashboard.js';
+import { formatPassthroughReasons } from './core/transform.js';
 
 /** Runtime config. The core transform tuning comes from DEFAULTS in
  *  transform.ts; startup knobs cover deployment plus emergency GPT scope
@@ -1057,8 +1058,12 @@ async function main(): Promise<void> {
         e.usage !== undefined
           ? ` tokens=${inputTokens}+${e.usage.output_tokens ?? 0} cache_read=${cacheRead}`
           : '';
+      // What was sent through untouched (text) rather than compressed, broken
+      // down by reason — mirrors the dashboard "sent as" column so the shell
+      // log and the UI tell the same story.
+      const passthroughTag = formatPassthroughReasons(e.info?.passthroughReasons);
       console.log(
-        `[${new Date().toISOString()}] ${e.method} ${e.path} → ${e.status} (${e.durationMs}ms) ${tag}${usageTag}`,
+        `[${new Date().toISOString()}] ${e.method} ${e.path} → ${e.status} (${e.durationMs}ms) ${tag}${usageTag}${passthroughTag ? ` ${passthroughTag}` : ''}`,
       );
 
       // Surface upstream 4xx error bodies inline so a regression in the

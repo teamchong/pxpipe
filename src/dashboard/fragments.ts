@@ -3,6 +3,7 @@
 
 import { HTMX_JS, ALPINE_JS } from './vendor.js';
 import { CACHE_CREATE_RATE, CACHE_READ_RATE } from '../core/baseline.js';
+import { PASSTHROUGH_REASON_LABELS } from '../core/transform.js';
 import type {
   StatsPayload,
   RecentPayload,
@@ -545,6 +546,21 @@ function statusCls(status: number): string {
   return 'good';
 }
 
+/** Render the passthrough-reason detail shown under the "Sent as" badge, e.g.
+ *  `kept sharp ×2 · not profitable`. Uses PASSTHROUGH_REASON_LABELS (the same
+ *  source the shell logger reads) so the UI and the shell log never drift.
+ *  Returns '' when nothing was passed through so callers append it blindly. */
+function passthroughReasonsHtml(pr: RecentRow['passthrough_reasons']): string {
+  if (!pr) return '';
+  const parts: string[] = [];
+  for (const [key, label] of PASSTHROUGH_REASON_LABELS) {
+    const n = pr[key] ?? 0;
+    if (n > 0) parts.push(`${label}${n > 1 ? ` ×${n}` : ''}`);
+  }
+  if (parts.length === 0) return '';
+  return ` <span class="pt-reasons" title="Blocks sent through as text instead of imaged, by reason">${escapeHtml(parts.join(' · '))}</span>`;
+}
+
 export function renderRecentFragment(p: RecentPayload): string {
   const rows = (p.recent ?? []).slice().reverse();
   const body =
@@ -581,13 +597,14 @@ export function renderRecentFragment(p: RecentPayload): string {
             const imaged = e.cc_added
               ? `<span class="badge badge-img">image</span>`
               : `<span class="badge badge-txt">text</span>`;
+            const ptReasons = passthroughReasonsHtml(e.passthrough_reasons);
             return (
               `<tr>` +
               `<td class="muted">${i + 1}</td>` +
               `<td><span class="pill pill-${statusCls(e.status)}">${e.status}</span></td>` +
               `<td class="endp">${escapeHtml(shortPath(e.path))}</td>` +
               `<td>${e.model ? `<code>${escapeHtml(e.model)}</code>` : '<span class="muted">—</span>'}</td>` +
-              `<td>${imaged}</td>` +
+              `<td>${imaged}${ptReasons}</td>` +
               `<td class="num">${e.cache_read != null ? numFmt(e.cache_read) : '—'}</td>` +
               `<td class="num">${e.baseline_input != null ? numFmt(e.baseline_input) : '—'}</td>` +
               `<td class="num">${e.actual_input != null ? numFmt(e.actual_input) : '—'}</td>` +
@@ -1035,6 +1052,8 @@ const CSS = `
     border-radius: 999px; padding: 0 5px; margin-left: 4px; vertical-align: 1px; cursor: help; white-space: nowrap; }
   .badge-img { background: var(--img-tint); color: var(--img-ink); }
   .badge-txt { background: var(--txt-tint); color: var(--txt-ink); }
+  .pt-reasons { display: inline-block; font-size: 9.5px; color: var(--muted); margin-left: 5px;
+    vertical-align: 1px; font-variant-numeric: tabular-nums; cursor: help; white-space: nowrap; }
 
   /* inspector */
   .viewer-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }

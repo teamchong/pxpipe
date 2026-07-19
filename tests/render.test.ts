@@ -870,7 +870,13 @@ describe('transform', () => {
                       properties: {
                         op: { type: 'string', enum: ['between'], description: 'operator' },
                         // draft-07 tuple validation — array-form `items`.
-                        value: { type: 'array', items: [{ type: 'number' }, { type: 'number' }] },
+                        value: {
+                          type: 'array',
+                          items: [
+                            { type: 'number', description: 'lower bound' },
+                            { type: 'number', description: 'upper bound' },
+                          ],
+                        },
                       },
                       required: ['op', 'value'],
                     },

@@ -64,6 +64,7 @@ const SCHEMA_SINGLE_SUBSCHEMA_KEYS = new Set([
  *  `required`/`enum`/`const` MUST survive untouched: stripping a property while
  *  leaving its name in `required` is exactly the bug this module prevents. */
 const SCHEMA_VERBATIM_KEYS = new Set([
+  '$schema',        // dialect declaration; stripping it can invalidate the schema
   'required',
   'enum',
   'const',
@@ -89,7 +90,7 @@ const FORMAT_MAX_LEN = 32;
 
 /** Strip long-form metadata from a JSON Schema node, preserving the structural
  *  keys a tool-use validator needs. Strips: description, title, examples,
- *  default, $schema, $id, $comment, long format. Recurses into
+ *  default, $id, $comment, long format. Recurses into
  *  properties/oneOf/anyOf/allOf/items etc. Returns a fresh object — never
  *  mutates the input. Property *names* (the keys inside `properties` and
  *  friends) are preserved even when they collide with annotation keywords. */
@@ -136,6 +137,8 @@ export function stripSchemaDescriptions(node: unknown, depth = 0): unknown {
       // additionalProperties may be a boolean — pass through untouched.
       if (typeof v === 'boolean') {
         out[k] = v;
+      } else if (Array.isArray(v)) {
+        out[k] = v.map((sub) => stripSchemaDescriptions(sub, depth + 1));
       } else {
         out[k] = stripSchemaDescriptions(v, depth + 1);
       }

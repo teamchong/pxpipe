@@ -23,6 +23,7 @@ import {
   type ExportResult,
 } from './core/export.js';
 import { readExportTextFile } from './export-collect.js';
+import { createCachedCptResolver } from './cpt-store.js';
 import {
   toTrackEvent,
   TRACK_BODY_INLINE_MAX,
@@ -198,6 +199,10 @@ Environment:
   PXPIPE_CONFIG           JSON config path (default ~/.config/pxpipe/config.json)
                           supports {"models": [...]} or {"models": "off"}
   PXPIPE_LOG              JSONL events path (default ~/.pxpipe/events.jsonl)
+  PXPIPE_ADAPTIVE_CPT     set to 1 to price the profitability gate with
+                          chars-per-token LEARNED from your own events.jsonl
+                          instead of the baked constants. Falls back per bucket
+                          until there is enough data. Writes ~/.pxpipe/cpt-state.jsonl
   PXPIPE_DUMP_DIR         debug: write every rendered PNG here (what the model
                           sees); off unless set. Compress arm only.
   PXPIPE_DEBUG_CAPTURE_4XX  debug: set to 1 to persist full 4xx request bodies
@@ -943,6 +948,21 @@ async function main(): Promise<void> {
   if (forcePassthrough) {
     console.log('[pxpipe] PXPIPE_DISABLE set — passthrough mode (compress=false), still logging usage + baselines');
   }
+  // Adaptive CPT (opt-in, PXPIPE_ADAPTIVE_CPT=1): learn chars-per-token per
+  // content bucket from this machine's own events.jsonl instead of using the
+  // baked constants, so the profitability gate stops mispricing text on
+  // workloads that differ from the hand-tuned defaults. Off by default — it
+  // changes gate decisions, so it ships behind a flag until a shadow-mode run
+  // has measured the delta. See src/core/cpt-fit.ts and src/cpt-store.ts.
+  const adaptiveCpt = /^(1|true|yes|on)$/i.test(process.env.PXPIPE_ADAPTIVE_CPT ?? '')
+    ? createCachedCptResolver()
+    : null;
+  if (adaptiveCpt) {
+    console.log(
+      '[pxpipe] PXPIPE_ADAPTIVE_CPT set — profitability gate will use chars-per-token ' +
+        'learned from events.jsonl (falls back to baked constants until enough data)',
+    );
+  }
   // Debug aid: when PXPIPE_DUMP_DIR is set, persist every rendered PNG this
   // process emits, so you can eyeball exactly what the model received (OCR /
   // legibility audits, demo inspection). Best-effort — never affects requests.
@@ -1016,6 +1036,13 @@ async function main(): Promise<void> {
       // still logging real usage + count_tokens baselines to its own PXPIPE_LOG.
       // (The dashboard kill switch does the same thing at runtime.)
       if (forcePassthrough || !dashboard.getCompressionEnabled()) return { compress: false };
+      // Adaptive CPT (opt-in): kick a throttled background refit and hand the
+      // gate the learned chars-per-token table. Never blocks the request — the
+      // first turns after start use the baked constants until the fit lands.
+      if (adaptiveCpt) {
+        void adaptiveCpt.refresh();
+        return { cptFor: adaptiveCpt.resolver };
+      }
       // Active path: use DEFAULTS in transform.ts for break-even gating.
       return {};
     },

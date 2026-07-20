@@ -4,6 +4,48 @@ All notable changes to pxpipe are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features /
 behavioral changes, patch = fixes).
 
+## Unreleased — 2026-07-19
+
+### Added
+- **Adaptive chars-per-token: the profitability gate can learn text density from
+  telemetry instead of using hand-tuned constants.** Opt in with
+  `PXPIPE_ADAPTIVE_CPT=1`; unset, gate behavior is byte-identical to before. The
+  gate prices text as `chars / CHARS_PER_TOKEN` — a constant of 4 for
+  reminders/tool_results and 2.0 for slab/history — while telemetry
+  ([plan](docs/ADAPTIVE_CPT_PLAN.md)) measured real marginal density near ~1.5 on
+  dense content, so the gate under-counted text cost and passed up profitable
+  compressions. A dependency-free 6-bucket least-squares fit
+  (`src/core/cpt-fit.ts`, pure/Workers-safe) over the `bucket_chars`,
+  `baseline_tokens` and `image_pixels` fields already logged to
+  `~/.pxpipe/events.jsonl` produces per-bucket rates; `src/cpt-store.ts`
+  (Node-only) reads the log, persists `~/.pxpipe/cpt-state.jsonl`, and serves the
+  gate a resolver. Image cost is subtracted on the 28×28 patch grid from
+  `anthropic-vision.ts` (exact for pxpipe's 1568×728 pages, both whole multiples
+  of 28). Learns both a per-`system_sha8` table and a pooled cross-project
+  fallback. Precedence: explicit host `charsPerToken` → learned → baked constant.
+  Every guard (min 20 samples, min 8 bucket appearances, plausible band 0.8–6.0,
+  condition-number check, non-positive slope, throwing resolver) falls back to
+  the constant **per bucket** — a wrong learned rate costs money, a missing one
+  is just today's behavior. Refits are throttled and run in the background, never
+  blocking a request. New `cpt_source` / `cpt_used` event fields record which
+  price each gate bucket ran with.
+
+### Known limitations / evidence
+- Reproduce without fixtures or screenshots:
+  `npx tsx eval/adaptive-cpt/demo-cpt.mts` seeds a synthetic event log at a known
+  density, recovers it, and prices one request three ways — showing the constant
+  declining a compression that a learned rate correctly takes.
+- Ships **verified correct but not measured for savings.** The fit recovers CPTs
+  it was generated from within 5% (including under noise), every guard fails
+  closed, and a learned rate demonstrably changes a real gate verdict in both
+  directions. How much this saves on production traffic is **not** established —
+  that needs a shadow-mode A/B. No savings figure is claimed until that run
+  exists, which is why the feature is opt-in rather than default.
+- Workers keeps the baked constants (no filesystem for the sidecar); only the
+  Node path learns.
+- Cold start: baked constants apply until a project has ≥20 events and the first
+  background refit completes.
+
 ## 0.9.0 — 2026-07-14
 
 ### Changed

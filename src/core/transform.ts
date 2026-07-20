@@ -123,6 +123,11 @@ export interface TransformOptions {
    *  for every block rendered to images. Off by default (entries inflate `info`;
    *  only a stateful harness can use them). */
   emitRecoverable?: boolean;
+  /** Adaptive CPT: learned chars-per-token for a gate bucket, or `undefined` to use
+   *  the baked constant. Supplied by `src/cpt-store.ts` on the Node path; the Workers
+   *  build passes nothing and keeps today's constants. An explicit `charsPerToken`
+   *  always wins over a learned value. See src/core/cpt-fit.ts. */
+  cptFor?: (bucket: BucketName, systemSha8?: string) => number | undefined;
 }
 
 const DEFAULTS: Required<TransformOptions> = {
@@ -148,6 +153,9 @@ const DEFAULTS: Required<TransformOptions> = {
   reflow: true,
   keepSharp: () => false,
   emitRecoverable: false,
+  // No learned CPT by default — every gate uses its baked constant unless the
+  // Node host injects a resolver.
+  cptFor: () => undefined,
   // GPT-only knobs; the Anthropic transform ignores them but Required<> needs them.
   collapseHistory: true,
   gptHistory: {},
@@ -477,6 +485,46 @@ function bumpBucket(info: TransformInfo, bucket: BucketName, chars: number): voi
   info.bucketChars[bucket] = (info.bucketChars[bucket] ?? 0) + chars;
 }
 
+/**
+ * Resolve the chars-per-token the gate should use for one bucket.
+ *
+ * Precedence, highest first:
+ *   1. an explicit host `charsPerToken` (a caller pinning the gate wins outright);
+ *   2. a learned CPT for this (system, bucket) from `options.cptFor` — adaptive CPT;
+ *   3. the baked constant for that call site (today's behavior).
+ *
+ * A resolver that throws or returns a non-finite/≤0 number is ignored, so a broken
+ * learned table can never be worse than the constant. Records which source won on
+ * `info.cptSource` for the dashboard.
+ */
+function resolveCpt(
+  opts: TransformOptions,
+  o: Required<TransformOptions>,
+  info: TransformInfo,
+  bucket: BucketName,
+  fallback: number,
+): number {
+  if (opts.charsPerToken !== undefined) {
+    (info.cptSource ??= {})[bucket] = 'host';
+    (info.cptUsed ??= {})[bucket] = o.charsPerToken;
+    return o.charsPerToken;
+  }
+  let learned: number | undefined;
+  try {
+    learned = o.cptFor(bucket, info.systemSha8);
+  } catch {
+    learned = undefined;
+  }
+  if (typeof learned === 'number' && Number.isFinite(learned) && learned > 0) {
+    (info.cptSource ??= {})[bucket] = 'learned';
+    (info.cptUsed ??= {})[bucket] = learned;
+    return learned;
+  }
+  (info.cptSource ??= {})[bucket] = 'default';
+  (info.cptUsed ??= {})[bucket] = fallback;
+  return fallback;
+}
+
 /** Map `classifyContent` shape to a tool_result bucket name. */
 function toolResultBucket(shape: 'structured' | 'log' | 'other'): BucketName {
   if (shape === 'structured') return 'tool_result_json';
@@ -612,6 +660,12 @@ export interface TransformInfo {
   };
   /** Pre-compaction TEXT char totals per gate-call bucket. Rolling-cpt regression denominator. */
   bucketChars?: BucketChars;
+  /** Adaptive CPT: which CPT source each gate bucket actually used this request.
+   *  `host` = caller pinned `charsPerToken`; `learned` = fitted from telemetry;
+   *  `default` = the baked constant. */
+  cptSource?: Partial<Record<BucketName, 'host' | 'learned' | 'default'>>;
+  /** The chars-per-token value each bucket's gate ran with (pairs with cptSource). */
+  cptUsed?: Partial<Record<BucketName, number>>;
   /** Chars fed into the history-image renderer. Folded into `bucketChars.history` too. */
   historyTextChars?: number;
   /** Blocks pinned as text by the caller's `keepSharp` predicate this request. */
@@ -1631,9 +1685,7 @@ async function runHistoryCollapseAndFinalize(
 ): Promise<{ body: Uint8Array; info: TransformInfo; collapsed: boolean }> {
   let collapsedFlag = false;
   if (Array.isArray(req.messages) && req.messages.length > 0) {
-    const historyCpt = opts.charsPerToken !== undefined
-      ? o.charsPerToken
-      : HISTORY_CHARS_PER_TOKEN;
+    const historyCpt = resolveCpt(opts, o, info, 'history', HISTORY_CHARS_PER_TOKEN);
     const horizon = Math.max(1, Math.floor(o.historyAmortizationHorizon));
     // Pass the symmetric warm-cache burn through to the history-collapse
     // gate as well. The slab gate alone got the symmetric treatment, which
@@ -1921,10 +1973,9 @@ export async function transformRequest(
   );
   // Gate geometry for dense single-col (tool_result/reminder) paths — 384-col/240-row.
   const denseGeo = denseGateGeometry(o.cols, numCols);
-  // Use slab cpt (2.0) unless host pinned charsPerToken explicitly.
-  const slabCpt = opts.charsPerToken !== undefined
-    ? o.charsPerToken
-    : SLAB_CHARS_PER_TOKEN;
+  // Use slab cpt (2.0) unless host pinned charsPerToken explicitly or adaptive
+  // CPT learned a rate for this project's slab.
+  const slabCpt = resolveCpt(opts, o, info, 'static_slab', SLAB_CHARS_PER_TOKEN);
   // Shrink canvas to longest actual line — pure function of (text, cols) so the
   // cache prefix stays byte-identical across turns. The banner sets a natural width floor.
   const reflowNoteImg = o.reflow
@@ -2107,7 +2158,8 @@ export async function transformRequest(
           // model reads.
           const reminderRaw = (blk as TextBlock).text;
           const reminderText = maybeReflow(compactSlabWhitespace(reminderRaw), o.reflow);
-          if (!isCompressionProfitable(reminderText, denseGeo.cols, undefined, numCols, o.charsPerToken, 0, 0, true, denseGeo.maxChars)) {
+          const reminderCpt = resolveCpt(opts, o, info, 'reminder', o.charsPerToken);
+          if (!isCompressionProfitable(reminderText, denseGeo.cols, undefined, numCols, reminderCpt, 0, 0, true, denseGeo.maxChars)) {
             bumpPassthrough(info, 'not_profitable');
             processedExisting.push(blk);
             continue;
@@ -2182,10 +2234,13 @@ export async function transformRequest(
               const inner = compactSlabWhitespace(innerRaw);
               // classifyContent sees pre-reflow `inner` so shape bucketing reflects real structure.
               const innerR = maybeReflow(inner, o.reflow);
+              // Resolved once: the same bucket drives the adaptive-CPT gate below
+              // and the telemetry attribution after a successful render.
+              const trBucket = toolResultBucket(classifyContent(inner));
               if (innerR.length < o.minToolResultChars) {
                 bumpPassthrough(info, 'below_threshold');
                 rewritten.push(blk);
-              } else if (!isCompressionProfitable(innerR, denseGeo.cols, o.maxImagesPerToolResult, numCols, o.charsPerToken, 0, 0, true, denseGeo.maxChars)) {
+              } else if (!isCompressionProfitable(innerR, denseGeo.cols, o.maxImagesPerToolResult, numCols, resolveCpt(opts, o, info, trBucket, o.charsPerToken), 0, 0, true, denseGeo.maxChars)) {
                 bumpPassthrough(info, 'not_profitable');
                 rewritten.push(blk);
               } else {
@@ -2220,7 +2275,7 @@ export async function transformRequest(
                   content: trFactSheet ? [...imgs, { type: 'text' as const, text: trFactSheet }] : imgs,
                 });
                 changed = true;
-                bumpBucket(info, toolResultBucket(classifyContent(inner)), innerRaw.length);
+                bumpBucket(info, trBucket, innerRaw.length);
               }
             } else if (Array.isArray(innerRaw)) {
               const newInner: Array<TextBlock | ImageBlock> = [];
@@ -2246,12 +2301,14 @@ export async function transformRequest(
                 const innerText = compactSlabWhitespace(innerTextRaw);
                 // R3: gate/page/render on reflowed text; classify pre-reflow.
                 const innerTextR = maybeReflow(innerText, o.reflow);
+                // One bucket for both the adaptive-CPT gate and the telemetry below.
+                const trTextBucket = toolResultBucket(classifyContent(innerText));
                 if (innerTextR.length < o.minToolResultChars) {
                   bumpPassthrough(info, 'below_threshold');
                   newInner.push(ib as TextBlock | ImageBlock);
                   continue;
                 }
-                if (!isCompressionProfitable(innerTextR, denseGeo.cols, o.maxImagesPerToolResult, numCols, o.charsPerToken, 0, 0, true, denseGeo.maxChars)) {
+                if (!isCompressionProfitable(innerTextR, denseGeo.cols, o.maxImagesPerToolResult, numCols, resolveCpt(opts, o, info, trTextBucket, o.charsPerToken), 0, 0, true, denseGeo.maxChars)) {
                   bumpPassthrough(info, 'not_profitable');
                   newInner.push(ib as TextBlock | ImageBlock);
                   continue;
@@ -2291,7 +2348,7 @@ export async function transformRequest(
                 for (const [cp, n] of dcp) {
                   droppedCodepoints.set(cp, (droppedCodepoints.get(cp) ?? 0) + n);
                 }
-                bumpBucket(info, toolResultBucket(classifyContent(innerText)), innerTextRaw.length);
+                bumpBucket(info, trTextBucket, innerTextRaw.length);
                 innerChanged = true;
               }
               if (innerChanged) {
@@ -2319,9 +2376,7 @@ export async function transformRequest(
   // protectedPrefix excludes the slab-bearing first user message — collapsing it
   // would reduce slab images to [image] placeholders and destroy the cache anchor.
   if (Array.isArray(req.messages) && req.messages.length > 0) {
-    const historyCpt = opts.charsPerToken !== undefined
-      ? o.charsPerToken
-      : HISTORY_CHARS_PER_TOKEN;
+    const historyCpt = resolveCpt(opts, o, info, 'history', HISTORY_CHARS_PER_TOKEN);
     const horizon = Math.max(1, Math.floor(o.historyAmortizationHorizon));
     const historyProfitable = (text: string, cols: number): boolean => {
       // Gate at dense 384-col/240-row geometry (matches history.ts renderer).

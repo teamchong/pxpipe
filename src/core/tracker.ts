@@ -80,6 +80,12 @@ export interface TrackEvent {
     'history',
     number
   >>;
+  /** Adaptive CPT: which chars-per-token source each gate bucket used this request
+   *  (`host` = caller-pinned, `learned` = fitted from telemetry, `default` = baked
+   *  constant), and the value it ran with. Lets a shadow-mode/eval run attribute a
+   *  decision change to the learned rate. Absent when no gate bucket fired. */
+  cpt_source?: Partial<Record<string, 'host' | 'learned' | 'default'>>;
+  cpt_used?: Partial<Record<string, number>>;
   /** TEXT chars that fed the history-image renderer; separate from bucket_chars because it credits a synthetic message. */
   history_text_chars?: number;
   /** sha8 of the collapsed history image. Unchanged across turns proves the prompt cache is hitting (cache_read).
@@ -261,6 +267,12 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     if (info.bucketChars && Object.keys(info.bucketChars).length > 0) {
       // Omit empty object so noop-pass requests stay lean; presence means at least one gate fired.
       out.bucket_chars = info.bucketChars;
+    }
+    // Adaptive CPT: only emitted when a learned rate actually reached a gate, so
+    // default-constant traffic keeps byte-identical rows.
+    if (info.cptSource && Object.values(info.cptSource).some((s) => s === 'learned')) {
+      out.cpt_source = info.cptSource;
+      if (info.cptUsed) out.cpt_used = info.cptUsed;
     }
     if (info.historyTextChars !== undefined && info.historyTextChars > 0) {
       out.history_text_chars = info.historyTextChars;

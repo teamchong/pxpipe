@@ -29,6 +29,26 @@ describe('anthropicMessagesToOpenAIResponses — message roles', () => {
     ]);
   });
 
+  it('encodes assistant text as output_text (Responses rejects input_text under role:assistant)', () => {
+    const out = toResponses({
+      model: 'm',
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: [{ type: 'text', text: 'Hello!' }] },
+        { role: 'assistant', content: 'plain string reply' },
+        { role: 'user', content: 'continue' },
+      ],
+    });
+    const assistant = out.input.filter((item: any) => item.role === 'assistant');
+    expect(assistant).toEqual([
+      { role: 'assistant', content: [{ type: 'output_text', text: 'Hello!' }] },
+      { role: 'assistant', content: [{ type: 'output_text', text: 'plain string reply' }] },
+    ]);
+    // User text stays input_text.
+    const user = out.input.filter((item: any) => item.role === 'user');
+    expect(user[0].content[0].type).toBe('input_text');
+  });
+
   it('drops empty system-role messages and rejects unknown roles', () => {
     const out = toResponses({
       model: 'm',

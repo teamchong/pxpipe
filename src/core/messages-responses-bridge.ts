@@ -36,14 +36,18 @@ function imageUrl(source: unknown): string | undefined {
   return undefined;
 }
 
-function inputParts(content: unknown, location = 'message'): JsonObject[] {
-  if (typeof content === 'string') return [{ type: 'input_text', text: content }];
+function inputParts(content: unknown, location = 'message', role = 'user'): JsonObject[] {
+  // Responses requires assistant-role message text to be `output_text`;
+  // `input_text` is only valid for user/system. Emitting input_text under
+  // role:"assistant" (any replayed assistant turn) is a 400.
+  const textType = role === 'assistant' ? 'output_text' : 'input_text';
+  if (typeof content === 'string') return [{ type: textType, text: content }];
   if (!Array.isArray(content)) invalidRequest(`${location} content must be a string or an array`);
   const out: JsonObject[] = [];
   for (const raw of content) {
     const part = object(raw);
     if (part?.type === 'text' && typeof part.text === 'string') {
-      out.push({ type: 'input_text', text: part.text });
+      out.push({ type: textType, text: part.text });
     } else if (part?.type === 'image') {
       const image_url = imageUrl(part.source);
       if (!image_url) invalidRequest(`Unsupported ${location} image source`);
@@ -120,7 +124,7 @@ export function anthropicMessagesToOpenAIResponses(body: Uint8Array): Uint8Array
       }
       const content = message.content;
       if (!Array.isArray(content)) {
-        const ordinary = inputParts(content, `${String(message.role)} message`);
+        const ordinary = inputParts(content, `${String(message.role)} message`, String(message.role));
         if (ordinary.length) input.push({ role: message.role, content: ordinary });
         continue;
       }
@@ -149,7 +153,7 @@ export function anthropicMessagesToOpenAIResponses(body: Uint8Array): Uint8Array
             output: functionOutput(part.content, part.is_error === true),
           });
         } else {
-          ordinary.push(...inputParts([rawPart], `${String(message.role)} message`));
+          ordinary.push(...inputParts([rawPart], `${String(message.role)} message`, String(message.role)));
         }
       }
       flushOrdinary();

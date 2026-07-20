@@ -101,8 +101,11 @@ converts a coin-flip-per-glyph read into a 100% text quote, at ~5% of source cha
    model-callable "rehydrate this region as text" tool is the real answer for
    **dense** exact-recall (code files, large tables) that no fixed-size sidecar can
    hold. This is the "put a glass over it" mechanism, and it's half-built.
-5. **Optional — glyph surgery** on `H~K` (d=1 defect) and case-contrast for the S/s
-   class. Zero token cost, bounded upside; do it in the same eval harness as (3).
+5. **Done — glyph surgery on `H~K` (d=1 defect).** `gen-atlas.ts` now repaints
+   the stock Spleen `K` (which was `H` minus one crossbar pixel) with a
+   diagonal-legged bitmap; `H~K` is now Hamming 8, and no alphanumeric pair
+   sits below d=2. Regression-guarded in `tests/render.test.ts`. Case-contrast
+   for the S/s class remains open; do it in the same eval harness as (3).
 
 ## Verdict on "is the factsheet the way, or should there be a RAG escape?"
 

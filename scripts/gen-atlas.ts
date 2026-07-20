@@ -254,11 +254,42 @@ for (const src of [contexts.primary, contexts.fallback]) {
   }
 }
 
+// --- Glyph surgery ---------------------------------------------------------
+// A few stock Spleen 5×8 cells are pathologically confusable with another
+// glyph at the atlas's pixel budget (see docs/LEGIBILITY-AUDIT-2026-07-01.md
+// §2). We repaint those cells with a hand-tuned bitmap. Keyed by codepoint;
+// each value is exactly `cellH` rows of `cellW` chars ('#' = ink). Applied
+// ONLY to the narrow primary Spleen 5×8 cell, so the JetBrains-Mono (6×11)
+// and CJK-fallback atlases are never touched.
+//
+// U+004B 'K': stock Spleen K is 'H' with one crossbar pixel removed (Hamming
+// distance 1 — the worst confusable pair in the atlas). This diagonal-legged
+// K sits at Hamming ≥6 from every other ASCII glyph.
+const GLYPH_OVERRIDES: Record<number, readonly string[]> = {
+  0x4b: ['.....', '#..#.', '#.#..', '##...', '##...', '#.#..', '#..#.', '.....'],
+};
+const SURGERY_OK = cellW === 5 && cellH === 8;
+function overrideCoverage(cp: number): Uint8Array | null {
+  const rows = GLYPH_OVERRIDES[cp];
+  if (!rows) return null;
+  if (rows.length !== cellH || rows.some((r) => r.length !== cellW)) {
+    throw new Error(
+      `[gen-atlas] glyph override U+${cp.toString(16).toUpperCase()} must be ` +
+        `${cellW}×${cellH}, got ${rows[0]?.length}×${rows.length}.`,
+    );
+  }
+  const cov = new Uint8Array(cellW * cellH);
+  for (let y = 0; y < cellH; y++)
+    for (let x = 0; x < cellW; x++) cov[y * cellW + x] = rows[y]![x] === '#' ? 255 : 0;
+  return cov;
+}
+
 const codepoints = new Uint32Array(found.length);
 const offsets = new Uint32Array(found.length);
 const wideFlags = new Uint8Array(found.length);
 const cellBitSlices: Uint8Array[] = [];
 let totalBits = 0;
+let surgeryApplied = 0;
 
 // Gray mode: collect raw coverage bytes (0-255) per pixel, 1 byte per pixel.
 // Used only when ATLAS_GRAY=1; the 1-bit path is unchanged when GRAY_MODE is false.
@@ -280,22 +311,33 @@ for (let i = 0; i < found.length; i++) {
 
   const img = ctx.getImageData(0, 0, w, cellH);
 
+  // Glyph surgery: swap in the hand-tuned bitmap for confusable narrow Spleen
+  // cells. `ov[p]` (0/255) stands in for the canvas R-channel byte everywhere.
+  const ov = SURGERY_OK && source === 'primary' && !wide ? overrideCoverage(cp) : null;
+  if (ov) surgeryApplied++;
+
   if (GRAY_MODE) {
     // Gray mode: record the raw R-channel coverage byte (canvas is white-on-black).
     offsets[i] = grayTotalBytes; // BYTE offset (not bit offset)
     const coverage = new Uint8Array(w * cellH);
-    for (let p = 0; p < coverage.length; p++) coverage[p] = img.data[p * 4]!;
+    for (let p = 0; p < coverage.length; p++) coverage[p] = ov ? ov[p]! : img.data[p * 4]!;
     graySlices.push(coverage);
     grayTotalBytes += coverage.length;
   } else {
     // 1-bit mode (default / production path): threshold and bit-pack.
     offsets[i] = totalBits;
     const bits = new Uint8Array(w * cellH);
-    for (let p = 0; p < bits.length; p++) bits[p] = img.data[p * 4]! >= 128 ? 1 : 0;
+    for (let p = 0; p < bits.length; p++) bits[p] = (ov ? ov[p]! : img.data[p * 4]!) >= 128 ? 1 : 0;
     cellBitSlices.push(bits);
     totalBits += bits.length;
   }
 }
+
+if (SURGERY_OK)
+  console.log(
+    `[gen-atlas] glyph surgery: ${surgeryApplied}/${Object.keys(GLYPH_OVERRIDES).length} ` +
+      `override(s) applied (Spleen 5×8 narrow cells).`,
+  );
 
 function bytesB64(bytes: Uint8Array): string {
   return Buffer.from(bytes).toString('base64');

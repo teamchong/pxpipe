@@ -3,6 +3,7 @@
 
 import { HTMX_JS, ALPINE_JS } from './vendor.js';
 import { CACHE_CREATE_RATE, CACHE_READ_RATE } from '../core/baseline.js';
+import { LOCALES, DEFAULT_LANG, t, type Lang, type Messages } from './i18n.js';
 import type {
   StatsPayload,
   RecentPayload,
@@ -52,23 +53,22 @@ function shortPath(p: string | null | undefined): string {
 
 // ---- compression toggle (kill switch) ------------------------------------
 
-export function renderToggleFragment(enabled: boolean): string {
-  // NOTE: "PASSTHROUGH MODE", "Disable compression", "Enable compression" are asserted by tests.
+export function renderToggleFragment(enabled: boolean, lang: Lang = DEFAULT_LANG): string {
+  const m = t(lang);
+  // NOTE: "PASSTHROUGH MODE", "Disable compression", "Enable compression" are asserted by tests (English default).
   const banner = enabled
     ? ''
-    : `<div class="banner"><strong>PASSTHROUGH MODE</strong> — compression is off. Every request goes to Claude unchanged: no images, no savings. Use this to A/B test, or if the upstream API is having problems.</div>`;
+    : `<div class="banner"><strong>${m.passthroughBannerTitle}</strong> — ${m.passthroughBannerBody}</div>`;
   // Button POSTs the OPPOSITE of current state; 2s poll keeps it fresh.
-  const confirm = enabled
-    ? ` hx-confirm="Turn compression off?\n\nRequests will pass straight through to Claude, unchanged. Restarting the proxy turns it back on."`
-    : '';
+  const confirm = enabled ? ` hx-confirm="${escapeHtml(m.disableConfirm)}"` : '';
   return (
     banner +
     `<div class="switch">` +
-    `<span class="switch-state ${enabled ? 'on' : 'off'}"><span class="switch-dot"></span>${enabled ? 'Compression on' : 'Compression off'}</span>` +
+    `<span class="switch-state ${enabled ? 'on' : 'off'}"><span class="switch-dot"></span>${enabled ? m.compressionOn : m.compressionOff}</span>` +
     `<button class="switch-btn" type="button" hx-post="/fragments/toggle" hx-target="#frag-toggle" hx-vals='{"enabled": ${!enabled}}'${confirm}>` +
-    (enabled ? 'Disable compression' : 'Enable compression') +
+    (enabled ? m.disableCompression : m.enableCompression) +
     `</button>` +
-    `<span class="hint">kill switch · resets to on when you restart</span>` +
+    `<span class="hint">${m.killSwitchHint}</span>` +
     `</div>`
   );
 }
@@ -97,7 +97,9 @@ export function renderModelsFragment(
   active: string[],
   configured: string[],
   enabled: boolean,
+  lang: Lang = DEFAULT_LANG,
 ): string {
+  const m = t(lang);
   const on = new Set(active);
   const labelOf = new Map(
     [...MODEL_CATALOG, ...GPT_MODEL_CATALOG, ...GROK_MODEL_CATALOG].map((m) => [m.id, m.label]),
@@ -137,27 +139,27 @@ export function renderModelsFragment(
     .join('');
   const moot = enabled
     ? ''
-    : `<div class="models"><span class="hint">compression is off — these settings have no effect right now</span></div>`;
+    : `<div class="models"><span class="hint">${m.compressionOffNoEffect}</span></div>`;
   return (
     moot +
     `<div class="models">` +
-    `<span class="models-label">Image Claude models</span>` +
+    `<span class="models-label">${m.imageClaudeModels}</span>` +
     claudeChips +
-    `<span class="hint">unlisted models get plain text</span>` +
+    `<span class="hint">${m.unlistedModelsHint}</span>` +
     `</div>` +
     `<div class="models">` +
-    `<span class="models-label">Image OpenAI Responses models</span>` +
+    `<span class="models-label">${m.imageOpenAIModels}</span>` +
     gptChips +
     grokChips +
     otherChips +
-    `<span class="hint">opt-in · no Anthropic cache_control</span>` +
+    `<span class="hint">${m.openAIModelsHint}</span>` +
     `</div>` +
     `<div class="models">` +
     `<span class="models-label">PXPIPE_MODELS</span>` +
     `<input class="models-csv" id="models-csv" type="text" name="list" ` +
     `value="${escapeHtml(active.join(','))}" spellcheck="false" autocomplete="off" ` +
     `hx-post="/fragments/models" hx-target="#frag-models" hx-trigger="change">` +
-    `<span class="hint">CSV of bases, or off · applies on enter/blur · export to persist</span>` +
+    `<span class="hint">${m.pxpipeModelsCsvHint}</span>` +
     `</div>`
   );
 }
@@ -173,14 +175,15 @@ void INPUT_USD_PER_MTOK; // suppress unused-var; renderHeaderFragment uses the s
 // the number stops swinging on tiny per-session samples. Cache-weighted on
 // purpose ("lifeweight"): it answers "did pxpipe move my real, cache-discounted
 // bill since this proxy started", not a raw token count.
-export function renderSessionSummaryFragment(s: StatsPayload): string {
+export function renderSessionSummaryFragment(s: StatsPayload, lang: Lang = DEFAULT_LANG): string {
+  const m = t(lang);
   const measured = s.compressed_requests ?? 0;
   if (measured <= 0) {
     return (
       `<div class="hero hero-empty">` +
-      `<div class="hero-eyebrow">Since start</div>` +
-      `<div class="hero-headline">Warming up…</div>` +
-      `<div class="hero-sub">Point Claude Code at this proxy and send a message. The moment a request flows through, your running savings show up right here.</div>` +
+      `<div class="hero-eyebrow">${m.sinceStartLabel}</div>` +
+      `<div class="hero-headline">${m.heroWarmingUpTitle}</div>` +
+      `<div class="hero-sub">${m.heroWarmingUpBody}</div>` +
       `</div>`
     );
   }
@@ -196,21 +199,14 @@ export function renderSessionSummaryFragment(s: StatsPayload): string {
   const inputPct = baselineW > 0 ? (1 - actualW / baselineW) * 100 : 0;
   const positive = inputPct >= 0;
   const bigNum = `${Math.abs(inputPct).toFixed(0)}%`;
-  const word = positive ? 'fewer tokens' : 'more tokens';
+  const word = positive ? m.heroFewerTokens : m.heroMoreTokens;
 
   return (
     `<div class="hero${positive ? '' : ' hero-neg'}">` +
-    `<div class="hero-eyebrow">Since start · ${numFmt(measured)} request${measured === 1 ? '' : 's'} imaged</div>` +
-    `<div class="hero-headline"><span class="hero-num">${bigNum}</span> ${word} after caching</div>` +
-    `<div class="hero-sub">` +
-    `<strong>${kFmt(actualW)}</strong> effective tokens vs <strong>${kFmt(baselineW)}</strong> if this same context ` +
-    `stayed plain text — both counted after normal cache discounts since this proxy started. ` +
-    `Your latest messages and Claude's live output are never compressed.` +
-    `</div>` +
-    `<div class="hero-meta">` +
-    `Cache-aware — cached reads counted at their real ~0.1× weight, not full price · ` +
-    `output untouched (${kFmt(rawOutput)}) · no $ assumptions` +
-    `</div>` +
+    `<div class="hero-eyebrow">${m.heroSinceStart(measured, numFmt(measured))}</div>` +
+    `<div class="hero-headline"><span class="hero-num">${bigNum}</span> ${word} ${m.heroAfterCaching}</div>` +
+    `<div class="hero-sub">${m.heroSubline(kFmt(actualW), kFmt(baselineW))}</div>` +
+    `<div class="hero-meta">${m.heroMeta(kFmt(rawOutput))}</div>` +
     `</div>`
   );
 }
@@ -246,7 +242,8 @@ function statTile(
   );
 }
 
-export function renderHeaderFragment(s: StatsPayload, port: number): string {
+export function renderHeaderFragment(s: StatsPayload, port: number, lang: Lang = DEFAULT_LANG): string {
+  const m = t(lang);
   const pa = s.pricing_assumptions;
 
   // Compare the same imaged requests on both sides. Passthrough requests are
@@ -257,36 +254,36 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
   const withoutAvg = paidImaged > 0 ? cAvg + (s.saved_usd ?? 0) / paidImaged : 0;
   const costTile = paidImaged > 0
     ? statTile(
-        'Cost per request',
+        m.statCostPerRequest,
         `$${cAvg.toFixed(4)}`,
-        `vs $${withoutAvg.toFixed(4)} without pxpipe`,
+        m.statCostPerRequestSub(`$${withoutAvg.toFixed(4)}`),
         cAvg <= withoutAvg ? 'pos' : 'neg',
-        'Average cost of paid imaged requests versus the cache-aware text counterfactual for those same requests. Unmeasured requests are assigned zero savings.',
+        m.statCostPerRequestTip,
       )
     : statTile(
-        'Cost per request',
-        'collecting…',
-        'waiting for a paid imaged request',
+        m.statCostPerRequest,
+        m.statCostCollecting,
+        m.statCostCollectingSub,
         'muted-val',
-        'The comparison appears after an imaged request returns provider usage.',
+        m.statCostCollectingTip,
       );
 
   const strip =
     `<div class="strip">` +
-    statTile('Requests', numFmt(s.requests), `${numFmt(s.compressed_requests)} turned into images`) +
+    statTile(m.statRequests, numFmt(s.requests), m.statRequestsSub(numFmt(s.compressed_requests))) +
     statTile(
-      'Input tokens saved',
+      m.statInputSaved,
       numFmt(s.saved_input_tokens),
-      'vs sending the same context as text',
+      m.statInputSavedSub,
       'pos',
-      'Bulky context (system prompt, tool output, old turns) sent as compact images instead of text. Cache-aware, input side only — recent turns and the live output stay text.',
+      m.statInputSavedTip,
     ) +
     statTile(
-      'Estimated saved',
+      m.statEstSaved,
       `$${(s.saved_usd ?? 0).toFixed(2)}`,
-      `at $${pa.input_per_mtok}/M base input price`,
+      m.statEstSavedSub(`$${pa.input_per_mtok}`),
       '',
-      'Cache-aware estimate using the server-reported 5-minute/1-hour write split when available (1.25×/2×), cache reads (0.10×), and the base input price.',
+      m.statEstSavedTip,
     ) +
     costTile +
     `</div>`;
@@ -344,18 +341,18 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
 
   const drawer =
     `<details class="drawer" id="math-drawer">` +
-    `<summary>Show the math &amp; honesty receipts</summary>` +
-    `<div class="drawer-intro">Every number above, derived from the same per-event log. The proxy only moves <em>input</em> tokens; output is shown on both sides so percentages stay honest.</div>` +
+    `<summary>${m.showTheMath}</summary>` +
+    `<div class="drawer-intro">${m.drawerIntro}</div>` +
     `<div class="math-grid">` +
-    mathBlock('Input tokens saved', savedMath) +
-    mathBlock('Dollars saved', usdMath) +
-    mathBlock('Cost per imaged request', costPerRequestMath) +
-    mathBlock('Share of total spend (diagnostic)', pctMath) +
-    mathBlock('Token-equivalent (what the weekly cap counts)', tokeqMath) +
+    mathBlock(m.mathInputSavedTitle, savedMath) +
+    mathBlock(m.mathDollarsSavedTitle, usdMath) +
+    mathBlock(m.mathCostPerRequestTitle, costPerRequestMath) +
+    mathBlock(m.mathShareOfSpendTitle, pctMath) +
+    mathBlock(m.mathTokenEquivTitle, tokeqMath) +
     `</div></details>`;
 
   // NOTE: tests assert the header fragment contains the port number.
-  const updated = `<div class="updated"><span class="live-dot"></span>live · port ${port} · uptime ${formatDuration(s.uptime_sec)}</div>`;
+  const updated = `<div class="updated"><span class="live-dot"></span>${m.liveStatus(port, formatDuration(s.uptime_sec))}</div>`;
 
   return strip + drawer + updated;
 }
@@ -398,27 +395,32 @@ export interface ContextMapData {
   restored?: boolean; // rebuilt from JSONL after a restart — PNG thumbnails are gone
 }
 
-const CTXMAP_BUCKETS: ReadonlyArray<readonly [string, string]> = [
-  ['static_slab', 'System prompt + tool docs'],
-  ['reminder', 'System-reminder blocks'],
-  ['tool_result_prose', 'Tool results — prose'],
-  ['tool_result_log', 'Tool results — logs'],
-  ['tool_result_json', 'Tool results — JSON'],
-  ['history', 'Older conversation turns'],
-];
+function ctxBuckets(m: Messages): ReadonlyArray<readonly [string, string]> {
+  return [
+    ['static_slab', m.ctxBucketStaticSlab],
+    ['reminder', m.ctxBucketReminder],
+    ['tool_result_prose', m.ctxBucketToolResultProse],
+    ['tool_result_log', m.ctxBucketToolResultLog],
+    ['tool_result_json', m.ctxBucketToolResultJson],
+    ['history', m.ctxBucketHistory],
+  ];
+}
 
 /** Image-vs-text breakdown for one request. */
 export function renderContextMapFragment(
   c: ContextMapData | undefined,
   history: ContextMapData[] = [],
   notFound = false,
+  lang: Lang = DEFAULT_LANG,
 ): string {
+  const m = t(lang);
+  const CTXMAP_BUCKETS = ctxBuckets(m);
   const isLatest = c !== undefined && c.id === (history.at(-1)?.id ?? -1);
   if (notFound) {
-    return `<div class="ctxmap"><div class="empty-note">That request's breakdown isn't kept anymore — only the most recent requests are. Pick <strong>Details</strong> on a newer row.</div></div>`;
+    return `<div class="ctxmap"><div class="empty-note">${m.ctxNoLongerKept}</div></div>`;
   }
   if (!c || (c.baselineTokens <= 0 && c.imageCount <= 0)) {
-    return `<div class="ctxmap"><div class="empty-note">Pick <strong>Details</strong> on a request to see exactly which parts became images and which stayed as text.</div></div>`;
+    return `<div class="ctxmap"><div class="empty-note">${m.ctxPickDetailsEmpty}</div></div>`;
   }
   // Cache-aware billing-equivalent basis — identical to the recent row's
   // As-text / Sent / Saved/lost columns. These are not raw token counts; they apply
@@ -445,36 +447,36 @@ export function renderContextMapFragment(
   const rc = c.responsesComposition;
   const responseRows: ReadonlyArray<readonly [string, number]> = rc
     ? [
-        ['Instructions', rc.instructions],
-        ['System / developer items', rc.systemDeveloper],
-        ['User / assistant text kept native', rc.userAssistant],
-        ['Native tool JSON', rc.toolsJson],
-        ['Function calls', rc.functionCalls],
-        ['Function outputs', rc.functionOutputs],
-        ['Function outputs eligible in old closed pairs', rc.imageableFunctionOutputs ?? 0],
-        ['Function outputs actually imaged this request', rc.collapsedFunctionOutputs ?? 0],
-        ['Reasoning / encrypted items', rc.reasoningEncrypted],
-        ['Compaction / opaque items', rc.compactionOpaque],
-        ['Other Responses items', rc.other],
+        [m.rcInstructions, rc.instructions],
+        [m.rcSystemDeveloper, rc.systemDeveloper],
+        [m.rcUserAssistant, rc.userAssistant],
+        [m.rcToolsJson, rc.toolsJson],
+        [m.rcFunctionCalls, rc.functionCalls],
+        [m.rcFunctionOutputs, rc.functionOutputs],
+        [m.rcImageableFunctionOutputs, rc.imageableFunctionOutputs ?? 0],
+        [m.rcCollapsedFunctionOutputs, rc.collapsedFunctionOutputs ?? 0],
+        [m.rcReasoningEncrypted, rc.reasoningEncrypted],
+        [m.rcCompactionOpaque, rc.compactionOpaque],
+        [m.rcOther, rc.other],
       ]
     : [];
   const responseBreakdown = rc
-    ? `<div class="split-note" style="margin-top:12px"><strong>Original Responses composition (local o200k estimate)</strong></div>` +
+    ? `<div class="split-note" style="margin-top:12px"><strong>${m.rcCompositionTitle}</strong></div>` +
       responseRows.filter(([, n]) => n > 0).map(([label, n]) =>
         `<div class="ctx-row"><span class="ctx-lbl">${label}</span><span class="ctx-val">${kFmt(n)} tok</span></div>`,
       ).join('') +
-      `<div class="ctx-row"><span class="ctx-lbl">Imageable text baseline</span><span class="ctx-val">${kFmt(c.baselineImagedTokens ?? 0)} tok</span></div>` +
-      `<div class="ctx-row"><span class="ctx-lbl">Adjacent completed pairs (old / recent native / imaged)</span><span class="ctx-val">${rc.completedFunctionPairs ?? 0} (${rc.oldFunctionPairs ?? 0} / ${rc.recentNativeFunctionPairs ?? 0} / ${rc.collapsedFunctionPairs ?? 0})</span></div>` +
-      `<div class="ctx-row"><span class="ctx-lbl">Open calls kept native</span><span class="ctx-val">${rc.openFunctionCalls ?? 0}</span></div>` +
-      `<div class="ctx-row"><span class="ctx-lbl">Native image parts</span><span class="ctx-val">${rc.imageParts}</span></div>` +
-      `<div class="ctx-row"><span class="ctx-lbl">Provider tokens not explained locally</span><span class="ctx-val">${kFmt(c.responsesUnexplainedTokens ?? 0)} tok</span></div>` +
-      `<div class="split-note">This diagnostic uses local o200k counts only; it never calls Anthropic /count_tokens.</div>`
+      `<div class="ctx-row"><span class="ctx-lbl">${m.rcImageableBaseline}</span><span class="ctx-val">${kFmt(c.baselineImagedTokens ?? 0)} tok</span></div>` +
+      `<div class="ctx-row"><span class="ctx-lbl">${m.rcAdjacentPairs}</span><span class="ctx-val">${rc.completedFunctionPairs ?? 0} (${rc.oldFunctionPairs ?? 0} / ${rc.recentNativeFunctionPairs ?? 0} / ${rc.collapsedFunctionPairs ?? 0})</span></div>` +
+      `<div class="ctx-row"><span class="ctx-lbl">${m.rcOpenCalls}</span><span class="ctx-val">${rc.openFunctionCalls ?? 0}</span></div>` +
+      `<div class="ctx-row"><span class="ctx-lbl">${m.rcNativeImageParts}</span><span class="ctx-val">${rc.imageParts}</span></div>` +
+      `<div class="ctx-row"><span class="ctx-lbl">${m.rcUnexplainedTokens}</span><span class="ctx-val">${kFmt(c.responsesUnexplainedTokens ?? 0)} tok</span></div>` +
+      `<div class="split-note">${m.rcDiagnosticNote}</div>`
     : '';
 
   const ids = c.imageIds ?? [];
-  const modelLabel = c.model ? escapeHtml(c.model) : 'the model';
+  const modelLabel = c.model ? escapeHtml(c.model) : m.ctxModelFallback;
   const gallery = ids.length
-    ? `<div class="pages-title">${ids.length} image page${ids.length === 1 ? '' : 's'} sent to ${modelLabel} — click one to read the exact text behind it:</div>` +
+    ? `<div class="pages-title">${m.ctxPagesSent(ids.length, modelLabel)}</div>` +
       `<div class="pages">` +
       ids
         .map(
@@ -484,51 +486,51 @@ export function renderContextMapFragment(
         .join('') +
       `</div>`
     : c.restored && c.imageCount > 0
-      ? `<div class="pages-title">${c.imageCount} image page${c.imageCount === 1 ? '' : 's'} were sent — thumbnails expired when the proxy restarted. The breakdown above is reconstructed from the saved log.</div>`
+      ? `<div class="pages-title">${m.ctxPagesRestored(c.imageCount)}</div>`
       : '';
 
   // Did the TEXT baseline's prefix read warm this turn? This follows the actual
   // request's observed cache state: cache_read > 0 means warm, cache_read === 0
   // means cold. No wall-clock-only counterfactual is credited.
   const warm = showCompare && c.warm;
-  const textNoun = warm ? 'cached text' : 'text';
+  const textNoun = warm ? m.ctxCachedText : m.ctxPlainText;
   // Raw count_tokens can grow (imaging bloated a short prompt), so say so rather
   // than rendering a nonsensical "shrank -36%".
   const rawPhrase =
-    rawShrink >= 0 ? `Raw content shrank ${rawShrink}%.` : `Raw content grew ${-rawShrink}%.`;
+    rawShrink >= 0 ? m.rawShrankPhrase(rawShrink) : m.rawGrewPhrase(-rawShrink);
   const headline = !showCompare
-    ? `<strong>${kFmt(c.actualInputEff || c.realInput)}</strong> billing-equivalent input tokens sent`
+    ? m.ctxHeadlineNoBaseline(kFmt(c.actualInputEff || c.realInput))
     : pct >= 0
-      ? `<span class="ctx-big">${pct}%</span> smaller — ${textNoun} would bill as <strong>${kFmt(base)}</strong> input tokens; images billed as <strong>${kFmt(real)}</strong>`
-      : `<span class="ctx-big">${-pct}%</span> bigger — images billed as <strong>${kFmt(real)}</strong> input tokens vs <strong>${kFmt(base)}</strong> for ${textNoun}`;
+      ? m.ctxHeadlineSmaller(pct, textNoun, kFmt(base), kFmt(real))
+      : m.ctxHeadlineBigger(-pct, kFmt(real), kFmt(base), textNoun);
   // Clarifying sub-line. It must match the actual request's cache state: claiming
   // a 0.1× read discount when cache_read===0 would count hypothetical cache as a
   // pxpipe effect, so cold rows price both paths cold.
   const subnote = !showCompare
-    ? 'Billed tokens count cache discounts (reads at 0.1×) — no trustworthy text baseline for this request yet.'
+    ? m.ctxNoTrustworthyBaseline
     : !warm
-      ? `No warm text cache this turn — the text counterfactual's prefix is priced at the 1.25× create rate (the same event the imaged path pays), identical basis to the Saved column. The gap is purely token count. ${rawPhrase}`
+      ? m.ctxColdNote('1.25×', rawPhrase)
       : pct < 0 && rawShrink > 0
-          ? `Billed = after cache discounts (reads at 0.1×), same basis as the Saved column. The raw text is ${rawShrink}% smaller, but most of it would have been a cheap cache-read — so imaging it cost more.`
-          : `Billed = after cache discounts (reads at 0.1×), same basis as the Saved column. ${rawPhrase}`;
-  const title = isLatest ? 'Latest request' : 'Selected request';
+          ? m.ctxWarmShrunkNote(rawShrink, rawPhrase)
+          : m.ctxWarmNote(rawPhrase);
+  const title = isLatest ? m.ctxLatest : m.ctxSelected;
 
   return (
     `<div class="ctxmap">` +
     `<div class="ctx-headline"><span class="ctx-title">${title}</span> ${headline}</div>` +
     `<div class="split-note ctx-subnote">${subnote}</div>` +
-    `<div class="legend"><span class="tag tag-img">Became an image</span><span class="tag tag-txt">Stayed as text</span></div>` +
+    `<div class="legend"><span class="tag tag-img">${m.ctxBecameImage}</span><span class="tag tag-txt">${m.ctxStayedText}</span></div>` +
     `<div class="split">` +
     `<div class="split-col split-img">` +
-    `<div class="split-head">Compressed into images <span class="split-sum">${kFmt(totalImagedChars)} chars · ${c.imageCount} page${c.imageCount === 1 ? '' : 's'}</span></div>` +
-    (imgRows || `<div class="ctx-row muted-row">nothing imaged this request</div>`) +
-    `<div class="split-note">pxpipe can misread exact values inside images — treat these as gist, not byte-exact.</div>` +
+    `<div class="split-head">${m.ctxCompressedInto(kFmt(totalImagedChars), c.imageCount)}</div>` +
+    (imgRows || `<div class="ctx-row muted-row">${m.ctxNothingImaged}</div>`) +
+    `<div class="split-note">${m.ctxImageAccuracyNote}</div>` +
     `</div>` +
     `<div class="split-col split-txt">` +
-    `<div class="split-head">Kept as plain text <span class="split-sum">byte-exact</span></div>` +
-    `<div class="ctx-row"><span class="ctx-lbl">Your latest messages</span><span class="ctx-val">verbatim</span></div>` +
-    `<div class="ctx-row"><span class="ctx-lbl">Model reply (output)</span><span class="ctx-val">${kFmt(c.output)} tok</span></div>` +
-    `<div class="split-note">never imaged — safe for IDs, hashes and exact numbers.</div>` +
+    `<div class="split-head">${m.ctxKeptAsTextLabel} <span class="split-sum">${m.ctxByteExact}</span></div>` +
+    `<div class="ctx-row"><span class="ctx-lbl">${m.ctxLatestMessages}</span><span class="ctx-val">${m.ctxVerbatim}</span></div>` +
+    `<div class="ctx-row"><span class="ctx-lbl">${m.ctxModelReply}</span><span class="ctx-val">${kFmt(c.output)} tok</span></div>` +
+    `<div class="split-note">${m.ctxNeverImagedNote}</div>` +
     `</div>` +
     `</div>` +
     responseBreakdown +
@@ -545,17 +547,18 @@ function statusCls(status: number): string {
   return 'good';
 }
 
-export function renderRecentFragment(p: RecentPayload): string {
+export function renderRecentFragment(p: RecentPayload, lang: Lang = DEFAULT_LANG): string {
+  const m = t(lang);
   const rows = (p.recent ?? []).slice().reverse();
   const body =
     rows.length === 0
-      ? `<tr><td colspan="10" class="empty-cell">No requests yet — they stream in here live.</td></tr>`
+      ? `<tr><td colspan="10" class="empty-cell">${m.noRequestsYet}</td></tr>`
       : rows
           .map((e: RecentRow, i: number) => {
             const viewId = (e.img_ids ?? (e.img_id != null ? [e.img_id] : []))[0];
             const viewLink =
               viewId != null
-                ? `<a class="row-view" href="#" hx-get="/fragments/context-map?req=${viewId}" hx-target="#frag-context-map" hx-swap="innerHTML">Details →</a>`
+                ? `<a class="row-view" href="#" hx-get="/fragments/context-map?req=${viewId}" hx-target="#frag-context-map" hx-swap="innerHTML">${m.detailsLink}</a>`
                 : `<span class="muted">—</span>`;
             const saved = e.session_saved_so_far_delta;
             // A loss that disappears when the newly written prefix is repriced at
@@ -569,7 +572,7 @@ export function renderRecentFragment(p: RecentPayload): string {
               cc > 0 &&
               saved + cc * (CACHE_CREATE_RATE - CACHE_READ_RATE) > 0;
             const createNote = createLoss
-              ? ` <span class="mk-create" title="Cache-create turn: this loss is the one-time ${CACHE_CREATE_RATE}× premium for writing ${numFmt(cc)} tokens to cache. Later turns re-read that prefix at ${CACHE_READ_RATE}×, which typically recoups it.">create</span>`
+              ? ` <span class="mk-create" title="${escapeHtml(m.createTurnTip(CACHE_CREATE_RATE, numFmt(cc), CACHE_READ_RATE))}">create</span>`
               : '';
             const savedCell = saved == null
               ? `<td class="num muted">—</td>`
@@ -579,8 +582,8 @@ export function renderRecentFragment(p: RecentPayload): string {
                   ? `<td class="num neg">${numFmt(saved)}${createNote}</td>`
                   : `<td class="num">0</td>`;
             const imaged = e.cc_added
-              ? `<span class="badge badge-img">image</span>`
-              : `<span class="badge badge-txt">text</span>`;
+              ? `<span class="badge badge-img">${m.badgeImage}</span>`
+              : `<span class="badge badge-txt">${m.badgeText}</span>`;
             return (
               `<tr>` +
               `<td class="muted">${i + 1}</td>` +
@@ -599,15 +602,15 @@ export function renderRecentFragment(p: RecentPayload): string {
           .join('');
   return (
     `<table class="rtable"><thead><tr>` +
-    `<th>#</th>` +
-    `<th>Result</th>` +
-    `<th>Endpoint</th>` +
-    `<th>Model</th>` +
-    `<th title="Was this request's context compressed into an image?">Sent as</th>` +
-    `<th class="num" title="Tokens served from Claude's cache (cheap)">Cache hits</th>` +
-    `<th class="num" title="Billing-equivalent input if kept as plain text, after cache create/read rates">As text</th>` +
-    `<th class="num" title="Actual billing-equivalent input after imaging, after cache create/read rates">Sent</th>` +
-    `<th class="num" title="As-text minus Sent; negative means imaging cost more">Saved/lost</th>` +
+    `<th>${m.thHash}</th>` +
+    `<th>${m.thResult}</th>` +
+    `<th>${m.thEndpoint}</th>` +
+    `<th>${m.thModel}</th>` +
+    `<th title="${escapeHtml(m.thSentAsTip)}">${m.thSentAs}</th>` +
+    `<th class="num" title="${escapeHtml(m.thCacheHitsTip)}">${m.thCacheHits}</th>` +
+    `<th class="num" title="${escapeHtml(m.thAsTextTip)}">${m.thAsText}</th>` +
+    `<th class="num" title="${escapeHtml(m.thSentTip)}">${m.thSent}</th>` +
+    `<th class="num" title="${escapeHtml(m.thSavedLostTip)}">${m.thSavedLost}</th>` +
     `<th></th>` +
     `</tr></thead><tbody>${body}</tbody></table>`
   );
@@ -622,7 +625,8 @@ export interface LatestFragmentInput {
   sourceText: string | null; // null = not captured
 }
 
-export function renderLatestFragment(inp: LatestFragmentInput): string {
+export function renderLatestFragment(inp: LatestFragmentInput, lang: Lang = DEFAULT_LANG): string {
+  const m = t(lang);
   const { payload, pin, showSource, sourceText } = inp;
   const hasPreview = payload.has_preview === true;
   const meta = payload.preview_meta ?? '';
@@ -637,35 +641,35 @@ export function renderLatestFragment(inp: LatestFragmentInput): string {
 
   const pinBar =
     pin != null
-      ? `<div class="viewer-bar"><button class="mini-btn" type="button" onclick="ppPin(null)">← back to latest</button><span class="mini-label">image #${pin}</span></div>`
+      ? `<div class="viewer-bar"><button class="mini-btn" type="button" onclick="ppPin(null)">${m.backToLatest}</button><span class="mini-label">${m.imageLabel(pin)}</span></div>`
       : '';
 
   let main: string;
   if (pin != null && pinnedEvicted) {
-    main = `<div class="evicted">image #${pin} is no longer in the buffer</div>`;
+    main = `<div class="evicted">${m.imageEvicted(pin)}</div>`;
   } else if (pin != null || hasPreview) {
     // When source pane is open the image appears inside the pairing — don't duplicate it.
     main = showSource ? '' : `<div class="frame"><img src="${imgSrc}" alt="rendered page" /></div>`;
   } else {
-    main = `<div class="empty-note">No images yet — they appear the instant pxpipe compresses a request.</div>`;
+    main = `<div class="empty-note">${m.noImagesYet}</div>`;
   }
 
   const showBtn = pin != null ? !pinnedEvicted : hasPreview;
   const caption =
-    pin != null ? `image #${pin}` : meta ? `${escapeHtml(meta)} · top-left at native size` : '';
+    pin != null ? m.imageLabel(pin) : meta ? `${escapeHtml(meta)} · ${m.nativeSizeCaption}` : '';
   const srcBtn = showBtn
-    ? `<button class="mini-btn" type="button" onclick="ppSource(${showSource ? 'false' : 'true'})">${showSource ? 'hide source text' : 'show the text behind this image'}</button>`
+    ? `<button class="mini-btn" type="button" onclick="ppSource(${showSource ? 'false' : 'true'})">${showSource ? m.hideSourceText : m.showSourceText}</button>`
     : '';
 
   let pane = '';
   if (showSource) {
     pane =
       sourceText == null
-        ? `<div class="evicted">source text wasn't captured for this image</div>`
+        ? `<div class="evicted">${m.sourceNotCaptured}</div>`
         : `<div class="pairing">` +
-          `<div class="pair-col"><div class="pair-head pair-img">What Claude sees · image</div><div class="frame frame-sm"><img src="${imgSrc}" alt="rendered page" /></div></div>` +
-          `<div class="pair-mid">made from ↓</div>` +
-          `<div class="pair-col"><div class="pair-head pair-txt">The original text · byte-exact</div><pre class="src-pane">${escapeHtml(sourceText)}</pre></div>` +
+          `<div class="pair-col"><div class="pair-head pair-img">${m.pairWhatClaudeSees}</div><div class="frame frame-sm"><img src="${imgSrc}" alt="rendered page" /></div></div>` +
+          `<div class="pair-mid">${m.pairMadeFrom}</div>` +
+          `<div class="pair-col"><div class="pair-head pair-txt">${m.pairOriginalText}</div><pre class="src-pane">${escapeHtml(sourceText)}</pre></div>` +
           `</div>`;
   }
 
@@ -676,7 +680,8 @@ export function renderLatestFragment(inp: LatestFragmentInput): string {
 
 const TOP_N = 8;
 
-export function renderSessionsFragment(p: SessionsPayload): string {
+export function renderSessionsFragment(p: SessionsPayload, lang: Lang = DEFAULT_LANG): string {
+  const msg = t(lang);
   const all = p.sessions ?? [];
   const rows = [...all]
     .sort((a, b) => (b.tokensSavedEst ?? 0) - (a.tokensSavedEst ?? 0))
@@ -689,8 +694,8 @@ export function renderSessionsFragment(p: SessionsPayload): string {
   };
   const barPct = (v: number) => (max <= 0 || v <= 0 ? 0 : (v / max) * 100);
 
-  const status = `<div class="status">${all.length} session${all.length === 1 ? '' : 's'} tracked</div>`;
-  if (rows.length === 0) return status + `<div class="empty">No sessions yet.</div>`;
+  const status = `<div class="status">${msg.sessionsTracked(all.length)}</div>`;
+  if (rows.length === 0) return status + `<div class="empty">${msg.noSessionsYet}</div>`;
 
   const chart = rows
     .map((s) => {
@@ -710,13 +715,14 @@ export function renderSessionsFragment(p: SessionsPayload): string {
   return (
     status +
     `<div class="bars">${chart}</div>` +
-    `<div class="axis">tokens saved per session (cache-aware) · top ${rows.length} of ${all.length}</div>`
+    `<div class="axis">${msg.sessionsAxis(rows.length, all.length)}</div>`
   );
 }
 
 // ---- full-history stats table --------------------------------------------
 
-export function renderStatsTableFragment(p: FullStatsPayload): string {
+export function renderStatsTableFragment(p: FullStatsPayload, lang: Lang = DEFAULT_LANG): string {
+  const m = t(lang);
   if (p.error || !p.summary) {
     return `<div class="status">${escapeHtml(p.error || 'no data')}</div><table class="dtable"><tbody></tbody></table>`;
   }
@@ -728,25 +734,25 @@ export function renderStatsTableFragment(p: FullStatsPayload): string {
   const charRatio =
     s.origCharsTotal > 0 ? ((s.imageBytesTotal / s.origCharsTotal) * 100).toFixed(3) + 'x' : '-';
 
-  // NOTE: the literal word "requests" is asserted by tests.
+  // NOTE: the literal word "requests" is asserted by tests (English default locale).
   const tr = (k: string, v: string) => `<tr><td>${k}</td><td class="num">${v}</td></tr>`;
   return (
-    `<div class="status">${numFmt(p.parsed)} events parsed from disk</div>` +
+    `<div class="status">${m.eventsParsed(numFmt(p.parsed))}</div>` +
     `<table class="dtable"><tbody>` +
-    tr('requests', numFmt(s.total)) +
-    tr('2xx / 4xx / 5xx', `${numFmt(s.ok2xx)} / ${numFmt(s.err4xx)} / ${numFmt(s.err5xx)}`) +
-    tr('compressed', numFmt(s.compressed)) +
-    tr('passthrough', numFmt(s.passthrough)) +
-    tr('input tokens', numFmt(s.inputTokensTotal)) +
-    tr('cache create', numFmt(s.cacheCreateTokensTotal)) +
-    tr('cache read', numFmt(s.cacheReadTokensTotal)) +
-    tr('cache hit (by tokens)', hitRateTok) +
-    tr('cache hit (by events)', hitRateEv) +
-    tr('original chars', numFmt(s.origCharsTotal)) +
-    tr('image bytes', numFmt(s.imageBytesTotal)) +
-    tr('bytes / char', charRatio) +
-    tr('latency p50 / p95', `${numFmt(s.durationP50)} / ${numFmt(s.durationP95)} ms`) +
-    tr('first-byte p50 / p95', `${numFmt(s.firstByteP50)} / ${numFmt(s.firstByteP95)} ms`) +
+    tr(m.rowRequests, numFmt(s.total)) +
+    tr(m.row2xx4xx5xx, `${numFmt(s.ok2xx)} / ${numFmt(s.err4xx)} / ${numFmt(s.err5xx)}`) +
+    tr(m.rowCompressed, numFmt(s.compressed)) +
+    tr(m.rowPassthrough, numFmt(s.passthrough)) +
+    tr(m.rowInputTokens, numFmt(s.inputTokensTotal)) +
+    tr(m.rowCacheCreate, numFmt(s.cacheCreateTokensTotal)) +
+    tr(m.rowCacheRead, numFmt(s.cacheReadTokensTotal)) +
+    tr(m.rowCacheHitByTokens, hitRateTok) +
+    tr(m.rowCacheHitByEvents, hitRateEv) +
+    tr(m.rowOriginalChars, numFmt(s.origCharsTotal)) +
+    tr(m.rowImageBytes, numFmt(s.imageBytesTotal)) +
+    tr(m.rowBytesPerChar, charRatio) +
+    tr(m.rowLatency, `${numFmt(s.durationP50)} / ${numFmt(s.durationP95)} ms`) +
+    tr(m.rowFirstByte, `${numFmt(s.firstByteP50)} / ${numFmt(s.firstByteP95)} ms`) +
     `</tbody></table>`
   );
 }
@@ -816,8 +822,10 @@ const CSS = `
     background: radial-gradient(circle at 35% 30%, #ffd0a8, var(--flame) 55%, var(--flame-strong));
     box-shadow: 0 0 0 4px var(--flame-tint); flex: none; }
   .wordmark { font-size: 22px; font-weight: 800; color: var(--ink); letter-spacing: -0.02em; }
-  .tagline { font-size: 12.5px; color: var(--muted); margin-top: 1px; max-width: 460px; }
+  .tagline { font-size: 12.5px; color: var(--muted); margin-top: 1px; max-width: 640px; }
   .controls { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
+  .controls-top { display: flex; align-items: center; gap: 6px; }
+  #lang-sel { max-width: 130px; }
 
   /* kill switch */
   .banner { display: block; margin: 0 0 8px; padding: 9px 13px; background: var(--bad-tint);
@@ -1087,7 +1095,8 @@ const CSS = `
 `;
 
 // Client glue: window.pp (pin+source state) → hx-vals; preserves <details> open state across swaps; routes htmx errors to toast tray.
-const GLUE_JS = `
+function glueJs(m: Messages): string {
+  return `
   window.pp = { pin: null, src: false };
   function ppPin(id) {
     window.pp.pin = id;
@@ -1115,20 +1124,22 @@ const GLUE_JS = `
   });
   document.body.addEventListener('htmx:sendError', function (ev) {
     window.dispatchEvent(new CustomEvent('pp-toast', {
-      detail: { text: 'proxy unreachable: ' + ev.detail.requestConfig.path }
+      detail: { text: ${JSON.stringify(m.proxyUnreachablePrefix)} + ev.detail.requestConfig.path }
     }));
   });
 `;
+}
 
 // Theme: light/dark via data-theme on <html>; saved in localStorage, defaults to system pref.
-const THEME_JS = `
+function themeJs(m: Messages): string {
+  return `
   (function () {
     function apply(t) {
       document.documentElement.dataset.theme = t;
       var b = document.getElementById('theme-btn');
       if (b) {
-        b.textContent = t === 'dark' ? '☀ Light' : '☾ Dark';
-        b.setAttribute('aria-label', t === 'dark' ? 'Switch to light mode' : 'Switch to dark mode');
+        b.textContent = t === 'dark' ? ${JSON.stringify(m.themeToLight)} : ${JSON.stringify(m.themeToDark)};
+        b.setAttribute('aria-label', t === 'dark' ? ${JSON.stringify(m.switchToLightAria)} : ${JSON.stringify(m.switchToDarkAria)});
       }
     }
     window.ppTheme = function () {
@@ -1139,15 +1150,35 @@ const THEME_JS = `
     apply(document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light');
   })();
 `;
+}
 
-export function renderPage(port: number): string {
+// Language selector: <select> built from the LOCALES registry, so a newly
+// registered locale (see i18n.ts) appears automatically with no template edit.
+// Picking a language writes the `pp-lang` cookie the server reads on every
+// request (see resolveLang in i18n.ts) and reloads — simplest way to keep the
+// whole server-rendered page + all htmx-polled fragments in lockstep.
+function langOptions(lang: Lang): string {
+  return (Object.keys(LOCALES) as Lang[])
+    .map((code) => `<option value="${code}"${code === lang ? ' selected' : ''}>${escapeHtml(LOCALES[code].label)}</option>`)
+    .join('');
+}
+
+const LANG_JS = `
+  window.ppLang = function (code) {
+    document.cookie = 'pp-lang=' + encodeURIComponent(code) + '; path=/; max-age=31536000; samesite=lax';
+    location.reload();
+  };
+`;
+
+export function renderPage(port: number, lang: Lang = DEFAULT_LANG): string {
+  const m = t(lang);
   // hx-trigger="load, every Ns": paint on load then poll (2s live, 5s aggregates).
   return `<!doctype html>
-<html lang="en">
+<html lang="${lang}">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>pxpipe — live dashboard</title>
+<title>${m.pageTitle}</title>
 <link rel="icon" href="${FAVICON}" />
 <style>${CSS}</style>
 <script>
@@ -1168,30 +1199,33 @@ export function renderPage(port: number): string {
     <span class="flame-dot"></span>
     <div>
       <div class="wordmark">pxpipe</div>
-      <div class="tagline">See exactly what got turned into images to shrink your Claude Code bill.</div>
+      <div class="tagline">${m.tagline}</div>
     </div>
   </div>
   <div class="controls">
-    <button type="button" id="theme-btn" class="theme-btn" onclick="ppTheme()" aria-label="Toggle dark mode" title="Toggle dark / light mode">☾ Dark</button>
+    <div class="controls-top">
+      <select id="lang-sel" class="theme-btn" onchange="ppLang(this.value)" aria-label="${escapeHtml(m.langSelectAria)}">${langOptions(lang)}</select>
+      <button type="button" id="theme-btn" class="theme-btn" onclick="ppTheme()" aria-label="${escapeHtml(m.toggleThemeAria)}" title="${escapeHtml(m.toggleThemeAria)}">☾ Dark</button>
+    </div>
     <div id="frag-toggle" hx-get="/fragments/toggle" hx-trigger="load, every 2s" hx-swap="innerHTML"></div>
   </div>
 </header>
 
 <details class="models-collapse">
-  <summary class="models-summary">Image model scope <span class="hint">Fable 5 only by default · expand to experiment with other families</span></summary>
-  <div class="models-warning">⚠ Image compression is tuned for Fable 5 only — other families can use <strong>more</strong> tokens, not less. Opt in only for deliberate experiments (custom system prompt, subagent model setup, …).</div>
+  <summary class="models-summary">${m.modelScopeSummary} <span class="hint">${m.modelScopeHint}</span></summary>
+  <div class="models-warning">${m.modelScopeWarning}</div>
   <div id="frag-models" hx-get="/fragments/models" hx-trigger="load, every 2s [!document.activeElement || document.activeElement.id !== 'models-csv']" hx-swap="innerHTML"></div>
-  <div class="models-routing"><span class="hint">imaging scope ≠ provider routing — non-Anthropic IDs also need routing env on the proxy</span> <button class="mini-btn" type="button" onclick="document.getElementById('routing-help').showModal()">routing help</button></div>
+  <div class="models-routing"><span class="hint">${m.routingScopeHint}</span> <button class="mini-btn" type="button" onclick="document.getElementById('routing-help').showModal()">${m.routingHelpBtn}</button></div>
 </details>
 
 <dialog id="routing-help" onclick="if (event.target === this) this.close()">
-  <h3>Routing Claude Code to OpenAI / Cloudflare models</h3>
-  <p>Claude models use Anthropic by default. Two optional routes can run together — set on the <strong>pxpipe process</strong> (keep provider credentials out of Claude Code):</p>
+  <h3>${m.routingHelpTitle}</h3>
+  <p>${m.routingHelpIntro}</p>
   <ul>
     <li><code>OPENAI_MODELS</code> — exact model IDs routed to OpenAI Responses (<code>OPENAI_UPSTREAM</code> + <code>OPENAI_API_KEY</code>)</li>
     <li><code>CLOUDFLARE_MODELS</code> — exact model IDs routed to Cloudflare's OpenAI-compatible endpoint (<code>CLOUDFLARE_ACCOUNT_ID</code> + <code>CLOUDFLARE_API_TOKEN</code>)</li>
   </ul>
-  <p>If a model appears in both lists: <code>CLOUDFLARE_MODELS &gt; OPENAI_MODELS &gt; default routing</code>.</p>
+  <p>${m.routingHelpEnvNote}</p>
   <pre>OPENAI_UPSTREAM=https://api.openai.com \\
 OPENAI_API_KEY=your-openai-key \\
 OPENAI_MODELS=gpt-5.6-sol \\
@@ -1199,9 +1233,9 @@ CLOUDFLARE_ACCOUNT_ID=your-account-id \\
 CLOUDFLARE_API_TOKEN=your-cloudflare-token \\
 CLOUDFLARE_MODELS=moonshotai/kimi-k3 \\
 npx pxpipe-proxy</pre>
-  <p>Non-Anthropic IDs are advertised with a <code>claude-</code> prefix because Claude Code needs a Claude-shaped ID; pxpipe strips it before forwarding. Switch to one inside Claude Code with <code>/model claude-&lt;model&gt;</code> — e.g. <code>/model claude-moonshotai/kimi-k3</code> — or launch with <code>claude --model claude-moonshotai/kimi-k3</code>. Verify discovery with <code>curl …/v1/models</code>.</p>
-  <p><code>PXPIPE_MODELS</code> above is separate: it controls image compression, not routing. Kimi K3 on Cloudflare is the only non-Anthropic model tested end to end — see <code>docs/CLAUDE_CODE_PROVIDER_ROUTING.md</code>.</p>
-  <button class="mini-btn" type="button" onclick="this.closest('dialog').close()">close</button>
+  <p>${m.routingHelpIdNote}</p>
+  <p>${m.routingHelpModelsNote}</p>
+  <button class="mini-btn" type="button" onclick="this.closest('dialog').close()">${m.closeBtn}</button>
 </dialog>
 
 <div id="frag-session" hx-get="/fragments/session-summary" hx-trigger="load, every 2s" hx-swap="innerHTML">
@@ -1211,16 +1245,16 @@ npx pxpipe-proxy</pre>
 <div id="frag-header" hx-get="/fragments/header" hx-trigger="load, every 2s" hx-swap="innerHTML"></div>
 
 <section class="section">
-  <h2 class="section-head">What happened to your context <span class="section-sub">click a request to see image vs text</span></h2>
+  <h2 class="section-head">${m.sectionWhatHappened} <span class="section-sub">${m.sectionWhatHappenedSub}</span></h2>
   <div class="xray">
     <div class="card">
-      <h3 class="card-head">Recent requests</h3>
+      <h3 class="card-head">${m.cardRecentRequests}</h3>
       <div id="frag-recent" hx-get="/fragments/recent" hx-trigger="load, every 2s" hx-swap="innerHTML"></div>
     </div>
     <div class="card">
-      <h3 class="card-head">Image vs text breakdown</h3>
+      <h3 class="card-head">${m.cardImageVsText}</h3>
       <div id="frag-context-map" hx-get="/fragments/context-map" hx-trigger="load" hx-swap="innerHTML"></div>
-      <h3 class="card-head spaced">Image ↔ source inspector</h3>
+      <h3 class="card-head spaced">${m.cardInspector}</h3>
       <div id="frag-latest" hx-get="/fragments/latest" hx-trigger="load, every 2s, pp-refresh" hx-swap="innerHTML"
            hx-vals='js:{pin: window.pp.pin == null ? "" : window.pp.pin, source: window.pp.src ? "1" : ""}'></div>
     </div>
@@ -1228,14 +1262,14 @@ npx pxpipe-proxy</pre>
 </section>
 
 <section class="section">
-  <h2 class="section-head">Top sessions <span class="section-sub">by tokens saved</span></h2>
+  <h2 class="section-head">${m.sectionTopSessions} <span class="section-sub">${m.sectionTopSessionsSub}</span></h2>
   <div class="card">
     <div id="frag-sessions" hx-get="/fragments/sessions" hx-trigger="load, every 5s" hx-swap="innerHTML"></div>
   </div>
 </section>
 
 <section class="section">
-  <h2 class="section-head">Full history <span class="section-sub">every event on disk</span></h2>
+  <h2 class="section-head">${m.sectionFullHistory} <span class="section-sub">${m.sectionFullHistorySub}</span></h2>
   <div class="card">
     <div id="frag-stats" hx-get="/fragments/stats" hx-trigger="load, every 5s" hx-swap="innerHTML"></div>
   </div>
@@ -1249,8 +1283,9 @@ npx pxpipe-proxy</pre>
 </div>
 
 <script>${HTMX_JS}</script>
-<script>${GLUE_JS}</script>
-<script>${THEME_JS}</script>
+<script>${glueJs(m)}</script>
+<script>${themeJs(m)}</script>
+<script>${LANG_JS}</script>
 <script>${ALPINE_JS}</script>
 </body>
 </html>`;

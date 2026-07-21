@@ -81,6 +81,7 @@ import type {
   FullStatsPayload,
   CurrentSessionPayload,
 } from './dashboard/types.js';
+import { DEFAULT_LANG, type Lang } from './dashboard/i18n.js';
 
 const RECENT_CAP = 50;
 
@@ -1378,23 +1379,24 @@ export class DashboardState {
     );
   }
 
-  serveHtml(port: number): Response {
-    return htmlResponse(renderPage(port));
+  serveHtml(port: number, lang: Lang = DEFAULT_LANG): Response {
+    return htmlResponse(renderPage(port, lang));
   }
 
   /** GET /fragments/<name> — server-rendered htmx fragments. Each one reuses
    *  the corresponding JSON endpoint's payload (via Response.json()) so the
    *  HTML and JSON surfaces can't drift apart. */
-  async serveFragment(name: string, url: URL, port: number): Promise<Response> {
+  async serveFragment(name: string, url: URL, port: number, lang: Lang = DEFAULT_LANG): Promise<Response> {
     switch (name) {
       case 'toggle':
-        return htmlResponse(renderToggleFragment(this.compressionEnabled));
+        return htmlResponse(renderToggleFragment(this.compressionEnabled, lang));
       case 'models':
         return htmlResponse(
           renderModelsFragment(
             getAllowedModelBases(),
             getConfiguredModelBases(),
             this.compressionEnabled,
+            lang,
           ),
         );
       case 'context-map': {
@@ -1404,26 +1406,26 @@ export class DashboardState {
           // or never recorded (no usage on that completion), say so — don't
           // silently fall back to the latest request's data under its label.
           const found = this.contextHistory.find((h) => h.id === Number(reqParam));
-          return htmlResponse(renderContextMapFragment(found, this.contextHistory, !found));
+          return htmlResponse(renderContextMapFragment(found, this.contextHistory, !found, lang));
         }
         // No specific request → default to the latest.
         return htmlResponse(
-          renderContextMapFragment(this.contextHistory[this.contextHistory.length - 1], this.contextHistory),
+          renderContextMapFragment(this.contextHistory[this.contextHistory.length - 1], this.contextHistory, false, lang),
         );
       }
       case 'session-summary': {
         // Lifetime hero — same cumulative payload as the header strip so the
         // headline and the "$ saved" tiles never disagree and it stops jumping.
         const s = (await this.serveStats().json()) as StatsPayload;
-        return htmlResponse(renderSessionSummaryFragment(s));
+        return htmlResponse(renderSessionSummaryFragment(s, lang));
       }
       case 'header': {
         const s = (await this.serveStats().json()) as StatsPayload;
-        return htmlResponse(renderHeaderFragment(s, port));
+        return htmlResponse(renderHeaderFragment(s, port, lang));
       }
       case 'recent': {
         const r = (await this.serveRecent().json()) as RecentPayload;
-        return htmlResponse(renderRecentFragment(r));
+        return htmlResponse(renderRecentFragment(r, lang));
       }
       case 'latest': {
         const r = (await this.serveRecent().json()) as RecentPayload;
@@ -1439,18 +1441,18 @@ export class DashboardState {
               : this.images[this.images.length - 1];
           sourceText = entry?.sourceText ?? null;
         }
-        return htmlResponse(renderLatestFragment({ payload: r, pin, showSource, sourceText }));
+        return htmlResponse(renderLatestFragment({ payload: r, pin, showSource, sourceText }, lang));
       }
       case 'sessions': {
         const res = await this.serveSessionsJson();
         if (!res.ok) return htmlResponse(`<div class="status">sessions unavailable</div>`);
         const p = (await res.json()) as SessionsPayload;
-        return htmlResponse(renderSessionsFragment(p));
+        return htmlResponse(renderSessionsFragment(p, lang));
       }
       case 'stats': {
         const res = await this.serveApiStats();
         const p = (await res.json()) as FullStatsPayload;
-        return htmlResponse(renderStatsTableFragment(p));
+        return htmlResponse(renderStatsTableFragment(p, lang));
       }
       default:
         return new Response('unknown fragment', { status: 404 });

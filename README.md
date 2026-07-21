@@ -255,6 +255,8 @@ pnpm run build                # regenerates dist/
 
 Windows is community-supported: primary development targets macOS/Linux, and Windows-specific fixes rely on contributor PRs (thanks @makoribrian).
 
+The live dashboard ships in English and Italian, and picks a language from the browser automatically. See [docs/TRANSLATING.md](docs/TRANSLATING.md) if you want to add another one.
+
 ## FAQ
 
 **Is the headline end-to-end, or only on the requests you touched?**

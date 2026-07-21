@@ -34,6 +34,7 @@ import {
   dashboardPath,
   type DashboardRoute,
 } from './dashboard.js';
+import { resolveLang } from './dashboard/i18n.js';
 
 /** Runtime config. The core transform tuning comes from DEFAULTS in
  *  transform.ts; startup knobs cover deployment plus emergency GPT scope
@@ -387,10 +388,11 @@ async function dispatchDashboard(
   port: number,
 ): Promise<Response | undefined> {
   const method = req.method ?? 'GET';
+  const lang = resolveLang(req.headers.cookie, req.headers['accept-language']);
   switch (route.kind) {
     case 'html':
       if (method !== 'GET') return undefined;
-      return dashboard.serveHtml(port);
+      return dashboard.serveHtml(port, lang);
     case 'stats':
       if (method !== 'GET') return undefined;
       return dashboard.serveStats();
@@ -439,7 +441,7 @@ async function dispatchDashboard(
           return new Response('bad request body', { status: 400 });
         }
         dashboard.handleCompressionToggle({ enabled });
-        return dashboard.serveFragment('toggle', url, port);
+        return dashboard.serveFragment('toggle', url, port, lang);
       }
       // /fragments/models POSTs one chip flip {model, on}, or a whole-scope
       // rewrite {list: "csv"} from the PXPIPE_MODELS textbox. Server mutates
@@ -466,10 +468,10 @@ async function dispatchDashboard(
         }
         if (list !== null) dashboard.handleModelsSet(list);
         else if (model) dashboard.handleModelsToggle(model, on);
-        return dashboard.serveFragment('models', url, port);
+        return dashboard.serveFragment('models', url, port, lang);
       }
       if (method !== 'GET') return undefined;
-      return dashboard.serveFragment(route.name, url, port);
+      return dashboard.serveFragment(route.name, url, port, lang);
     }
     case 'api-compression': {
       if (method !== 'POST') {

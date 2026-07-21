@@ -246,7 +246,7 @@ describe('serveFragment', () => {
       });
 
       persisting.handleModelsToggle('gpt-5.6-sol', true);
-      expect(saved.at(-1)).toEqual(['claude-fable-5', 'gpt-5.6-sol']);
+      expect(saved.at(-1)).toEqual(['claude-fable-5', 'gemini-3.6-flash', 'gpt-5.6-sol']);
       persisting.handleModelsSet('claude-fable-5');
       expect(saved.at(-1)).toEqual(['claude-fable-5']);
       // Empty scope persists too (round-trips as 'off' on load).

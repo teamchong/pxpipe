@@ -5,7 +5,7 @@ import { createProxy, type ProxyEvent } from '../src/core/proxy.js';
 let ambientPxpipeModels: string | undefined;
 beforeAll(() => {
   ambientPxpipeModels = process.env.PXPIPE_MODELS;
-  process.env.PXPIPE_MODELS = 'claude-fable-5,gpt-5.6-sol';
+  process.env.PXPIPE_MODELS = 'claude-fable-5,gpt-5.6-sol,gemini-3.6-flash';
 });
 afterAll(() => {
   if (ambientPxpipeModels === undefined) delete process.env.PXPIPE_MODELS;
@@ -81,6 +81,49 @@ describe('proxy usage extraction', () => {
     expect(captured!.usage?.output_tokens).toBe(7);
     expect(captured!.usage?.cache_read_input_tokens).toBe(100);
     expect(captured!.firstByteMs).toBeTypeOf('number');
+  });
+
+  it('extracts Gemini usage from a streamed JSON array response', async () => {
+    const restore = mockUpstream(
+      () =>
+        new Response(
+          JSON.stringify([
+            { candidates: [{ content: { parts: [{ text: 'hello' }] } }] },
+            {
+              candidates: [{ content: { parts: [{ text: ' world' }] } }],
+              usageMetadata: { promptTokenCount: 2048, candidatesTokenCount: 9 },
+            },
+          ]),
+          { status: 200, headers: { 'content-type': 'application/json; charset=UTF-8' } },
+        ),
+    );
+
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      upstream: 'http://ocproxy.test',
+      transform: { compress: false },
+      onRequest: (event) => {
+        captured = event;
+      },
+    });
+    const res = await proxy(
+      new Request(
+        'http://localhost/google-ai-studio/v1beta/models/gemini-3.6-flash:streamGenerateContent',
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'hi' }] }] }),
+        },
+      ),
+    );
+    await res.text();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    restore();
+
+    expect(captured?.model).toBe('gemini-3.6-flash');
+    expect(captured?.accountingProvider).toBe('openai');
+    expect(captured?.usage?.input_tokens).toBe(2048);
+    expect(captured?.usage?.output_tokens).toBe(9);
   });
 
   it('never calls Anthropic count_tokens for Sol Responses', async () => {

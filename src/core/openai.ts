@@ -128,7 +128,7 @@ export function isGrokModel(model: string | null | undefined): boolean {
 export const GROK_TOKENS_PER_MEGAPIXEL = 1000;
 
 /** Per-image vision-token cost for the model actually serving the request.
- *  Claude: Anthropic pixel formula. Grok: measured tok/MPix. Gemini: flat ~1,089.
+ *  Claude: Anthropic pixel formula. Grok: measured tok/MPix. Gemini: 1,078 at 1568×728.
  *  GPT/o-series: OpenAI tile/patch formula. Model-based, not endpoint-based. */
 export function visionTokensForModel(model: string, w: number, h: number): number {
   if (isGeminiModel(model)) {

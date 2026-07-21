@@ -8,7 +8,10 @@
  * Run just this file:  pnpm vitest run tests/responses-bridge-roles.test.ts
  */
 import { describe, expect, it } from 'vitest';
-import { anthropicMessagesToOpenAIResponses } from '../src/core/messages-responses-bridge.js';
+import {
+  anthropicMessagesToOpenAIResponses,
+  openAIResponseToAnthropicMessage,
+} from '../src/core/messages-responses-bridge.js';
 
 const enc = (obj: unknown): Uint8Array => new TextEncoder().encode(JSON.stringify(obj));
 const dec = (b: Uint8Array): any => JSON.parse(new TextDecoder().decode(b));
@@ -61,5 +64,21 @@ describe('anthropicMessagesToOpenAIResponses — message roles', () => {
     expect(() =>
       toResponses({ model: 'm', messages: [{ role: 'tool', content: 'x' }] }),
     ).toThrow(/user, assistant, or system role/);
+  });
+});
+
+describe('openAIResponseToAnthropicMessage — function-call arguments', () => {
+  it('treats an empty arguments string as {} instead of throwing', () => {
+    // A no-arg tool call can arrive as arguments:"" — JSON.parse('') would
+    // throw and fail the whole turn. Must degrade to empty input.
+    const msg = openAIResponseToAnthropicMessage(
+      { id: 'resp_1', model: 'gpt', output: [
+        { type: 'function_call', call_id: 'c1', name: 'now', arguments: '' },
+      ] },
+      'fallback',
+    );
+    const toolUse = (msg.content as any[]).find((b) => b.type === 'tool_use');
+    expect(toolUse).toMatchObject({ type: 'tool_use', id: 'c1', name: 'now', input: {} });
+    expect(msg.stop_reason).toBe('tool_use');
   });
 });

@@ -79,6 +79,21 @@ async function measureFableDensity(fixture: string): Promise<Density> {
   return { cpt, pages: r.pages.length, pixels: r.pixels, visionTokens };
 }
 
+async function measureGeminiDensity(fixture: string): Promise<Density> {
+  // Widescreen geometry (312-col Spleen): flat 1089 vision tokens per page.
+  const r = await renderTextToImages(fixture, { reflow: true });
+  if (r.droppedChars > 0) {
+    throw new Error(`gemini fixture dropped ${r.droppedChars} chars — atlas gap, fix before charting`);
+  }
+  const visionTokens = r.pages.length * 1089;
+  const cpt = fixture.length / visionTokens;
+  console.log(
+    `Gemini density: ${fixture.length} chars → ${r.pages.length} pages, ` +
+      `${visionTokens} vision tokens → ${cpt.toFixed(2)} chars/vision-token`,
+  );
+  return { cpt, pages: r.pages.length, pixels: r.pixels, visionTokens };
+}
+
 
 // ---------------------------------------------------------------------------
 // 2. Data
@@ -100,7 +115,7 @@ interface Point {
   dy?: number;
 }
 
-function points(fableCpt: number): Point[] {
+function points(fableCpt: number, geminiCpt: number): Point[] {
   const t = (
     kind: Point['kind'],
     name: string,
@@ -133,6 +148,8 @@ function points(fableCpt: number): Point[] {
     t('openai', 'GPT-5.6', 2026.52, 1_050_000, 'right'),
     // the model powering this session: claude-fable-5[1m], 1M-token window
     t('claude', 'Fable 5 [1m]', 2026.05, 1_000_000, 'below'),
+    // Gemini 3.6 Flash 1M window
+    t('gemini', 'Gemini 3.6 Flash', 2026.50, 1_000_000, 'below'),
     // Grok 4.5: text-window only (opt-in; no pxpipe overlay on this chart).
     // Window = xAI docs maxPromptLength for grok-4.5 (500000).
     t('grok', 'Grok 4.5', 2026.42, 500_000, 'below', 10),
@@ -141,6 +158,14 @@ function points(fableCpt: number): Point[] {
       x: 2026.05,
       tokens: 1_000_000,
       chars: Math.round(1_000_000 * fableCpt),
+      kind: 'pxpipe',
+      label: 'above',
+    },
+    {
+      name: 'Gemini 3.6 Flash + pxpipe',
+      x: 2026.50,
+      tokens: 1_000_000,
+      chars: Math.round(1_000_000 * geminiCpt),
       kind: 'pxpipe',
       label: 'above',
     },
@@ -220,7 +245,7 @@ function draw(data: Point[], fableCpt: number): Buffer {
   const bottom = 1000 - 72;
   // Linear scale — log gave every decade equal height, which flattened the whole
   // point of the chart: 18M must physically tower ~4.5× over the 4M pack.
-  const Y_MAX = 20_000_000;
+  const Y_MAX = 24_000_000;
   const X_MIN = 2018;
   const X_MAX = 2027.25;
   const y = (v: number) => bottom - (v / Y_MAX) * (bottom - top);
@@ -277,10 +302,11 @@ function draw(data: Point[], fableCpt: number): Buffer {
     ctx.stroke();
   }
 
-  // Dashed vertical connector: Fable text window → same window imaged (pxpipe).
+  // Dashed vertical connector: Fable / Gemini text window → same window imaged (pxpipe).
   // Grok is plotted as a text series only (no pxpipe overlay).
   const overlays: Array<{ textName: string; pxName: string }> = [
     { textName: 'Fable 5 [1m]', pxName: 'Fable 5 [1m] + pxpipe' },
+    { textName: 'Gemini 3.6 Flash', pxName: 'Gemini 3.6 Flash + pxpipe' },
   ];
   for (const o of overlays) {
     const base = data.find((p) => p.name === o.textName)!;
@@ -384,7 +410,7 @@ function draw(data: Point[], fableCpt: number): Buffer {
     [colors.gemini, 'Google · Gemini'],
     [colors.claude, 'Anthropic · Claude → Fable'],
     [colors.grok, 'xAI · Grok 4.5'],
-    [colors.pxpipe, 'Fable 5 [1m] · same 1M window · pxpipe images (measured)'],
+    [colors.pxpipe, 'pxpipe images (measured overlays)'],
   ];
   ctx.font = '400 13px sans-serif';
   let ly = top + 20;
@@ -413,7 +439,8 @@ function draw(data: Point[], fableCpt: number): Buffer {
 // ---------------------------------------------------------------------------
 const fixture = loadFixture();
 const fable = await measureFableDensity(fixture);
-const data = points(fable.cpt);
+const gemini = await measureGeminiDensity(fixture);
+const data = points(fable.cpt, gemini.cpt);
 
 console.log('\n  model                released   window (tokens)   chars in window');
 for (const p of data) {
@@ -423,8 +450,14 @@ for (const p of data) {
 }
 const fableText = data.find((p) => p.name === 'Fable 5 [1m]')!;
 const fablePx = data.find((p) => p.name === 'Fable 5 [1m] + pxpipe')!;
+const geminiText = data.find((p) => p.name === 'Gemini 3.6 Flash')!;
+const geminiPx = data.find((p) => p.name === 'Gemini 3.6 Flash + pxpipe')!;
+
 console.log(
   `\n  Fable pxpipe multiplier on the same window: ${(fablePx.chars / fableText.chars).toFixed(2)}×`,
+);
+console.log(
+  `  Gemini 3.6 Flash pxpipe multiplier on the same window: ${(geminiPx.chars / geminiText.chars).toFixed(2)}×`,
 );
 
 mkdirSync(dirname(OUT), { recursive: true });

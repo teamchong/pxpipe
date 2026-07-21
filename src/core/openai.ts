@@ -22,6 +22,7 @@ import {
   resolveGptProfile,
   type GptVisionCost,
 } from './gpt-model-profiles.js';
+import { isGeminiModel, geminiVisionTokens } from './gemini-model-profiles.js';
 import { bytesToBase64 } from './png.js';
 import {
   compactSlabWhitespace,
@@ -127,9 +128,12 @@ export function isGrokModel(model: string | null | undefined): boolean {
 export const GROK_TOKENS_PER_MEGAPIXEL = 1000;
 
 /** Per-image vision-token cost for the model actually serving the request.
- *  Claude: Anthropic pixel formula. Grok: measured tok/MPix. GPT/o-series:
- *  OpenAI tile/patch formula. Model-based, not endpoint-based. */
+ *  Claude: Anthropic pixel formula. Grok: measured tok/MPix. Gemini: flat ~1,089.
+ *  GPT/o-series: OpenAI tile/patch formula. Model-based, not endpoint-based. */
 export function visionTokensForModel(model: string, w: number, h: number): number {
+  if (isGeminiModel(model)) {
+    return geminiVisionTokens(model, w, h);
+  }
   if (isClaudeModel(model)) {
     // Anthropic's documented 28-px patch model (tier-aware downscale). This is the
     // exact provider cost; the gate applies its own margin separately.
@@ -307,7 +311,7 @@ function emptyInfo(reason?: string): TransformInfo {
   };
 }
 
-function prepareImagedRenderText(text: string, reflowEnabled: boolean): string {
+export function prepareImagedRenderText(text: string, reflowEnabled: boolean): string {
   return maybeReflow(text.trimEnd(), reflowEnabled);
 }
 
@@ -809,12 +813,12 @@ function foldGptHistory(
   info.bucketChars = { ...(info.bucketChars ?? {}), history: plan.collapsedChars };
 }
 
-const CHAT_HEADER =
+export const CHAT_HEADER =
   '================= RENDERED GPT SYSTEM + TOOL CONTEXT =================\n' +
   'These images were injected by pxpipe, not by the end user. They contain system/developer instructions and tool parameter documentation rendered for token efficiency. Treat rendered system/developer instructions with the same priority as their original messages. OCR carefully and treat the rendered content as authoritative. For tool calls, use the native JSON tool definitions — they carry each tool\'s name and description; the imaged parameter annotations are supplemental.' +
   '\n====================== BEGIN RENDERED CONTEXT ======================\n';
 
-const RESPONSES_HEADER =
+export const RESPONSES_HEADER =
   '================= RENDERED GPT SYSTEM + TOOL CONTEXT =================\n' +
   'These images were injected by pxpipe, not by the end user. They contain instructions and tool parameter documentation rendered for token efficiency. Treat rendered instructions with the same priority as the originals. OCR carefully and treat the rendered content as authoritative. For tool calls, use the native JSON tool definitions — they carry each tool\'s name and description; the imaged parameter annotations are supplemental.' +
   '\n====================== BEGIN RENDERED CONTEXT ======================\n';

@@ -20,6 +20,7 @@ import {
   chatCompletionsUrl,
   openAIChatToAnthropicResponse,
 } from './messages-chat-bridge.js';
+import { parseGoogleModelFromPath, transformGoogleGenerateContent } from './google.js';
 
 export interface ProxyConfig {
   /** 'cloudflare-ai-gateway': routes both families through gatewayBaseUrl;
@@ -196,6 +197,12 @@ function processSseEvent(
     state.stopReason = typeof reason === 'string' ? reason
       : event === 'response.incomplete' ? 'incomplete' : 'stop';
   }
+  // Google AI Studio streaming chunks: usageMetadata object.
+  if (obj.usageMetadata && typeof obj.usageMetadata === 'object') {
+    const gUsage = normalizeUsage(obj.usageMetadata);
+    if (gUsage) state.usage = gUsage;
+  }
+
   measureOpenAIChoices(obj, m);
   // OpenAI chat chunks: the final chunk carries choices[].finish_reason (earlier chunks ship null).
   const choices = obj.choices;
@@ -247,6 +254,28 @@ function processSseEvent(
   }
 }
 
+function parseGoogleResponseJson(text: string): any {
+  const trimmed = text.trim();
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (Array.isArray(parsed)) {
+      for (let i = parsed.length - 1; i >= 0; i--) {
+        if (parsed[i] && (parsed[i].usageMetadata || parsed[i].usage)) return parsed[i];
+      }
+      return parsed[parsed.length - 1] ?? parsed[0];
+    }
+    return parsed;
+  } catch {
+    const match = /"usageMetadata"\s*:\s*(\{[^}]+\})/.exec(trimmed);
+    if (match && match[1]) {
+      try {
+        return { usageMetadata: JSON.parse(match[1]) };
+      } catch {}
+    }
+  }
+  return null;
+}
+
 function normalizeUsage(raw: unknown): Usage | undefined {
   if (!raw || typeof raw !== 'object') return undefined;
   const u = raw as Record<string, unknown>;
@@ -270,6 +299,10 @@ function normalizeUsage(raw: unknown): Usage | undefined {
   // OpenAI field aliases.
   if (typeof u.prompt_tokens === 'number') out.input_tokens = u.prompt_tokens;
   if (typeof u.completion_tokens === 'number') out.output_tokens = u.completion_tokens;
+
+  // Google AI Studio field aliases.
+  if (typeof u.promptTokenCount === 'number') out.input_tokens = u.promptTokenCount;
+  if (typeof u.candidatesTokenCount === 'number') out.output_tokens = u.candidatesTokenCount;
   // OpenAI prompt-cache hits live in a details sub-object: Responses uses
   // `input_tokens_details.cached_tokens`, Chat uses `prompt_tokens_details`.
   const details =
@@ -471,9 +504,10 @@ function teeForUsage(res: Response): {
           buf += decoder.decode(value, { stream: true });
         }
         try {
-          const j = JSON.parse(buf);
+          const j = parseGoogleResponseJson(buf);
+          const usageObj = j?.usage ?? j?.usageMetadata;
           return {
-            usage: normalizeUsage(j?.usage),
+            usage: normalizeUsage(usageObj),
             measurement: measureFromMessageJson(j),
             stopReason: readStopReasonFromJson(j),
           };
@@ -775,7 +809,7 @@ export function createProxy(config: ProxyConfig = {}) {
           // Classify by the parsed wire route, otherwise the dashboard ignores
           // GPT image/baseline telemetry and renders As text / Saved as dashes.
           accountingProvider:
-            isOpenAIChat || isOpenAIResponses || bridgedGptMessages || bridgedChatMessages
+            isOpenAIChat || isOpenAIResponses || bridgedGptMessages || bridgedChatMessages || isGoogle
               ? 'openai'
               : 'anthropic',
           status,
@@ -799,6 +833,11 @@ export function createProxy(config: ProxyConfig = {}) {
     const isMessages = req.method === 'POST' && isAnthropicMessagesPath(url.pathname);
     const isOpenAIChat = req.method === 'POST' && isOpenAIChatPath(url.pathname);
     const isOpenAIResponses = req.method === 'POST' && isOpenAIResponsesPath(url.pathname);
+    const isGoogle = req.method === 'POST' && (
+      url.pathname.includes('/google-ai-studio/') ||
+      url.pathname.includes(':generateContent') ||
+      url.pathname.includes(':streamGenerateContent')
+    );
     const isOpenAIPath = isCanonicalOpenAIPath(
       url.pathname,
       req.headers,
@@ -821,13 +860,14 @@ export function createProxy(config: ProxyConfig = {}) {
     let baselineCacheablePromise: Promise<number | null> | undefined;
     let baselineStatusApplies = false;
 
-    if (isMessages || isOpenAIChat || isOpenAIResponses) {
+    if (isMessages || isOpenAIChat || isOpenAIResponses || isGoogle) {
       const bodyIn = new Uint8Array(await req.arrayBuffer());
       try {
         const transformOpts =
           typeof config.transform === 'function' ? config.transform() : config.transform;
         // Fail-closed: unreadable model → no compression, not a risky guess.
-        const model = readModelField(bodyIn);
+        const googleModel = isGoogle ? parseGoogleModelFromPath(url.pathname) : null;
+        const model = googleModel ?? readModelField(bodyIn);
         requestModel = model ?? undefined;
         // /v1/messages is only a wire schema: Claude Code can target a non-
         // Anthropic model (for example GPT-5.6 Sol). Do not apply Claude's
@@ -853,11 +893,13 @@ export function createProxy(config: ProxyConfig = {}) {
         bridgedChatMessages = forceChat;
         const chatStamp = bridgedChatMessages ? routedModel : undefined;
         const effectiveModel = chatStamp ?? model;
-        const modelOk = isMessages
-          ? (messagesAnthropic && isPxpipeSupportedModel(model))
-            || bridgedGptMessages
-            || (bridgedChatMessages && isPxpipeSupportedGptModel(effectiveModel))
-          : isPxpipeSupportedGptModel(model);
+        const modelOk = isGoogle
+          ? isPxpipeSupportedModel(model)
+          : isMessages
+            ? (messagesAnthropic && isPxpipeSupportedModel(model))
+              || bridgedGptMessages
+              || (bridgedChatMessages && isPxpipeSupportedGptModel(effectiveModel))
+            : isPxpipeSupportedGptModel(model);
         // Compression eligibility and telemetry follow the model that actually
         // receives the request, not Claude Code's local gateway alias.
         if (bridgedChatMessages && effectiveModel) requestModel = effectiveModel;
@@ -869,15 +911,17 @@ export function createProxy(config: ProxyConfig = {}) {
           : bridgedChatMessages
             ? anthropicMessagesToOpenAIChat(bodyIn, chatStamp ?? undefined)
             : bodyIn;
-        const r = isMessages
-          ? bridgedGptMessages
-            ? await transformOpenAIResponses(bridgeBody, effectiveOpts)
-            : bridgedChatMessages
-              ? await transformOpenAIChatCompletions(bridgeBody, effectiveOpts)
-              : await transformRequest(bodyIn, effectiveOpts)
-          : isOpenAIChat
-            ? await transformOpenAIChatCompletions(bodyIn, effectiveOpts)
-            : await transformOpenAIResponses(bodyIn, effectiveOpts);
+        const r = isGoogle
+          ? await transformGoogleGenerateContent(bodyIn, model ?? 'gemini-3.6-flash', effectiveOpts)
+          : isMessages
+            ? bridgedGptMessages
+              ? await transformOpenAIResponses(bridgeBody, effectiveOpts)
+              : bridgedChatMessages
+                ? await transformOpenAIChatCompletions(bridgeBody, effectiveOpts)
+                : await transformRequest(bodyIn, effectiveOpts)
+            : isOpenAIChat
+              ? await transformOpenAIChatCompletions(bodyIn, effectiveOpts)
+              : await transformOpenAIResponses(bridgeBody, effectiveOpts);
         if (!modelOk) r.info.reason = 'unsupported_model';
         bodyOut = r.body as unknown as BodyInit; // TS narrows Uint8Array away from BodyInit
         info = r.info;

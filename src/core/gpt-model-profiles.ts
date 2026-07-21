@@ -29,6 +29,7 @@ import {
   DEFAULT_RENDER_FONT,
   type RenderFont,
 } from './render.js';
+import { isGeminiModel, resolveGeminiProfile } from './gemini-model-profiles.js';
 
 export const GPT_MAX_HEIGHT_PX = 1932;
 
@@ -375,6 +376,7 @@ export function resolveGptProfile(model: string | null | undefined): GptModelPro
   // Match applicability.ts: bracketed transport variants (for example [1m])
   // do not define a different visual reader profile.
   const m = (model ?? '').toLowerCase().replace(/\[[^\]]*\]/g, '');
+  if (isGeminiModel(m)) return resolveGeminiProfile(m);
   const env = envProfiles();
   if (env.size > 0) {
     let best: GptModelProfile | undefined;

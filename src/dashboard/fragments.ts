@@ -93,6 +93,10 @@ const GROK_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
   { id: 'grok-4.5', label: 'Grok 4.5' },
 ];
 
+const GEMINI_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
+  { id: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash' },
+];
+
 export function renderModelsFragment(
   active: string[],
   configured: string[],
@@ -100,17 +104,18 @@ export function renderModelsFragment(
 ): string {
   const on = new Set(active);
   const labelOf = new Map(
-    [...MODEL_CATALOG, ...GPT_MODEL_CATALOG, ...GROK_MODEL_CATALOG].map((m) => [m.id, m.label]),
+    [...MODEL_CATALOG, ...GPT_MODEL_CATALOG, ...GROK_MODEL_CATALOG, ...GEMINI_MODEL_CATALOG].map((m) => [m.id, m.label]),
   );
   // Union the catalog with env-configured + active ids so PXPIPE_MODELS-enabled
-  // families always show as toggles, then split into two chip rows (Claude /
-  // OpenAI Responses) plus the PXPIPE_MODELS CSV textbox that mirrors the scope.
+  // families always show as toggles, then split into chip rows (Claude /
+  // OpenAI Responses / Gemini) plus the PXPIPE_MODELS CSV textbox that mirrors the scope.
   const ids: string[] = [];
   const seen = new Set<string>();
   for (const id of [
     ...MODEL_CATALOG.map((m) => m.id),
     ...GPT_MODEL_CATALOG.map((m) => m.id),
     ...GROK_MODEL_CATALOG.map((m) => m.id),
+    ...GEMINI_MODEL_CATALOG.map((m) => m.id),
     ...configured,
     ...active,
   ]) {
@@ -129,10 +134,11 @@ export function renderModelsFragment(
     );
   };
   const claudeChips = ids.filter((id) => id.startsWith('claude')).map(chipFor).join('');
+  const geminiChips = ids.filter((id) => id.includes('gemini')).map(chipFor).join('');
   const gptChips = ids.filter((id) => id.startsWith('gpt')).map(chipFor).join('');
   const grokChips = ids.filter((id) => id.startsWith('grok')).map(chipFor).join('');
   const otherChips = ids
-    .filter((id) => !id.startsWith('claude') && !id.startsWith('gpt') && !id.startsWith('grok'))
+    .filter((id) => !id.startsWith('claude') && !id.startsWith('gpt') && !id.startsWith('grok') && !id.includes('gemini'))
     .map(chipFor)
     .join('');
   const moot = enabled
@@ -144,6 +150,11 @@ export function renderModelsFragment(
     `<span class="models-label">Image Claude models</span>` +
     claudeChips +
     `<span class="hint">unlisted models get plain text</span>` +
+    `</div>` +
+    `<div class="models">` +
+    `<span class="models-label">Image Gemini models</span>` +
+    geminiChips +
+    `<span class="hint">enabled by default · 100/100 vision reader</span>` +
     `</div>` +
     `<div class="models">` +
     `<span class="models-label">Image OpenAI Responses models</span>` +
@@ -1178,8 +1189,8 @@ export function renderPage(port: number): string {
 </header>
 
 <details class="models-collapse">
-  <summary class="models-summary">Image model scope <span class="hint">Fable 5 only by default · expand to experiment with other families</span></summary>
-  <div class="models-warning">⚠ Image compression is tuned for Fable 5 only — other families can use <strong>more</strong> tokens, not less. Opt in only for deliberate experiments (custom system prompt, subagent model setup, …).</div>
+  <summary class="models-summary">Image model scope <span class="hint">Fable 5 and Gemini 3.6 Flash by default · expand to experiment with other families</span></summary>
+  <div class="models-warning">⚠ Image compression is validated for Fable 5 and Gemini 3.6 Flash — other families can use <strong>more</strong> tokens, not less. Opt in only for deliberate experiments.</div>
   <div id="frag-models" hx-get="/fragments/models" hx-trigger="load, every 2s [!document.activeElement || document.activeElement.id !== 'models-csv']" hx-swap="innerHTML"></div>
   <div class="models-routing"><span class="hint">imaging scope ≠ provider routing — non-Anthropic IDs also need routing env on the proxy</span> <button class="mini-btn" type="button" onclick="document.getElementById('routing-help').showModal()">routing help</button></div>
 </details>

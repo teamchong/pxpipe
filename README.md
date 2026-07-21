@@ -22,13 +22,12 @@ This is what the model sees instead of text:
 tokens as this page. Real pipeline output; the model reads renders like this
 at 100/100 (see benchmarks).*
 
-![chart: characters a frontier context window holds, 2018–2026 — vendor text series including Grok 4.5; orange measured overlay is Fable 5 [1m] + pxpipe ~18M (4.6×)](docs/assets/context-window-chars.png)
+![chart: characters a frontier context window holds, 2018–2026 — vendor text series including Grok 4.5; orange measured overlays are Fable 5 [1m] + pxpipe ~18.3M (4.6×) and Gemini 3.6 Flash + pxpipe ~20.9M (5.2×)](docs/assets/context-window-chars.png)
 
 *Eight years of context growth, in characters. Every text line tops out near
 ~4M chars (a 1M-token window at ~4 chars/token); **Grok 4.5** is shown as a
-text-window point only (500K). The orange overlay is the **same Fable 5 1M
-window** read through pxpipe images — ~18M chars at the measured Anthropic
-density (**4.6×** the text ceiling). Density is measured from a live render at
+text-window point only (500K). The orange overlays are the **same 1M
+windows** read through pxpipe images — ~18.3M chars for Fable 5 (**4.6×**) and ~20.9M chars for Gemini 3.6 Flash (**5.2×** text capacity). Density is measured from a live render at
 generation time, not hand-typed: regenerate with
 `npx tsx scripts/gen-context-chart.ts`
 ([source](scripts/gen-context-chart.ts)).*
@@ -105,9 +104,9 @@ without running the proxy.
   re-sends as text. Claude Code re-sends system + tools + history on
   `/anthropic/messages` and typically lands ~60–70%. Details and measured
   splits: [docs/CACHING_AND_SAVINGS.md](docs/CACHING_AND_SAVINGS.md).
-- **Model scope:** default `PXPIPE_MODELS=claude-fable-5`. Sol, Opus
+- **Model scope:** default `PXPIPE_MODELS=claude-fable-5,gemini-3.6-flash`. Sol, Opus
   4.7/4.8, GPT 5.5, and **Grok** are opt-in only (dashboard chips or
-  `PXPIPE_MODELS`) — not good enough as silent defaults for imaged context.
+  `PXPIPE_MODELS`) — Gemini 3.6 Flash matches Fable 5 quality (100/100 arithmetic, 98/98 gist, 15/15 dense hex) and is enabled by default.
   Grok packing + factsheet helps exact IDs, but quality remains below Fable:
   82/100 arithmetic, 83/98 gist, and 13/18 state tracking. The exact Sol id
   still matters. Sibling variants such as `gpt-5.6-terra` do not
@@ -152,24 +151,29 @@ used for these novel-arithmetic rows.
 | test | model | N | pxpipe (image) |
 | --- | --- | ---: | ---: |
 | novel arithmetic | `claude-fable-5` | 100 | **100%** |
+| novel arithmetic | `google/gemini-3.6-flash` | 100 | **100%** |
 | novel arithmetic | `gpt-5.6-sol` | 100 | **98%** |
 | novel arithmetic | `claude-opus-4-8` | 100 | 93% |
 | novel arithmetic | `grok-4.5` | 100 | **82%** |
 | novel arithmetic | `moonshotai/kimi-k3` | 100 | **79%** |
 | gist recall A/B (decisions, values, paths, names, negations; distractors; 15k–45k char sessions) | `claude-fable-5` | 98 | **98/98** |
+| same gist corpus, production images + factsheet | `google/gemini-3.6-flash` | 98 | **98/98** |
 | same gist corpus, production images + factsheet | `gpt-5.6-sol` | 98 | **83/98** |
 | same gist corpus, production images + factsheet | `grok-4.5` | 98 | **83/98** |
 | same gist corpus, production images + factsheet | `moonshotai/kimi-k3` | 98 | **84/98** |
 | state tracking (value mutated 3×, final/first/count) | `claude-fable-5` | 18 | **18/18** |
+| same state-tracking corpus | `google/gemini-3.6-flash` | 18 | **18/18** |
 | same state-tracking corpus | `gpt-5.6-sol` | 18 | **17/18** |
 | same state-tracking corpus | `grok-4.5` | 18 | **13/18** |
 | same state-tracking corpus | `moonshotai/kimi-k3` | 18 | **15/18** |
 | confabulation on never-stated facts (lower is better) | `claude-fable-5` | 16 | **0/16** |
+| same never-stated probes (lower is better) | `google/gemini-3.6-flash` | 16 | **0/16** |
 | same never-stated probes (lower is better) | `gpt-5.6-sol` | 16 | **4/16** |
 | same never-stated probes (lower is better) | `grok-4.5` | 16 | **0/16** |
 | same never-stated probes (lower is better) | `moonshotai/kimi-k3` | 16 | **1/16** |
-| verbatim 12-char hex, dense render | `claude-opus-4-8` | 15 | **0/15** |
+| verbatim 12-char hex, dense render | `google/gemini-3.6-flash` | 15 | **15/15** |
 | verbatim 12-char hex, dense render | `claude-fable-5` | 15 | **13/15** |
+| verbatim 12-char hex, dense render | `claude-opus-4-8` | 15 | **0/15** |
 | verbatim 12-char hex, same dense pages | `gpt-5.6-sol` | 15 | **0/15** |
 | verbatim 12-char hex, same dense pages | `grok-4.5` | 15 | **0/15** |
 | verbatim 12-char hex, same dense pages | `moonshotai/kimi-k3` | 15 | **0/15** |
@@ -177,9 +181,9 @@ used for these novel-arithmetic rows.
 **Harness split:** Fable/Opus quality and SWE-bench rows use **Claude**; Sol and Grok quality use
 **Codex’s Responses provider** (`OPENAI_BASE_URL`). Kimi K3
 used the same novel-arithmetic corpus and production renderer through pxpipe's
-Cloudflare Messages bridge — see the
-[`K3 receipt`](eval/sol-profile/model-moonshotai_kimi-k3-novel-arithmetic-results.json) and
-[`eval/grok-density/QUALITY_SUITE.md`](eval/grok-density/QUALITY_SUITE.md).
+Cloudflare Messages bridge. Gemini 3.6 Flash used Google AI Studio — see
+[`Gemini 3.6 Flash receipts`](eval/sol-profile/GEMINI_3_6_FLASH_QUALITY_RESULTS.md) and
+[`K3 receipt`](eval/sol-profile/model-moonshotai_kimi-k3-novel-arithmetic-results.json).
 
 K3 semantic and exact-recall receipts:
 [`gist/state/guards`](eval/sol-profile/gist-recall-moonshotai_kimi-k3-results.json) and
@@ -200,6 +204,7 @@ chars/vision-token ÷ 4 (prose text baseline). Not a model-quality score.
 | family | window | as text (@4 c/tok) | as pxpipe images | density | multiplier |
 |---|---:|---:|---:|---:|---:|
 | **`claude-fable-5[1m]`** (default) | 1M | ~4.0M | **~18.3M** | ~18.3 c/vt (px÷750) | **~4.6×** |
+| **`google/gemini-3.6-flash`** | 1M | ~4.0M | **~20.9M** | ~20.9 c/vt (flat 1089 tok) | **~5.2×** |
 
 Regenerate: `npx tsx scripts/gen-context-chart.ts` · chart PNG
 [`docs/assets/context-window-chars.png`](docs/assets/context-window-chars.png).

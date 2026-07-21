@@ -382,7 +382,7 @@ function isOpenAIEvent(
 ): boolean {
   if (accountingProvider) return accountingProvider === 'openai';
   if (!path) return false;
-  return path.includes('responses') || path.includes('chat/completions');
+  return path.includes('responses') || path.includes('chat/completions') || path.includes('google-ai-studio') || path.includes('generateContent');
 }
 
 /** Cache-aware eff bundle for one GPT event. Shared by the live `update()`

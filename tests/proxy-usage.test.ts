@@ -88,10 +88,15 @@ describe('proxy usage extraction', () => {
       () =>
         new Response(
           JSON.stringify([
-            { candidates: [{ content: { parts: [{ text: 'hello' }] } }] },
+            { candidates: [{ content: { parts: [{ text: 'hello' }, { text: 'thinking', thought: true }] } }] },
             {
-              candidates: [{ content: { parts: [{ text: ' world' }] } }],
-              usageMetadata: { promptTokenCount: 2048, candidatesTokenCount: 9 },
+              candidates: [{ content: { parts: [{ text: ' world' }, { functionCall: { name: 'f', args: {} } }] }, finishReason: 'STOP' }],
+              usageMetadata: {
+                promptTokenCount: 2048,
+                candidatesTokenCount: 9,
+                thoughtsTokenCount: 11,
+                cachedContentTokenCount: 100,
+              },
             },
           ]),
           { status: 200, headers: { 'content-type': 'application/json; charset=UTF-8' } },
@@ -121,9 +126,129 @@ describe('proxy usage extraction', () => {
     restore();
 
     expect(captured?.model).toBe('gemini-3.6-flash');
-    expect(captured?.accountingProvider).toBe('openai');
+    expect(captured?.accountingProvider).toBe('google');
     expect(captured?.usage?.input_tokens).toBe(2048);
-    expect(captured?.usage?.output_tokens).toBe(9);
+    expect(captured?.usage?.output_tokens).toBe(20);
+    expect(captured?.usage?.cached_tokens).toBe(100);
+    expect(captured?.measurement?.textChars).toBe(11);
+    expect(captured?.measurement?.thinkingChars).toBe(8);
+    expect(captured?.measurement?.toolUseChars).toBeGreaterThan(0);
+    expect(captured?.stopReason).toBe('STOP');
+  });
+
+  it('uses Gemini countTokens for the gate and measured text baseline', async () => {
+    const upstreamRequests: Request[] = [];
+    const restore = mockUpstream(async (req) => {
+      upstreamRequests.push(req.clone());
+      if (req.url.includes(':countTokens')) {
+        const body = await req.clone().json() as {
+          generateContentRequest?: { model?: string; contents?: unknown; systemInstruction?: unknown };
+        };
+        expect(body.generateContentRequest?.model).toBe('models/gemini-3.6-flash');
+        expect(body.generateContentRequest?.contents).toBeDefined();
+        return new Response(JSON.stringify({
+          totalTokens: JSON.stringify(body.generateContentRequest).includes('inlineData') ? 120 : 400,
+        }), { headers: { 'content-type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({
+        candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
+        usageMetadata: { promptTokenCount: 120, candidatesTokenCount: 1 },
+      }), { headers: { 'content-type': 'application/json' } });
+    });
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      upstream: 'http://ocproxy.test',
+      transform: { compress: true },
+      onRequest: (event) => { captured = event; },
+    });
+    const body = JSON.stringify({
+      model: 'gemini-body-must-not-win',
+      systemInstruction: { parts: [{ text: 'System instruction. '.repeat(200) }] },
+      contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
+    });
+    const res = await proxy(new Request(
+      'http://localhost/google-ai-studio/v1beta/models/gemini-3.6-flash:streamGenerateContent?alt=sse&key=test',
+      { method: 'POST', headers: { 'content-type': 'application/json' }, body },
+    ));
+    await res.text();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    restore();
+
+    expect(upstreamRequests.filter((req) => req.url.includes(':countTokens'))).toHaveLength(2);
+    expect(upstreamRequests[0]!.url).toContain(':countTokens?key=test');
+    expect(upstreamRequests[0]!.url).not.toContain('alt=sse');
+    expect(captured?.accountingProvider).toBe('google');
+    expect(captured?.info?.compressed).toBe(true);
+    expect(captured?.info?.baselineTokens).toBe(400);
+    expect(captured?.info?.baselineImagedTokens).toBe(400);
+    expect(captured?.info?.baselineProbeStatus).toBe('ok');
+  });
+
+  it('passes Gemini through when countTokens fails', async () => {
+    const forwardedBodies: string[] = [];
+    const restore = mockUpstream(async (req) => {
+      if (req.url.includes(':countTokens')) return new Response('no', { status: 503 });
+      forwardedBodies.push(await req.clone().text());
+      return new Response(JSON.stringify({
+        candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
+        usageMetadata: { promptTokenCount: 400, candidatesTokenCount: 1 },
+      }), { headers: { 'content-type': 'application/json' } });
+    });
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      upstream: 'http://ocproxy.test',
+      transform: { compress: true },
+      onRequest: (event) => { captured = event; },
+    });
+    const body = JSON.stringify({
+      systemInstruction: { parts: [{ text: 'System instruction. '.repeat(200) }] },
+      contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
+    });
+    const res = await proxy(new Request(
+      'http://localhost/google-ai-studio/v1beta/models/gemini-3.6-flash:generateContent',
+      { method: 'POST', headers: { 'content-type': 'application/json' }, body },
+    ));
+    await res.text();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    restore();
+
+    expect(forwardedBodies).toEqual([body]);
+    expect(captured?.info?.compressed).toBe(false);
+    expect(captured?.info?.reason).toBe('baseline_probe_failed');
+    expect(captured?.info?.baselineProbeStatus).toBe('failed');
+  });
+
+  it('classifies bypassed Gemini traffic as Google without probing', async () => {
+    const upstreamRequests: Request[] = [];
+    const restore = mockUpstream(async (req) => {
+      upstreamRequests.push(req.clone());
+      return new Response(JSON.stringify({
+        candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
+        usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 1 },
+      }), { headers: { 'content-type': 'application/json' } });
+    });
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      upstream: 'http://ocproxy.test',
+      onRequest: (event) => { captured = event; },
+    });
+    const body = JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'hi' }] }] });
+    const res = await proxy(new Request(
+      'http://localhost/google-ai-studio/v1beta/models/gemini-3.6-flash:generateContent',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-pxpipe-bypass': '1' },
+        body,
+      },
+    ));
+    await res.text();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    restore();
+
+    expect(upstreamRequests).toHaveLength(1);
+    expect(await upstreamRequests[0]!.text()).toBe(body);
+    expect(captured?.model).toBe('gemini-3.6-flash');
+    expect(captured?.accountingProvider).toBe('google');
   });
 
   it('never calls Anthropic count_tokens for Sol Responses', async () => {

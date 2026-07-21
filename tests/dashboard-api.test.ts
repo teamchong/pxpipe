@@ -631,6 +631,59 @@ describe('GPT savings split', () => {
   });
 });
 
+describe('Gemini savings split', () => {
+  beforeEach(() => {
+    setAllowedModelBases(['gemini-3.6-flash']);
+  });
+
+  it('shows measured token savings without applying Claude dollar pricing', async () => {
+    dash.update({
+      method: 'POST',
+      path: '/google-ai-studio/v1beta/models/gemini-3.6-flash:generateContent',
+      model: 'gemini-3.6-flash',
+      accountingProvider: 'google',
+      status: 200,
+      durationMs: 100,
+      usage: { input_tokens: 120, output_tokens: 10 },
+      info: {
+        compressed: true,
+        baselineTokens: 400,
+        baselineProbeStatus: 'ok',
+        imageCount: 1,
+      },
+    } as never);
+
+    const stats = (await dash.serveStats().json()) as StatsPayload;
+    expect(stats.saved_input_tokens).toBe(0);
+    expect(stats.saved_usd).toBe(0);
+    const recent = (await dash.serveRecent().json()) as RecentPayload;
+    expect(recent.recent.at(-1)?.baseline_input).toBe(400);
+    expect(recent.recent.at(-1)?.actual_input).toBe(120);
+    expect(recent.recent.at(-1)?.session_saved_so_far_delta).toBe(280);
+  });
+
+  it('preserves Gemini cached-token rows during replay', async () => {
+    writeEvents(tmp, [ev({
+      path: '/google-ai-studio/v1beta/models/gemini-3.6-flash:generateContent',
+      model: 'gemini-3.6-flash',
+      accounting_provider: 'google',
+      compressed: true,
+      input_tokens: 120,
+      output_tokens: 10,
+      cached_tokens: 40,
+      baseline_tokens: 400,
+      baseline_probe_status: 'ok',
+      image_count: 1,
+    })]);
+
+    await dash.replay(tmp.eventsFile);
+    const recent = (await dash.serveRecent().json()) as RecentPayload;
+    expect(recent.recent.at(-1)?.cache_read).toBe(40);
+    expect(recent.recent.at(-1)?.baseline_input).toBe(400);
+    expect(recent.recent.at(-1)?.actual_input).toBe(120);
+  });
+});
+
 describe('server-observed warmth: text follows actual cache_read', () => {
   // The text counterfactual is hypothetical, so its cache state follows the only
   // server-observed signal we have: cr>0 means warm for both paths, cr===0 means

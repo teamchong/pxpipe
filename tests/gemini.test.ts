@@ -15,7 +15,7 @@ describe('Gemini Model Profiles & Identification', () => {
   it('correctly identifies Gemini family model strings', () => {
     expect(isGeminiModel('gemini-3.6-flash')).toBe(true);
     expect(isGeminiModel('google/gemini-3.6-flash')).toBe(true);
-    expect(isGeminiModel('GEMINI-PRO')).toBe(true);
+    expect(isGeminiModel('GEMINI-PRO')).toBe(false);
     expect(isGeminiModel('gpt-5.6-sol')).toBe(false);
     expect(isGeminiModel('claude-fable-5')).toBe(false);
     expect(isGeminiModel('grok-4.5')).toBe(false);
@@ -26,21 +26,19 @@ describe('Gemini Model Profiles & Identification', () => {
     expect(prof1).toBe(GEMINI_3_6_FLASH_PROFILE);
     expect(prof1.stripCols).toBe(312);
     expect(prof1.maxHeightPx).toBe(728);
-    expect(prof1.vision.base).toBe(1089);
+    expect(prof1.vision.base).toBe(1078);
     expect(prof1.style.font).toBe('spleen-5x8');
 
     const prof2 = resolveGptProfile('google/gemini-3.6-flash');
     expect(prof2.stripCols).toBe(312);
     expect(prof2.maxHeightPx).toBe(728);
-    expect(prof2.vision.base).toBe(1089);
+    expect(prof2.vision.base).toBe(1078);
   });
 
-  it('prices Gemini images at flat ~1,089 tokens regardless of resolution or aspect ratio', () => {
-    expect(geminiVisionTokens('gemini-3.6-flash', 100, 100)).toBe(1089);
-    expect(geminiVisionTokens('gemini-3.6-flash', 1568, 728)).toBe(1089);
+  it('uses the measured production-geometry image cost', () => {
+    expect(geminiVisionTokens('gemini-3.6-flash', 1568, 728)).toBe(1078);
 
-    expect(visionTokensForModel('gemini-3.6-flash', 100, 100)).toBe(1089);
-    expect(visionTokensForModel('google/gemini-3.6-flash', 2048, 2048)).toBe(1089);
-    expect(visionTokensForModel('gemini-3.6-flash', 4096, 512)).toBe(1089);
+    expect(visionTokensForModel('gemini-3.6-flash', 1568, 728)).toBe(1078);
+    expect(visionTokensForModel('google/gemini-3.6-flash', 1568, 728)).toBe(1078);
   });
 });

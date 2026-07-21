@@ -3,7 +3,7 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { renderTextToPngs } from '../../dist/core/render.js';
-import { resolveGptProfile } from '../../dist/core/gpt-model-profiles.js';
+import { resolveGeminiProfile } from '../../dist/core/gemini-model-profiles.js';
 import { factSheetText } from '../../dist/core/factsheet.js';
 import { visionTokensForModel } from '../../dist/core/openai.js';
 import { callGemini } from './gemini-client.mjs';
@@ -15,7 +15,7 @@ const N = Math.max(1, Number(process.env.N || 100));
 const SEED = Number(process.env.SEED || 20260711);
 const CONCURRENCY = Math.max(1, Number(process.env.CONCURRENCY || 5));
 const TIMEOUT = Number(process.env.TIMEOUT_MS || 180000);
-const profile = resolveGptProfile(MODEL);
+const profile = resolveGeminiProfile();
 const RESULT = join(HERE, `novel-arithmetic-results.json`);
 
 function lcg(seed) { let s = seed >>> 0; return () => s = (Math.imul(s, 1664525) + 1013904223) >>> 0; }

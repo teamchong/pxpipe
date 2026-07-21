@@ -14,7 +14,7 @@ export interface TrackEvent {
   path: string;
   /** Top-level request model when present. */
   model?: string;
-  accounting_provider?: 'anthropic' | 'openai';
+  accounting_provider?: 'anthropic' | 'openai' | 'google';
   status: number;
   duration_ms: number;
   first_byte_ms?: number;

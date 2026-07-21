@@ -13,8 +13,8 @@
  *  - Text points: window tokens × 4 chars/token (the standard English-prose
  *    rule of thumb; token-dense content like code/JSON tokenizes *worse*,
  *    ~2-2.5, so 4 is the generous assumption for the text series).
- *  - Fable pxpipe point: window tokens × measured chars-per-vision-token via
- *    Claude dense geometry + Anthropic 750 px/token pricing.
+ *  - pxpipe points: window tokens × measured chars-per-vision-token using the
+ *    shipped 312-column geometry and each provider's image-token accounting.
  *
  * Window sizes (announcement-era frontier defaults), with release dates used
  * for x-axis placement:
@@ -36,7 +36,7 @@ const OUT = join(ROOT, 'docs/assets/context-window-chars.png');
 const README_EXAMPLE = join(ROOT, 'docs/assets/example-render.png');
 
 const TEXT_CPT = 4; // chars per text token, prose rule of thumb
-const PX_PER_VISION_TOKEN = 750; // Anthropic image pricing: tokens = w*h/750
+const GEMINI_TOKENS_PER_FULL_PAGE = 1078; // measured at 1568x728
 
 interface Density {
   /** chars per vision-token for this family's render+billing profile */
@@ -70,7 +70,10 @@ async function measureFableDensity(fixture: string): Promise<Density> {
   if (r.droppedChars > 0) {
     throw new Error(`fable fixture dropped ${r.droppedChars} chars — atlas gap, fix before charting`);
   }
-  const visionTokens = Math.ceil(r.pixels / PX_PER_VISION_TOKEN);
+  const visionTokens = r.pages.reduce(
+    (total, page) => total + Math.ceil(page.width / 28) * Math.ceil(page.height / 28),
+    0,
+  );
   const cpt = fixture.length / visionTokens;
   console.log(
     `Fable density: ${fixture.length} chars → ${r.pages.length} pages, ` +
@@ -80,12 +83,12 @@ async function measureFableDensity(fixture: string): Promise<Density> {
 }
 
 async function measureGeminiDensity(fixture: string): Promise<Density> {
-  // Widescreen geometry (312-col Spleen): flat 1089 vision tokens per page.
+  // Widescreen geometry (312-col Spleen): measured 1078 tokens per page.
   const r = await renderTextToImages(fixture, { reflow: true });
   if (r.droppedChars > 0) {
     throw new Error(`gemini fixture dropped ${r.droppedChars} chars — atlas gap, fix before charting`);
   }
-  const visionTokens = r.pages.length * 1089;
+  const visionTokens = r.pages.length * GEMINI_TOKENS_PER_FULL_PAGE;
   const cpt = fixture.length / visionTokens;
   console.log(
     `Gemini density: ${fixture.length} chars → ${r.pages.length} pages, ` +
@@ -200,7 +203,7 @@ function pngWidth(path: string): number {
   return png.readUInt32BE(16);
 }
 
-function draw(data: Point[], fableCpt: number): Buffer {
+function draw(data: Point[], fableCpt: number, geminiCpt: number): Buffer {
   const logicalWidth = 1180;
   const logicalHeight = 1000;
   const outputWidth = pngWidth(README_EXAMPLE);
@@ -233,7 +236,7 @@ function draw(data: Point[], fableCpt: number): Buffer {
   ctx.font = '400 14px sans-serif';
   ctx.fillText(
     `each point: model · context window (tokens) → characters it holds · text at ~${TEXT_CPT} chars/token · ` +
-      `Fable pxpipe measured at ${fableCpt.toFixed(1)} chars/vision-token (px ÷ ${PX_PER_VISION_TOKEN})`,
+      `pxpipe uses shipped 312-column pages · Fable ${fableCpt.toFixed(1)} · Gemini ${geminiCpt.toFixed(1)} chars/vision-token`,
     36,
     68,
   );
@@ -461,5 +464,5 @@ console.log(
 );
 
 mkdirSync(dirname(OUT), { recursive: true });
-writeFileSync(OUT, draw(data, fable.cpt));
+writeFileSync(OUT, draw(data, fable.cpt, gemini.cpt));
 console.log(`\nwrote ${OUT}`);

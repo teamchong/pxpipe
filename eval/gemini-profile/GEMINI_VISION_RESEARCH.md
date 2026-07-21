@@ -26,8 +26,8 @@ Unlike Anthropic (which scales vision tokens dynamically with pixel dimensions v
 | Extreme-wide 8:1 | 4096×512 | 8.00 | **1,034** |
 
 ### Key Takeaway on Vision Cost
-Gemini 3.6 Flash resamples all incoming images to a internal ViT grid of $33 \times 33 = 1089$ patches.
-Because image token cost is **fixed** (~1,089 tokens/image), **larger canvas sizes and higher character capacities (e.g., 312 columns on 1568×728 widescreen pages or 152 columns on 1932px tall pages) yield maximum character packing per vision token.**
+The measurements show nearly flat image-token usage across these dimensions (1,034-1,113 tokens), but they do not establish Google's internal resampling architecture.
+Because image token cost was nearly flat in this sweep, larger legible canvases can pack more characters per measured vision token.
 
 ---
 
@@ -74,7 +74,7 @@ Testing 3-channel RGB overprint multiplexing (where three independent text strea
   {
     test: (m) => /gemini/i.test(m),
     profile: {
-      vision: { regime: 'tile', base: 1089, perTile: 0 },
+      vision: { regime: 'tile', base: 1078, perTile: 0 },
       stripCols: ANTHROPIC_STRIP_COLS, // 312 columns
       maxHeightPx: ANTHROPIC_MAX_HEIGHT_PX, // 728 px
       minCompressTokens: 500,
@@ -89,18 +89,11 @@ Testing 3-channel RGB overprint multiplexing (where three independent text strea
   }
 ```
 
-And `visionTokensForModel` in `src/core/openai.ts` handles flat ~1,089 token billing for Gemini models:
+`geminiVisionTokens` in `src/core/gemini-model-profiles.ts` records the measured production-geometry value:
 
 ```typescript
-export function isGeminiModel(model: string | null | undefined): boolean {
-  return /gemini/i.test((model ?? '').toLowerCase());
-}
-
-export function visionTokensForModel(model: string, w: number, h: number): number {
-  if (isGeminiModel(model)) {
-    return 1089;
-  }
-  ...
+export function geminiVisionTokens(_model: string, _w: number, _h: number): number {
+  return 1078;
 }
 ```
 
@@ -108,7 +101,7 @@ export function visionTokensForModel(model: string, w: number, h: number): numbe
 
 ## 5. Quality Benchmark Summary (Dedicated Gemini Profile)
 
-Evaluated on `google/gemini-3.6-flash`:
+Evaluated on `google/gemini-3.6-flash` at the shipped 312-column, 728px profile:
 
 | test | N | Gemini 3.6 Flash | notes |
 |---|---:|---:|---|
@@ -116,11 +109,10 @@ Evaluated on `google/gemini-3.6-flash`:
 | gist recall A/B | 98 | **98/98 (100%)** | all 22 sessions completed |
 | state tracking | 18 | **18/18 (100%)** | subset of gist corpus |
 | never-stated probes | 16 | **0/16 confabulated** | 0 false positives |
-| verbatim 12-char hex | 15 | **15/15 (100%)** | dense render |
+| verbatim 12-char hex | 15 | **14/15 (93%)** | dense render |
 
 Receipts:
 - `eval/gemini-profile/dimension-research-results.json`
-- `eval/gemini-profile/rgb-separation-diagnostic-results.json`
 - `eval/gemini-profile/novel-arithmetic-results.json`
 - `eval/gemini-profile/gist-recall-results.json`
 - `eval/gemini-profile/verbatim-hex-results.json`

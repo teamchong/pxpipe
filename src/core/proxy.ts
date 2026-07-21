@@ -64,7 +64,7 @@ export interface ProxyEvent {
   model?: string;
   /** Provider cost/usage semantics after any internal wire bridge. Unlike
    * `path`, this describes the upstream that actually billed the request. */
-  accountingProvider?: 'anthropic' | 'openai';
+  accountingProvider?: 'anthropic' | 'openai' | 'google';
   status: number;
   /** Wall-clock ms from request start to event fire (≈ end of upstream body). */
   durationMs: number;
@@ -168,7 +168,7 @@ function processSseEvent(
   // Parse `event:` + `data:` lines; continuation data: lines concatenate per SSE spec.
   let event = '';
   let data = '';
-  for (const line of block.split('\n')) {
+  for (const line of block.split(/\r\n|\r|\n/)) {
     if (line.startsWith('event:')) event = line.slice(6).trim();
     else if (line.startsWith('data:')) data += line.slice(5).replace(/^\s/, '');
   }
@@ -202,6 +202,7 @@ function processSseEvent(
     const gUsage = normalizeUsage(obj.usageMetadata);
     if (gUsage) state.usage = gUsage;
   }
+  measureGoogleCandidates(obj, m, state);
 
   measureOpenAIChoices(obj, m);
   // OpenAI chat chunks: the final chunk carries choices[].finish_reason (earlier chunks ship null).
@@ -260,24 +261,21 @@ function objectRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-function parseGoogleResponseJson(text: string): Record<string, unknown> | null {
+function parseJsonObjects(text: string): Record<string, unknown>[] | null {
   const trimmed = text.trim();
   try {
     const parsed: unknown = JSON.parse(trimmed);
     if (Array.isArray(parsed)) {
-      for (let i = parsed.length - 1; i >= 0; i--) {
-        const item = objectRecord(parsed[i]);
-        if (item && (item.usageMetadata || item.usage)) return item;
-      }
-      return objectRecord(parsed[parsed.length - 1]) ?? objectRecord(parsed[0]);
+      return parsed.map(objectRecord).filter((item): item is Record<string, unknown> => item !== null);
     }
-    return objectRecord(parsed);
+    const item = objectRecord(parsed);
+    return item ? [item] : null;
   } catch {
     const match = /"usageMetadata"\s*:\s*(\{[^}]+\})/.exec(trimmed);
     if (match && match[1]) {
       try {
         const usageMetadata: unknown = JSON.parse(match[1]);
-        return { usageMetadata };
+        return [{ usageMetadata }];
       } catch {}
     }
   }
@@ -310,7 +308,12 @@ function normalizeUsage(raw: unknown): Usage | undefined {
 
   // Google AI Studio field aliases.
   if (typeof u.promptTokenCount === 'number') out.input_tokens = u.promptTokenCount;
-  if (typeof u.candidatesTokenCount === 'number') out.output_tokens = u.candidatesTokenCount;
+  if (typeof u.candidatesTokenCount === 'number' || typeof u.thoughtsTokenCount === 'number') {
+    out.output_tokens =
+      (typeof u.candidatesTokenCount === 'number' ? u.candidatesTokenCount : 0) +
+      (typeof u.thoughtsTokenCount === 'number' ? u.thoughtsTokenCount : 0);
+  }
+  if (typeof u.cachedContentTokenCount === 'number') out.cached_tokens = u.cachedContentTokenCount;
   // OpenAI prompt-cache hits live in a details sub-object: Responses uses
   // `input_tokens_details.cached_tokens`, Chat uses `prompt_tokens_details`.
   const details =
@@ -341,6 +344,35 @@ function measureOpenAIChoices(obj: Record<string, unknown>, m: OutputMeasurement
       }
     }
   }
+}
+
+function measureGoogleCandidates(
+  obj: Record<string, unknown>,
+  m: OutputMeasurement,
+  state?: { stopReason: string | undefined },
+): boolean {
+  if (!Array.isArray(obj.candidates)) return false;
+  for (const rawCandidate of obj.candidates) {
+    const candidate = objectRecord(rawCandidate);
+    if (!candidate) continue;
+    if (state && typeof candidate.finishReason === 'string') state.stopReason = candidate.finishReason;
+    const content = objectRecord(candidate.content);
+    if (!Array.isArray(content?.parts)) continue;
+    for (const rawPart of content.parts) {
+      const part = objectRecord(rawPart);
+      if (!part) continue;
+      if (typeof part.text === 'string') {
+        if (part.thought === true) m.thinkingChars += part.text.length;
+        else m.textChars += part.text.length;
+      }
+      if (part.functionCall !== undefined) {
+        try {
+          m.toolUseChars += JSON.stringify(part.functionCall).length;
+        } catch {}
+      }
+    }
+  }
+  return true;
 }
 
 /** Measure non-streaming messages.content[] — same OutputMeasurement shape as the SSE accumulator. */
@@ -490,11 +522,11 @@ function teeForUsage(res: Response): {
           const { done, value } = await reader.read();
           if (done) break;
           buf += decoder.decode(value, { stream: true });
-          // SSE events are terminated by a blank line.
-          let evEnd: number;
-          while ((evEnd = buf.indexOf('\n\n')) >= 0) {
-            const block = buf.slice(0, evEnd);
-            buf = buf.slice(evEnd + 2);
+          // SSE events are terminated by a blank line; support LF and CRLF.
+          let boundary: RegExpExecArray | null;
+          while ((boundary = /\r\n\r\n|\n\n|\r\r/.exec(buf)) !== null) {
+            const block = buf.slice(0, boundary.index);
+            buf = buf.slice(boundary.index + boundary[0].length);
             processSseEvent(block, m, state);
           }
         }
@@ -512,12 +544,24 @@ function teeForUsage(res: Response): {
           buf += decoder.decode(value, { stream: true });
         }
         try {
-          const j = parseGoogleResponseJson(buf);
-          const usageObj = j?.usage ?? j?.usageMetadata;
+          const objects = parseJsonObjects(buf);
+          if (!objects) return { usage: undefined, measurement: undefined, stopReason: undefined };
+          let usage: Usage | undefined;
+          let recognizedGoogle = false;
+          const measurement: OutputMeasurement = {
+            textChars: 0, thinkingChars: 0, toolUseChars: 0, redactedBlockCount: 0,
+          };
+          const state: { stopReason: string | undefined } = { stopReason: undefined };
+          for (const object of objects) {
+            const nextUsage = normalizeUsage(object.usage ?? object.usageMetadata);
+            if (nextUsage) usage = nextUsage;
+            recognizedGoogle = measureGoogleCandidates(object, measurement, state) || recognizedGoogle;
+          }
+          const last = objects[objects.length - 1];
           return {
-            usage: normalizeUsage(usageObj),
-            measurement: measureFromMessageJson(j),
-            stopReason: readStopReasonFromJson(j),
+            usage,
+            measurement: recognizedGoogle ? measurement : measureFromMessageJson(last),
+            stopReason: state.stopReason ?? readStopReasonFromJson(last),
           };
         } catch {
           return { usage: undefined, measurement: undefined, stopReason: undefined };
@@ -641,6 +685,30 @@ async function countTokensUpstream(
     if (!res.ok) return null;
     const json = (await res.json()) as { input_tokens?: unknown };
     return typeof json.input_tokens === 'number' ? json.input_tokens : null;
+  } catch {
+    return null;
+  }
+}
+
+async function countGoogleTokensUpstream(
+  countTokensUrl: string,
+  body: Uint8Array,
+  headers: Headers,
+  model: string,
+): Promise<number | null> {
+  try {
+    const request = JSON.parse(new TextDecoder().decode(body)) as Record<string, unknown>;
+    const countBody = JSON.stringify({
+      generateContentRequest: { ...request, model: `models/${model}` },
+    });
+    const res = await fetch(countTokensUrl, {
+      method: 'POST',
+      headers,
+      body: countBody,
+    });
+    if (!res.ok) return null;
+    const json = await res.json() as { totalTokens?: unknown };
+    return typeof json.totalTokens === 'number' ? json.totalTokens : null;
   } catch {
     return null;
   }
@@ -817,8 +885,9 @@ export function createProxy(config: ProxyConfig = {}) {
           // Responses-shaped even though they are not canonical `/v1/*` paths.
           // Classify by the parsed wire route, otherwise the dashboard ignores
           // GPT image/baseline telemetry and renders As text / Saved as dashes.
-          accountingProvider:
-            isOpenAIChat || isOpenAIResponses || bridgedGptMessages || bridgedChatMessages || isGoogle
+          accountingProvider: isGoogleRoute
+            ? 'google'
+            : isOpenAIChat || isOpenAIResponses || bridgedGptMessages || bridgedChatMessages
               ? 'openai'
               : 'anthropic',
           status,
@@ -849,21 +918,23 @@ export function createProxy(config: ProxyConfig = {}) {
     const isMessages = !bypass && req.method === 'POST' && isAnthropicMessagesPath(url.pathname);
     const isOpenAIChat = !bypass && req.method === 'POST' && isOpenAIChatPath(url.pathname);
     const isOpenAIResponses = !bypass && req.method === 'POST' && isOpenAIResponsesPath(url.pathname);
-    const isGoogle = !bypass && req.method === 'POST' && (
-      url.pathname.includes('/google-ai-studio/') ||
-      url.pathname.includes(':generateContent') ||
-      url.pathname.includes(':streamGenerateContent')
-    );
+    const googleModel = req.method === 'POST'
+      ? parseGoogleModelFromPath(url.pathname)
+      : null;
+    const isGoogleRoute = googleModel !== null;
+    const isGoogle = isGoogleRoute && !bypass;
     const isOpenAIPath = isCanonicalOpenAIPath(
       url.pathname,
       req.headers,
       config.openAIApiKey !== undefined,
     );
-    const upstreamBase = providerPrefixed ? passthroughUpstream : isOpenAIPath ? openAIUpstream : upstream;
+    const upstreamBase = isGoogleRoute || providerPrefixed
+      ? passthroughUpstream
+      : isOpenAIPath ? openAIUpstream : upstream;
 
     let bodyOut: BodyInit | null = null;
     let info: TransformInfo | undefined;
-    let requestModel: string | undefined;
+    let requestModel: string | undefined = googleModel ?? undefined;
     let bridgedGptMessages = false;
     let bridgedChatMessages = false;
     let modelRouteForRequest: 'openai' | 'cloudflare' | undefined;
@@ -882,7 +953,6 @@ export function createProxy(config: ProxyConfig = {}) {
         const transformOpts =
           typeof config.transform === 'function' ? config.transform() : config.transform;
         // Fail-closed: unreadable model → no compression, not a risky guess.
-        const googleModel = isGoogle ? parseGoogleModelFromPath(url.pathname) : null;
         const model = googleModel ?? readModelField(bodyIn);
         requestModel = model ?? undefined;
         // /v1/messages is only a wire schema: Claude Code can target a non-
@@ -927,8 +997,8 @@ export function createProxy(config: ProxyConfig = {}) {
           : bridgedChatMessages
             ? anthropicMessagesToOpenAIChat(bodyIn, chatStamp ?? undefined)
             : bodyIn;
-        const r = isGoogle
-          ? await transformGoogleGenerateContent(bodyIn, model ?? 'gemini-3.6-flash', effectiveOpts)
+        let r = isGoogle
+          ? await transformGoogleGenerateContent(bodyIn, model!, effectiveOpts)
           : isMessages
             ? bridgedGptMessages
               ? await transformOpenAIResponses(bridgeBody, effectiveOpts)
@@ -938,6 +1008,53 @@ export function createProxy(config: ProxyConfig = {}) {
             : isOpenAIChat
               ? await transformOpenAIChatCompletions(bodyIn, effectiveOpts)
               : await transformOpenAIResponses(bodyIn, effectiveOpts);
+        if (isGoogle && r.info.compressed) {
+          const countHeaders = applyGatewayHeaders(filterHeaders(req.headers, STRIP_REQ_HEADERS));
+          countHeaders.set('content-type', 'application/json');
+          const countUrl = new URL(
+            passthroughUpstream + url.pathname.replace(
+              /:(?:generateContent|streamGenerateContent)$/,
+              ':countTokens',
+            ),
+          );
+          for (const [key, value] of url.searchParams) countUrl.searchParams.append(key, value);
+          countUrl.searchParams.delete('alt');
+          const [baseline, transformed] = await Promise.all([
+            countGoogleTokensUpstream(countUrl.toString(), bodyIn, countHeaders, model!),
+            countGoogleTokensUpstream(countUrl.toString(), r.body, countHeaders, model!),
+          ]);
+          if (baseline === null || transformed === null || transformed >= baseline) {
+            r = {
+              body: bodyIn,
+              info: {
+                ...r.info,
+                compressed: false,
+                reason: baseline === null || transformed === null
+                  ? 'baseline_probe_failed'
+                  : `not_profitable (${transformed} >= ${baseline} tokens)`,
+                imageCount: 0,
+                imageBytes: 0,
+                imageTokens: undefined,
+                baselineImagedTokens: undefined,
+                nativeInjectedTokens: undefined,
+                baselineProbeStatus: baseline === null || transformed === null ? 'failed' : 'ok',
+              },
+            };
+          } else {
+            r.info.baselineTokens = baseline;
+            r.info.baselineImagedTokens = baseline;
+            r.info.nativeInjectedTokens = undefined;
+            r.info.baselineProbeStatus = 'ok';
+            r.info.gateEval = {
+              site: 'slab',
+              imageTokens: transformed,
+              textTokens: baseline,
+              burnImageSide: 0,
+              burnTextSide: 0,
+              profitable: true,
+            };
+          }
+        }
         if (!modelOk) r.info.reason = 'unsupported_model';
         bodyOut = r.body as unknown as BodyInit; // TS narrows Uint8Array away from BodyInit
         info = r.info;

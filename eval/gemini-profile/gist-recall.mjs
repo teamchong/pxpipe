@@ -3,14 +3,14 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { renderTextToPngs } from '../../dist/core/render.js';
-import { resolveGptProfile } from '../../dist/core/gpt-model-profiles.js';
+import { resolveGeminiProfile } from '../../dist/core/gemini-model-profiles.js';
 import { factSheetText } from '../../dist/core/factsheet.js';
 import { callGemini } from './gemini-client.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, '../gist-recall');
 const MODEL = process.env.MODEL || 'gemini-3.6-flash';
-const profile = resolveGptProfile(MODEL);
+const profile = resolveGeminiProfile();
 const LIVE = process.env.LIVE === '1';
 const TIMEOUT = Number(process.env.TIMEOUT_MS || 240000);
 const TIERS = [['work', 10], ['work2', 6], ['work3', 6]];

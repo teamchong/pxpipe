@@ -96,29 +96,41 @@ function applyConfigFileDefaults(): void {
 
 /** Dashboard persistence hook: write the runtime model scope back to the
  *  config file's `models` key so chip toggles survive a restart. Other keys
- *  are preserved; an unreadable file is replaced rather than crashed on.
+ *  are preserved; an invalid existing file is left untouched.
  *  NOTE: on the next start an explicit PXPIPE_MODELS env still wins over the
  *  persisted value (same precedence as every other config-file default). */
 function persistModelBasesToConfig(bases: readonly string[]): void {
   const file = process.env.PXPIPE_CONFIG ?? DEFAULT_CONFIG_FILE;
   let cfg: Record<string, unknown> = {};
+  let mode = 0o600;
   try {
     const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as unknown;
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      cfg = parsed as Record<string, unknown>;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      console.warn(`[pxpipe] could not persist model scope: invalid config object ${file}`);
+      return;
     }
-  } catch {
-    // Missing or invalid file — start fresh with just the models key.
+    cfg = parsed as Record<string, unknown>;
+    mode = fs.statSync(file).mode & 0o777;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') {
+      console.warn(`[pxpipe] could not persist model scope: invalid config ${file}: ${(e as Error).message}`);
+      return;
+    }
   }
   // Empty array round-trips as 'off' via normalizeModelsConfig on load.
   cfg.models = [...bases];
+  const tmp = `${file}.tmp-${process.pid}`;
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     // Write-then-rename so a crash mid-write can't corrupt the config.
-    const tmp = `${file}.tmp-${process.pid}`;
-    fs.writeFileSync(tmp, `${JSON.stringify(cfg, null, 2)}\n`);
+    fs.writeFileSync(tmp, `${JSON.stringify(cfg, null, 2)}\n`, { mode });
     fs.renameSync(tmp, file);
   } catch (e) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      // The write may have failed before the temporary file was created.
+    }
     console.warn(`[pxpipe] could not persist model scope to ${file}: ${(e as Error).message}`);
   }
 }

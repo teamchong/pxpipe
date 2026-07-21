@@ -1,7 +1,7 @@
 /**
  * Google AI Studio / Gemini API request transformer and usage extractor.
  * Intercepts /google-ai-studio/v1beta/models/*:generateContent and :streamGenerateContent
- * requests, extracts static instructions & tools, renders them to PNG image parts, and
+ * requests, extracts static system instructions, renders them to PNG image parts, and
  * passes transformed payloads to Google AI Studio.
  */
 
@@ -38,9 +38,21 @@ export interface GoogleGenerateContentRequest {
   [key: string]: unknown;
 }
 
+const GOOGLE_ROUTE = /^\/google-ai-studio\/(?:v1|v1beta)\/models\/([^/:]+):(generateContent|streamGenerateContent)$/;
+
 export function parseGoogleModelFromPath(pathname: string): string | null {
-  const match = /\/models\/([^:]+):/i.exec(pathname);
+  const match = GOOGLE_ROUTE.exec(pathname);
   return match && match[1] ? match[1] : null;
+}
+
+const SYSTEM_POINTER =
+  'The original system instruction is rendered in the image at the start of the first user turn. ' +
+  'Treat that image as this system instruction, with the same authority and priority.';
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
 }
 
 export async function transformGoogleGenerateContent(
@@ -53,12 +65,15 @@ export async function transformGoogleGenerateContent(
   } = {},
 ): Promise<{ body: Uint8Array; info: TransformInfo }> {
   const text = new TextDecoder().decode(bodyBytes);
-  let req: GoogleGenerateContentRequest;
+  let parsed: unknown;
   try {
-    req = JSON.parse(text);
+    parsed = JSON.parse(text);
   } catch {
     return { body: bodyBytes, info: createDefaultInfo(modelName) };
   }
+  const reqRecord = record(parsed);
+  if (!reqRecord) return { body: bodyBytes, info: createDefaultInfo(modelName) };
+  const req = reqRecord as GoogleGenerateContentRequest;
 
   const info = createDefaultInfo(modelName);
   if (options.compress === false) {
@@ -68,8 +83,15 @@ export async function transformGoogleGenerateContent(
 
   // Extract system instructions
   const systemTexts: string[] = [];
-  if (req.systemInstruction?.parts) {
-    for (const part of req.systemInstruction.parts) {
+  const systemInstruction = record(req.systemInstruction);
+  const systemParts = systemInstruction?.parts;
+  if (systemParts !== undefined && !Array.isArray(systemParts)) {
+    return { body: bodyBytes, info };
+  }
+  if (Array.isArray(systemParts)) {
+    for (const rawPart of systemParts) {
+      const part = record(rawPart);
+      if (!part) return { body: bodyBytes, info };
       if (typeof part.text === 'string' && part.text.trim()) {
         systemTexts.push(part.text);
         info.staticChars += part.text.length;
@@ -104,22 +126,18 @@ export async function transformGoogleGenerateContent(
     0,
   );
   const textTokens = Math.max(1, Math.ceil(combinedRaw.length / 3.5));
+  const fsText = factSheetText(combinedRaw, profile.factSheetFormat);
+  const nativeText = SYSTEM_POINTER + (fsText ?? '');
+  const nativeInjectedTokens = Math.ceil(nativeText.length / 3.5);
 
-  const profitable = imageTokens < textTokens;
   info.gateEval = {
     site: 'slab',
     imageTokens,
     textTokens,
-    burnImageSide: 0,
+    burnImageSide: nativeInjectedTokens,
     burnTextSide: 0,
-    profitable,
+    profitable: true,
   };
-
-  if (!profitable) {
-    info.reason = `not_profitable (slab=${combined.length} chars)`;
-    info.passthroughReasons = { not_profitable: 1 };
-    return { body: bodyBytes, info };
-  }
 
   // Build image parts
   const imageParts: GooglePart[] = images.map((img) => ({
@@ -129,15 +147,20 @@ export async function transformGoogleGenerateContent(
     },
   }));
 
-  const fsText = factSheetText(combinedRaw, profile.factSheetFormat);
   if (fsText) {
     imageParts.push({ text: fsText });
   }
 
   // Prepare transformed request
+  if (req.contents !== undefined && !Array.isArray(req.contents)) {
+    return { body: bodyBytes, info: createDefaultInfo(modelName) };
+  }
   const contents = Array.isArray(req.contents) ? [...req.contents] : [];
   if (contents.length > 0 && contents[0] && contents[0].role === 'user') {
     const firstTurn = contents[0];
+    if (firstTurn.parts !== undefined && !Array.isArray(firstTurn.parts)) {
+      return { body: bodyBytes, info: createDefaultInfo(modelName) };
+    }
     contents[0] = {
       ...firstTurn,
       parts: [...imageParts, ...(firstTurn.parts || [])],
@@ -149,18 +172,23 @@ export async function transformGoogleGenerateContent(
     });
   }
 
-  // Clear original systemInstruction since it is now imaged in contents[0]
+  // Keep a native system-level pointer so the imaged instruction retains its
+  // original authority instead of being demoted to ordinary user content.
   const transformedReq: GoogleGenerateContentRequest = {
     ...req,
     contents,
+    systemInstruction: {
+      ...req.systemInstruction,
+      parts: [{ text: SYSTEM_POINTER }],
+    },
   };
-  delete transformedReq.systemInstruction;
 
   info.compressed = true;
   info.imageCount = images.length;
   info.imageBytes = images.reduce((acc, img) => acc + img.png.byteLength, 0);
   info.imageTokens = imageTokens;
   info.baselineImagedTokens = textTokens;
+  info.nativeInjectedTokens = nativeInjectedTokens;
 
   const transformedBytes = new TextEncoder().encode(JSON.stringify(transformedReq));
   return { body: transformedBytes, info };

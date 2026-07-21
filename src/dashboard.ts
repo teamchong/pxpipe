@@ -378,11 +378,11 @@ export const ASSUMED_INPUT_USD_PER_MTOK = 10.0;
  *  Anthropic paths are `/v1/messages[/count_tokens]`; neither word appears. */
 function isOpenAIEvent(
   path: string | undefined,
-  accountingProvider?: 'anthropic' | 'openai',
+  accountingProvider?: 'anthropic' | 'openai' | 'google',
 ): boolean {
   if (accountingProvider) return accountingProvider === 'openai';
   if (!path) return false;
-  return path.includes('responses') || path.includes('chat/completions') || path.includes('google-ai-studio') || path.includes('generateContent');
+  return path.includes('responses') || path.includes('chat/completions');
 }
 
 /** Cache-aware eff bundle for one GPT event. Shared by the live `update()`
@@ -619,6 +619,8 @@ export class DashboardState {
     const cc1h = u?.cache_creation?.ephemeral_1h_input_tokens ?? 0;
     const cr = u?.cache_read_input_tokens ?? 0;
     const gpt = isOpenAIEvent(ev.path, ev.accountingProvider);
+    const google = ev.accountingProvider === 'google'
+      || ev.path.includes('google-ai-studio') || ev.path.includes('generateContent');
 
     // Unified per-row accounting, filled by the provider branch below. The
     // downstream totals / per-session / recent-row code reads only these —
@@ -636,7 +638,22 @@ export class DashboardState {
     let warmForRow: boolean; // did the TEXT baseline read warm? Server-observed:
     // Anthropic cr>0 or GPT cached_tokens>0. Drives Context Map narration.
 
-    if (gpt) {
+    if (google) {
+      haveUsage = u !== undefined && (inp > 0 || out > 0);
+      const baseline = info?.baselineTokens;
+      haveBaseline = info?.baselineProbeStatus === 'ok'
+        && typeof baseline === 'number' && baseline > 0;
+      creditSaving = haveBaseline && haveUsage && compressed;
+      const measuredBaseline = haveBaseline ? baseline as number : inp;
+      actualInputEff = inp;
+      baselineInputEff = creditSaving ? measuredBaseline : inp;
+      outputEquiv = out;
+      rawActual = inp;
+      rawBaseline = creditSaving ? measuredBaseline : inp;
+      baselineForRow = creditSaving ? measuredBaseline : 0;
+      cacheReadForRow = u?.cached_tokens ?? 0;
+      warmForRow = cacheReadForRow > 0;
+    } else if (gpt) {
       // GPT cost model: no count_tokens probe, no cache-create premium, no
       // per-session warmth — the discount is automatic and folded into the
       // cached-input rate. Baseline is the measured imaged-vs-text delta.
@@ -807,7 +824,8 @@ export class DashboardState {
     // Measured headline: only compressed rows with a usable probe. An
     // uncompressed row contributes zero saved (baseline === actual), so
     // including it here would only dilute the "saved on rows we moved" %.
-    if (creditSaving) {
+    const dollarEligible = !google;
+    if (creditSaving && dollarEligible) {
       totals.baselineInputWeighted += baselineInputEff;
       totals.actualInputWeighted += actualInputEff;
       totals.outputWeighted += outputEquiv;
@@ -820,7 +838,7 @@ export class DashboardState {
     // can't measure the counterfactual, so actual ≈ baseline). This
     // keeps the ratio bounded at 100% — you can't save more than you
     // would have paid.
-    if (haveUsage) {
+    if (haveUsage && dollarEligible) {
       // baselineInputEff already folds the uncompressed/probe-failed fallback
       // to actualInputEff, so passthrough rows contribute zero saved here.
       totals.allBaselineEquivalentWeighted += baselineInputEff;
@@ -882,7 +900,7 @@ export class DashboardState {
       // update() so the lifetime totals block (above) and the per-session
       // block (here) read the same values. Re-deriving them here would
       // duplicate the cache-aware-baseline math and invite drift.
-      if (creditSaving) {
+      if (creditSaving && dollarEligible) {
         s.baselineInputWeighted += baselineInputEff;
         s.actualInputWeighted += actualInputEff;
         s.baselineMeasuredCount += 1;
@@ -895,7 +913,7 @@ export class DashboardState {
       // above (allActualInputWeighted / allOutputWeighted). Used as the
       // honest denominator for the session's saved-% so caching wins on
       // unmeasured requests still count toward "what you actually paid".
-      if (haveUsage) {
+      if (haveUsage && dollarEligible) {
         s.allActualInputWeighted += actualInputEff;
         s.allOutputWeighted += outputEquiv;
       }
@@ -972,6 +990,8 @@ export class DashboardState {
       const cr = t.cache_read_tokens ?? 0;
       const compressed = t.compressed === true;
       const gpt = isOpenAIEvent(t.path, t.accounting_provider);
+      const google = t.accounting_provider === 'google'
+        || t.path.includes('google-ai-studio') || t.path.includes('generateContent');
 
       // Same unified accounting as update(); see the branch comments there.
       let haveUsage: boolean;
@@ -985,7 +1005,21 @@ export class DashboardState {
       let cacheReadForRow: number;
       let warmForRow: boolean; // text-baseline warmth for the Context Map narration
 
-      if (gpt) {
+      if (google) {
+        haveUsage = inp > 0 || out > 0;
+        const baseline = (t as { baseline_tokens?: number }).baseline_tokens;
+        haveBaseline = (t as { baseline_probe_status?: string }).baseline_probe_status === 'ok'
+          && typeof baseline === 'number' && baseline > 0;
+        creditSaving = haveBaseline && haveUsage && compressed;
+        const measuredBaseline = haveBaseline ? baseline as number : inp;
+        actualInputEff = inp;
+        baselineInputEff = creditSaving ? measuredBaseline : inp;
+        rawActual = inp;
+        rawBaseline = creditSaving ? measuredBaseline : inp;
+        baselineForRow = creditSaving ? measuredBaseline : 0;
+        cacheReadForRow = (t as { cached_tokens?: number }).cached_tokens ?? 0;
+        warmForRow = cacheReadForRow > 0;
+      } else if (gpt) {
         const e = gptEff({
           model: t.model,
           inputTokens: inp,
@@ -1120,7 +1154,7 @@ export class DashboardState {
         input_tokens: t.input_tokens,
         output_tokens: t.output_tokens,
         cache_create: t.cache_create_tokens,
-        cache_read: gpt ? cacheReadForRow : t.cache_read_tokens,
+        cache_read: gpt || google ? cacheReadForRow : t.cache_read_tokens,
         actual_input: haveUsage ? round1(actualInputEff) : undefined,
         baseline_input:
           creditSaving ? round1(baselineInputEff) : undefined,

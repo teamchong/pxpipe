@@ -22,12 +22,12 @@ This is what the model sees instead of text:
 tokens as this page. Real pipeline output; the model reads renders like this
 at 100/100 (see benchmarks).*
 
-![chart: characters a frontier context window holds, 2018–2026 — vendor text series including Grok 4.5; orange measured overlays are Fable 5 [1m] + pxpipe ~18.3M (4.6×) and Gemini 3.6 Flash + pxpipe ~20.9M (5.2×)](docs/assets/context-window-chars.png)
+![chart: characters a frontier context window holds, 2018–2026 — vendor text series including Grok 4.5; orange measured overlays are Fable 5 [1m] + pxpipe ~19.0M (4.8×) and Gemini 3.6 Flash + pxpipe ~21.3M (5.3×)](docs/assets/context-window-chars.png)
 
 *Eight years of context growth, in characters. Every text line tops out near
 ~4M chars (a 1M-token window at ~4 chars/token); **Grok 4.5** is shown as a
 text-window point only (500K). The orange overlays are the **same 1M
-windows** read through pxpipe images — ~18.3M chars for Fable 5 (**4.6×**) and ~20.9M chars for Gemini 3.6 Flash (**5.2×** text capacity). Density is measured from a live render at
+windows** read through pxpipe images — ~19.0M chars for Fable 5 (**4.8×**) and ~21.3M chars for Gemini 3.6 Flash (**5.3×** text capacity). Density is measured from a live render at
 generation time, not hand-typed: regenerate with
 `npx tsx scripts/gen-context-chart.ts`
 ([source](scripts/gen-context-chart.ts)).*
@@ -106,7 +106,7 @@ without running the proxy.
   splits: [docs/CACHING_AND_SAVINGS.md](docs/CACHING_AND_SAVINGS.md).
 - **Model scope:** default `PXPIPE_MODELS=claude-fable-5,gemini-3.6-flash`. Sol, Opus
   4.7/4.8, GPT 5.5, and **Grok** are opt-in only (dashboard chips or
-  `PXPIPE_MODELS`) — Gemini 3.6 Flash matches Fable 5 quality (100/100 arithmetic, 98/98 gist, 15/15 dense hex) and is enabled by default.
+  `PXPIPE_MODELS`) — Gemini 3.6 Flash matches Fable 5 on arithmetic and gist and scores 14/15 versus Fable's 13/15 on dense hex; it is enabled by default.
   Grok packing + factsheet helps exact IDs, but quality remains below Fable:
   82/100 arithmetic, 83/98 gist, and 13/18 state tracking. The exact Sol id
   still matters. Sibling variants such as `gpt-5.6-terra` do not
@@ -171,7 +171,7 @@ used for these novel-arithmetic rows.
 | same never-stated probes (lower is better) | `gpt-5.6-sol` | 16 | **4/16** |
 | same never-stated probes (lower is better) | `grok-4.5` | 16 | **0/16** |
 | same never-stated probes (lower is better) | `moonshotai/kimi-k3` | 16 | **1/16** |
-| verbatim 12-char hex, dense render | `google/gemini-3.6-flash` | 15 | **15/15** |
+| verbatim 12-char hex, dense render | `google/gemini-3.6-flash` | 15 | **14/15** |
 | verbatim 12-char hex, dense render | `claude-fable-5` | 15 | **13/15** |
 | verbatim 12-char hex, dense render | `claude-opus-4-8` | 15 | **0/15** |
 | verbatim 12-char hex, same dense pages | `gpt-5.6-sol` | 15 | **0/15** |
@@ -203,8 +203,8 @@ chars/vision-token ÷ 4 (prose text baseline). Not a model-quality score.
 
 | family | window | as text (@4 c/tok) | as pxpipe images | density | multiplier |
 |---|---:|---:|---:|---:|---:|
-| **`claude-fable-5[1m]`** (default) | 1M | ~4.0M | **~18.3M** | ~18.3 c/vt (px÷750) | **~4.6×** |
-| **`google/gemini-3.6-flash`** | 1M | ~4.0M | **~20.9M** | ~20.9 c/vt (flat 1089 tok) | **~5.2×** |
+| **`claude-fable-5[1m]`** (default) | 1M | ~4.0M | **~19.0M** | ~19.0 c/vt (exact 28px patches) | **~4.8×** |
+| **`google/gemini-3.6-flash`** | 1M | ~4.0M | **~21.3M** | ~21.3 c/vt (1,078 tok/page) | **~5.3×** |
 
 Regenerate: `npx tsx scripts/gen-context-chart.ts` · chart PNG
 [`docs/assets/context-window-chars.png`](docs/assets/context-window-chars.png).

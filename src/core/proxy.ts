@@ -254,22 +254,30 @@ function processSseEvent(
   }
 }
 
-function parseGoogleResponseJson(text: string): any {
+function objectRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function parseGoogleResponseJson(text: string): Record<string, unknown> | null {
   const trimmed = text.trim();
   try {
-    const parsed = JSON.parse(trimmed);
+    const parsed: unknown = JSON.parse(trimmed);
     if (Array.isArray(parsed)) {
       for (let i = parsed.length - 1; i >= 0; i--) {
-        if (parsed[i] && (parsed[i].usageMetadata || parsed[i].usage)) return parsed[i];
+        const item = objectRecord(parsed[i]);
+        if (item && (item.usageMetadata || item.usage)) return item;
       }
-      return parsed[parsed.length - 1] ?? parsed[0];
+      return objectRecord(parsed[parsed.length - 1]) ?? objectRecord(parsed[0]);
     }
-    return parsed;
+    return objectRecord(parsed);
   } catch {
     const match = /"usageMetadata"\s*:\s*(\{[^}]+\})/.exec(trimmed);
     if (match && match[1]) {
       try {
-        return { usageMetadata: JSON.parse(match[1]) };
+        const usageMetadata: unknown = JSON.parse(match[1]);
+        return { usageMetadata };
       } catch {}
     }
   }
@@ -929,7 +937,7 @@ export function createProxy(config: ProxyConfig = {}) {
                 : await transformRequest(bodyIn, effectiveOpts)
             : isOpenAIChat
               ? await transformOpenAIChatCompletions(bodyIn, effectiveOpts)
-              : await transformOpenAIResponses(bridgeBody, effectiveOpts);
+              : await transformOpenAIResponses(bodyIn, effectiveOpts);
         if (!modelOk) r.info.reason = 'unsupported_model';
         bodyOut = r.body as unknown as BodyInit; // TS narrows Uint8Array away from BodyInit
         info = r.info;

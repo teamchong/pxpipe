@@ -38,10 +38,10 @@ export const GEMINI_3_6_FLASH_PROFILE: GptModelProfile = {
 };
 
 export function isGeminiModel(model: string | null | undefined): boolean {
-  return /gemini/i.test((model ?? '').toLowerCase());
+  return /gemini/i.test(model ?? '');
 }
 
-export function resolveGeminiProfile(model: string | null | undefined): GptModelProfile {
+export function resolveGeminiProfile(): GptModelProfile {
   return GEMINI_3_6_FLASH_PROFILE;
 }
 

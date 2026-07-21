@@ -68,7 +68,7 @@ Testing 3-channel RGB overprint multiplexing (where three independent text strea
 
 ## 4. Dedicated Gemini Model Profile
 
-`src/core/gpt-model-profiles.ts` defines Gemini's dedicated profile:
+`src/core/gemini-model-profiles.ts` defines Gemini's dedicated profile:
 
 ```typescript
   {

@@ -1,11 +1,10 @@
 /**
- * Unit tests for Google AI Studio / Gemini API transformer and usage extractor.
+ * Unit tests for the Google AI Studio / Gemini API transformer.
  */
 
 import { describe, expect, it } from 'vitest';
 import {
   transformGoogleGenerateContent,
-  extractGoogleUsage,
   parseGoogleModelFromPath,
 } from '../src/core/google.js';
 
@@ -15,44 +14,6 @@ describe('parseGoogleModelFromPath', () => {
     expect(parseGoogleModelFromPath('/v1beta/models/gemini-3.6-flash:streamGenerateContent')).toBe('gemini-3.6-flash');
     expect(parseGoogleModelFromPath('/models/google/gemini-3.6-flash:generateContent')).toBe('google/gemini-3.6-flash');
     expect(parseGoogleModelFromPath('/v1/messages')).toBeNull();
-  });
-});
-
-describe('extractGoogleUsage', () => {
-  it('extracts promptTokenCount and candidatesTokenCount from JSON or SSE chunk', () => {
-    const raw = JSON.stringify({
-      candidates: [{ content: { parts: [{ text: 'hello' }] } }],
-      usageMetadata: {
-        promptTokenCount: 1089,
-        candidatesTokenCount: 42,
-        totalTokenCount: 1131,
-      },
-    });
-    const usage = extractGoogleUsage(raw);
-    expect(usage).toEqual({
-      input_tokens: 1089,
-      output_tokens: 42,
-    });
-  });
-
-  it('extracts usageMetadata from Google AI Studio stream JSON array format', () => {
-    const rawArray = JSON.stringify([
-      { candidates: [{ content: { parts: [{ text: 'chunk 1' }] } }] },
-      {
-        candidates: [{ content: { parts: [{ text: 'chunk 2' }] } }],
-        usageMetadata: { promptTokenCount: 2048, candidatesTokenCount: 99 },
-      },
-    ]);
-    const usage = extractGoogleUsage(rawArray);
-    expect(usage).toEqual({
-      input_tokens: 2048,
-      output_tokens: 99,
-    });
-  });
-
-  it('returns null on invalid JSON or missing usageMetadata', () => {
-    expect(extractGoogleUsage('invalid json')).toBeNull();
-    expect(extractGoogleUsage(JSON.stringify({ text: 'hi' }))).toBeNull();
   });
 });
 

@@ -6,7 +6,7 @@
  */
 
 import { renderTextToPngs, shrinkColsToContent } from './render.js';
-import { resolveGeminiProfile, isGeminiModel } from './gemini-model-profiles.js';
+import { geminiVisionTokens, resolveGeminiProfile } from './gemini-model-profiles.js';
 import { bytesToBase64 } from './png.js';
 import { compactSlabWhitespace, type TransformInfo } from './transform.js';
 import { prepareImagedRenderText, CHAT_HEADER } from './openai.js';
@@ -41,40 +41,6 @@ export interface GoogleGenerateContentRequest {
 export function parseGoogleModelFromPath(pathname: string): string | null {
   const match = /\/models\/([^:]+):/i.exec(pathname);
   return match && match[1] ? match[1] : null;
-}
-
-export function extractGoogleUsage(rawText: string): { input_tokens?: number; output_tokens?: number } | null {
-  const trimmed = rawText.trim();
-  let json: any = null;
-  try {
-    const parsed = JSON.parse(trimmed);
-    if (Array.isArray(parsed)) {
-      for (let i = parsed.length - 1; i >= 0; i--) {
-        if (parsed[i]?.usageMetadata || parsed[i]?.usage) {
-          json = parsed[i];
-          break;
-        }
-      }
-      if (!json) json = parsed[parsed.length - 1];
-    } else {
-      json = parsed;
-    }
-  } catch {
-    const match = /"usageMetadata"\s*:\s*(\{[^}]+\})/.exec(trimmed);
-    if (match && match[1]) {
-      try {
-        json = { usageMetadata: JSON.parse(match[1]) };
-      } catch {}
-    }
-  }
-  const u = json?.usageMetadata ?? json?.usage;
-  if (u && typeof u.promptTokenCount === 'number') {
-    return {
-      input_tokens: u.promptTokenCount,
-      output_tokens: typeof u.candidatesTokenCount === 'number' ? u.candidatesTokenCount : 0,
-    };
-  }
-  return null;
 }
 
 export async function transformGoogleGenerateContent(
@@ -118,7 +84,7 @@ export async function transformGoogleGenerateContent(
     return { body: bodyBytes, info };
   }
 
-  const profile = resolveGeminiProfile(modelName);
+  const profile = resolveGeminiProfile();
   const combined = compactSlabWhitespace(combinedRaw).trimEnd();
   const reflowNote = options.reflow !== false
     ? ' The glyph ↵ (U+21B5) marks an original hard line break in content; treat it as a real newline.'
@@ -133,7 +99,10 @@ export async function transformGoogleGenerateContent(
   );
 
   const images = await renderTextToPngs(renderedText, cols, profile.style, profile.maxHeightPx);
-  const imageTokens = images.length * 1089;
+  const imageTokens = images.reduce(
+    (total, image) => total + geminiVisionTokens(modelName, image.width, image.height),
+    0,
+  );
   const textTokens = Math.max(1, Math.ceil(combinedRaw.length / 3.5));
 
   const profitable = imageTokens < textTokens;

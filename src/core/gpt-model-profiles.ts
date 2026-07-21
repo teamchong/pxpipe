@@ -376,7 +376,7 @@ export function resolveGptProfile(model: string | null | undefined): GptModelPro
   // Match applicability.ts: bracketed transport variants (for example [1m])
   // do not define a different visual reader profile.
   const m = (model ?? '').toLowerCase().replace(/\[[^\]]*\]/g, '');
-  if (isGeminiModel(m)) return resolveGeminiProfile(m);
+  if (isGeminiModel(m)) return resolveGeminiProfile();
   const env = envProfiles();
   if (env.size > 0) {
     let best: GptModelProfile | undefined;

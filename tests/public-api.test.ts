@@ -32,6 +32,8 @@ describe('public library API', () => {
   it('recognizes Fable 5 (with suffix aliases) as the default scope; Opus is OFF by default', () => {
     expect(isPxpipeSupportedModel('claude-fable-5')).toBe(true);
     expect(isPxpipeSupportedModel('claude-fable-5-high')).toBe(true);
+    expect(isPxpipeSupportedModel('google/gemini-3.6-flash')).toBe(true);
+    expect(isPxpipeSupportedModel('untrusted/google/gemini-3.6-flash')).toBe(false);
     // Opus 4.8 is OPT-IN, not in the default scope — same pipeline/render as
     // Fable, but it reads imaged content at a tax (FINDINGS.md 2026-06-16), so
     // the default doesn't silently compress the operator's main driver. Enable

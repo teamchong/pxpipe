@@ -22,7 +22,7 @@ describe('Gemini Model Profiles & Identification', () => {
   });
 
   it('resolves dedicated Gemini profile via resolveGeminiProfile and resolveGptProfile', () => {
-    const prof1 = resolveGeminiProfile('gemini-3.6-flash');
+    const prof1 = resolveGeminiProfile();
     expect(prof1).toBe(GEMINI_3_6_FLASH_PROFILE);
     expect(prof1.stripCols).toBe(312);
     expect(prof1.maxHeightPx).toBe(728);

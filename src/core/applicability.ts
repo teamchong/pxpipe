@@ -83,7 +83,7 @@ function isAllowed(model: string | null | undefined): boolean {
   const base = baseModelId(model).toLowerCase();
   return allowedModelBases().some((b) => {
     const target = b.toLowerCase();
-    return base === target || base.startsWith(`${target}-`) || base === `google/${target}` || base.endsWith(`/${target}`);
+    return base === target || base.startsWith(`${target}-`) || base === `google/${target}`;
   });
 }
 

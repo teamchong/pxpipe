@@ -14,6 +14,6 @@ Gemini 3.6 Flash achieves 100% parity with Fable 5 on reasoning and state tracki
 
 Receipts:
 
-- `model-gemini-3.6-flash-novel-arithmetic-results.json`
-- `gist-recall-gemini-3.6-flash-results.json`
-- `verbatim-hex-gemini-3.6-flash-results.json`
+- `novel-arithmetic-results.json`
+- `gist-recall-results.json`
+- `verbatim-hex-results.json`

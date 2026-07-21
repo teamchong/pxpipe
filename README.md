@@ -182,7 +182,7 @@ used for these novel-arithmetic rows.
 **Codex’s Responses provider** (`OPENAI_BASE_URL`). Kimi K3
 used the same novel-arithmetic corpus and production renderer through pxpipe's
 Cloudflare Messages bridge. Gemini 3.6 Flash used Google AI Studio — see
-[`Gemini 3.6 Flash receipts`](eval/sol-profile/GEMINI_3_6_FLASH_QUALITY_RESULTS.md) and
+[`Gemini 3.6 Flash receipts`](eval/gemini-profile/QUALITY_RESULTS.md) and
 [`K3 receipt`](eval/sol-profile/model-moonshotai_kimi-k3-novel-arithmetic-results.json).
 
 K3 semantic and exact-recall receipts:

@@ -20,14 +20,8 @@ behavioral changes, patch = fixes).
 - Anthropic's patch-based vision-token model and model-specific render profiles.
 
 ### Changed
-- Multi-column rendering was removed from the public render and transform
-  options. It was never exposed in the dashboard; Node used single-column by
-  default, while the Cloudflare Worker defaulted to two columns and SDK callers
-  could opt in. Production geometry measurements showed that gutters increased
-  a representative Gemini corpus from 30 images to 31 or 32, so single-column
-  rendering is now the only path. This removes the pre-1.0 `multiCol` option
-  from `RenderTextToImagesOptions` and `TransformOptions`, and removes the
-  Worker `MULTI_COL` setting.
+- Removed the undocumented pre-1.0 `multiCol` SDK option and Worker setting;
+  Node and dashboard behavior remains single-column.
 - Missing atlas glyphs are escaped as `[U+HEX]` instead of silently dropped.
 - Gemini and OpenAI history compression preserve the live request and recent
   tail as native text while imaging only closed old history.

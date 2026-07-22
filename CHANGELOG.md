@@ -27,7 +27,10 @@ behavioral changes, patch = fixes).
   cache writes, and exclude current and legacy Google traffic from Claude-priced
   dollar totals.
 - Dashboard model-scope changes persist in the Node config file across restarts.
-- 4xx request-body persistence is opt-in rather than enabled by default.
+- 4xx request and upstream error-body persistence is opt-in rather than enabled
+  by default; telemetry, config, and debug files use private filesystem modes.
+- Dashboard routes remain loopback-only even when the proxy API binds externally,
+  and browser mutations reject cross-origin requests.
 - Compatibility: removed the pre-1.0 `multiCol` SDK option and Worker setting;
   rendering is now single-column in every runtime.
 

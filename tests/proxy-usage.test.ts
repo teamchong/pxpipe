@@ -364,7 +364,7 @@ describe('proxy usage extraction', () => {
       onRequest: (e) => { captured = e; },
     });
     const body = JSON.stringify({
-      model: 'gpt-5.6-sol', max_tokens: 16,
+      model: 'claude-gpt-5.6-sol', max_tokens: 16,
       system: 'System instruction. '.repeat(900),
       messages: [
         { role: 'user', content: [
@@ -399,6 +399,7 @@ describe('proxy usage extraction', () => {
     expect(upstreamRequests[0]!.headers.has('anthropic-beta')).toBe(false);
     expect(upstreamRequests.some((r) => r.url.includes('/count_tokens'))).toBe(false);
     const sent = JSON.parse(await upstreamRequests[0]!.text()) as any;
+    expect(sent.model).toBe('gpt-5.6-sol');
     expect(sent.max_output_tokens).toBe(16);
     expect(sent.tools[0]).toMatchObject({ type: 'function', name: 'search' });
     expect(sent.input).toContainEqual(expect.objectContaining({
@@ -1287,6 +1288,7 @@ describe('proxy usage extraction', () => {
     let captured: ProxyEvent | undefined;
     const proxy = createProxy({
       transform: {},
+      captureErrorReqBody: true,
       onRequest: (e) => {
         captured = e;
       },
@@ -1325,6 +1327,7 @@ describe('proxy usage extraction', () => {
     let captured: ProxyEvent | undefined;
     const proxy = createProxy({
       transform: {},
+      captureErrorReqBody: true,
       onRequest: (e) => {
         captured = e;
       },
@@ -1410,8 +1413,8 @@ describe('proxy usage extraction', () => {
   });
 
   it('does NOT capture the 4xx request body by default (privacy, issue #69)', async () => {
-    // Request bodies hold full prompts + any secrets in context, so raw-body
-    // capture is opt-in only. errorBody (the upstream error) still lands.
+    // Either side of a custom gateway error may echo prompts or credentials,
+    // so both request and upstream error-body persistence are opt-in only.
     const restore = mockUpstream(
       () =>
         new Response(JSON.stringify({ error: { type: 'bad' } }), {
@@ -1442,7 +1445,7 @@ describe('proxy usage extraction', () => {
     expect(captured!.status).toBe(400);
     expect(captured!.reqBodySha8).toMatch(/^[0-9a-f]{8}$/); // hash still lands
     expect(captured!.reqBodyGz).toBeUndefined(); // but not the raw body
-    expect(captured!.errorBody).toBeDefined(); // upstream error still captured
+    expect(captured!.errorBody).toBeUndefined();
   });
 
   it('does NOT gzip the request body on 2xx (but still sets reqBodySha8)', async () => {

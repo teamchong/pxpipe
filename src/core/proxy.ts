@@ -50,10 +50,8 @@ export interface ProxyConfig {
   transform?: TransformOptions | (() => TransformOptions);
   /** Called after every request — useful for logging / metrics in the host. */
   onRequest?: (event: ProxyEvent) => void | Promise<void>;
-  /** Persist the gzipped request body on 4xx (→ reqBodyGz, sidecar/inline).
-   *  Off by default: request bodies hold full prompts and any secrets in
-   *  context, so raw-body capture is opt-in debugging only. The upstream
-   *  error body (errorBody) is unaffected — it carries no user content. */
+  /** Persist 4xx diagnostics: the gzipped request body plus the upstream error
+   *  body. Off by default because either side may contain prompts or secrets. */
   captureErrorReqBody?: boolean;
 }
 
@@ -977,7 +975,7 @@ export function createProxy(config: ProxyConfig = {}) {
         // Messages → Chat Completions bridge toward Cloudflare Workers AI.
         bridgedChatMessages = forceChat;
         const chatStamp = bridgedChatMessages ? routedModel : undefined;
-        const effectiveModel = chatStamp ?? model;
+        const effectiveModel = (bridgedGptMessages || bridgedChatMessages) ? routedModel : model;
         const modelOk = isGoogle
           ? isPxpipeSupportedModel(model)
           : isMessages
@@ -987,12 +985,20 @@ export function createProxy(config: ProxyConfig = {}) {
             : isPxpipeSupportedGptModel(model);
         // Compression eligibility and telemetry follow the model that actually
         // receives the request, not Claude Code's local gateway alias.
-        if (bridgedChatMessages && effectiveModel) requestModel = effectiveModel;
+        if ((bridgedGptMessages || bridgedChatMessages) && effectiveModel) {
+          requestModel = effectiveModel;
+        }
         const effectiveOpts = modelOk
           ? transformOpts
           : { ...transformOpts, compress: false };
         const bridgeBody = bridgedGptMessages
-          ? anthropicMessagesToOpenAIResponses(bodyIn)
+          ? (() => {
+              const bridged = JSON.parse(new TextDecoder().decode(
+                anthropicMessagesToOpenAIResponses(bodyIn),
+              )) as Record<string, unknown>;
+              bridged.model = effectiveModel;
+              return new TextEncoder().encode(JSON.stringify(bridged));
+            })()
           : bridgedChatMessages
             ? anthropicMessagesToOpenAIChat(bodyIn, chatStamp ?? undefined)
             : bodyIn;
@@ -1182,7 +1188,16 @@ export function createProxy(config: ProxyConfig = {}) {
       measurementPromise.catch(() => undefined),
       stopReasonPromise.catch(() => undefined),
     ]).then(([usage, errorBody, measurement, stopReason]) =>
-      fire(upstreamRes.status, info, undefined, firstByteMs, usage, errorBody, measurement, stopReason),
+      fire(
+        upstreamRes.status,
+        info,
+        undefined,
+        firstByteMs,
+        usage,
+        config.captureErrorReqBody ? errorBody : undefined,
+        measurement,
+        stopReason,
+      ),
     );
 
     return new Response(teed.body, {

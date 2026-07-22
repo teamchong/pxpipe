@@ -11,6 +11,7 @@ import { once } from 'node:events';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
+import { isIP } from 'node:net';
 import { spawnSync } from 'node:child_process';
 import { createProxy, parseGatewayHeaders, resolveUpstreams, type ProxyConfig } from './core/proxy.js';
 import {
@@ -40,10 +41,8 @@ import {
  *  control. No CLI flags beyond --help/--version. */
 interface RuntimeConfig {
   port: number;
-  /** Interface to bind. Defaults to 127.0.0.1 (loopback only) — the dashboard
-   *  is unauthenticated and serves captured request context, so it must not be
-   *  exposed to the LAN by default. Set HOST=0.0.0.0 to opt into all interfaces
-   *  (e.g. reaching the dashboard from another device / the host of a container). */
+  /** Interface to bind. Defaults to 127.0.0.1; non-loopback bindings expose
+   *  only the proxy API because dashboard routes remain loopback-only. */
   host: string;
   upstream: string;
   openAIUpstream: string;
@@ -57,7 +56,7 @@ interface RuntimeConfig {
   gatewayBaseUrl?: string;
   gatewayHeaders?: Record<string, string>;
   eventsFile: string;
-  /** Persist 4xx request bodies to disk for debugging. Off unless
+  /** Persist 4xx request and upstream error bodies for debugging. Off unless
    *  PXPIPE_DEBUG_CAPTURE_4XX=1. */
   captureErrorReqBody: boolean;
 }
@@ -102,7 +101,6 @@ function applyConfigFileDefaults(): void {
 function persistModelBasesToConfig(bases: readonly string[]): void {
   const file = process.env.PXPIPE_CONFIG ?? DEFAULT_CONFIG_FILE;
   let cfg: Record<string, unknown> = {};
-  let mode = 0o600;
   try {
     const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as unknown;
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
@@ -110,7 +108,6 @@ function persistModelBasesToConfig(bases: readonly string[]): void {
       return;
     }
     cfg = parsed as Record<string, unknown>;
-    mode = fs.statSync(file).mode & 0o777;
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== 'ENOENT') {
       console.warn(`[pxpipe] could not persist model scope: invalid config ${file}: ${(e as Error).message}`);
@@ -121,10 +118,13 @@ function persistModelBasesToConfig(bases: readonly string[]): void {
   cfg.models = [...bases];
   const tmp = `${file}.tmp-${process.pid}`;
   try {
-    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const parentExists = fs.existsSync(path.dirname(file));
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    if (!parentExists) fs.chmodSync(path.dirname(file), 0o700);
     // Write-then-rename so a crash mid-write can't corrupt the config.
-    fs.writeFileSync(tmp, `${JSON.stringify(cfg, null, 2)}\n`, { mode });
+    fs.writeFileSync(tmp, `${JSON.stringify(cfg, null, 2)}\n`, { mode: 0o600 });
     fs.renameSync(tmp, file);
+    fs.chmodSync(file, 0o600);
   } catch (e) {
     try {
       fs.unlinkSync(tmp);
@@ -182,8 +182,8 @@ function parseCli(argv: string[]): RuntimeConfig {
     eventsFile:
       process.env.PXPIPE_LOG ??
       path.join(os.homedir(), '.pxpipe', 'events.jsonl'),
-    // Off by default: 4xx request bodies hold full prompts + any secrets in
-    // context. Opt in for debugging only. (issue #69)
+    // Off by default: either side of a 4xx may hold prompts or secrets.
+    // Opt in for debugging only. (issue #69)
     captureErrorReqBody: process.env.PXPIPE_DEBUG_CAPTURE_4XX === '1',
   };
 }
@@ -216,8 +216,8 @@ Flags:
 Environment:
   PORT                    listen port (default 47821)
   HOST                    interface to bind (default 127.0.0.1, loopback only).
-                          Set 0.0.0.0 to expose the dashboard off-host — note it
-                          is unauthenticated and serves captured request context.
+                          Non-loopback bindings expose only the proxy API;
+                          dashboard routes remain loopback-only.
   PXPIPE_UPSTREAM         upstream API base for every API family
   ANTHROPIC_UPSTREAM      Anthropic API base; overrides PXPIPE_UPSTREAM
                            (default https://api.anthropic.com)
@@ -241,9 +241,9 @@ Environment:
   PXPIPE_LOG              JSONL events path (default ~/.pxpipe/events.jsonl)
   PXPIPE_DUMP_DIR         debug: write every rendered PNG here (what the model
                           sees); off unless set. Compress arm only.
-  PXPIPE_DEBUG_CAPTURE_4XX  debug: set to 1 to persist full 4xx request bodies
-                          (prompts + any secrets in context) to disk. Off by
-                          default; on-disk telemetry keeps only hashes.
+  PXPIPE_DEBUG_CAPTURE_4XX  debug: set to 1 to persist full 4xx request and
+                          upstream error bodies (prompts + any secrets in
+                          context) to disk. Off by default.
 
 Use with Claude Code:
   ANTHROPIC_BASE_URL=http://127.0.0.1:47821 claude
@@ -414,6 +414,48 @@ async function readRequestBody(req: IncomingMessage): Promise<string> {
   return Buffer.concat(chunks).toString('utf8');
 }
 
+function isLoopbackAddress(address: string | undefined): boolean {
+  if (!address) return false;
+  return address === '::1' || address === '127.0.0.1' || address.startsWith('127.')
+    || address.startsWith('::ffff:127.');
+}
+
+function isLoopbackHostname(hostname: string): boolean {
+  const host = hostname.toLowerCase();
+  return host === 'localhost' || host === '[::1]' || host === '::1'
+    || (isIP(host) === 4 && host.split('.')[0] === '127');
+}
+
+function isDashboardMutation(route: DashboardRoute, method: string): boolean {
+  return method === 'POST' && (
+    route.kind === 'api-compression'
+    || (route.kind === 'fragment' && (route.name === 'toggle' || route.name === 'models'))
+  );
+}
+
+/** Reject browser cross-site writes to the unauthenticated loopback dashboard. */
+function isSameOriginDashboardRequest(req: IncomingMessage, url: URL): boolean {
+  const fetchSite = req.headers['sec-fetch-site'];
+  if (fetchSite === 'cross-site') return false;
+  const origin = req.headers.origin;
+  if (origin === undefined) return true; // local CLI/curl clients do not send Origin
+  try {
+    return new URL(origin).origin === url.origin;
+  } catch {
+    return false;
+  }
+}
+
+function ensurePrivateDirectory(dir: string): void {
+  const existed = fs.existsSync(dir);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  if (!existed) {
+    fs.chmodSync(dir, 0o700);
+  } else if ((fs.statSync(dir).mode & 0o077) !== 0) {
+    throw new Error('directory is accessible by other users');
+  }
+}
+
 /**
  * Dispatch a matched DashboardRoute to the appropriate handler. Returns
  * undefined when the method/route combination doesn't apply so the caller
@@ -561,7 +603,10 @@ class FileTracker implements Tracker {
   private ensureOpen(): boolean {
     if (this.fd != null) return true;
     try {
-      fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
+      const parent = path.dirname(this.filePath);
+      const parentExists = fs.existsSync(parent);
+      fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
+      if (!parentExists) fs.chmodSync(parent, 0o700);
     } catch {
       /* dir may already exist or be unmkable; openSync below will surface */
     }
@@ -572,7 +617,8 @@ class FileTracker implements Tracker {
       this.bytesWritten = 0;
     }
     try {
-      this.fd = fs.openSync(this.filePath, 'a');
+      this.fd = fs.openSync(this.filePath, 'a', 0o600);
+      fs.chmodSync(this.filePath, 0o600);
       return true;
     } catch (err) {
       if (!this.brokenLogged) {
@@ -667,7 +713,7 @@ async function maybeWriteBodySidecar(
 ): Promise<string | undefined> {
   try {
     // Lazy mkdir — only when we actually need to write.
-    fs.mkdirSync(dir, { recursive: true });
+    ensurePrivateDirectory(dir);
   } catch {
     return undefined;
   }
@@ -678,7 +724,8 @@ async function maybeWriteBodySidecar(
   const tag = sha8 ?? 'nohash';
   const filePath = path.join(dir, `${ts}-${tag}.json.gz`);
   try {
-    await fs.promises.writeFile(filePath, bytesGz);
+    await fs.promises.writeFile(filePath, bytesGz, { mode: 0o600 });
+    await fs.promises.chmod(filePath, 0o600);
     return filePath;
   } catch {
     return undefined;
@@ -993,7 +1040,7 @@ async function main(): Promise<void> {
   let imageDumpSeq = 0;
   if (imageDumpDir) {
     try {
-      fs.mkdirSync(imageDumpDir, { recursive: true });
+      ensurePrivateDirectory(imageDumpDir);
       console.log(`[pxpipe] PXPIPE_DUMP_DIR set — dumping rendered PNGs to ${imageDumpDir}`);
     } catch (err) {
       console.warn(`[pxpipe] PXPIPE_DUMP_DIR unusable (${(err as Error).message}) — image dumping disabled`);
@@ -1078,7 +1125,7 @@ async function main(): Promise<void> {
         for (let i = 0; i < pngs.length; i++) {
           const name = `${stamp}_req${String(seq).padStart(3, '0')}_${modelTag}_p${String(i + 1).padStart(2, '0')}.png`;
           try {
-            fs.writeFileSync(path.join(imageDumpDir, name), pngs[i]!);
+            fs.writeFileSync(path.join(imageDumpDir, name), pngs[i]!, { mode: 0o600 });
           } catch (err) {
             console.warn(`[pxpipe] PNG dump write failed: ${(err as Error).message}`);
             break; // dir vanished / full — stop hammering it this request
@@ -1108,9 +1155,8 @@ async function main(): Promise<void> {
         `[${new Date().toISOString()}] ${e.method} ${e.path} → ${e.status} (${e.durationMs}ms) ${tag}${usageTag}`,
       );
 
-      // Surface upstream 4xx error bodies inline so a regression in the
-      // request shape is obvious without having to grep events.jsonl. The
-      // tracker JSONL already has the full ~2 KiB capture.
+      // Upstream error bodies are present only under PXPIPE_DEBUG_CAPTURE_4XX;
+      // custom gateways may echo prompt fragments or credentials in them.
       if (e.errorBody) {
         const trimmed = e.errorBody.length > 400
           ? e.errorBody.slice(0, 400) + '…'
@@ -1158,6 +1204,15 @@ async function main(): Promise<void> {
         const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
         const route = dashboardPath(url.pathname);
         if (route) {
+          if (!isLoopbackAddress(req.socket.remoteAddress) || !isLoopbackHostname(url.hostname)) {
+            await writeWebResponse(new Response('dashboard is loopback-only', { status: 403 }), res);
+            return;
+          }
+          if (isDashboardMutation(route, req.method ?? 'GET')
+            && !isSameOriginDashboardRequest(req, url)) {
+            await writeWebResponse(new Response('cross-origin dashboard mutation denied', { status: 403 }), res);
+            return;
+          }
           const webRes = await dispatchDashboard(dashboard, route, req, url, opts.port);
           if (webRes) {
             await writeWebResponse(webRes, res);
@@ -1183,9 +1238,8 @@ async function main(): Promise<void> {
     console.log(`[pxpipe] listening on http://${displayHost}:${opts.port}`);
     if (!isLoopbackHost) {
       console.warn(
-        `[pxpipe] WARNING: bound to ${opts.host} — the unauthenticated dashboard ` +
-          `(captured request context + kill switch) is reachable off-host. ` +
-          `Unset HOST to restrict to loopback.`,
+        `[pxpipe] bound to ${opts.host}; proxy API is reachable off-host, ` +
+          `but dashboard routes remain loopback-only.`,
       );
     }
     const routes = resolveUpstreams(config);
@@ -1201,8 +1255,9 @@ async function main(): Promise<void> {
     console.log(`[pxpipe] dashboard → http://127.0.0.1:${opts.port}/`);
     if (opts.captureErrorReqBody) {
       console.warn(
-        `[pxpipe] PXPIPE_DEBUG_CAPTURE_4XX=1 — persisting full 4xx request bodies ` +
-          `(prompts + any secrets in context) to ${bodySidecarDir}. Debugging only.`,
+        `[pxpipe] PXPIPE_DEBUG_CAPTURE_4XX=1 — persisting full 4xx request and ` +
+          `upstream error bodies (prompts + any secrets in context) to ${bodySidecarDir}. ` +
+          `Debugging only.`,
       );
     }
   });

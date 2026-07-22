@@ -200,7 +200,11 @@ function anthropicUsage(raw: unknown): JsonObject {
 }
 
 function parseArguments(value: unknown): unknown {
-  if (typeof value !== 'string') return {};
+  // Empty string = a no-argument tool call; treat as {} rather than throwing.
+  // Mirrors the Chat bridge (messages-chat-bridge.ts) and the streaming path,
+  // which both yield input:{} for empty args. Without this, JSON.parse('')
+  // throws and fails the whole turn on a benign no-arg tool call.
+  if (typeof value !== 'string' || value.trim() === '') return {};
   try { return JSON.parse(value); } catch {
     throw new Error('OpenAI returned malformed function-call arguments');
   }

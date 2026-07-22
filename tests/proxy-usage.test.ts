@@ -184,7 +184,7 @@ describe('proxy usage extraction', () => {
     expect(captured?.info?.baselineProbeStatus).toBe('ok');
   });
 
-  it('passes Gemini through when countTokens fails', async () => {
+  it('keeps Gemini compression when optional countTokens measurement fails', async () => {
     const forwardedBodies: string[] = [];
     const restore = mockUpstream(async (req) => {
       if (req.url.includes(':countTokens')) return new Response('no', { status: 503 });
@@ -212,9 +212,10 @@ describe('proxy usage extraction', () => {
     await new Promise((resolve) => setTimeout(resolve, 20));
     restore();
 
-    expect(forwardedBodies).toEqual([body]);
-    expect(captured?.info?.compressed).toBe(false);
-    expect(captured?.info?.reason).toBe('baseline_probe_failed');
+    expect(forwardedBodies).toHaveLength(1);
+    expect(forwardedBodies[0]).toContain('inlineData');
+    expect(captured?.info?.compressed).toBe(true);
+    expect(captured?.info?.reason).toBeUndefined();
     expect(captured?.info?.baselineProbeStatus).toBe('failed');
   });
 

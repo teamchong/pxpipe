@@ -113,8 +113,9 @@ without running the proxy.
   inherit Sol's allowlist or render profile. `PXPIPE_MODELS=off` disables
   imaging. Everything else passes through byte-identical. On the GPT path,
   tool definitions stay native JSON and no Anthropic `cache_control`
-  markers are used. Responses history compression recognizes adjacent completed
-  `function_call`/`function_call_output` pairs: only old closed pairs are imaged;
+  markers are used. Responses history compression recognizes completed
+  `function_call`/`function_call_output` pairs, including OpenCode's parallel
+  calls-then-outputs rounds: only old closed rounds are imaged atomically;
   the newest six completed pairs, every open call, and malformed/orphan state
   remain native. The default history budget is 32 images; opt-in long-session
   coverage can be raised (defensive cap 100) with

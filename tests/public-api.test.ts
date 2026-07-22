@@ -379,7 +379,7 @@ describe('public library API', () => {
     expect(firstUser.content[0].type).toBe('image_url');
     expect(firstUser.content[0].image_url.url).toMatch(/^data:image\/png;base64,/);
     expect(out.messages[0].content).toContain('rendered into image');
-    expect(out.tools[0].function.description).toBe('Read a file from disk. '.repeat(100));
+    expect(out.tools[0].function.description).toBe('Full docs: see "## Tool: read_file" in the rendered context image.');
     expect(out.tools[0].function.parameters.description).toBeUndefined();
     expect(out.tools[0].function.parameters.properties.path.description).toBeUndefined();
     expect(JSON.stringify(out)).not.toContain('cache_control');

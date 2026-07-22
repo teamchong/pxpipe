@@ -453,6 +453,59 @@ describe('planResponsesPairCollapse — native state classification', () => {
     expect(plan.pairState.malformedItems).toBe(2);
   });
 
+  it('collapses OpenCode parallel call/output rounds atomically', async () => {
+    const items: Array<Record<string, unknown>> = [];
+    for (let round = 0; round < 6; round++) {
+      for (let call = 0; call < 4; call++) {
+        const id = `round_${round}_${call}`;
+        items.push({
+          type: 'function_call', id: `fc_${id}`, call_id: id,
+          name: 'read', arguments: `{"path":"${id}"}`,
+        });
+      }
+      for (let call = 0; call < 4; call++) {
+        const id = `round_${round}_${call}`;
+        items.push({
+          type: 'function_call_output', call_id: id,
+          output: `${id} ${'large output '.repeat(300)}`,
+        });
+      }
+    }
+    const plan = await planResponsesPairCollapse(items, yes, {
+      responsesMode: 'mixed', keepRecentPairs: 4,
+      minCollapseTokens: 1, maxImages: 100,
+    });
+    expect(plan.pairState).toMatchObject({
+      completedPairs: 24,
+      oldCompletedPairs: 20,
+      recentCompletedPairs: 4,
+      malformedItems: 0,
+      collapsedPairs: 20,
+    });
+    const selected = new Set(plan.selectedIndices);
+    for (let round = 0; round < 6; round++) {
+      const roundIndices = Array.from({ length: 8 }, (_, i) => round * 8 + i);
+      const selectedCount = roundIndices.filter((i) => selected.has(i)).length;
+      expect([0, 8]).toContain(selectedCount);
+    }
+    expect(plan.pairState.collapsedFunctionOutputTokens).toBeGreaterThan(0);
+  });
+
+  it('keeps an incomplete parallel round entirely native', async () => {
+    const items: Array<Record<string, unknown>> = [
+      { type: 'function_call', call_id: 'a', name: 'read', arguments: '{}' },
+      { type: 'function_call', call_id: 'b', name: 'read', arguments: '{}' },
+      { type: 'function_call_output', call_id: 'a', output: 'a result' },
+    ];
+    const plan = await planResponsesPairCollapse(items, yes, {
+      responsesMode: 'mixed', keepRecentPairs: 0,
+      minCollapseTokens: 1, maxImages: 100,
+    });
+    expect(plan.selectedIndices).toEqual([]);
+    expect(plan.pairState.openCalls).toBe(1);
+    expect(plan.pairState.malformedItems).toBe(2);
+  });
+
   it('keeps orphan, duplicate, reversed, and missing-id items native', async () => {
     const items: Array<Record<string, unknown>> = [];
     for (let i = 0; i < 12; i++) items.push(...pair(`good_${i}`));

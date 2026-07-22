@@ -1023,21 +1023,23 @@ export function createProxy(config: ProxyConfig = {}) {
             countGoogleTokensUpstream(countUrl.toString(), bodyIn, countHeaders, model!),
             countGoogleTokensUpstream(countUrl.toString(), r.body, countHeaders, model!),
           ]);
-          if (baseline === null || transformed === null || transformed >= baseline) {
+          if (baseline === null || transformed === null) {
+            // countTokens is optional measurement, not a delivery dependency.
+            // The transformer already applied a conservative local gate.
+            r.info.baselineProbeStatus = 'failed';
+          } else if (transformed >= baseline) {
             r = {
               body: bodyIn,
               info: {
                 ...r.info,
                 compressed: false,
-                reason: baseline === null || transformed === null
-                  ? 'baseline_probe_failed'
-                  : `not_profitable (${transformed} >= ${baseline} tokens)`,
+                reason: `not_profitable (${transformed} >= ${baseline} tokens)`,
                 imageCount: 0,
                 imageBytes: 0,
                 imageTokens: undefined,
                 baselineImagedTokens: undefined,
                 nativeInjectedTokens: undefined,
-                baselineProbeStatus: baseline === null || transformed === null ? 'failed' : 'ok',
+                baselineProbeStatus: 'ok',
               },
             };
           } else {

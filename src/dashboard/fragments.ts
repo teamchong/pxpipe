@@ -212,14 +212,13 @@ export function renderSessionSummaryFragment(s: StatsPayload): string {
   return (
     `<div class="hero${positive ? '' : ' hero-neg'}">` +
     `<div class="hero-eyebrow">Since start · ${numFmt(measured)} request${measured === 1 ? '' : 's'} imaged</div>` +
-    `<div class="hero-headline"><span class="hero-num">${bigNum}</span> ${word} after caching</div>` +
+    `<div class="hero-headline"><span class="hero-num">${bigNum}</span> ${word}</div>` +
     `<div class="hero-sub">` +
-    `<strong>${kFmt(actualW)}</strong> effective tokens vs <strong>${kFmt(baselineW)}</strong> if this same context ` +
-    `stayed plain text — both counted after normal cache discounts since this proxy started. ` +
-    `Your latest messages and Claude's live output are never compressed.` +
+    `<strong>${kFmt(actualW)}</strong> provider-accounted input tokens vs <strong>${kFmt(baselineW)}</strong> if this same context ` +
+    `stayed plain text. Your latest messages and model output are never compressed.` +
     `</div>` +
     `<div class="hero-meta">` +
-    `Cache-aware — cached reads counted at their real ~0.1× weight, not full price · ` +
+    `Provider-token basis; cache discounts applied where measurable · ` +
     `output untouched (${kFmt(rawOutput)}) · no $ assumptions` +
     `</div>` +
     `</div>`
@@ -259,6 +258,11 @@ function statTile(
 
 export function renderHeaderFragment(s: StatsPayload, port: number): string {
   const pa = s.pricing_assumptions;
+  const unpricedImaged = Math.max(
+    0,
+    (s.compressed_requests ?? 0) - (s.compressed_paid_requests ?? 0),
+  );
+  const onlyUnpriced = unpricedImaged > 0 && (s.compressed_paid_requests ?? 0) === 0;
 
   // Compare the same imaged requests on both sides. Passthrough requests are
   // generally smaller because the profitability gate selected them, so their
@@ -274,12 +278,38 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
         cAvg <= withoutAvg ? 'pos' : 'neg',
         'Average cost of paid imaged requests versus the cache-aware text counterfactual for those same requests. Unmeasured requests are assigned zero savings.',
       )
-    : statTile(
+    : onlyUnpriced
+      ? statTile(
+          'Cost per request',
+          '—',
+          'provider pricing not configured',
+          'muted-val',
+          'Token savings are available, but this provider is excluded from Claude-priced dollar estimates.',
+        )
+      : statTile(
         'Cost per request',
         'collecting…',
         'waiting for a paid imaged request',
         'muted-val',
         'The comparison appears after an imaged request returns provider usage.',
+      );
+
+  const savedUsdTile = onlyUnpriced
+    ? statTile(
+        'Estimated saved',
+        '—',
+        'provider pricing not configured',
+        'muted-val',
+        'Token savings are shown separately. Dollar estimates require provider-specific pricing and are not inferred from Claude rates.',
+      )
+    : statTile(
+        'Estimated saved',
+        `$${(s.saved_usd ?? 0).toFixed(2)}`,
+        unpricedImaged > 0
+          ? `${numFmt(unpricedImaged)} provider-priced request${unpricedImaged === 1 ? '' : 's'} excluded`
+          : `at $${pa.input_per_mtok}/M base input price`,
+        '',
+        'Cache-aware estimate for requests covered by the configured pricing assumptions. Other providers remain excluded.',
       );
 
   const strip =
@@ -290,15 +320,9 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
       numFmt(s.saved_input_tokens),
       'vs sending the same context as text',
       'pos',
-      'Bulky context (system prompt, tool output, old turns) sent as compact images instead of text. Cache-aware, input side only — recent turns and the live output stay text.',
-    ) +
-    statTile(
-      'Estimated saved',
-      `$${(s.saved_usd ?? 0).toFixed(2)}`,
-      `at $${pa.input_per_mtok}/M base input price`,
-      '',
-      'Cache-aware estimate using the server-reported 5-minute/1-hour write split when available (1.25×/2×), cache reads (0.10×), and the base input price.',
-    ) +
+       'Bulky context sent as compact images instead of text. Uses provider-reported input tokens and a measured or model-profile text counterfactual; recent turns and output stay text.',
+     ) +
+    savedUsdTile +
     costTile +
     `</div>`;
 
@@ -312,7 +336,10 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
     mathRow('saved', s.saved_input_tokens, `<span class="op">=</span> baseline − actual`) +
     `<span class="src">output excluded — identical with/without compression</span>`;
 
-  const usdMath =
+  const usdMath = onlyUnpriced
+    ? `<div><span class="v">Unavailable for this provider.</span></div>` +
+      `<span class="src">Token savings are still reported; Claude pricing is not applied across providers.</span>`
+    :
     `<div><span class="k">formula:</span> <span class="v">$ saved = saved_tokens × $${pa.input_per_mtok}/Mtok</span></div>` +
     `<div class="sp"></div>` +
     mathRow('saved_tokens', s.saved_input_tokens, '(cache-aware, input-side)') +
@@ -475,7 +502,7 @@ export function renderContextMapFragment(
         `<div class="ctx-row"><span class="ctx-lbl">${label}</span><span class="ctx-val">${kFmt(n)} tok</span></div>`,
       ).join('') +
       `<div class="ctx-row"><span class="ctx-lbl">Imageable text baseline</span><span class="ctx-val">${kFmt(c.baselineImagedTokens ?? 0)} tok</span></div>` +
-      `<div class="ctx-row"><span class="ctx-lbl">Adjacent completed pairs (old / recent native / imaged)</span><span class="ctx-val">${rc.completedFunctionPairs ?? 0} (${rc.oldFunctionPairs ?? 0} / ${rc.recentNativeFunctionPairs ?? 0} / ${rc.collapsedFunctionPairs ?? 0})</span></div>` +
+      `<div class="ctx-row"><span class="ctx-lbl">Completed tool pairs (old / recent native / imaged)</span><span class="ctx-val">${rc.completedFunctionPairs ?? 0} (${rc.oldFunctionPairs ?? 0} / ${rc.recentNativeFunctionPairs ?? 0} / ${rc.collapsedFunctionPairs ?? 0})</span></div>` +
       `<div class="ctx-row"><span class="ctx-lbl">Open calls kept native</span><span class="ctx-val">${rc.openFunctionCalls ?? 0}</span></div>` +
       `<div class="ctx-row"><span class="ctx-lbl">Native image parts</span><span class="ctx-val">${rc.imageParts}</span></div>` +
       `<div class="ctx-row"><span class="ctx-lbl">Provider tokens not explained locally</span><span class="ctx-val">${kFmt(c.responsesUnexplainedTokens ?? 0)} tok</span></div>` +
@@ -502,6 +529,7 @@ export function renderContextMapFragment(
   // request's observed cache state: cache_read > 0 means warm, cache_read === 0
   // means cold. No wall-clock-only counterfactual is credited.
   const warm = showCompare && c.warm;
+  const google = c.model?.startsWith('gemini-') === true;
   const textNoun = warm ? 'cached text' : 'text';
   // Raw count_tokens can grow (imaging bloated a short prompt), so say so rather
   // than rendering a nonsensical "shrank -36%".
@@ -510,13 +538,19 @@ export function renderContextMapFragment(
   const headline = !showCompare
     ? `<strong>${kFmt(c.actualInputEff || c.realInput)}</strong> billing-equivalent input tokens sent`
     : pct >= 0
-      ? `<span class="ctx-big">${pct}%</span> smaller — ${textNoun} would bill as <strong>${kFmt(base)}</strong> input tokens; images billed as <strong>${kFmt(real)}</strong>`
-      : `<span class="ctx-big">${-pct}%</span> bigger — images billed as <strong>${kFmt(real)}</strong> input tokens vs <strong>${kFmt(base)}</strong> for ${textNoun}`;
+      ? google
+        ? `<span class="ctx-big">${pct}%</span> smaller — text would account as <strong>${kFmt(base)}</strong> input tokens; images account as <strong>${kFmt(real)}</strong>`
+        : `<span class="ctx-big">${pct}%</span> smaller — ${textNoun} would bill as <strong>${kFmt(base)}</strong> input tokens; images billed as <strong>${kFmt(real)}</strong>`
+      : google
+        ? `<span class="ctx-big">${-pct}%</span> bigger — images account as <strong>${kFmt(real)}</strong> input tokens vs <strong>${kFmt(base)}</strong> for text`
+        : `<span class="ctx-big">${-pct}%</span> bigger — images billed as <strong>${kFmt(real)}</strong> input tokens vs <strong>${kFmt(base)}</strong> for ${textNoun}`;
   // Clarifying sub-line. It must match the actual request's cache state: claiming
   // a 0.1× read discount when cache_read===0 would count hypothetical cache as a
   // pxpipe effect, so cold rows price both paths cold.
   const subnote = !showCompare
     ? 'Billed tokens count cache discounts (reads at 0.1×) — no trustworthy text baseline for this request yet.'
+    : google
+      ? `Same provider-token basis as the Saved column. The gap is token count. ${rawPhrase}`
     : !warm
       ? `No warm text cache this turn — the text counterfactual's prefix is priced at the 1.25× create rate (the same event the imaged path pays), identical basis to the Saved column. The gap is purely token count. ${rawPhrase}`
       : pct < 0 && rawShrink > 0
@@ -615,7 +649,7 @@ export function renderRecentFragment(p: RecentPayload): string {
     `<th>Endpoint</th>` +
     `<th>Model</th>` +
     `<th title="Was this request's context compressed into an image?">Sent as</th>` +
-    `<th class="num" title="Tokens served from Claude's cache (cheap)">Cache hits</th>` +
+    `<th class="num" title="Tokens the provider reported as served from cache">Cache hits</th>` +
     `<th class="num" title="Billing-equivalent input if kept as plain text, after cache create/read rates">As text</th>` +
     `<th class="num" title="Actual billing-equivalent input after imaging, after cache create/read rates">Sent</th>` +
     `<th class="num" title="As-text minus Sent; negative means imaging cost more">Saved/lost</th>` +
@@ -674,7 +708,7 @@ export function renderLatestFragment(inp: LatestFragmentInput): string {
       sourceText == null
         ? `<div class="evicted">source text wasn't captured for this image</div>`
         : `<div class="pairing">` +
-          `<div class="pair-col"><div class="pair-head pair-img">What Claude sees · image</div><div class="frame frame-sm"><img src="${imgSrc}" alt="rendered page" /></div></div>` +
+          `<div class="pair-col"><div class="pair-head pair-img">What the model sees · image</div><div class="frame frame-sm"><img src="${imgSrc}" alt="rendered page" /></div></div>` +
           `<div class="pair-mid">made from ↓</div>` +
           `<div class="pair-col"><div class="pair-head pair-txt">The original text · byte-exact</div><pre class="src-pane">${escapeHtml(sourceText)}</pre></div>` +
           `</div>`;

@@ -241,6 +241,11 @@ interface Totals {
    *  doesn't touch output). Without this the headline ignores half the
    *  bill on output-heavy sessions. */
   outputWeighted: number;
+  /** Claude-priced subset of the measured totals. Google rows contribute to
+   * token savings above, but not to dollar estimates based on Claude rates. */
+  pricedActualInputWeighted: number;
+  pricedBaselineInputWeighted: number;
+  pricedOutputWeighted: number;
   /** Sum of weighted COUNTERFACTUAL input tokens across ALL requests
    *  with a usage block. For measured rows: cache-aware baseline (what the
    *  unproxied path would have billed). For unmeasured/probe-failed rows:
@@ -308,6 +313,9 @@ function emptyTotals(startedAt = Date.now() / 1000): Totals {
     actualInputWeighted: 0,
     baselineInputWeighted: 0,
     outputWeighted: 0,
+    pricedActualInputWeighted: 0,
+    pricedBaselineInputWeighted: 0,
+    pricedOutputWeighted: 0,
     allBaselineEquivalentWeighted: 0,
     allActualInputWeighted: 0,
     allOutputWeighted: 0,
@@ -383,6 +391,44 @@ function isOpenAIEvent(
   if (accountingProvider) return accountingProvider === 'openai';
   if (!path) return false;
   return path.includes('responses') || path.includes('chat/completions');
+}
+
+function googleEff(args: {
+  inputTokens: number;
+  outputTokens: number;
+  compressed: boolean;
+  baselineTokens: number;
+  baselineProbeStatus: string | undefined;
+  imageTokens: number;
+  baselineImagedTokens: number;
+  nativeInjectedTokens: number;
+}): {
+  haveUsage: boolean;
+  haveBaseline: boolean;
+  creditSaving: boolean;
+  actualInputEff: number;
+  baselineInputEff: number;
+} {
+  const { inputTokens: inp, outputTokens: out, compressed } = args;
+  const haveUsage = inp > 0 || out > 0;
+  const measuredBaseline = args.baselineProbeStatus === 'ok' && args.baselineTokens > 0
+    ? args.baselineTokens
+    : 0;
+  const estimatedBaseline = compressed
+    && args.imageTokens > 0
+    && args.baselineImagedTokens > 0
+    ? Math.max(0, inp - args.imageTokens - args.nativeInjectedTokens + args.baselineImagedTokens)
+    : 0;
+  const baseline = measuredBaseline || estimatedBaseline;
+  const haveBaseline = baseline > 0;
+  const creditSaving = haveBaseline && haveUsage && compressed;
+  return {
+    haveUsage,
+    haveBaseline,
+    creditSaving,
+    actualInputEff: inp,
+    baselineInputEff: creditSaving ? baseline : inp,
+  };
 }
 
 /** Cache-aware eff bundle for one GPT event. Shared by the live `update()`
@@ -597,14 +643,14 @@ export class DashboardState {
   /** Fold one event into the running totals + ring buffer.
    *
    *  Savings math is gated on a per-request `baseline_tokens` measurement
-   *  from the parallel count_tokens probe AND an upstream usage block.
-   *  When either is missing, we still count the request but skip its
-   *  savings contribution — no estimation. */
+   *  from the parallel count_tokens probe or model-profile estimation (Google/GPT),
+   *  plus an upstream usage block. When both probe and estimation are missing,
+   *  we still count the request but skip its savings contribution. */
   update(ev: ProxyEvent): void {
     // Stash the image bytes before they get GC'd by the request finishing.
     // The returned id (if any) is stamped onto this request's RecentRow so
     // the dashboard can pull the exact image that request rendered.
-    const imgIds = ev.info ? this.captureImage(ev.info) : [];
+    const imgIds = ev.info?.compressed ? this.captureImage(ev.info) : [];
     const imgId = imgIds[0];
 
     const u = ev.usage;
@@ -639,20 +685,29 @@ export class DashboardState {
     // Anthropic cr>0 or GPT cached_tokens>0. Drives Context Map narration.
 
     if (google) {
-      haveUsage = u !== undefined && (inp > 0 || out > 0);
-      const baseline = info?.baselineTokens;
-      haveBaseline = info?.baselineProbeStatus === 'ok'
-        && typeof baseline === 'number' && baseline > 0;
-      creditSaving = haveBaseline && haveUsage && compressed;
-      const measuredBaseline = haveBaseline ? baseline as number : inp;
-      actualInputEff = inp;
-      baselineInputEff = creditSaving ? measuredBaseline : inp;
+      const e = googleEff({
+        inputTokens: inp,
+        outputTokens: out,
+        compressed,
+        baselineTokens: info?.baselineTokens ?? 0,
+        baselineProbeStatus: info?.baselineProbeStatus,
+        imageTokens: info?.imageTokens ?? 0,
+        baselineImagedTokens: info?.baselineImagedTokens ?? 0,
+        nativeInjectedTokens: info?.nativeInjectedTokens ?? 0,
+      });
+      haveUsage = e.haveUsage;
+      haveBaseline = e.haveBaseline;
+      creditSaving = e.creditSaving;
+      actualInputEff = e.actualInputEff;
+      baselineInputEff = e.baselineInputEff;
       outputEquiv = out;
       rawActual = inp;
-      rawBaseline = creditSaving ? measuredBaseline : inp;
-      baselineForRow = creditSaving ? measuredBaseline : 0;
+      rawBaseline = creditSaving ? baselineInputEff : inp;
+      baselineForRow = creditSaving ? baselineInputEff : 0;
       cacheReadForRow = u?.cached_tokens ?? 0;
-      warmForRow = cacheReadForRow > 0;
+      // Google fallback savings are raw provider-token deltas; do not imply
+      // that an unknown cache discount was applied to the counterfactual.
+      warmForRow = false;
     } else if (gpt) {
       // GPT cost model: no count_tokens probe, no cache-create premium, no
       // per-session warmth — the discount is automatic and folded into the
@@ -821,14 +876,20 @@ export class DashboardState {
     totals.requests += 1;
     if (compressed) totals.compressedRequests += 1;
 
-    // Measured headline: only compressed rows with a usable probe. An
+    // Token headline: compressed rows with a usable measured or local
+    // baseline. An
     // uncompressed row contributes zero saved (baseline === actual), so
     // including it here would only dilute the "saved on rows we moved" %.
     const dollarEligible = !google;
-    if (creditSaving && dollarEligible) {
+    if (creditSaving) {
       totals.baselineInputWeighted += baselineInputEff;
       totals.actualInputWeighted += actualInputEff;
       totals.outputWeighted += outputEquiv;
+      if (dollarEligible) {
+        totals.pricedBaselineInputWeighted += baselineInputEff;
+        totals.pricedActualInputWeighted += actualInputEff;
+        totals.pricedOutputWeighted += outputEquiv;
+      }
     }
     // All-rows COUNTERFACTUAL spend, ungated on the probe — the honest
     // denominator for "did pxpipe move my real bill". Measured rows
@@ -1006,19 +1067,29 @@ export class DashboardState {
       let warmForRow: boolean; // text-baseline warmth for the Context Map narration
 
       if (google) {
-        haveUsage = inp > 0 || out > 0;
-        const baseline = (t as { baseline_tokens?: number }).baseline_tokens;
-        haveBaseline = (t as { baseline_probe_status?: string }).baseline_probe_status === 'ok'
-          && typeof baseline === 'number' && baseline > 0;
-        creditSaving = haveBaseline && haveUsage && compressed;
-        const measuredBaseline = haveBaseline ? baseline as number : inp;
-        actualInputEff = inp;
-        baselineInputEff = creditSaving ? measuredBaseline : inp;
+        const e = googleEff({
+          inputTokens: inp,
+          outputTokens: out,
+          compressed,
+          baselineTokens: (t as { baseline_tokens?: number }).baseline_tokens ?? 0,
+          baselineProbeStatus:
+            (t as { baseline_probe_status?: string }).baseline_probe_status,
+          imageTokens: (t as { image_tokens?: number }).image_tokens ?? 0,
+          baselineImagedTokens:
+            (t as { baseline_imaged_tokens?: number }).baseline_imaged_tokens ?? 0,
+          nativeInjectedTokens:
+            (t as { native_injected_tokens?: number }).native_injected_tokens ?? 0,
+        });
+        haveUsage = e.haveUsage;
+        haveBaseline = e.haveBaseline;
+        creditSaving = e.creditSaving;
+        actualInputEff = e.actualInputEff;
+        baselineInputEff = e.baselineInputEff;
         rawActual = inp;
-        rawBaseline = creditSaving ? measuredBaseline : inp;
-        baselineForRow = creditSaving ? measuredBaseline : 0;
+        rawBaseline = creditSaving ? baselineInputEff : inp;
+        baselineForRow = creditSaving ? baselineInputEff : 0;
         cacheReadForRow = (t as { cached_tokens?: number }).cached_tokens ?? 0;
-        warmForRow = cacheReadForRow > 0;
+        warmForRow = false;
       } else if (gpt) {
         const e = gptEff({
           model: t.model,
@@ -1240,10 +1311,15 @@ export class DashboardState {
     const actual = totals.actualInputWeighted;
     const output = totals.outputWeighted; // already × OUTPUT_TOKEN_RATE
     const saved = baseline - actual;
+    const pricedBaseline = totals.pricedBaselineInputWeighted;
+    const pricedActual = totals.pricedActualInputWeighted;
+    const pricedOutput = totals.pricedOutputWeighted;
+    const pricedSaved = pricedBaseline - pricedActual;
     const pctInput = baseline > 0 ? (saved / baseline) * 100 : 0;
     const baselineTotal = baseline + output;
     const actualTotal = actual + output;
-    const pctTotal = baselineTotal > 0 ? (saved / baselineTotal) * 100 : 0;
+    const pricedBaselineTotal = pricedBaseline + pricedOutput;
+    const pctTotal = pricedBaselineTotal > 0 ? (pricedSaved / pricedBaselineTotal) * 100 : 0;
 
     // Share-of-all-spend: honest denominator. The numerator can only credit
     // savings against rows where we have a probe baseline (otherwise it's
@@ -1261,7 +1337,7 @@ export class DashboardState {
     // not 280%.
     const allCounterfactualBill = allBaselineEquiv + allOutput;
     const pctAllSpend =
-      allCounterfactualBill > 0 ? (saved / allCounterfactualBill) * 100 : 0;
+      allCounterfactualBill > 0 ? (pricedSaved / allCounterfactualBill) * 100 : 0;
 
     // Direct observed split — actual $ per request, partitioned by which
     // path ran. Token-equivalent (input × 1.0 + cache_create × 1.25 +
@@ -1333,7 +1409,7 @@ export class DashboardState {
       compressed_minus_passthrough_avg_usd: round4(splitDeltaUsd),
       split_sufficient_sample: splitSufficient,
       split_min_sample_per_bucket: SUFFICIENT,
-      saved_usd: round4((saved * ASSUMED_INPUT_USD_PER_MTOK) / 1e6),
+      saved_usd: round4((pricedSaved * ASSUMED_INPUT_USD_PER_MTOK) / 1e6),
       output_weighted: Math.round(output),
       baseline_token_equivalent: Math.round(baselineTotal),
       actual_token_equivalent: Math.round(actualTotal),

@@ -400,9 +400,9 @@ function isFlatFunctionTool(tool: unknown): tool is ResponsesFlatTool {
   );
 }
 
-/** Render only schema annotations removed from the native tool definition.
- * Structural JSON and the top-level tool description remain native, so putting
- * them in the image too spends vision tokens without replacing any text. */
+/** Render schema annotations removed from the native tool definition. The full
+ * top-level description rides in the same image and is replaced by a short
+ * per-tool pointer, matching the Anthropic tool-reference approach. */
 function schemaAnnotationLines(node: unknown, path = '$', depth = 0): string[] {
   if (!node || typeof node !== 'object' || depth > 20) return [];
   if (Array.isArray(node)) {
@@ -444,15 +444,15 @@ function schemaAnnotationLines(node: unknown, path = '$', depth = 0): string[] {
 function renderToolDoc(tool: OpenAIFunctionTool): string {
   const f = tool.function;
   const annotations = schemaAnnotationLines(f.parameters);
-  return annotations.length
-    ? [`## Tool parameter annotations: ${f.name ?? '?'}`, ...annotations].join('\n')
+  return f.description || annotations.length
+    ? [`## Tool: ${f.name ?? '?'}`, f.description ?? '', ...annotations].filter(Boolean).join('\n')
     : '';
 }
 
 function renderFlatToolDoc(tool: ResponsesFlatTool): string {
   const annotations = schemaAnnotationLines(tool.parameters);
-  return annotations.length
-    ? [`## Tool parameter annotations: ${tool.name ?? '?'}`, ...annotations].join('\n')
+  return tool.description || annotations.length
+    ? [`## Tool: ${tool.name ?? '?'}`, tool.description ?? '', ...annotations].filter(Boolean).join('\n')
     : '';
 }
 
@@ -473,6 +473,7 @@ function rewriteToolsForGpt(tools: unknown[] | undefined): {
       ...tool,
       function: {
         ...tool.function,
+        description: `Full docs: see "## Tool: ${tool.function.name ?? '?'}" in the rendered context image.`,
         parameters: stripSchemaDescriptions(tool.function.parameters),
       },
     };
@@ -495,6 +496,7 @@ function rewriteFlatToolsForGpt(tools: unknown[] | undefined): {
     changed = true;
     return {
       ...tool,
+      description: `Full docs: see "## Tool: ${tool.name ?? '?'}" in the rendered context image.`,
       parameters: stripSchemaDescriptions(tool.parameters),
     };
   });

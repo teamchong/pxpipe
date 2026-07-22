@@ -124,7 +124,10 @@ export interface HistoryCollapseInfo {
 /**
  * Return the last index ≤ cutoffExclusive at which all tool_use_ids are matched
  * by tool_results in [0..i]. Returns -1 if no closed boundary exists.
- * Robust to interleaved/parallel tool calls via openSet tracking.
+ * Robust to interleaved/parallel tool calls via openSet tracking. Consecutive
+ * assistant-tool/user-result pairs are treated as one tool round: some Anthropic
+ * clients serialize a parallel batch that way, so the apparently-closed gap
+ * between two pairs is not a safe collapse boundary.
  */
 export function findClosedPrefixBoundary(
   messages: Message[],
@@ -133,19 +136,37 @@ export function findClosedPrefixBoundary(
   if (cutoffExclusive <= 0) return -1;
   const openSet = new Set<string>();
   let lastClosed = -1;
+  let inToolRound = false;
   const limit = Math.min(cutoffExclusive, messages.length);
   for (let i = 0; i < limit; i++) {
     const msg = messages[i]!;
+
+    const assistantToolUses =
+      msg.role === 'assistant' && Array.isArray(msg.content)
+        ? msg.content.filter(
+            (blk): blk is ToolUseBlock =>
+              !!blk && (blk as ToolUseBlock).type === 'tool_use',
+          )
+        : [];
+
+    // A closed tool pair is only provisional until we see what follows. OpenCode
+    // commonly emits a parallel Anthropic round as A-call/A-result,
+    // B-call/B-result. Do not expose the gap between those adjacent pairs as a
+    // collapse boundary.
+    if (inToolRound && openSet.size === 0 && assistantToolUses.length === 0) {
+      lastClosed = i - 1;
+      inToolRound = false;
+    }
+
     if (!Array.isArray(msg.content)) {
-      if (openSet.size === 0) lastClosed = i; // plain string — no tool blocks
+      if (openSet.size === 0 && !inToolRound) lastClosed = i;
       continue;
     }
     if (msg.role === 'assistant') {
-      for (const blk of msg.content) {
-        if (blk && (blk as ToolUseBlock).type === 'tool_use') {
-          const id = (blk as ToolUseBlock).id;
-          if (typeof id === 'string') openSet.add(id);
-        }
+      if (assistantToolUses.length > 0) inToolRound = true;
+      for (const blk of assistantToolUses) {
+        const id = blk.id;
+        if (typeof id === 'string') openSet.add(id);
       }
     } else if (msg.role === 'user') {
       for (const blk of msg.content) {
@@ -155,7 +176,21 @@ export function findClosedPrefixBoundary(
         }
       }
     }
-    if (openSet.size === 0) lastClosed = i;
+    if (openSet.size === 0 && !inToolRound) lastClosed = i;
+  }
+
+  // The end of a closed round is safe only if the actual next message does not
+  // continue it with another serialized tool call. Looking one message past the
+  // cutoff changes no collapsed index; it merely prevents splitting the round.
+  if (inToolRound && openSet.size === 0) {
+    const next = messages[limit];
+    const nextContinuesRound =
+      next?.role === 'assistant' &&
+      Array.isArray(next.content) &&
+      next.content.some(
+        (blk) => !!blk && (blk as ToolUseBlock).type === 'tool_use',
+      );
+    if (!nextContinuesRound) lastClosed = limit - 1;
   }
   return lastClosed;
 }

@@ -544,6 +544,20 @@ interface ResponsesCompletedPair {
   outputTokens: number;
 }
 
+/** One protocol-atomic tool round. OpenCode emits parallel tools as
+ * call A, call B, …, output A, output B, …; removing only one pair would leave
+ * the native round structurally incomplete. A round is therefore the smallest
+ * unit the planner may select. */
+interface ResponsesCompletedRound {
+  pairs: ResponsesCompletedPair[];
+  indices: number[];
+  startIndex: number;
+  endIndex: number;
+  text: string;
+  callTokens: number;
+  outputTokens: number;
+}
+
 function responseItemType(item: unknown): string {
   const o = item as Record<string, unknown> | null;
   return o && typeof o.type === 'string' ? o.type : '';
@@ -605,12 +619,13 @@ function responseReferencedIds(items: unknown[]): Set<string> {
 }
 
 /** Classify Responses tool state without interpreting recency from raw item count.
- * Only an unambiguous adjacent call/output pair is collapsible. Native items
- * between the call and output would be reordered by a single image replacement. */
+ * Accept both adjacent pairs and protocol-atomic parallel rounds:
+ * `call A, call B, output A, output B`. Unknown/intervening native items remain
+ * hard barriers, and duplicate/reversed/orphan state is never selected. */
 function classifyResponsesPairs(
   items: unknown[],
   keepRecentPairs: number,
-): { old: ResponsesCompletedPair[]; state: ResponsesPairState } {
+): { old: ResponsesCompletedRound[]; state: ResponsesPairState } {
   const calls = new Map<string, number[]>();
   const outputs = new Map<string, number[]>();
   let missingIdItems = 0;
@@ -625,7 +640,7 @@ function classifyResponsesPairs(
     map.set(id, at);
   }
 
-  const completed: ResponsesCompletedPair[] = [];
+  const pairByCallIndex = new Map<number, ResponsesCompletedPair>();
   let openCalls = 0;
   let orphanOutputs = 0;
   let malformedItems = missingIdItems;
@@ -633,12 +648,12 @@ function classifyResponsesPairs(
   for (const id of ids) {
     const cs = calls.get(id) ?? [];
     const os = outputs.get(id) ?? [];
-    if (cs.length === 1 && os.length === 1 && os[0] === cs[0]! + 1) {
+    if (cs.length === 1 && os.length === 1 && cs[0]! < os[0]!) {
       const callIndex = cs[0]!;
       const outputIndex = os[0]!;
       const call = items[callIndex] as Record<string, unknown>;
       const output = items[outputIndex] as Record<string, unknown>;
-      completed.push({
+      pairByCallIndex.set(callIndex, {
         callIndex,
         outputIndex,
         text: `${responseCallText(call)}\n${responseOutputText(output)}`,
@@ -649,24 +664,84 @@ function classifyResponsesPairs(
           typeof output.output === 'string' ? output.output : safeJson(output.output),
         ),
       });
-      continue;
-    }
-    if (cs.length > 0 && os.length === 0) openCalls += cs.length;
+    } else if (cs.length > 0 && os.length === 0) openCalls += cs.length;
     else if (os.length > 0 && cs.length === 0) orphanOutputs += os.length;
     else malformedItems += cs.length + os.length;
   }
-  completed.sort((a, b) => a.outputIndex - b.outputIndex);
+
+  // Discover contiguous calls* + outputs* rounds. A candidate unique pair that
+  // does not fit one of these rounds is non-adjacent protocol state and remains
+  // native. This is the shape OpenCode uses for parallel tool calls.
+  const completed: ResponsesCompletedRound[] = [];
+  const acceptedCallIndices = new Set<number>();
+  for (let i = 0; i < items.length;) {
+    if (responseItemType(items[i]) !== 'function_call' || !pairByCallIndex.has(i)) {
+      i++;
+      continue;
+    }
+    const calls: ResponsesCompletedPair[] = [];
+    let j = i;
+    while (responseItemType(items[j]) === 'function_call' && pairByCallIndex.has(j)) {
+      calls.push(pairByCallIndex.get(j)!);
+      j++;
+    }
+    const roundOutputIndices = new Set(calls.map((pair) => pair.outputIndex));
+    const outputs: number[] = [];
+    // Do not absorb an output belonging to orphan/other state into this round.
+    while (
+      responseItemType(items[j]) === 'function_call_output'
+      && roundOutputIndices.has(j)
+    ) {
+      outputs.push(j);
+      j++;
+    }
+    const outputSet = new Set(outputs);
+    const valid = calls.length > 0
+      && outputs.length === calls.length
+      && calls.every((pair) => outputSet.has(pair.outputIndex));
+    if (!valid) {
+      i++;
+      continue;
+    }
+    const byOutput = [...calls].sort((a, b) => a.outputIndex - b.outputIndex);
+    const indices = [
+      ...calls.map((pair) => pair.callIndex),
+      ...byOutput.map((pair) => pair.outputIndex),
+    ];
+    completed.push({
+      pairs: calls,
+      indices,
+      startIndex: i,
+      endIndex: j - 1,
+      text: byOutput.map((pair) => pair.text).join('\n\n'),
+      callTokens: calls.reduce((sum, pair) => sum + pair.callTokens, 0),
+      outputTokens: calls.reduce((sum, pair) => sum + pair.outputTokens, 0),
+    });
+    for (const pair of calls) acceptedCallIndices.add(pair.callIndex);
+    i = j;
+  }
+  for (const pair of pairByCallIndex.values()) {
+    if (!acceptedCallIndices.has(pair.callIndex)) malformedItems += 2;
+  }
+
   const keep = Math.max(0, Math.floor(keepRecentPairs));
-  const oldCount = Math.max(0, completed.length - keep);
-  const old = completed.slice(0, oldCount);
-  const imageableFunctionCallTokens = old.reduce((n, p) => n + p.callTokens, 0);
-  const imageableFunctionOutputTokens = old.reduce((n, p) => n + p.outputTokens, 0);
+  let recentStart = completed.length;
+  let recentPairs = 0;
+  while (recentStart > 0 && recentPairs < keep) {
+    recentStart--;
+    recentPairs += completed[recentStart]!.pairs.length;
+  }
+  const old = completed.slice(0, recentStart);
+  const completedPairs = completed.reduce((n, round) => n + round.pairs.length, 0);
+  const oldPairs = old.reduce((n, round) => n + round.pairs.length, 0);
+  const imageableFunctionCallTokens = old.reduce((n, round) => n + round.callTokens, 0);
+  const imageableFunctionOutputTokens = old.reduce((n, round) => n + round.outputTokens, 0);
   return {
     old,
     state: {
-      completedPairs: completed.length,
-      recentCompletedPairs: completed.length - old.length,
-      oldCompletedPairs: old.length,
+      completedPairs,
+      recentCompletedPairs: completedPairs - oldPairs,
+      oldCompletedPairs: oldPairs,
       openCalls,
       orphanOutputs,
       malformedItems,
@@ -699,13 +774,13 @@ interface ResponsesMixedUnit {
  * Every other item is a hard barrier, preserving native protocol order/state. */
 async function planResponsesMixedCollapse(
   items: unknown[],
-  old: ResponsesCompletedPair[],
+  old: ResponsesCompletedRound[],
   state: ResponsesPairState,
   isProfitable: GptProfitableFn,
   o: GptHistoryOptions,
 ): Promise<ResponsesPairCollapsePlan> {
   const base = emptyResponsesPairPlan(state);
-  const oldByCall = new Map(old.map((pair) => [pair.callIndex, pair]));
+  const oldByCall = new Map(old.map((round) => [round.startIndex, round]));
   const messageIndices: number[] = [];
   const referencedIds = responseReferencedIds(items);
   let latestUserIndex = -1;
@@ -727,18 +802,18 @@ async function planResponsesMixedCollapse(
     current = [];
   };
   for (let i = 0; i < items.length; i++) {
-    const pair = oldByCall.get(i);
-    const pairCall = pair ? items[pair.callIndex] as Record<string, unknown> | null : null;
-    const pairOutput = pair ? items[pair.outputIndex] as Record<string, unknown> | null : null;
-    const pairReferenced = !!pair && [pairCall?.id, pairOutput?.id]
+    const round = oldByCall.get(i);
+    const roundReferenced = !!round && round.indices
+      .map((index) => items[index] as Record<string, unknown> | null)
+      .map((item) => item?.id)
       .some((id) => typeof id === 'string' && referencedIds.has(id));
-    if (pair && !pairReferenced) {
+    if (round && !roundReferenced) {
       current.push({
-        indices: [pair.callIndex, pair.outputIndex],
-        text: pair.text,
-        baselineTokens: pair.callTokens + pair.outputTokens,
+        indices: round.indices,
+        text: round.text,
+        baselineTokens: round.callTokens + round.outputTokens,
       });
-      i = pair.outputIndex;
+      i = round.endIndex;
       continue;
     }
     const item = items[i] as Record<string, unknown> | null;
@@ -820,12 +895,10 @@ async function planResponsesMixedCollapse(
   }
   const selectedIndices = segments.flatMap((segment) => segment.selectedIndices).sort((a, b) => a - b);
   const selectedIds = new Set(selectedIndices);
-  const selectedPairs = old.filter(
-    (pair) => selectedIds.has(pair.callIndex) && selectedIds.has(pair.outputIndex),
-  );
-  state.collapsedPairs = selectedPairs.length;
-  state.collapsedFunctionCallTokens = selectedPairs.reduce((n, pair) => n + pair.callTokens, 0);
-  state.collapsedFunctionOutputTokens = selectedPairs.reduce((n, pair) => n + pair.outputTokens, 0);
+  const selectedRounds = old.filter((round) => round.indices.every((index) => selectedIds.has(index)));
+  state.collapsedPairs = selectedRounds.reduce((n, round) => n + round.pairs.length, 0);
+  state.collapsedFunctionCallTokens = selectedRounds.reduce((n, round) => n + round.callTokens, 0);
+  state.collapsedFunctionOutputTokens = selectedRounds.reduce((n, round) => n + round.outputTokens, 0);
   const images = segments.flatMap((segment) => segment.images);
   const imageSources = segments.flatMap((segment) => segment.imageSources);
   const text = segments.map((segment) => segment.text).join('\n\n');
@@ -856,9 +929,9 @@ async function planResponsesMixedCollapse(
   };
 }
 
-/** Render only old, unambiguously completed Responses call/output pairs.
- * Native messages, reasoning, recent pairs, open calls, and malformed state stay
- * in place. Consecutive pairs may share pages, but no segment crosses native state. */
+/** Render only old, unambiguously completed Responses call/output rounds.
+ * Native messages, reasoning, recent rounds, open calls, and malformed state stay
+ * in place. Consecutive rounds may share pages, but no segment crosses native state. */
 export async function planResponsesPairCollapse(
   items: unknown[],
   isProfitable: GptProfitableFn,
@@ -882,15 +955,15 @@ export async function planResponsesPairCollapse(
     return { ...base, reason: 'too_many_images', collapsedChars: allText.length };
   }
 
-  const runs: ResponsesCompletedPair[][] = [];
-  for (const pair of old) {
+  const runs: ResponsesCompletedRound[][] = [];
+  for (const round of old) {
     const run = runs.at(-1);
-    if (run && pair.callIndex === run.at(-1)!.outputIndex + 1) run.push(pair);
-    else runs.push([pair]);
+    if (run && round.startIndex === run.at(-1)!.endIndex + 1) run.push(round);
+    else runs.push([round]);
   }
 
-  const renderPairs = async (pairs: ResponsesCompletedPair[]) => {
-    const source = pairs.map((pair) => pair.text).join('\n\n');
+  const renderPairs = async (rounds: ResponsesCompletedRound[]) => {
+    const source = rounds.map((round) => round.text).join('\n\n');
     const safe = neutralizeSentinel(source);
     let renderedText = o.reflow ? reflow(safe) ?? safe : safe;
     const images = await renderTextToPngs(
@@ -923,10 +996,10 @@ export async function planResponsesPairCollapse(
 
     const selected = run.slice(0, low);
     const selectedIndices = selected
-      .flatMap((pair) => [pair.callIndex, pair.outputIndex])
+      .flatMap((round) => round.indices)
       .sort((a, b) => a - b);
     segments.push({
-      insertAt: selected[0]!.callIndex,
+      insertAt: selected[0]!.startIndex,
       selectedIndices,
       images: best.images,
       imageSources: best.images.map(() => best.source),
@@ -951,12 +1024,10 @@ export async function planResponsesPairCollapse(
   const imageSources = segments.flatMap((segment) => segment.imageSources);
   const text = segments.map((segment) => segment.text).join('\n\n');
   const selectedIds = new Set(selectedIndices);
-  const selectedPairs = old.filter(
-    (pair) => selectedIds.has(pair.callIndex) && selectedIds.has(pair.outputIndex),
-  );
-  state.collapsedPairs = selectedPairs.length;
-  state.collapsedFunctionCallTokens = selectedPairs.reduce((n, pair) => n + pair.callTokens, 0);
-  state.collapsedFunctionOutputTokens = selectedPairs.reduce((n, pair) => n + pair.outputTokens, 0);
+  const selectedRounds = old.filter((round) => round.indices.every((index) => selectedIds.has(index)));
+  state.collapsedPairs = selectedRounds.reduce((n, round) => n + round.pairs.length, 0);
+  state.collapsedFunctionCallTokens = selectedRounds.reduce((n, round) => n + round.callTokens, 0);
+  state.collapsedFunctionOutputTokens = selectedRounds.reduce((n, round) => n + round.outputTokens, 0);
 
   const droppedCodepoints = new Map<number, number>();
   let droppedChars = 0;

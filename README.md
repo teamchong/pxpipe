@@ -157,7 +157,7 @@ is confabulations, so lower is better.
 | `claude-fable-5` | **100/100** | **98/98** | **18/18** | **0/16** | **13/15** | June 2026 production profiles: [arithmetic + hex](FINDINGS.md), [gist/state/guards](eval/gist-recall/) |
 | `google/gemini-3.6-flash` | **100/100** | **98/98** | **18/18** | **0/16** | **14/15** | current shipped profile: [quality results](eval/gemini-profile/QUALITY_RESULTS.md) |
 | `gpt-5.6-sol` | **98/100** | 83/98 | 17/18 | 4/16 | 0/15 | prior 5×8 broad suite; native 14px pilot: 7/8 exact, 0 inventions, gist/guard pass: [pilot](eval/sol-profile/README.md) |
-| `claude-opus-4-8` | 93/100 | — | — | — | 0/15 | native 14px blind sweep: 8/8 exact, 0 confabulations; [results](eval/opus-density/RESULTS.md) |
+| `claude-opus-4-8` | 93/100 | 59/98 | 12/18 | 7/16 | 0/15 | dense-hex from native 14px blind sweep (8/8 exact, 0 confab); gist/state/never-stated from full gist-recall image arm at Opus's own 14px profile (782px pages, jetbrains-mono-14, upstream-bypassed :8082, preflight-guarded); [receipts](eval/gist-recall/OPUS_14PX.md) |
 | `grok-4.5` | 82/100 | 83/98 | 13/18 | **0/16** | 0/15 | current shipped profile: [quality results](eval/grok-density/QUALITY_RESULTS.md) |
 | `moonshotai/kimi-k3` | 79/100 | 84/98 | 15/18 | 1/16 | 0/15 | generic GPT profile: [quality results](eval/sol-profile/KIMI_K3_QUALITY_RESULTS.md) |
 

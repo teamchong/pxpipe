@@ -8,7 +8,19 @@ MODEL = os.environ.get('MODEL', 'claude-fable-5')
 CLAUDE = os.path.expanduser('~/.claude/local/claude')
 CCI = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'lib', 'cci.py')
 probes = json.load(open(f'{WORK}/probes.json'))
+
+# --- preflight guard: never test a corpus rendered for a different model ---
+if 'image' in os.environ.get('GR_ARMS', 'text,image').split(','):
+    try:
+        _meta = json.load(open(f'{WORK}/render.meta.json'))
+    except FileNotFoundError:
+        sys.exit(f'PREFLIGHT ABORT: {WORK}/render.meta.json missing - render the image corpus for {MODEL} first')
+    if _meta.get('model') != MODEL:
+        sys.exit(f"PREFLIGHT ABORT: corpus rendered for {_meta.get('model')!r}, but MODEL={MODEL!r} - re-render for this model before spending API calls")
+    print(f"preflight ok: corpus matches {MODEL} (font {_meta.get('font')}, {_meta.get('pageWidthPx')}px pages)", flush=True)
 env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_BASE_URL'}
+_bu = os.environ.get('GR_BASE_URL')
+if _bu: env['ANTHROPIC_BASE_URL'] = _bu
 env['CCI_TIMEOUT'] = '210'   # self-exit before the subprocess timeout=240 hard kill
 
 def ask(prompt):
@@ -35,10 +47,10 @@ def one(job):
     ans = ask(prompt)
     return dict(arm=arm, **p, answer=ans)
 
-jobs = [(arm, p) for arm in ['text', 'image'] for p in probes]
+jobs = [(arm, p) for arm in os.environ.get('GR_ARMS','text,image').split(',') for p in probes]
 print(f'{len(jobs)} calls, model {MODEL}', flush=True)
 out = open(f'{WORK}/results.jsonl', 'w')
-with ThreadPoolExecutor(max_workers=6) as ex:
+with ThreadPoolExecutor(max_workers=int(os.environ.get("GR_WORKERS","6"))) as ex:
     for i, res in enumerate(ex.map(one, jobs)):
         out.write(json.dumps(res) + '\n'); out.flush()
         ok = '?' 

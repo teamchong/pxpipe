@@ -177,7 +177,7 @@ describe('ticket-style codes and occurrence counts', () => {
 
 
   it('covers the Grok density-harness probes (hex/camel/path/port)', () => {
-    // Production Grok keeps 5x8 images and relies on the fact-sheet for exact
+    // Production Grok keeps native-14px images and relies on the fact-sheet for exact
     // IDs. If extraction drops any of these shapes, image-only confab returns.
     const text = [
       'token cache key is a3f9c1e0b7d2',

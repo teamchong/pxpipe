@@ -127,19 +127,19 @@ without running the proxy.
   and allows 64 images, while Grok allows 24 images. Opt-in long-session
   coverage can be changed (defensive cap 100) with
   `PXPIPE_GPT_HISTORY_MAX_IMAGES=48` after validating the provider's request cap.
-- **Per-model rendering:** opt-in Opus and `gpt-5.6-sol` use native 14px
-  JetBrains Mono glyphs in a 9×16 cell. Opus uses 86 columns; Sol uses 84.
+- **Per-model rendering:** opt-in Opus, Sol, and Grok use native 14px
+  JetBrains Mono glyphs in a 9×16 cell. Opus 86 cols; Sol/Grok 84 cols.
   Fable keeps its 312-column, 1568×728 5×8 Spleen profile. These
   are selected by exact model id, including history pages and profitability
   math. Recognized IDs can ride in the bounded factsheet, and
   recent/open tool state stays native.
   [Sol receipts](eval/sol-profile/QUALITY_RESULTS.md) and
   [profile evidence](docs/MODEL_RENDER_PROFILES.md).
-- **Grok 4.5 (opt-in):** uses 5×8 Spleen, IDS, a text factsheet, and maxH 512.
+- **Grok 4.5 (opt-in):** native 14px / 84 cols / maxH 512 (best of 8–16px sweep: 4/8 exact).
   Off by default (not Fable-level pure-image).
   Enable with
   `PXPIPE_MODELS=claude-fable-5,grok-4.5` or the dashboard chip.
-  [eval/grok-density/QUALITY_RESULTS.md](eval/grok-density/QUALITY_RESULTS.md).
+  [eval/grok-density/native-sweep/RESULTS.md](eval/grok-density/native-sweep/RESULTS.md).
 
 </details>
 
@@ -158,7 +158,7 @@ is confabulations, so lower is better.
 | `google/gemini-3.6-flash` | **100/100** | **98/98** | **18/18** | **0/16** | **14/15** | current shipped profile: [quality results](eval/gemini-profile/QUALITY_RESULTS.md) |
 | `gpt-5.6-sol` | **98/100** | 83/98 | 17/18 | 4/16 | 0/15 | prior 5×8 broad suite; native 14px pilot: 7/8 exact, 0 inventions, gist/guard pass: [pilot](eval/sol-profile/README.md) |
 | `claude-opus-4-8` | 93/100 | 59/98 | 12/18 | 7/16 | 0/15 | dense-hex from native 14px blind sweep (8/8 exact, 0 confab); gist/state/never-stated from full gist-recall image arm at Opus's own 14px profile (782px pages, jetbrains-mono-14, upstream-bypassed :8082, preflight-guarded); [receipts](eval/gist-recall/OPUS_14PX.md) |
-| `grok-4.5` | 82/100 | 83/98 | 13/18 | **0/16** | 0/15 | current shipped profile: [quality results](eval/grok-density/QUALITY_RESULTS.md) |
+| `grok-4.5` | 82/100 | 83/98 | 13/18 | **0/16** | 0/15 | native 14px sweep 4/8 exact (best rung); [native-sweep](eval/grok-density/native-sweep/RESULTS.md), [quality](eval/grok-density/QUALITY_RESULTS.md) |
 | `moonshotai/kimi-k3` | 79/100 | 84/98 | 15/18 | 1/16 | 0/15 | generic GPT profile: [quality results](eval/sol-profile/KIMI_K3_QUALITY_RESULTS.md) |
 
 ### Native-profile cost check

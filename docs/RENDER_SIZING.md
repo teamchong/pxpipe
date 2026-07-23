@@ -22,7 +22,7 @@ grows with content until the profile cap, then overflow becomes another page.
 | Fable / Anthropic default | Spleen + Unifont, 5×8 | 312 | 1568 px | 728 px |
 | opt-in Claude Opus | JetBrains Mono 14px, native 9×16 | 86 | 782 px | 728 px |
 | opt-in `gpt-5.6-sol` | JetBrains Mono 14px, native 9×16 | 84 | 764 px | 1954 px |
-| opt-in Grok 4.5 | Spleen + Unifont, 5×8 white AA + IDS + factsheet (no grid) | 152 | 768 px | 512 px |
+| opt-in Grok 4.5 | JetBrains Mono 14px, native 9×16 + IDS + factsheet | 84 | 764 px | 512 px |
 | other OpenAI fallback | Spleen + Unifont, 5×8 | 152 | 768 px | 1932 px |
 
 Complete profile values and evidence are in
@@ -40,7 +40,7 @@ The 1568×728 Claude page stays inside both bounds, so rasterized glyphs reach
 the vision encoder without the old 0.555× resample.
 
 OpenAI-shaped profiles use portrait strips. GPT 5.6 Sol uses 84×9+8, a 764px
-strip up to 1954px; Grok uses 152×5+8, a 768px strip up to 512px.
+strip up to 1954px; Grok uses 84×9+8, a 764px strip up to 512px.
 
 ## Font and Unicode
 
@@ -83,7 +83,7 @@ contract, not a preferred aspect ratio.
 | 2026-06-17 | ~1932px experiment | fewer pages, later shown to be server-resampled on Anthropic |
 | 2026-07-01 | Claude 1568×728 clamp | made billed pixels survive Anthropic preprocessing |
 | 2026-07-09 | exact-model profiles | separated Claude, GPT 5.6 Sol, and Grok geometry/style |
-| 2026-07-11 | Grok profile | Shared 5×8 + IDS + factsheet production stack; Grok opt-in only |
+| 2026-07-23 | Grok native 14px | JB Mono 8–16px sweep: 14px best (4/8); 84 cols / maxH 512; still opt-in |
 | 2026-07-11 | default scope | Fable only; Sol and Grok remain opt-in after broader quality tests |
 
 Older benchmark receipts retain their historical geometry; do not rewrite those

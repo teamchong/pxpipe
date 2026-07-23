@@ -264,10 +264,10 @@ path. Opt-in `gpt-5.6-sol` uses 84 columns with a native 9×16 JetBrains Mono
 14px atlas;
 Fable uses 312 columns with the 5×8 Spleen atlas; opt-in Opus uses 86 columns
 with native 14px JetBrains Mono. Grok remains **opt-in** and
-uses **5×8** / 152 columns at maxHeight 512 with white AA (**no grid**) plus an
+uses **native 14px** / 84 columns at maxHeight 512 with white AA (**no grid**) plus an
 in-image IDS block and the text factsheet. Its measured arithmetic, gist, and
 state results remain below Fable. See
-[eval/grok-density/QUALITY_RESULTS.md](../eval/grok-density/QUALITY_RESULTS.md).
+[eval/grok-density/native-sweep/RESULTS.md](../eval/grok-density/native-sweep/RESULTS.md).
 
 The early n=1 raw-image pilot failed both 6×11 and the old shared 5×8
 call. The 5×8 production-profile follow-up scored 96/100 pure and

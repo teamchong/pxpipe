@@ -9,7 +9,7 @@ from the model id.
 | `claude-fable-5*` | yes | Spleen 5×8 | 312 | 728 px | established Claude suites |
 | `claude-*opus*` | opt-in | JetBrains Mono 14px, 9×16 | 86 | 728 px | blind sweep: 8/8 exact, 0 confabulations, 33% savings |
 | `gpt-5.6-sol*` | opt-in | JetBrains Mono 14px, 9×16 | 84 | 1954 px | 7/8 exact, 0 inventions, gist and guard pass, 42% savings |
-| `grok-*` | opt-in | Spleen 5×8 | 152 | 512 px | 82/100 arithmetic; 83/98 gist |
+| `grok-*` | opt-in | JetBrains Mono 14px, 9×16 | 84 | 512 px | native sweep best rung 4/8 exact; still opt-in |
 | other GPT/o-series | opt-in | Spleen 5×8 | 152 | 1932 px | conservative fallback |
 
 Every production path adds IDS rows to the image and an adjacent text factsheet

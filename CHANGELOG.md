@@ -13,6 +13,10 @@ behavioral changes, patch = fixes).
 - Opt-in `gpt-5.6-sol` uses the same native 14px glyphs at 84 columns. Its paid
   pilot preserved gist and guard checks, read 7/8 exact values, and produced no
   unsupported inventions; Sol remains off by default.
+- Opt-in Grok 4.5 moves from Spleen 5×8/152 cols to native 14px/84 cols at
+  maxH 512 (best rung on the JB Mono 8–16px blind sweep: 4/8 exact, 48% save).
+  No rung was fully clean; Grok stays opt-in. Gate and vision math still use
+  the measured 1000 tok/MPix rate on the new 764×≤512 geometry.
 
 ## 0.10.0 — 2026-07-22
 
@@ -97,9 +101,8 @@ behavioral changes, patch = fixes).
 - `gpt-5.6-sol` is now opt-in rather than silently enabled. Its exact profile
   remains available when selected, and sibling 5.6 variants do not inherit it.
 - Complete per-model render profiles now drive font atlas, cell spacing,
-  geometry, style, history pages, and profitability math. Sol uses a 6×11
-  JetBrains Mono atlas; opt-in Grok uses the measured effective 9×12 arm plus
-  the factsheet.
+  geometry, style, history pages, and profitability math. Sol and opt-in Grok
+  use native 14px JetBrains Mono (9×16); Grok keeps maxH 512 and the factsheet.
 - Dashboard exposes the GPT model row and `?` controls now show accessible
   hover/focus tooltips.
 - Dashboard overall totals now include only currently enabled models. Traffic

@@ -259,21 +259,24 @@ const BUILTIN_RULES: ProfileRule[] = [
     profile: CLAUDE_FABLE_PROFILE,
   },
 
-  // Grok remains opt-in. It shares the 5×8 production stack but uses shorter
-  // pages because its dense-image recall falls with taller strips.
+  // Grok remains opt-in. Native 14px / 84 cols / maxH 512 is the densest best
+  // rung from the JB Mono 8–16px blind sweep (eval/grok-density/native-sweep).
   {
     test: (m) => /^grok-/.test(m),
     profile: {
       // Vision struct unused: visionTokensForModel prices Grok by pixels.
       vision: { regime: 'tile', base: 85, perTile: 170 },
-      // 152 cols × 5px + pad = 768px short-side floor.
-      stripCols: C,
+      // Native 14px was the densest best rung on the Grok JB Mono 8–16px blind
+      // sweep (4/8 exact, 4 confab, 48% savings). 84 × 9px + pad = 764px ≤ 768.
+      // No rung was fully clean; 14px tied 15/16px on exact and beat smaller cells.
+      stripCols: 84,
       maxHeightPx: 512,
       minCompressTokens: 500,
       factSheetFormat: 'full',
       history: { ...BASE_HISTORY, maxImages: 24 },
       style: {
         ...BASE_STYLE,
+        font: 'jetbrains-mono-14',
         aa: true,
         grid: false,
         gridCols: 0,

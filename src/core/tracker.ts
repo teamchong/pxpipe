@@ -104,6 +104,12 @@ export interface TrackEvent {
   system_sha8?: string;
   claude_md_sha8?: string;
   first_user_sha8?: string;
+  /** Why cache_prefix_sha8 changed vs the previous turn of the same session
+   *  (keyed by first_user_sha8). Only set on change turns when a prior turn was
+   *  seen in this process. 'model_switch' / 'system_change' are legitimate
+   *  invalidations; 'history_reimage' means a new collapse epoch; 'pxpipe_drift'
+   *  means nothing upstream-visible changed — the true #11 bug signal. */
+  prefix_change_reason?: 'model_switch' | 'system_change' | 'history_reimage' | 'pxpipe_drift';
 
   // From Anthropic/OpenAI Usage:
   input_tokens?: number;
@@ -329,7 +335,47 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     out.stop_reason = ev.stopReason;
     if (SAFETY_STOP_REASONS.has(ev.stopReason)) out.safety_flagged = true;
   }
+  classifyPrefixChange(out);
   return out;
+}
+
+/** Last-seen fingerprints per session (keyed by first_user_sha8), for prefix-change attribution.
+ *  Best-effort in-process memory: survives across turns in the Node host; on Workers an isolate
+ *  recycle just means the next change turn goes unclassified (field absent), never misclassified. */
+const lastPrefixBySession = new Map<
+  string,
+  { model?: string; system?: string; prefix: string; history?: string }
+>();
+/** LRU cap so long-running proxies don't grow unbounded (one entry per session). */
+const LAST_PREFIX_MAX_SESSIONS = 64;
+
+/** Attribute a cache_prefix_sha8 change to its cause (see #11). Mutates `out` in place. */
+function classifyPrefixChange(out: TrackEvent): void {
+  const key = out.first_user_sha8;
+  const prefix = out.cache_prefix_sha8;
+  if (!key || !prefix) return;
+  const prev = lastPrefixBySession.get(key);
+  // Re-insert to refresh LRU position (Map preserves insertion order).
+  lastPrefixBySession.delete(key);
+  lastPrefixBySession.set(key, {
+    model: out.model,
+    system: out.system_sha8,
+    prefix,
+    history: out.history_image_sha8,
+  });
+  if (lastPrefixBySession.size > LAST_PREFIX_MAX_SESSIONS) {
+    const oldest = lastPrefixBySession.keys().next().value;
+    if (oldest !== undefined) lastPrefixBySession.delete(oldest);
+  }
+  if (!prev || prev.prefix === prefix) return;
+  out.prefix_change_reason =
+    prev.model !== out.model
+      ? 'model_switch'
+      : prev.system !== out.system_sha8
+        ? 'system_change'
+        : prev.history !== out.history_image_sha8
+          ? 'history_reimage'
+          : 'pxpipe_drift';
 }
 
 /** Stop reasons that mean a safety classifier fired (Anthropic / OpenAI spellings). */

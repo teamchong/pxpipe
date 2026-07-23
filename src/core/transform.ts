@@ -696,6 +696,11 @@ const DYNAMIC_BLOCK_TAGS = [
   'git_status',
   'directoryStructure',
   'system-reminder',
+  // `<total_tokens>N tokens left</total_tokens>` — decrements every turn; if
+  // left in the static slab it breaks the cacheable prefix right after it
+  // (verified A/B in events.jsonl: cache_read frozen at the pure-slab size,
+  // cache_create re-billing the whole tail at 1.25x instead of 0.1x reads).
+  'total_tokens',
 ] as const;
 
 // Known-static slab tags — suppresses first-sighting `unknownStaticTags` noise
@@ -725,6 +730,10 @@ const KNOWN_STATIC_TAGS = [
   'outputFormatting',
   'structuredWorkflow',
   'toolUseInstructions',
+  // Tag-classification canary prompts (~90 input tokens): these blocks are
+  // genuinely static there — suppress first-sighting noise only.
+  'severity',
+  'category',
 ] as const;
 
 function splitStaticDynamic(text: string): {
@@ -2319,27 +2328,37 @@ export async function transformRequest(
     }
   }
 
-  // Volatile env/context text lands at the END of the last user message (see
-  // the block above image splice for why). Runs AFTER history collapse so the
-  // env bytes stay in the live tail — never imaged into a frozen chunk — and
-  // AFTER 5b so they are never run through tool_result compression. Note
-  // tool_result blocks legally precede trailing text blocks in a user message
-  // (Claude Code appends its own system-reminders the same way).
+  // Volatile env/context text lands at the END of the FIRST user message — a
+  // POSITION-STABLE slot. It previously rode the LAST user message, but that
+  // slot roams forward every turn: pxpipe is stateless and the client never
+  // sees the wrapper, so at turn N+1 the message that carried it at turn N is
+  // replayed WITHOUT it. Byte-identical content at a moving position still
+  // diverges the replayed prefix at the old position, so every cache entry
+  // downstream of the slab/history anchor missed and the entire live tail
+  // re-created at the 1.25x rate each turn (events.jsonl 2026-07-21: read
+  // frozen at 25669 for 8 turns while create climbed 8797→21312). The wrapper
+  // bytes are already turn-invariant (env is static, token budget is pinned),
+  // so a fixed slot lets the tail accrue into cache; if the env genuinely
+  // changes (version bump), one full-prefix rewrite is the accepted cost.
+  // Runs AFTER history collapse and AFTER 5b, so the env bytes are appended
+  // raw — never imaged into a frozen chunk, never run through tool_result
+  // compression on this pass. Note tool_result blocks legally precede
+  // trailing text blocks in a user message (Claude Code appends its own
+  // system-reminders the same way).
   //
   // The block is wrapped in <system-reminder> tags so the model (and any
   // human reading a transcript) attributes it as injected context, NOT user
   // prose. Without the wrapper the relocated "# Environment" section blends
   // seamlessly into the user's message — on an empty/short user turn it can
-  // BECOME the entire visible message (observed live, 2026-07). The wrapper
-  // rides in the volatile tail behind the slab anchor, so it costs ~60 chars
-  // per request and cannot perturb the cached prefix. Same-pass safety: 5a
-  // (compressReminders) runs earlier and only scans the first user message,
-  // so this block is never self-imaged; and pxpipe is stateless per request,
-  // so the wrapper never appears in inbound client history (no compounding).
+  // BECOME the entire visible message (observed live, 2026-07). Same-pass
+  // safety: 5a (compressReminders) runs earlier in the SAME pass, so this
+  // block is never self-imaged this turn; and pxpipe is stateless per
+  // request, so the wrapper never appears in inbound client history (no
+  // compounding across turns).
   if (volatileEnvText) {
     const wrappedEnvText = `<system-reminder>\nContext relocated by pxpipe from the system prompt (volatile per-turn environment state — not written by the user):\n\n${volatileEnvText}\n</system-reminder>`;
     const msgs = req.messages ?? [];
-    for (let i = msgs.length - 1; i >= 0; i--) {
+    for (let i = 0; i < msgs.length; i++) {
       const m = msgs[i]!;
       if (m.role !== 'user') continue;
       const content = Array.isArray(m.content)

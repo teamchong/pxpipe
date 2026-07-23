@@ -367,3 +367,81 @@ describe('toTrackEvent body-sample mapping', () => {
     expect(out.req_body_sample_path).toBeUndefined();
   });
 });
+
+describe('prefix_change_reason classification (#11)', () => {
+  const baseEv = {
+    method: 'POST',
+    path: '/v1/messages',
+    status: 200,
+    durationMs: 100,
+  };
+  /** Build an event for session `key` with the given fingerprints. */
+  const turn = (
+    key: string,
+    f: { model?: string; system?: string; prefix: string; history?: string },
+  ) =>
+    toTrackEvent({
+      ...baseEv,
+      model: f.model ?? 'claude-fable-5',
+      info: {
+        firstUserSha8: key,
+        systemSha8: f.system ?? 'sys00001',
+        cachePrefixSha8: f.prefix,
+        historyImageSha: f.history ?? 'hist0001',
+      },
+    } as unknown as ProxyEvent);
+
+  it('is absent on the first turn of a session and on stable-prefix turns', () => {
+    const first = turn('sess-a1', { prefix: 'pfx00001' });
+    expect(first.prefix_change_reason).toBeUndefined();
+    const stable = turn('sess-a1', { prefix: 'pfx00001' });
+    expect(stable.prefix_change_reason).toBeUndefined();
+  });
+
+  it('attributes a prefix change to a model switch', () => {
+    turn('sess-b2', { prefix: 'pfx00001', model: 'claude-fable-5' });
+    const out = turn('sess-b2', { prefix: 'pfx00002', model: 'claude-sonnet-5' });
+    expect(out.prefix_change_reason).toBe('model_switch');
+  });
+
+  it('attributes a prefix change to a system prompt change', () => {
+    turn('sess-c3', { prefix: 'pfx00001', system: 'sys00001' });
+    const out = turn('sess-c3', { prefix: 'pfx00002', system: 'sys00002' });
+    expect(out.prefix_change_reason).toBe('system_change');
+  });
+
+  it('attributes a prefix change to a history re-image (new collapse epoch)', () => {
+    turn('sess-d4', { prefix: 'pfx00001', history: 'hist0001' });
+    const out = turn('sess-d4', { prefix: 'pfx00002', history: 'hist0002' });
+    expect(out.prefix_change_reason).toBe('history_reimage');
+  });
+
+  it('flags pxpipe_drift when the prefix changed but nothing upstream-visible did', () => {
+    turn('sess-e5', { prefix: 'pfx00001' });
+    const out = turn('sess-e5', { prefix: 'pfx00002' });
+    expect(out.prefix_change_reason).toBe('pxpipe_drift');
+  });
+
+  it('model switch wins over simultaneous history re-image (precedence order)', () => {
+    turn('sess-f6', { prefix: 'pfx00001', model: 'claude-fable-5', history: 'hist0001' });
+    const out = turn('sess-f6', {
+      prefix: 'pfx00002',
+      model: 'claude-opus-4-8',
+      history: 'hist0002',
+    });
+    expect(out.prefix_change_reason).toBe('model_switch');
+  });
+
+  it('does not classify events lacking a session key or prefix sha', () => {
+    const noKey = toTrackEvent({
+      ...baseEv,
+      info: { cachePrefixSha8: 'pfx00001' },
+    } as unknown as ProxyEvent);
+    expect(noKey.prefix_change_reason).toBeUndefined();
+    const noPrefix = toTrackEvent({
+      ...baseEv,
+      info: { firstUserSha8: 'sess-g7' },
+    } as unknown as ProxyEvent);
+    expect(noPrefix.prefix_change_reason).toBeUndefined();
+  });
+});

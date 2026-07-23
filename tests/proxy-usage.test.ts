@@ -471,7 +471,7 @@ describe('proxy usage extraction', () => {
     });
     expect(captured?.stopReason).toBe('tool_use');
     expect(captured?.info?.compressed).toBe(true);
-    expect(captured?.info?.firstImageWidth).toBe(768);
+    expect(captured?.info?.firstImageWidth).toBe(680);
     expect(captured?.info?.baselineProbeStatus).toBeUndefined();
   });
 
@@ -1204,10 +1204,10 @@ describe('proxy usage extraction', () => {
     expect(captured?.model).toBe('gpt-5.6-sol');
     expect(captured?.accountingProvider).toBe('openai');
     expect(captured?.info?.compressed).toBe(true);
-    // OpenCode reaches the Responses transformer directly. Sol's production
-    // profile supplies the validated 768px-wide monochrome renderer.
-    expect(captured?.info?.firstImageWidth).toBe(768);
-    expect(captured?.info?.firstImageHeight).toBeLessThanOrEqual(1932);
+    // OpenCode reaches the Responses transformer directly. Sol uses its
+    // JetBrains Mono profile and original-detail patch geometry.
+    expect(captured?.info?.firstImageWidth).toBe(680);
+    expect(captured?.info?.firstImageHeight).toBeLessThanOrEqual(1954);
     expect(captured?.info?.imageTokens ?? 0).toBeGreaterThan(0);
     expect(captured?.info?.baselineImagedTokens ?? 0).toBeGreaterThan(
       captured?.info?.imageTokens ?? 0,

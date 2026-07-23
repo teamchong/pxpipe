@@ -18,6 +18,12 @@ behavioral changes, patch = fixes).
   open calls, malformed protocol state, and the recent working tail stay native.
 
 ### Changed
+- Opt-in `gpt-5.6-sol` now uses genuine 12px JetBrains Mono glyphs in a native
+  8×13 cell at 84 columns, replacing 10px glyphs padded to an effective 9×12
+  cell. The resulting full strip is 680px wide; its raw pilot scored 7/8 exact
+  fields with one confabulation.
+- A genuine 13px/8×14 Sol follow-up regressed to 2/8 aggregate exact fields and
+  was rejected; production remains on the 12px/8×13 profile.
 - Missing atlas glyphs are escaped as `[U+HEX]` instead of silently dropped.
 - Models are instructed not to guess exact identifiers, paths, hashes, versions,
   or numbers that are visible only in an image and absent from the factsheet.

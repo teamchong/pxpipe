@@ -4,6 +4,13 @@ All notable changes to pxpipe are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features /
 behavioral changes, patch = fixes).
 
+## Unreleased
+
+### Changed
+- Opt-in `gpt-5.6-sol` now uses native 14px JetBrains Mono at 84 columns. Its paid
+  pilot preserved gist and guard checks, read 7/8 exact values, and produced no
+  unsupported inventions; Sol remains off by default.
+
 ## 0.10.0 — 2026-07-22
 
 ### Added

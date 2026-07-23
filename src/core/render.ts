@@ -59,9 +59,27 @@ import {
   ATLAS_GRAY_WIDE_FLAGS as JBM12_GRAY_WIDE_FLAGS,
   atlasGrayRank as jbMono12GrayRank,
 } from './atlas-gray-jbmono12.js';
+import {
+  ATLAS_CELL_W as JBM14_CELL_W,
+  ATLAS_CELL_H as JBM14_CELL_H,
+  ATLAS_ASCENT as JBM14_ASCENT,
+  ATLAS_PIXELS as JBM14_PIXELS,
+  ATLAS_OFFSETS as JBM14_OFFSETS,
+  ATLAS_WIDE_FLAGS as JBM14_WIDE_FLAGS,
+  atlasRank as jbMono14Rank,
+} from './atlas-jbmono14.js';
+import {
+  ATLAS_GRAY_CELL_W as JBM14_GRAY_CELL_W,
+  ATLAS_GRAY_CELL_H as JBM14_GRAY_CELL_H,
+  ATLAS_GRAY_ASCENT as JBM14_GRAY_ASCENT,
+  ATLAS_GRAY_PIXELS as JBM14_GRAY_PIXELS,
+  ATLAS_GRAY_OFFSETS as JBM14_GRAY_OFFSETS,
+  ATLAS_GRAY_WIDE_FLAGS as JBM14_GRAY_WIDE_FLAGS,
+  atlasGrayRank as jbMono14GrayRank,
+} from './atlas-gray-jbmono14.js';
 import { encodeGrayPng, encodeRgbPng } from './png.js';
 
-export type RenderFont = 'spleen-5x8' | 'jetbrains-mono-10' | 'jetbrains-mono-12';
+export type RenderFont = 'spleen-5x8' | 'jetbrains-mono-10' | 'jetbrains-mono-12' | 'jetbrains-mono-14';
 export const DEFAULT_RENDER_FONT: RenderFont = 'spleen-5x8';
 
 interface BitAtlas {
@@ -152,9 +170,31 @@ const JBM12_ATLAS: AtlasSet = {
   },
 };
 
+const JBM14_ATLAS: AtlasSet = {
+  bit: {
+    cellW: JBM14_CELL_W,
+    cellH: JBM14_CELL_H,
+    ascent: JBM14_ASCENT,
+    pixels: JBM14_PIXELS,
+    offsets: JBM14_OFFSETS,
+    wideFlags: JBM14_WIDE_FLAGS,
+    rank: jbMono14Rank,
+  },
+  gray: {
+    cellW: JBM14_GRAY_CELL_W,
+    cellH: JBM14_GRAY_CELL_H,
+    ascent: JBM14_GRAY_ASCENT,
+    pixels: JBM14_GRAY_PIXELS,
+    offsets: JBM14_GRAY_OFFSETS,
+    wideFlags: JBM14_GRAY_WIDE_FLAGS,
+    rank: jbMono14GrayRank,
+  },
+};
+
 function atlasSet(font: RenderFont | undefined): AtlasSet {
   if (font === 'jetbrains-mono-10') return JBM10_ATLAS;
   if (font === 'jetbrains-mono-12') return JBM12_ATLAS;
+  if (font === 'jetbrains-mono-14') return JBM14_ATLAS;
   return DEFAULT_ATLAS;
 }
 

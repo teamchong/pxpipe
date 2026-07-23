@@ -70,6 +70,7 @@ function fakeUpstream() {
 
 const FORCE = { charsPerToken: 1, minCompressChars: 1 } as const;
 const big = (n: number) => 'x'.repeat(n);
+const dense = (n: number) => Array.from({ length: Math.ceil(n / 17) }, (_, i) => `k${i.toString(16)}=v${i * 7919}`).join('\n').slice(0, n);
 const APPENDED_SYSTEM_SENTINEL = 'APPENDED_SYSTEM_SENTINEL_keep_live_text';
 const BASE_SYSTEM_SENTINEL = 'BASE_SYSTEM_SENTINEL_image_me';
 const LARGE_SYSTEM_CHARS = 80_000;
@@ -229,7 +230,7 @@ describe('design: RECENT REQUEST stays legible (GPT)', () => {
       '/v1/chat/completions',
       JSON.stringify({
         model: 'gpt-5.6-sol',
-        messages: [{ role: 'system', content: 'SYS ' + big(60_000) }, ...turns],
+        messages: [{ role: 'system', content: 'SYS ' + dense(60_000) }, ...turns],
       }),
     );
     const hay = JSON.stringify(out);

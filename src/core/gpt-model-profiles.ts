@@ -119,7 +119,9 @@ export const DEFAULT_GPT_PROFILE: GptModelProfile = {
 const GPT56_SOL_PROFILE: GptModelProfile = {
   // GPT-5.6 original detail bills the submitted 32px patches without a patch cap.
   vision: { regime: 'patch', multiplier: 1 },
-  // 84 × 8px + padding = 680px with genuine 12px JetBrains Mono glyphs.
+  // Match the native 14px reader profile. Sol remains opt-in: its two-fixture
+  // pilot retained gist/guard and had no unsupported inventions, but one exact
+  // identifier was truncated.
   stripCols: 84,
   // 1954px permits 149 rows at an actual 1945px, filling 61 patch rows.
   maxHeightPx: 1954,
@@ -140,7 +142,7 @@ const GPT56_SOL_PROFILE: GptModelProfile = {
   },
   style: {
     ...BASE_STYLE,
-    font: 'jetbrains-mono-12',
+    font: 'jetbrains-mono-14',
     cellWBonus: 0,
     cellHBonus: 0,
   },
@@ -255,7 +257,7 @@ function nonNegativeInt(v: unknown, fallback: number): number {
 }
 
 function renderFont(v: unknown, fallback: RenderFont): RenderFont {
-  return v === 'spleen-5x8' || v === 'jetbrains-mono-10' || v === 'jetbrains-mono-12'
+  return v === 'spleen-5x8' || v === 'jetbrains-mono-10' || v === 'jetbrains-mono-12' || v === 'jetbrains-mono-14'
     ? v
     : fallback;
 }

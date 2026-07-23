@@ -10,9 +10,8 @@
 import {
   DENSE_CONTENT_CHARS_PER_IMAGE,
   DENSE_CONTENT_COLS,
-  MAX_HEIGHT_PX,
-  PAD_X,
-  CELL_W,
+  renderCellHeight,
+  renderCellWidth,
 } from './render.js';
 // Dogfood the public SDK: render via the same `./transform` entry external
 // consumers import (pxpipe-proxy/transform → renderTextToImages), not the
@@ -20,6 +19,7 @@ import {
 import { renderTextToImages } from './library.js';
 import { estimateImageCount, REPORT_CHARS_PER_TOKEN } from './transform.js';
 import { visionTokensForModel } from './openai.js';
+import { resolveGptProfile } from './gpt-model-profiles.js';
 import {
   factSheetTextFromEntries,
   extractFactSheetTokensAllPages,
@@ -156,9 +156,7 @@ export function parseExportArgv(
   let git = false;
   let diff: string | undefined;
   let stdin = false;
-  // Locked to the proxy's density — NO CLI knob. Export must render exactly what the
-  // proxy ships to the model; the proxy has no width flag, so neither does export.
-  const cols = DENSE_CONTENT_COLS;
+  let cols = DENSE_CONTENT_COLS;
   let out =
     defaultOut ??
     (typeof process !== 'undefined'
@@ -234,6 +232,7 @@ export function parseExportArgv(
     }
   }
 
+  cols = resolveGptProfile(model).stripCols;
   return {
     kind: 'opts',
     parsed: { targets, include, exclude, git, diff, stdin, cols, out, model, json, open },
@@ -294,9 +293,11 @@ export function computeTokenReport(
   cols: number,
   model: string,
 ): ExportTokenReport {
-  const stripW = 2 * PAD_X + cols * CELL_W;
-  const estImages = estimateImageCount(sourceText, cols, DENSE_CONTENT_CHARS_PER_IMAGE);
-  const perStrip = exportImageTokens(model, stripW, MAX_HEIGHT_PX);
+  const profile = resolveGptProfile(model);
+  const stripW = 8 + cols * renderCellWidth(profile.style);
+  const linesPerImage = Math.max(1, Math.floor((profile.maxHeightPx - 8) / renderCellHeight(profile.style)));
+  const estImages = estimateImageCount(sourceText, cols, DENSE_CONTENT_CHARS_PER_IMAGE, linesPerImage);
+  const perStrip = exportImageTokens(model, stripW, profile.maxHeightPx);
   const imageTokens = Math.round(estImages * perStrip);
   const textTokens = Math.round(sourceText.length / REPORT_CHARS_PER_TOKEN);
   const percentSaved =
@@ -424,6 +425,7 @@ export async function runExportCore(
   // Render to PNG pages via the public SDK primitive. shrink=true sizes the canvas
   // to the widest line so short-line code isn't padded to full width.
   const { pages: images } = await renderTextToImages(sourceText, {
+    model: opts.model,
     cols: opts.cols,
     shrink: true,
     reflow: true,

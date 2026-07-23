@@ -495,10 +495,9 @@ function draw(data: Point[], fableCpt: number, geminiCpt: number): Buffer {
 // ---------------------------------------------------------------------------
 const fixture = loadFixture();
 const fable = await measureDensity('Fable', fixture, patchTokenCount);
-// Opus 5 is measured, not derived from Fable. The two profiles are currently
-// byte-identical, so this returns the same cpt — but hardcoding `fable.cpt` for Opus
-// would silently go stale the moment CLAUDE_OPUS_PROFILE diverges. Render under the
-// resolved profile's own geometry so the chart tracks it.
+// Opus 5 is measured, not derived from Fable. Both resolve to CLAUDE_PROFILE
+// today, so this returns the same cpt — but hardcoding `fable.cpt` would go stale
+// if resolveClaudeProfile ever splits them. Render under the resolved geometry.
 const opusProfile = resolveGptProfile('claude-opus-5');
 const opus = await measureDensity('Opus', fixture, patchTokenCount, {
   cols: opusProfile.stripCols,

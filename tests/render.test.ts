@@ -50,6 +50,8 @@ describe('model-selectable font atlases', () => {
     expect(renderCellHeight({ font: 'jetbrains-mono-10', aa: true })).toBe(11);
     expect(renderCellWidth({ font: 'jetbrains-mono-12', aa: true })).toBe(8);
     expect(renderCellHeight({ font: 'jetbrains-mono-12', aa: true })).toBe(13);
+    expect(renderCellWidth({ font: 'jetbrains-mono-14', aa: true })).toBe(9);
+    expect(renderCellHeight({ font: 'jetbrains-mono-14', aa: true })).toBe(16);
 
     const text = 'tokenLedgerShard a3f9c1e0b7d2';
     const defaultImg = await renderChunkToPng(text, 40, { aa: true });

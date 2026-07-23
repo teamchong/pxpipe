@@ -419,6 +419,20 @@ describe('runExportCore integration', () => {
     }
   });
 
+  it('offline export derives Opus and Sol geometry from the model profile', async () => {
+    const sourceText = Array.from({ length: 600 }, (_, i) => `field_${i}=value_${i * 7919}`).join('\n');
+    const opus = await runExportCore(sourceText, {
+      sourceFiles: [], cols: 86, model: 'claude-opus-4-8',
+    });
+    const sol = await runExportCore(sourceText, {
+      sourceFiles: [], cols: 84, model: 'gpt-5.6-sol',
+    });
+    expect(opus.manifest.pages[0]?.width).toBeLessThanOrEqual(782);
+    expect(sol.manifest.pages[0]?.width).toBeLessThanOrEqual(764);
+    expect(opus.manifest.pages.every((page) => page.height <= 728)).toBe(true);
+    expect(sol.manifest.pages.every((page) => page.height <= 1954)).toBe(true);
+  });
+
   it('PNG artifacts are valid PNG files (start with PNG magic bytes)', async () => {
     const sourceText = 'export function foo() { return 1; }\n'.repeat(10);
     const result = await runExportCore(sourceText, {

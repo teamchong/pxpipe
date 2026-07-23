@@ -23,8 +23,13 @@ import { visionTokensForModel } from '../../dist/core/openai.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WORK_DIR = join(HERE, '.work');
-const PREFLIGHT_PATH = join(HERE, 'preflight.json');
-const RESULTS_PATH = join(HERE, 'results.json');
+const NATIVE_SIZE_SWEEP = /^(1|true)$/i.test(process.env.SOL_PROFILE_NATIVE_SIZE_SWEEP || '');
+const CANDIDATE_FONT_PX = Number(process.env.SOL_PROFILE_CANDIDATE_FONT_PX || 12);
+const CANDIDATE_CELL_W = Number(process.env.SOL_PROFILE_CANDIDATE_CELL_W || 8);
+const CANDIDATE_CELL_H = Number(process.env.SOL_PROFILE_CANDIDATE_CELL_H || 13);
+const CANDIDATE_NAME = `jbmono${CANDIDATE_FONT_PX}`;
+const PREFLIGHT_PATH = join(HERE, NATIVE_SIZE_SWEEP ? `preflight-${CANDIDATE_NAME}.json` : 'preflight.json');
+const RESULTS_PATH = join(HERE, NATIVE_SIZE_SWEEP ? `results-${CANDIDATE_NAME}.json` : 'results.json');
 const RAW_DIR = join(HERE, 'raw');
 
 const MODEL = 'gpt-5.6-sol';
@@ -37,6 +42,7 @@ const RESUME_AFTER_OUTPUT_CAP = process.env.SOL_PROFILE_RESUME_AFTER_OUTPUT_CAP 
 const RESUME_OLD_AS_RETUNE = process.env.SOL_PROFILE_RESUME_OLD_AS_RETUNE === '1';
 const RESUME_SPACED_RETUNE = process.env.SOL_PROFILE_RESUME_SPACED_RETUNE === '1';
 const RESUME_AFTER_OLD_CONTROL_FAILURE = process.env.SOL_PROFILE_RESUME_AFTER_OLD_CONTROL_FAILURE === '1';
+const RESUME_NATIVE_SIZE_SWEEP = /^(1|true)$/i.test(process.env.SOL_PROFILE_NATIVE_SIZE_RESUME || '');
 
 function invariant(condition, message) {
   if (!condition) throw new Error(message);
@@ -211,20 +217,27 @@ invariant(renderCellWidth(PROFILES.old_shared.style) === 5, 'Old shared profile 
 invariant(renderCellHeight(PROFILES.old_shared.style) === 8, 'Old shared profile must use 8px cells');
 invariant(PROFILES.current_sol.cols === 84, 'Current Sol profile must use 84 columns');
 invariant(PROFILES.current_sol.maxHeightPx === 1954, 'Current Sol max height must be 1954px');
-invariant(PROFILES.current_sol.style.font === 'jetbrains-mono-12', 'Current Sol profile must use JetBrains Mono 12');
+if (!NATIVE_SIZE_SWEEP) {
+  invariant(PROFILES.current_sol.style.font === 'jetbrains-mono-12', 'Current Sol profile must use JetBrains Mono 12');
+}
 invariant(PROFILES.current_sol.style.aa === true, 'Current Sol profile must use grayscale AA');
-invariant(renderCellWidth(PROFILES.current_sol.style) === 8, 'Current Sol profile must use 8px cells');
-invariant(renderCellHeight(PROFILES.current_sol.style) === 13, 'Current Sol profile must use 13px cells');
+if (!NATIVE_SIZE_SWEEP) {
+  invariant(renderCellWidth(PROFILES.current_sol.style) === 8, 'Current Sol profile must use 8px cells');
+  invariant(renderCellHeight(PROFILES.current_sol.style) === 13, 'Current Sol profile must use 13px cells');
+}
 invariant(PROFILES.retuned_sol_9x12.cols === 84, 'Retuned Sol candidate must use 84 columns');
 invariant(renderCellWidth(PROFILES.retuned_sol_9x12.style) === 9, 'Retuned Sol candidate must use 9px cells');
 invariant(renderCellHeight(PROFILES.retuned_sol_9x12.style) === 12, 'Retuned Sol candidate must use 12px cells');
 
-const CALL_ORDER = [
+const DEFAULT_CALL_ORDER = [
   { fixture: 'alpha', profile: 'current_sol' },
   { fixture: 'alpha', profile: 'old_shared' },
   { fixture: 'beta', profile: 'old_shared' },
   { fixture: 'beta', profile: 'current_sol' },
 ];
+const CALL_ORDER = NATIVE_SIZE_SWEEP
+  ? FIXTURE_SPECS.map(({ id: fixture }) => ({ fixture, profile: 'current_sol' }))
+  : DEFAULT_CALL_ORDER;
 // If the first attempt consumed its whole output cap as hidden reasoning, it is
 // not a recall observation. A manually reviewed resume still counts that attempt
 // against the cap, retries the candidate with reasoning disabled, retains one
@@ -245,6 +258,14 @@ const CANDIDATE_REPLICATION_ORDER = [
   { fixture: 'beta', profile: 'current_sol' },
 ];
 invariant(CALL_ORDER.length <= MAX_CALLS, 'Call plan exceeds the four-call cap');
+if (NATIVE_SIZE_SWEEP) {
+  invariant(PROFILES.current_sol.style.cellWBonus === 0, 'Native sweep forbids horizontal cell padding');
+  invariant(PROFILES.current_sol.style.cellHBonus === 0, 'Native sweep forbids vertical cell padding');
+  invariant(renderCellWidth(PROFILES.current_sol.style) === CANDIDATE_CELL_W,
+    `${CANDIDATE_NAME}: expected ${CANDIDATE_CELL_W}px cell width`);
+  invariant(renderCellHeight(PROFILES.current_sol.style) === CANDIDATE_CELL_H,
+    `${CANDIDATE_NAME}: expected ${CANDIDATE_CELL_H}px cell height`);
+}
 
 function safePct(value) {
   return Math.round(value * 10) / 10;
@@ -510,7 +531,9 @@ async function callResponses(arm, sequence) {
     ? parseError
     : (json?.error?.message || `Responses HTTP ${response.status}`);
 
-  const stem = `${String(sequence).padStart(2, '0')}-${arm.fixture}-${arm.profile}`;
+  const stem = NATIVE_SIZE_SWEEP
+    ? `${CANDIDATE_NAME}-${arm.fixture}`
+    : `${String(sequence).padStart(2, '0')}-${arm.fixture}-${arm.profile}`;
   await mkdir(RAW_DIR, { recursive: true });
   await writeFile(join(RAW_DIR, `${stem}.response.json`), rawBody);
   await writeJsonAtomic(join(RAW_DIR, `${stem}.receipt.json`), {
@@ -549,6 +572,11 @@ const preflight = {
   generatedAt: new Date().toISOString(),
   live: false,
   model: MODEL,
+  candidate: NATIVE_SIZE_SWEEP ? {
+    name: CANDIDATE_NAME,
+    fontPx: CANDIDATE_FONT_PX,
+    nativeCell: `${CANDIDATE_CELL_W}x${CANDIDATE_CELL_H}`,
+  } : null,
   endpointPolicy: 'direct Responses endpoint; port 47821 is rejected',
   callCap: MAX_CALLS,
   callOrder: CALL_ORDER,
@@ -595,7 +623,17 @@ if (!HAS_APPROVAL) {
 
 let results;
 let liveCallArms = callArms;
-if (RESUME_AFTER_OLD_CONTROL_FAILURE) {
+if (RESUME_NATIVE_SIZE_SWEEP) {
+  invariant(NATIVE_SIZE_SWEEP, 'Native-size resume requires sweep mode');
+  results = JSON.parse(await readFile(RESULTS_PATH, 'utf8'));
+  invariant(results.model === MODEL, 'Native-size result model mismatch');
+  const completedFixtures = new Set(results.calls.map((call) => call.fixture));
+  liveCallArms = callArms.filter((arm) => !completedFixtures.has(arm.fixture));
+  invariant(liveCallArms.length > 0, 'Native-size sweep has no remaining fixtures');
+  invariant(results.calls.length + liveCallArms.length <= MAX_CALLS, 'Native-size resume exceeds paid-call cap');
+  results.stoppedEarly = false;
+  results.stopReason = null;
+} else if (RESUME_AFTER_OLD_CONTROL_FAILURE) {
   results = JSON.parse(await readFile(RESULTS_PATH, 'utf8'));
   invariant(results.model === MODEL, 'Candidate-replication result model mismatch');
   invariant(results.calls.length === 2, 'Candidate replication requires exactly two prior attempts');
@@ -736,7 +774,7 @@ for (let i = 0; i < liveCallArms.length; i++) {
     `guard=${score.guard.ok ? 'ok' : 'fail'} confab=${score.confabulations.length} ` +
     `latency=${receipt.latencyMs}ms`);
 
-  if (receipt.error || !score.pass) {
+  if (!NATIVE_SIZE_SWEEP && (receipt.error || !score.pass)) {
     results.stoppedEarly = i < liveCallArms.length - 1;
     results.stopReason = receipt.error
       ? `transport/API failure on ${arm.fixture}/${arm.profile}: ${receipt.error}`

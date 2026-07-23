@@ -17,17 +17,7 @@ import type { GptModelProfile } from './gpt-model-profiles.js';
  */
 
 /** Claude 4.7+. Vision struct unused: visionTokensForModel prices Claude by pixels. */
-export const CLAUDE_FABLE_PROFILE: GptModelProfile = {
-  vision: { regime: 'tile', base: 85, perTile: 170 },
-  stripCols: ANTHROPIC_STRIP_COLS,
-  maxHeightPx: ANTHROPIC_MAX_HEIGHT_PX,
-  visionTier: 'high-res',
-  factSheetFormat: 'full',
-  history: BASE_HISTORY,
-  style: { ...BASE_STYLE },
-};
-
-export const CLAUDE_OPUS_PROFILE: GptModelProfile = {
+export const CLAUDE_PROFILE: GptModelProfile = {
   vision: { regime: 'tile', base: 85, perTile: 170 },
   stripCols: ANTHROPIC_STRIP_COLS,
   maxHeightPx: ANTHROPIC_MAX_HEIGHT_PX,
@@ -39,7 +29,7 @@ export const CLAUDE_OPUS_PROFILE: GptModelProfile = {
 
 /** Pre-4.7 Claude: same render geometry, standard image-resolution tier. */
 export const CLAUDE_LEGACY_PROFILE: GptModelProfile = {
-  ...CLAUDE_FABLE_PROFILE,
+  ...CLAUDE_PROFILE,
   visionTier: 'standard',
   style: { ...BASE_STYLE },
 };
@@ -73,10 +63,8 @@ export function isPre47Claude(m: string): boolean {
   return major < 4 || (major === 4 && minor < 7);
 }
 
-/** Pick the Claude profile for an id. Version beats family: the standard
- *  resolution tier cuts across opus/sonnet/haiku. */
+/** Pick the Claude profile for an id. Only the resolution tier varies: render
+ *  geometry is identical across opus/sonnet/haiku/fable. */
 export function resolveClaudeProfile(m: string): GptModelProfile {
-  if (isPre47Claude(m)) return CLAUDE_LEGACY_PROFILE;
-  if (m.includes('opus')) return CLAUDE_OPUS_PROFILE;
-  return CLAUDE_FABLE_PROFILE;
+  return isPre47Claude(m) ? CLAUDE_LEGACY_PROFILE : CLAUDE_PROFILE;
 }

@@ -1045,7 +1045,7 @@ export function createProxy(config: ProxyConfig = {}) {
               ? await transformOpenAIResponses(bridgeBody, effectiveOpts)
               : bridgedChatMessages
                 ? await transformOpenAIChatCompletions(bridgeBody, effectiveOpts)
-                : await transformRequest(bodyIn, effectiveOpts)
+                : await transformRequest(bodyIn, { ...effectiveOpts, model: effectiveModel ?? undefined })
             : isOpenAIChat
               ? await transformOpenAIChatCompletions(bodyIn, effectiveOpts)
               : await transformOpenAIResponses(bodyIn, effectiveOpts);

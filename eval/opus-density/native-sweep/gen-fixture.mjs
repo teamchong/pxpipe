@@ -5,24 +5,24 @@
 import { writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomInt } from 'node:crypto';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const R = (n) => randomBytes(n).toString('hex').slice(0, n);
 const WORDS = ['ledger','shard','queue','render','atlas','token','commit','stripe',
   'glyph','patch','vision','cursor','buffer','stream','digest','anchor','cache',
   'probe','sweep','retune','baseline','profile'];
-const w = () => WORDS[randomBytes(1)[0] % WORDS.length];
-const d = (n) => Array.from({ length: n }, () => randomBytes(1)[0] % 10).join('');
+const w = () => WORDS[randomInt(WORDS.length)];
+const d = (n) => Array.from({ length: n }, () => randomInt(10)).join('');
 const cap = (s) => s[0].toUpperCase() + s.slice(1);
 const B64 = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
-const b64 = (n) => Array.from({ length: n }, () => B64[randomBytes(1)[0] % B64.length]).join('');
+const b64 = (n) => Array.from({ length: n }, () => B64[randomInt(B64.length)]).join('');
 
 const targets = [
   { key: 'hex12',  value: R(12),                q: `The 12-char hex id immediately after "trace=".` },
   { key: 'camel',  value: w()+cap(w())+cap(w()), q: `The camelCase symbol right after "export function " (before "(").` },
   { key: 'path',   value: `/Users/${w()}/repos/${w()}/src/core/${w()}${d(2)}.ts`, q: `The full file path right after "wrote " (ends .ts).` },
-  { key: 'semver', value: `${1+randomBytes(1)[0]%9}.${randomBytes(1)[0]%40}.${randomBytes(1)[0]%99}`, q: `The version right after "pxpipe-proxy@".` },
+  { key: 'semver', value: `${1 + randomInt(9)}.${randomInt(40)}.${randomInt(99)}`, q: `The version right after "pxpipe-proxy@".` },
   { key: 'bytes',  value: d(11),                q: `The integer right after "flushed " (before " bytes").` },
   { key: 'reqid',  value: `${R(8)}-${R(4)}`,     q: `The id right after "req_" (8hex-4hex).` },
   { key: 'envvar', value: `${w().toUpperCase()}_${w().toUpperCase()}_${d(1)}`, q: `The UPPER_SNAKE env var just before "=1" on the export line.` },

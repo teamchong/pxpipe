@@ -127,10 +127,9 @@ without running the proxy.
   and allows 64 images, while Grok allows 24 images. Opt-in long-session
   coverage can be changed (defensive cap 100) with
   `PXPIPE_GPT_HISTORY_MAX_IMAGES=48` after validating the provider's request cap.
-- **Per-model rendering:** opt-in `gpt-5.6-sol` uses native 12px JetBrains Mono
-  glyphs in an 8×13 cell, 84 columns, and a 680px full-width strip; Claude keeps
-  its 312-column, 1568×728
-  5×8 Spleen profile. These
+- **Per-model rendering:** opt-in Opus and `gpt-5.6-sol` use native 14px
+  JetBrains Mono glyphs in a 9×16 cell. Opus uses 86 columns; Sol uses 84.
+  Fable keeps its 312-column, 1568×728 5×8 Spleen profile. These
   are selected by exact model id, including history pages and profitability
   math. Recognized IDs can ride in the bounded factsheet, and
   recent/open tool state stays native.
@@ -157,10 +156,27 @@ is confabulations, so lower is better.
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
 | `claude-fable-5` | **100/100** | **98/98** | **18/18** | **0/16** | **13/15** | June 2026 production profiles: [arithmetic + hex](FINDINGS.md), [gist/state/guards](eval/gist-recall/) |
 | `google/gemini-3.6-flash` | **100/100** | **98/98** | **18/18** | **0/16** | **14/15** | current shipped profile: [quality results](eval/gemini-profile/QUALITY_RESULTS.md) |
-| `gpt-5.6-sol` | **98/100** | 83/98 | 17/18 | 4/16 | 0/15 | prior 5×8 broad suite; current 8×13 raw pilot: 7/8 exact, 1 confabulation: [pilot](eval/sol-profile/README.md) |
-| `claude-opus-4-8` | 93/100 | — | — | — | 0/15 | historical profile: [arithmetic](eval/gsm8k/), [dense hex](eval/needle-haystack/) |
+| `gpt-5.6-sol` | **98/100** | 83/98 | 17/18 | 4/16 | 0/15 | prior 5×8 broad suite; native 14px pilot: 7/8 exact, 0 inventions, gist/guard pass: [pilot](eval/sol-profile/README.md) |
+| `claude-opus-4-8` | 93/100 | — | — | — | 0/15 | native 14px blind sweep: 8/8 exact, 0 confabulations; [results](eval/opus-density/RESULTS.md) |
 | `grok-4.5` | 82/100 | 83/98 | 13/18 | **0/16** | 0/15 | current shipped profile: [quality results](eval/grok-density/QUALITY_RESULTS.md) |
 | `moonshotai/kimi-k3` | 79/100 | 84/98 | 15/18 | 1/16 | 0/15 | generic GPT profile: [quality results](eval/sol-profile/KIMI_K3_QUALITY_RESULTS.md) |
+
+### Native-profile cost check
+
+Offline export of the same deterministic 454,045-character dense record corpus
+through each complete profile produced:
+
+| model profile | pages | text estimate | image tokens | savings |
+|---|---:|---:|---:|---:|
+| Fable, Spleen 5×8 | 17 | 122,715 | 23,856 | 80.6% |
+| Opus, JetBrains Mono 14px | 118 | 122,715 | 85,428 | 30.4% |
+| Sol, JetBrains Mono 14px | 45 | 122,715 | 65,424 | 46.7% |
+
+The text estimate uses 3.7 characters/token; image tokens use each model's
+provider formula and actual rendered page dimensions. These figures establish
+profile cost on this corpus, not a universal workload savings rate. Opus's
+separate blind fixture retained 33% while reading 8/8 exact; Sol's paid fixtures
+estimated 42% while reading 7/8 exact with no unsupported inventions.
 
 The runs use different transports and profile generations, not one identical
 image geometry. Fable and Opus use Claude; Gemini uses Google AI Studio; Sol

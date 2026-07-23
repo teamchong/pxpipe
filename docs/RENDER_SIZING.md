@@ -19,8 +19,9 @@ grows with content until the profile cap, then overflow becomes another page.
 
 | model rule | atlas / effective cell | columns | full width | max height |
 |---|---|---:|---:|---:|
-| Claude / Anthropic | Spleen + Unifont, 5×8 | 312 | 1568 px | 728 px |
-| opt-in `gpt-5.6-sol` | JetBrains Mono 12px, native 8×13 | 84 | 680 px | 1954 px |
+| Fable / Anthropic default | Spleen + Unifont, 5×8 | 312 | 1568 px | 728 px |
+| opt-in Claude Opus | JetBrains Mono 14px, native 9×16 | 86 | 782 px | 728 px |
+| opt-in `gpt-5.6-sol` | JetBrains Mono 14px, native 9×16 | 84 | 764 px | 1954 px |
 | opt-in Grok 4.5 | Spleen + Unifont, 5×8 white AA + IDS + factsheet (no grid) | 152 | 768 px | 512 px |
 | other OpenAI fallback | Spleen + Unifont, 5×8 | 152 | 768 px | 1932 px |
 
@@ -28,9 +29,8 @@ Complete profile values and evidence are in
 [`MODEL_RENDER_PROFILES.md`](MODEL_RENDER_PROFILES.md).
 
 The Sol row is the **currently configured** geometry. Its paid raw-image pilot
-scored 4/4 exact on alpha and 3/4 on beta, with one confabulated port; gist and
-guard passed on both. It did not clear the strict two-fixture acceptance bar, so
-Sol remains opt-in. See
+scored 7/8 exact with one truncated identifier, no unsupported inventions, and
+passing gist and guard checks on both fixtures. Sol remains opt-in. See
 [`eval/sol-profile/RESULTS.md`](../eval/sol-profile/RESULTS.md).
 
 ## Provider boundaries
@@ -39,7 +39,7 @@ Anthropic resizes images to fit both a 1568px long edge and roughly 1.15MP.
 The 1568×728 Claude page stays inside both bounds, so rasterized glyphs reach
 the vision encoder without the old 0.555× resample.
 
-OpenAI-shaped profiles use portrait strips. GPT 5.6 Sol uses 84×8+8, a 680px
+OpenAI-shaped profiles use portrait strips. GPT 5.6 Sol uses 84×9+8, a 764px
 strip up to 1954px; Grok uses 152×5+8, a 768px strip up to 512px.
 
 ## Font and Unicode

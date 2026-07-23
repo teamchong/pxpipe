@@ -14,6 +14,7 @@
 import { createProxy, type ProxyConfig } from './core/proxy.js';
 import type { TransformOptions } from './core/transform.js';
 import { toTrackEvent, JsonLogTracker, noopTracker, type Tracker } from './core/tracker.js';
+import { setAllowedModelBases } from './core/applicability.js';
 
 export interface Env {
   /** Optional single upstream base for every API family. Family-specific env vars override it. */
@@ -36,6 +37,8 @@ export interface Env {
   MIN_REMINDER_CHARS?: string;
   MIN_TOOL_RESULT_CHARS?: string;
   COLS?: string;
+  /** Comma-separated model bases eligible for compression. */
+  PXPIPE_MODELS?: string;
   /** When "0" / "false", disable per-request event JSON logs. Default-on.
    *  Cloudflare ingests console.log as Workers Logs; pipe via Logpush to
    *  R2/S3 for the same JSONL shape Node writes to disk. */
@@ -68,6 +71,14 @@ const truthy = (v: string | undefined, fallback: boolean): boolean =>
 
 export default {
   async fetch(req: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
+    const configuredModels = env.PXPIPE_MODELS?.trim();
+    setAllowedModelBases(
+      configuredModels === undefined || configuredModels === ''
+        ? null
+        : /^(0|false|no|off|none)$/i.test(configuredModels)
+          ? []
+          : configuredModels.split(',').map((model) => model.trim()).filter(Boolean),
+    );
     // ── Caller auth ────────────────────────────────────────────────────
     // If this deployment injects API keys, never serve anonymous callers:
     // workers.dev URLs are discoverable, and without this gate anyone who

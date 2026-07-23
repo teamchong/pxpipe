@@ -17,6 +17,7 @@ import {
   type KeepSharpBlock,
   type RecoverableBlock,
 } from './transform.js';
+import { resolveGptProfile } from './gpt-model-profiles.js';
 
 export type { KeepSharpBlock, RecoverableBlock };
 
@@ -116,7 +117,7 @@ export async function transformAnthropicMessages(
   }
 
   try {
-    const { body, info } = await transformRequest(original, input.options);
+    const { body, info } = await transformRequest(original, { ...input.options, model: input.model ?? undefined });
     const reason = classifyReason(info);
     const markerCount = countCacheControlMarkers(body);
     return {
@@ -147,7 +148,9 @@ export async function transformAnthropicMessages(
 // ---------------------------------------------------------------------------
 
 export interface RenderTextToImagesOptions {
-  /** Wrap-width cap in cols. Default DENSE_CONTENT_COLS (384). */
+  /** Model whose complete built-in render profile supplies defaults. */
+  readonly model?: string;
+  /** Wrap-width cap. Defaults to the model profile when `model` is set. */
   readonly cols?: number;
   /** Shrink the canvas to the widest actual line (default true). `false` keeps the
    *  full `cols` width — the proxy's eval-backed full-canvas behavior. */
@@ -158,9 +161,9 @@ export interface RenderTextToImagesOptions {
   readonly reflow?: boolean;
   /** Max source chars per page. Default DENSE_CONTENT_CHARS_PER_IMAGE. */
   readonly maxCharsPerImage?: number;
-  /** Render style. Default DENSE_RENDER_STYLE (bare 5×8 cell, anti-aliased). */
+  /** Render style. Defaults to the model profile when `model` is set. */
   readonly style?: RenderStyle;
-  /** Max page height in px. Default MAX_HEIGHT_PX (728 — Anthropic 1568-edge / ~1.15 MP safe). */
+  /** Max page height. Defaults to the model profile when `model` is set. */
   readonly maxHeightPx?: number;
 }
 
@@ -189,9 +192,10 @@ export async function renderTextToImages(
   text: string,
   opts: RenderTextToImagesOptions = {},
 ): Promise<RenderTextToImagesResult> {
-  const maxCols = Math.max(1, (opts.cols ?? DENSE_CONTENT_COLS) | 0);
-  const style = opts.style ?? DENSE_RENDER_STYLE;
-  const maxHeightPx = opts.maxHeightPx ?? MAX_HEIGHT_PX;
+  const profile = opts.model ? resolveGptProfile(opts.model) : undefined;
+  const maxCols = Math.max(1, (opts.cols ?? profile?.stripCols ?? DENSE_CONTENT_COLS) | 0);
+  const style = opts.style ?? profile?.style ?? DENSE_RENDER_STYLE;
+  const maxHeightPx = opts.maxHeightPx ?? profile?.maxHeightPx ?? MAX_HEIGHT_PX;
   const maxChars = opts.maxCharsPerImage ?? DENSE_CONTENT_CHARS_PER_IMAGE;
 
   // Reflow (the proxy's dense default; opt-in here): minify trailing whitespace + collapse

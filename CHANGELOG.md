@@ -4,6 +4,16 @@ All notable changes to pxpipe are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features /
 behavioral changes, patch = fixes).
 
+## Unreleased
+
+### Changed
+- Opt-in Claude Opus now uses native 14px JetBrains Mono at 86 columns. It was
+  the smallest blind-read candidate with 8/8 exact values and no confabulations,
+  retaining 33% estimated savings on the evaluation fixture.
+- Opt-in `gpt-5.6-sol` uses the same native 14px glyphs at 84 columns. Its paid
+  pilot preserved gist and guard checks, read 7/8 exact values, and produced no
+  unsupported inventions; Sol remains off by default.
+
 ## 0.10.0 — 2026-07-22
 
 ### Added

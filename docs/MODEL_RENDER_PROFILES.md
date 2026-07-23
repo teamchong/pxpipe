@@ -7,7 +7,8 @@ from the model id.
 | model rule | default | cell | columns | max height | evidence |
 |---|:---:|---|---:|---:|---|
 | `claude-fable-5*` | yes | Spleen 5×8 | 312 | 728 px | established Claude suites |
-| `gpt-5.6-sol*` | opt-in | JetBrains Mono 12px, 8×13 | 84 | 1954 px | raw pilot: 7/8 exact, 1 confabulation; rejected 13px: 2/8 exact |
+| `claude-*opus*` | opt-in | JetBrains Mono 14px, 9×16 | 86 | 728 px | blind sweep: 8/8 exact, 0 confabulations, 33% savings |
+| `gpt-5.6-sol*` | opt-in | JetBrains Mono 14px, 9×16 | 84 | 1954 px | 7/8 exact, 0 inventions, gist and guard pass, 42% savings |
 | `grok-*` | opt-in | Spleen 5×8 | 152 | 512 px | 82/100 arithmetic; 83/98 gist |
 | other GPT/o-series | opt-in | Spleen 5×8 | 152 | 1932 px | conservative fallback |
 
@@ -24,7 +25,8 @@ PXPIPE_MODELS=claude-fable-5,gpt-5.6-sol
 
 `gpt-5.6-terra` and other siblings do not inherit the Sol profile or allowlist.
 
-Evidence: [Sol results](../eval/sol-profile/QUALITY_RESULTS.md),
+Evidence: [Opus results](../eval/opus-density/RESULTS.md),
+[Sol results](../eval/sol-profile/RESULTS.md),
 [Grok results](../eval/grok-density/QUALITY_RESULTS.md).
 
 ## Overrides

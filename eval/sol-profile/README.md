@@ -7,13 +7,18 @@ This directory contains raw image-reading benchmarks for the exact
 - `current_sol`: the production-resolved JetBrains Mono 10/Unifont grayscale AA,
   6×11 cell, 126 columns.
 
-Production now uses a native JetBrains Mono 12px, 8×13, 84-column profile. A
-2026-07-23 raw-image pilot scored 4/4 exact on alpha and 3/4 on beta; both passed
-gist and guard, while beta invented one port. The geometry therefore has direct
-readability evidence but did not clear the strict two-fixture acceptance bar.
+The opt-in profile now uses native JetBrains Mono 14px, 9×16, at 84 columns. A
+2026-07-23 raw-image pilot scored 3/4 exact on alpha and 4/4 on beta; both passed
+gist and guard, and neither produced an unsupported value. The alpha miss was a
+truncation (`retryBudgetSeconds` to `retryBudgetSec`), so this proves useful
+image context rather than byte-perfect OCR. Sol remains off by default.
 JetBrains Mono 12 RGB-overprint work and its
 negative channel-separation result are kept as research; see [`QUALITY_RESULTS.md`](./QUALITY_RESULTS.md) and
 [`RGB_SEPARATION_RESULTS.md`](./RGB_SEPARATION_RESULTS.md).
+
+A native 11–15px sweep selected 14px for the opt-in profile. Native 11px scored
+3/8 exact, 13px scored 2/8, and 12px invented a port. Native 14px scored 7/8
+with no inventions at 42.0% estimated savings. See [`RESULTS.md`](./RESULTS.md).
 
 ## Rejected 13px follow-up (2026-07-23)
 
@@ -21,10 +26,10 @@ A genuine JetBrains Mono 13px atlas rasterized to an 8×14 cell. At 84 columns,
 each fixture rendered as `680×1954` plus `680×1324`, costing an estimated 2,288
 image tokens. It regressed to 1/4 exact on both fixtures, with three
 confabulations each; beta also missed gist. The 13px candidate was rejected and
-production remains on the 12px 8×13 profile. Full scoring is in
+the 13px candidate was rejected. Full scoring is in
 `results-jbmono13.json`.
 
-## Native 8×13 profile pilot (2026-07-23)
+## Native 12px/8×13 comparison pilot (2026-07-23)
 
 | fixture | exact | confabulations | gist | guard | estimated image tokens | savings vs text |
 |---|---:|---:|:---:|:---:|---:|---:|

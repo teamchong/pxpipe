@@ -260,9 +260,10 @@ Measured on local `/v1/responses` rows (same endpoint, different models):
 | gpt-5 | ~73% | often | ~34% overall; ~42% on collapsed warm rows |
 
 Render profiles are selected by exact model id, not by the shared Responses
-path. Opt-in `gpt-5.6-sol` uses 84 columns with a native 8×13 JetBrains Mono
-12px atlas;
-Claude uses 312 columns with the 5×8 Spleen atlas. Grok remains **opt-in** and
+path. Opt-in `gpt-5.6-sol` uses 84 columns with a native 9×16 JetBrains Mono
+14px atlas;
+Fable uses 312 columns with the 5×8 Spleen atlas; opt-in Opus uses 86 columns
+with native 14px JetBrains Mono. Grok remains **opt-in** and
 uses **5×8** / 152 columns at maxHeight 512 with white AA (**no grid**) plus an
 in-image IDS block and the text factsheet. Its measured arithmetic, gist, and
 state results remain below Fable. See
@@ -272,8 +273,9 @@ The early n=1 raw-image pilot failed both 6×11 and the old shared 5×8
 call. The 5×8 production-profile follow-up scored 96/100 pure and
 98/100 production arithmetic, but broader gist and dense exact recall remained
 below Fable. Sol is kept opt-in; sibling GPT-5.6 variants remain off.
-The current 8×13 profile later scored 7/8 exact across two raw-image fixtures,
-with one confabulated port, and therefore did not clear its strict acceptance bar.
+The current 9×16 profile scored 7/8 exact across two raw-image fixtures,
+with one truncated identifier and no unsupported inventions; it did not clear
+the strict byte-exact acceptance bar.
 Production still sends the identifier factsheet because image text is not byte-safe. See
 [`eval/sol-profile/QUALITY_RESULTS.md`](../eval/sol-profile/QUALITY_RESULTS.md).
 

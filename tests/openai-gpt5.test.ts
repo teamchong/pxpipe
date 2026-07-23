@@ -170,8 +170,8 @@ describe('transformOpenAIChatCompletions (gpt-5.6-sol)', () => {
     expect(parts[0]!.type).toBe('image_url');
     expect(parts[0]!.image_url!.url).toMatch(/^data:image\/png;base64,/);
 
-    // Sol uses native JetBrains Mono 12 in an 8x13 cell at 84 columns.
-    expect(result.info.firstImageWidth).toBe(680);
+    // Sol uses native JetBrains Mono 14 in a 9x16 cell at 84 columns.
+    expect(result.info.firstImageWidth).toBe(764);
     expect(result.info.gateEval?.imageTokens).toBe(result.info.imageTokens);
 
     // System message replaced with pointer.
@@ -1055,14 +1055,15 @@ describe('image parts request detail = "original" (avoid downscale of dense text
 
 describe('resolveGptProfile (Claude on Responses)', () => {
   it('uses Anthropic geometry by model id, not the GPT Responses defaults', () => {
-    // Several families share /v1/responses. Claude must not inherit GPT's
-    // 152-col / 1932 px profile: Anthropic dense pages are 312 cols × 728 px.
+    // Several families share /v1/responses. Claude profiles must retain
+    // Anthropic's 728px no-resize height while selecting model-specific fonts.
     // Wrong geometry overstates image tokens and leaves As text / Saved blank.
     const p = resolveGptProfile('claude-opus-4-8');
     expect(p.maxHeightPx).toBe(728);
-    expect(p.stripCols).toBe(312);
+    expect(p.stripCols).toBe(86);
+    expect(p.style.font).toBe('jetbrains-mono-14');
     expect(resolveGptProfile('claude-3-5-opus').maxHeightPx).toBe(728);
-    expect(resolveGptProfile('claude-3-5-opus').stripCols).toBe(312);
+    expect(resolveGptProfile('claude-3-5-opus').stripCols).toBe(86);
     expect(resolveGptProfile('claude-fable-5').maxHeightPx).toBe(728);
     expect(resolveGptProfile('claude-fable-5').stripCols).toBe(312);
     expect(resolveGptProfile('claude-fable-5').minCompressTokens).toBeUndefined();
@@ -1077,7 +1078,7 @@ describe('resolveGptProfile (Claude on Responses)', () => {
       expect(sol.maxHeightPx, model).toBe(1954);
       expect(sol.stripCols, model).toBe(84);
       expect(sol.minCompressTokens, model).toBe(500);
-      expect(sol.style.font, model).toBe('jetbrains-mono-12');
+      expect(sol.style.font, model).toBe('jetbrains-mono-14');
       expect(sol.style.cellWBonus, model).toBe(0);
       expect(sol.style.cellHBonus, model).toBe(0);
       expect(sol.style.aa, model).toBe(true);

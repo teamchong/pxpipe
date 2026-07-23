@@ -1,5 +1,39 @@
 # GPT-5.6 Sol raw image-recall pilot
 
+## Rejected native 13px follow-up (2026-07-23)
+
+JetBrains Mono 13px rasterized to an 8×14 cell. Both fixtures used `680×1954`
+and `680×1324` pages, estimated at 2,288 image tokens per call.
+
+| fixture | exact | confabulations | gist | guard | verdict |
+|---|---:|---:|:---:|:---:|---|
+| alpha | **1/4** | **3** | pass | pass | **fail** |
+| beta | **1/4** | **3** | fail | pass | **fail** |
+
+The 13px profile regressed from the 12px profile's 7/8 aggregate exact result,
+so it was rejected. Production remains on 12px. Complete scoring and provider
+usage are in `results-jbmono13.json`, with raw bodies and receipts under the
+`raw/jbmono13-*` names.
+
+## Native 8×13 follow-up (2026-07-23)
+
+The production JetBrains Mono 12px profile was tested at 84 columns with
+`680×1945` and `680×1100` pages per fixture.
+
+| fixture | exact | confabulations | gist | guard | estimated image tokens | verdict |
+|---|---:|---:|:---:|:---:|---:|---|
+| alpha | **4/4** | **0** | pass | pass | 2,112 | pass |
+| beta | **3/4** | **1** | pass | pass | 2,112 | **fail** |
+
+Beta returned port `41825` instead of `18082`. Provider input usage was 2,728
+tokens for alpha and 2,726 for beta. The paired alpha Spleen 5×8 control scored
+0/4 exact with four confabulations. The production candidate therefore improved
+substantially over the control but did not clear the strict two-fixture bar.
+
+Raw follow-up receipts are `raw/01-alpha-current_sol.*`,
+`raw/02-alpha-old_shared.*`, and `raw/03-beta-current_sol.*`; complete scoring is
+in `results.json`.
+
 Live run: **2026-07-09**
 
 Model: **`gpt-5.6-sol`**

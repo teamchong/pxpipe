@@ -41,9 +41,27 @@ import {
   ATLAS_GRAY_WIDE_FLAGS as JBM10_GRAY_WIDE_FLAGS,
   atlasGrayRank as jbMono10GrayRank,
 } from './atlas-gray-jbmono10.js';
+import {
+  ATLAS_CELL_W as JBM12_CELL_W,
+  ATLAS_CELL_H as JBM12_CELL_H,
+  ATLAS_ASCENT as JBM12_ASCENT,
+  ATLAS_PIXELS as JBM12_PIXELS,
+  ATLAS_OFFSETS as JBM12_OFFSETS,
+  ATLAS_WIDE_FLAGS as JBM12_WIDE_FLAGS,
+  atlasRank as jbMono12Rank,
+} from './atlas-jbmono12.js';
+import {
+  ATLAS_GRAY_CELL_W as JBM12_GRAY_CELL_W,
+  ATLAS_GRAY_CELL_H as JBM12_GRAY_CELL_H,
+  ATLAS_GRAY_ASCENT as JBM12_GRAY_ASCENT,
+  ATLAS_GRAY_PIXELS as JBM12_GRAY_PIXELS,
+  ATLAS_GRAY_OFFSETS as JBM12_GRAY_OFFSETS,
+  ATLAS_GRAY_WIDE_FLAGS as JBM12_GRAY_WIDE_FLAGS,
+  atlasGrayRank as jbMono12GrayRank,
+} from './atlas-gray-jbmono12.js';
 import { encodeGrayPng, encodeRgbPng } from './png.js';
 
-export type RenderFont = 'spleen-5x8' | 'jetbrains-mono-10';
+export type RenderFont = 'spleen-5x8' | 'jetbrains-mono-10' | 'jetbrains-mono-12';
 export const DEFAULT_RENDER_FONT: RenderFont = 'spleen-5x8';
 
 interface BitAtlas {
@@ -113,8 +131,31 @@ const JBM10_ATLAS: AtlasSet = {
   },
 };
 
+const JBM12_ATLAS: AtlasSet = {
+  bit: {
+    cellW: JBM12_CELL_W,
+    cellH: JBM12_CELL_H,
+    ascent: JBM12_ASCENT,
+    pixels: JBM12_PIXELS,
+    offsets: JBM12_OFFSETS,
+    wideFlags: JBM12_WIDE_FLAGS,
+    rank: jbMono12Rank,
+  },
+  gray: {
+    cellW: JBM12_GRAY_CELL_W,
+    cellH: JBM12_GRAY_CELL_H,
+    ascent: JBM12_GRAY_ASCENT,
+    pixels: JBM12_GRAY_PIXELS,
+    offsets: JBM12_GRAY_OFFSETS,
+    wideFlags: JBM12_GRAY_WIDE_FLAGS,
+    rank: jbMono12GrayRank,
+  },
+};
+
 function atlasSet(font: RenderFont | undefined): AtlasSet {
-  return font === 'jetbrains-mono-10' ? JBM10_ATLAS : DEFAULT_ATLAS;
+  if (font === 'jetbrains-mono-10') return JBM10_ATLAS;
+  if (font === 'jetbrains-mono-12') return JBM12_ATLAS;
+  return DEFAULT_ATLAS;
 }
 
 function bitGlyph(codepoint: number, font: RenderFont | undefined): { atlas: BitAtlas; rank: number } | null {

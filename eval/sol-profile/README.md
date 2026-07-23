@@ -7,20 +7,61 @@ This directory contains raw image-reading benchmarks for the exact
 - `current_sol`: the production-resolved JetBrains Mono 10/Unifont grayscale AA,
   6×11 cell, 126 columns.
 
-Production remains on the validated 5×8 Spleen profile. The later JetBrains
-Mono 12 RGB-overprint work and its negative channel-separation result are kept
-as research; see [`QUALITY_RESULTS.md`](./QUALITY_RESULTS.md) and
+Production now uses a native JetBrains Mono 12px, 8×13, 84-column profile. A
+2026-07-23 raw-image pilot scored 4/4 exact on alpha and 3/4 on beta; both passed
+gist and guard, while beta invented one port. The geometry therefore has direct
+readability evidence but did not clear the strict two-fixture acceptance bar.
+JetBrains Mono 12 RGB-overprint work and its
+negative channel-separation result are kept as research; see [`QUALITY_RESULTS.md`](./QUALITY_RESULTS.md) and
 [`RGB_SEPARATION_RESULTS.md`](./RGB_SEPARATION_RESULTS.md).
 
-## Live status (2026-07-09)
+## Rejected 13px follow-up (2026-07-23)
 
-The 5×8 arm **was tested**, not merely rendered:
+A genuine JetBrains Mono 13px atlas rasterized to an 8×14 cell. At 84 columns,
+each fixture rendered as `680×1954` plus `680×1324`, costing an estimated 2,288
+image tokens. It regressed to 1/4 exact on both fixtures, with three
+confabulations each; beta also missed gist. The 13px candidate was rejected and
+production remains on the 12px 8×13 profile. Full scoring is in
+`results-jbmono13.json`.
+
+## Native 8×13 profile pilot (2026-07-23)
+
+| fixture | exact | confabulations | gist | guard | estimated image tokens | savings vs text |
+|---|---:|---:|:---:|:---:|---:|---:|
+| alpha | **4/4** | **0** | pass | pass | 2,112 | 56.8% |
+| beta | **3/4** | **1** | pass | pass | 2,112 | 56.7% |
+
+The beta miss was the port: expected `18082`, returned `41825`. The paired alpha
+5×8 control scored 0/4 with four confabulations. Full response bodies, usage,
+latency, and scoring are retained in `results.json` and `raw/`.
+
+## Production-profile benchmark results (2026-07-17)
+
+The production 5×8 Spleen profile was evaluated through the direct Responses
+upstream, not pxpipe:
+
+| test | text | production image | notes |
+|---|---:|---:|---|
+| novel arithmetic, N=100 | 100/100 | **98/100** | pure image 96/100 |
+| gist recall | not measured | **83/98** | no transport errors |
+| state tracking | not measured | **17/18** | no transport errors |
+| never-stated guards | not measured | **4/16 confabulated** | no transport errors |
+| dense 12-character hex | not run | **0/15** | all calls completed |
+
+Matched arithmetic usage was 5,300 text input tokens versus 7,000 production-
+image input tokens, a **32.1% increase**. See
+[`QUALITY_RESULTS.md`](./QUALITY_RESULTS.md) for the rejected RGB research arms
+and receipt names.
+
+## Initial profile-selection pilot (2026-07-09)
+
+The earlier pilot produced:
 
 | arm | paid/scored | exact | confabulations | gist | guard | status |
 |---|:---:|---:|---:|:---:|:---:|---|
 | JetBrains 6×11 / 126 cols | yes | **0/4** | **4** | pass | pass | fail |
 | Spleen 5×8 / 152 cols | yes | **0/4** | **4** | fail | pass | fail |
-| JetBrains effective 9×12 / 84 cols | no | — | — | — | — | locally rendered; paid call pending |
+| JetBrains Mono 12px, native 8×13 / 84 cols | yes | **7/8 across two fixtures** | **1** | pass | pass | fails strict bar |
 
 There was also one paid setup attempt for 6×11 that returned no answer because
 all 512 output tokens were hidden reasoning tokens. It counts toward spending

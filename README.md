@@ -127,16 +127,17 @@ without running the proxy.
   and allows 64 images, while Grok allows 24 images. Opt-in long-session
   coverage can be changed (defensive cap 100) with
   `PXPIPE_GPT_HISTORY_MAX_IMAGES=48` after validating the provider's request cap.
-- **Per-model rendering:** opt-in `gpt-5.6-sol` uses a 152-column,
-  768px-wide 5×8 Spleen profile; Claude keeps its 312-column, 1568×728
+- **Per-model rendering:** opt-in `gpt-5.6-sol` uses native 12px JetBrains Mono
+  glyphs in an 8×13 cell, 84 columns, and a 680px full-width strip; Claude keeps
+  its 312-column, 1568×728
   5×8 Spleen profile. These
   are selected by exact model id, including history pages and profitability
   math. Recognized IDs can ride in the bounded factsheet, and
   recent/open tool state stays native.
   [Sol receipts](eval/sol-profile/QUALITY_RESULTS.md) and
   [profile evidence](docs/MODEL_RENDER_PROFILES.md).
-- **Grok 4.5 (opt-in):** same production recipe as Sol (5×8 Spleen, IDS, text
-  factsheet; Grok strip maxH 512). Off by default (not Fable-level pure-image).
+- **Grok 4.5 (opt-in):** uses 5×8 Spleen, IDS, a text factsheet, and maxH 512.
+  Off by default (not Fable-level pure-image).
   Enable with
   `PXPIPE_MODELS=claude-fable-5,grok-4.5` or the dashboard chip.
   [eval/grok-density/QUALITY_RESULTS.md](eval/grok-density/QUALITY_RESULTS.md).
@@ -156,7 +157,7 @@ is confabulations, so lower is better.
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
 | `claude-fable-5` | **100/100** | **98/98** | **18/18** | **0/16** | **13/15** | June 2026 production profiles: [arithmetic + hex](FINDINGS.md), [gist/state/guards](eval/gist-recall/) |
 | `google/gemini-3.6-flash` | **100/100** | **98/98** | **18/18** | **0/16** | **14/15** | current shipped profile: [quality results](eval/gemini-profile/QUALITY_RESULTS.md) |
-| `gpt-5.6-sol` | **98/100** | 83/98 | 17/18 | 4/16 | 0/15 | current shipped profile: [quality results](eval/sol-profile/QUALITY_RESULTS.md) |
+| `gpt-5.6-sol` | **98/100** | 83/98 | 17/18 | 4/16 | 0/15 | prior 5×8 broad suite; current 8×13 raw pilot: 7/8 exact, 1 confabulation: [pilot](eval/sol-profile/README.md) |
 | `claude-opus-4-8` | 93/100 | — | — | — | 0/15 | historical profile: [arithmetic](eval/gsm8k/), [dense hex](eval/needle-haystack/) |
 | `grok-4.5` | 82/100 | 83/98 | 13/18 | **0/16** | 0/15 | current shipped profile: [quality results](eval/grok-density/QUALITY_RESULTS.md) |
 | `moonshotai/kimi-k3` | 79/100 | 84/98 | 15/18 | 1/16 | 0/15 | generic GPT profile: [quality results](eval/sol-profile/KIMI_K3_QUALITY_RESULTS.md) |

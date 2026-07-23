@@ -36,6 +36,7 @@ const TIMEOUT_MS = Number(process.env.SOL_PROFILE_TIMEOUT_MS || 180_000);
 const RESUME_AFTER_OUTPUT_CAP = process.env.SOL_PROFILE_RESUME_AFTER_OUTPUT_CAP === '1';
 const RESUME_OLD_AS_RETUNE = process.env.SOL_PROFILE_RESUME_OLD_AS_RETUNE === '1';
 const RESUME_SPACED_RETUNE = process.env.SOL_PROFILE_RESUME_SPACED_RETUNE === '1';
+const RESUME_AFTER_OLD_CONTROL_FAILURE = process.env.SOL_PROFILE_RESUME_AFTER_OLD_CONTROL_FAILURE === '1';
 
 function invariant(condition, message) {
   if (!condition) throw new Error(message);
@@ -200,7 +201,7 @@ const PROFILES = {
     maxHeightPx: resolvedSol.maxHeightPx,
     // Retune only the Sol candidate: keep its JetBrains glyph atlas, but use
     // the same effective cell density that rescued exact recall for Grok.
-    style: { ...resolvedSol.style, cellWBonus: 3, cellHBonus: 1 },
+    style: { ...resolvedSol.style, font: 'jetbrains-mono-10', cellWBonus: 3, cellHBonus: 1 },
   },
 };
 
@@ -208,12 +209,12 @@ invariant(MODEL === 'gpt-5.6-sol', 'This harness must never target a different m
 invariant(PROFILES.old_shared.cols === 152, 'Old shared profile must stay at 152 columns');
 invariant(renderCellWidth(PROFILES.old_shared.style) === 5, 'Old shared profile must use 5px cells');
 invariant(renderCellHeight(PROFILES.old_shared.style) === 8, 'Old shared profile must use 8px cells');
-invariant(PROFILES.current_sol.cols === 126, 'Current Sol profile must stay at 126 columns for this pilot');
-invariant(PROFILES.current_sol.maxHeightPx === 1932, 'Current Sol max height must be 1932px');
-invariant(PROFILES.current_sol.style.font === 'jetbrains-mono-10', 'Current Sol profile must use JetBrains Mono 10');
+invariant(PROFILES.current_sol.cols === 84, 'Current Sol profile must use 84 columns');
+invariant(PROFILES.current_sol.maxHeightPx === 1954, 'Current Sol max height must be 1954px');
+invariant(PROFILES.current_sol.style.font === 'jetbrains-mono-12', 'Current Sol profile must use JetBrains Mono 12');
 invariant(PROFILES.current_sol.style.aa === true, 'Current Sol profile must use grayscale AA');
-invariant(renderCellWidth(PROFILES.current_sol.style) === 6, 'Current Sol profile must use 6px cells');
-invariant(renderCellHeight(PROFILES.current_sol.style) === 11, 'Current Sol profile must use 11px cells');
+invariant(renderCellWidth(PROFILES.current_sol.style) === 8, 'Current Sol profile must use 8px cells');
+invariant(renderCellHeight(PROFILES.current_sol.style) === 13, 'Current Sol profile must use 13px cells');
 invariant(PROFILES.retuned_sol_9x12.cols === 84, 'Retuned Sol candidate must use 84 columns');
 invariant(renderCellWidth(PROFILES.retuned_sol_9x12.style) === 9, 'Retuned Sol candidate must use 9px cells');
 invariant(renderCellHeight(PROFILES.retuned_sol_9x12.style) === 12, 'Retuned Sol candidate must use 12px cells');
@@ -240,6 +241,9 @@ const OLD_FALLBACK_RETUNE_ORDER = [
 const SPACED_RETUNE_ORDER = [
   { fixture: 'alpha', profile: 'retuned_sol_9x12' },
 ];
+const CANDIDATE_REPLICATION_ORDER = [
+  { fixture: 'beta', profile: 'current_sol' },
+];
 invariant(CALL_ORDER.length <= MAX_CALLS, 'Call plan exceeds the four-call cap');
 
 function safePct(value) {
@@ -253,7 +257,7 @@ async function renderArm(spec, profile) {
   const prompt = promptFor(spec);
   const images = await renderTextToPngs(packed, profile.cols, profile.style, profile.maxHeightPx);
   invariant(images.length > 0, `${spec.id}/${profile.name}: renderer returned no images`);
-  if (profile.name !== 'retuned_sol_9x12') {
+  if (profile.name === 'old_shared') {
     invariant(images.length === 1, `${spec.id}/${profile.name}: original pilot arms must remain one image per call`);
   }
 
@@ -591,7 +595,29 @@ if (!HAS_APPROVAL) {
 
 let results;
 let liveCallArms = callArms;
-if (RESUME_SPACED_RETUNE) {
+if (RESUME_AFTER_OLD_CONTROL_FAILURE) {
+  results = JSON.parse(await readFile(RESULTS_PATH, 'utf8'));
+  invariant(results.model === MODEL, 'Candidate-replication result model mismatch');
+  invariant(results.calls.length === 2, 'Candidate replication requires exactly two prior attempts');
+  const [candidate, control] = results.calls;
+  invariant(candidate.fixture === 'alpha' && candidate.profile === 'current_sol' && candidate.score?.pass,
+    'Candidate replication requires a passing alpha/current_sol attempt');
+  invariant(control.fixture === 'alpha' && control.profile === 'old_shared' && !control.score?.pass,
+    'Candidate replication requires a failed alpha/old_shared control attempt');
+  liveCallArms = CANDIDATE_REPLICATION_ORDER.map(({ fixture, profile }) => {
+    const arm = preparedByKey.get(`${fixture}/${profile}`);
+    invariant(arm, `Missing candidate replication arm ${fixture}/${profile}`);
+    return arm;
+  });
+  invariant(results.calls.length + liveCallArms.length <= MAX_CALLS, 'Candidate replication would exceed paid-call cap');
+  results.stoppedEarly = false;
+  results.stopReason = null;
+  results.candidateReplication = {
+    reason: 'candidate passed alpha while the paired old-profile control failed acceptance',
+    reviewedAt: new Date().toISOString(),
+    remainingOrder: CANDIDATE_REPLICATION_ORDER,
+  };
+} else if (RESUME_SPACED_RETUNE) {
   results = JSON.parse(await readFile(RESULTS_PATH, 'utf8'));
   invariant(results.model === MODEL, 'Spaced-retune result model mismatch');
   invariant(results.calls.length === 3, 'Spaced retune requires exactly three prior attempts');

@@ -17,11 +17,8 @@
 
 /**
  * GPT strip height, DECOUPLED from render.ts's MAX_HEIGHT_PX (which is Anthropic's
- * 1568-edge / ~1.15 MP clamp). OpenAI's pre-tokenize resize is different: fit within
- * 2048×2048, then shortest side → 768. A 768-px-wide portrait strip up to 2048 px tall
- * survives un-resampled, so GPT keeps the taller page. Every built-in cost number below
- * (1190 / 1445 / 2372 / 1464 / 630 …) was calibrated at this height — do not re-link to
- * the Anthropic constant.
+ * 1568-edge / ~1.15 MP clamp). Named profiles may override this where their image
+ * sizing and font geometry differ.
  */
 import {
   MAX_HEIGHT_PX as ANTHROPIC_MAX_HEIGHT_PX,
@@ -33,10 +30,10 @@ import { isGeminiModel, resolveGeminiProfile } from './gemini-model-profiles.js'
 
 export const GPT_MAX_HEIGHT_PX = 1932;
 
-/** Image-token cost model (mirrors OpenAI's mandatory pre-tokenize resize). */
+/** Image-token cost model. An omitted patchCap means original dimensions are billed. */
 export type GptVisionCost =
   | { regime: 'tile'; base: number; perTile: number }
-  | { regime: 'patch'; multiplier: number; patchCap: number };
+  | { regime: 'patch'; multiplier: number; patchCap?: number };
 
 export interface GptRenderStyle {
   /** Rasterized font atlas. */
@@ -160,11 +157,12 @@ export const CLAUDE_OPUS_PROFILE: GptModelProfile = {
 };
 
 const GPT56_SOL_PROFILE: GptModelProfile = {
-  vision: { regime: 'patch', multiplier: 1, patchCap: 10000 },
-  // Validated production recipe. Rejected RGB-overprint research lives under
-  // eval/sol-profile and is not shipped in the runtime renderer.
-  stripCols: C,
-  maxHeightPx: H,
+  // GPT-5.6 original detail bills the submitted 32px patches without a patch cap.
+  vision: { regime: 'patch', multiplier: 1 },
+  // 84 × 8px + padding = 680px with genuine 12px JetBrains Mono glyphs.
+  stripCols: 84,
+  // 1954px permits 149 rows at an actual 1945px, filling 61 patch rows.
+  maxHeightPx: 1954,
   minCompressTokens: 500,
   factSheetFormat: 'full',
   history: {
@@ -180,7 +178,12 @@ const GPT56_SOL_PROFILE: GptModelProfile = {
     framing: 'compact',
     factSheetScope: 'combined',
   },
-  style: { ...BASE_STYLE, font: 'spleen-5x8' },
+  style: {
+    ...BASE_STYLE,
+    font: 'jetbrains-mono-12',
+    cellWBonus: 0,
+    cellHBonus: 0,
+  },
 };
 
 interface ProfileRule {
@@ -291,7 +294,10 @@ function isValidVision(v: unknown): v is GptVisionCost {
   if (!v || typeof v !== 'object') return false;
   const o = v as Record<string, unknown>;
   if (o.regime === 'tile') return Number.isFinite(o.base) && Number.isFinite(o.perTile);
-  if (o.regime === 'patch') return Number.isFinite(o.multiplier) && Number.isFinite(o.patchCap);
+  if (o.regime === 'patch') {
+    return Number.isFinite(o.multiplier) &&
+      (o.patchCap === undefined || (Number.isFinite(o.patchCap) && (o.patchCap as number) > 0));
+  }
   return false;
 }
 
@@ -304,7 +310,9 @@ function nonNegativeInt(v: unknown, fallback: number): number {
 }
 
 function renderFont(v: unknown, fallback: RenderFont): RenderFont {
-  return v === 'spleen-5x8' || v === 'jetbrains-mono-10' ? v : fallback;
+  return v === 'spleen-5x8' || v === 'jetbrains-mono-10' || v === 'jetbrains-mono-12'
+    ? v
+    : fallback;
 }
 
 function factSheetFormat(v: unknown, fallback: GptModelProfile['factSheetFormat']): GptModelProfile['factSheetFormat'] {

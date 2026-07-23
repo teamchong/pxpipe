@@ -147,7 +147,6 @@ isCompressionProfitable(
   textOrLen: string | number,
   cols: number,
   imageCountCap: number | undefined,
-  numCols = 1,
   charsPerToken: number = CHARS_PER_TOKEN,
   bucket?: BlockBucket,        // NEW
 ): boolean

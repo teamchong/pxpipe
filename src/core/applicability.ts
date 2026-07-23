@@ -24,7 +24,7 @@ function baseModelId(model: string): string {
 /** Dashboard runtime override; null = fall back to PXPIPE_MODELS env / built-in default. In-memory only. */
 let runtimeModelBases: readonly string[] | null = null;
 
-/** Built-in default scope when PXPIPE_MODELS is unset: Fable 5 only.
+/** Built-in default scope when PXPIPE_MODELS is unset: Fable 5 and Gemini 3.6 Flash.
  *  Everything else is opt-in via dashboard chips or PXPIPE_MODELS:
  *  - Opus 4.7/4.8 — worse at reading imaged content (FINDINGS.md 2026-06-16:
  *    Opus 4.8 ~2pp arithmetic, 6/15 dense-hex vs Fable 100/100).
@@ -34,7 +34,7 @@ let runtimeModelBases: readonly string[] | null = null;
  *  - Grok 4.5 — 82/100 arithmetic, 83/98 gist, and 13/18 state tracking.
  *  Both profiles remain available for explicit opt-in.
  *  Silently imaging weak or unvalidated readers is the wrong default. */
-const DEFAULT_MODEL_BASES = ['claude-fable-5'];
+const DEFAULT_MODEL_BASES = ['claude-fable-5', 'gemini-3.6-flash'];
 
 function falsey(v: string): boolean {
   return /^(0|false|no|off|none)$/i.test(v.trim());
@@ -91,8 +91,15 @@ export function isValidModelBaseId(id: string): boolean {
  *  alias; [variant] tags stripped first. */
 function isAllowed(model: string | null | undefined): boolean {
   if (typeof model !== 'string') return false;
-  const base = baseModelId(model);
-  return allowedModelBases().some((b) => base === b || base.startsWith(`${b}-`));
+  const base = baseModelId(model).toLowerCase();
+  if (base.includes('gemini')) {
+    const validated = base === 'gemini-3.6-flash' || base === 'google/gemini-3.6-flash';
+    if (!validated) return false;
+  }
+  return allowedModelBases().some((b) => {
+    const target = b.toLowerCase();
+    return base === target || base.startsWith(`${target}-`) || base === `google/${target}`;
+  });
 }
 
 /** True when pxpipe may transform this Anthropic model. */

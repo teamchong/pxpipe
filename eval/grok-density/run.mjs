@@ -181,8 +181,7 @@ console.log(`profile: stripCols=${PROFILE.stripCols} maxHeightPx=${PROFILE.maxHe
 console.log(`text baseline ≈ ${TEXT_TOKENS} tok (chars/4)`);
 
 for (const v of VARIANTS) {
-  // Match the Responses transform: single-col portrait strip, profile max height,
-  // no library multi-col packing.
+  // Match the Responses transform: portrait strip at the profile max height.
   const imgs = await renderTextToPngs(SESSION, v.cols, v.style, PROFILE.maxHeightPx);
   const pages = imgs.map((im) => ({ png: im.png, width: im.width, height: im.height }));
   const imageTokens = imageTokensForPages(pages);

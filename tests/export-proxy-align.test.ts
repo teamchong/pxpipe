@@ -4,8 +4,8 @@
 // render to the SAME PNG bytes whether it goes through the `pxpipe export` CLI or the
 // live proxy's history-image compression. Both now share one renderer:
 //
-//   export  → renderTextToImages(text, { cols, shrink, multiCol })   [library.ts, public SDK]
-//   proxy   → textToImageBlocks(text, cols, numCols, shrinkWidth)    [transform.ts, internal]
+//   export  → renderTextToImages(text, { cols, shrink })   [library.ts, public SDK]
+//   proxy   → textToImageBlocks(text, cols, shrinkWidth)   [transform.ts, internal]
 //
 // textToImageBlocks is the proxy's packaging wrapper (adds base64 ImageBlocks +
 // droppedCodepoints); its column-selection rule is mirrored verbatim by renderTextToImages
@@ -30,20 +30,17 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
  * Render `text` through both paths and assert full parity: page count, per-page PNG bytes,
  * pixel dimensions, dropped-glyph count, and total pixel area.
  *
- * `multiCol`/`shrink` map the export's SDK opts onto the proxy's positional args:
- *   export  renderTextToImages(text, { cols, shrink, multiCol })
- *   proxy   textToImageBlocks(text, cols, numCols=multiCol, shrinkWidth=shrink)
+ * `shrink` maps the export's SDK option onto the proxy's positional argument.
  */
 async function expectIdenticalRender(
   text: string,
-  { multiCol = 1, shrink = true }: { multiCol?: number; shrink?: boolean } = {},
+  { shrink = true }: { shrink?: boolean } = {},
 ): Promise<number> {
   const exported = await renderTextToImages(text, {
     cols: DENSE_CONTENT_COLS,
     shrink,
-    multiCol,
   });
-  const proxied = await textToImageBlocks(text, DENSE_CONTENT_COLS, multiCol, shrink);
+  const proxied = await textToImageBlocks(text, DENSE_CONTENT_COLS, shrink);
 
   // Same number of pages.
   expect(proxied.pngs.length).toBe(exported.pages.length);
@@ -75,37 +72,34 @@ describe('export ⇄ proxy render alignment', () => {
       'const xs = [1, 2, 3].map((n) => n * 2);',
       'export default add;',
     ].join('\n');
-    // export's real call is multiCol:'auto'; for shrunk narrow content the SDK collapses
-    // to single-col (cols < maxCols ⇒ numCols=1), which is what the proxy emits. multiCol:1
-    // here exercises that same single-col outcome against the real proxy function.
-    await expectIdenticalRender(code, { multiCol: 1, shrink: true });
+    await expectIdenticalRender(code, { shrink: true });
   });
 
   it('full-width prose (lines at the 384-col cap) → byte-identical', async () => {
     const line = 'lorem ipsum dolor sit amet '.repeat(20); // > 384 display cols → fills width
     const prose = Array.from({ length: 12 }, () => line).join('\n');
-    await expectIdenticalRender(prose, { multiCol: 1, shrink: true });
+    await expectIdenticalRender(prose, { shrink: true });
   });
 
   it('large input spanning multiple pages → every page byte-identical', async () => {
     // Enough lines to overflow MAX_HEIGHT_PX and force pagination, so we pin multi-PAGE
     // parity (page-boundary slicing must match between the two paths).
     const big = Array.from({ length: 900 }, (_, i) => `line ${i}: const value_${i} = compute(${i});`).join('\n');
-    const pages = await expectIdenticalRender(big, { multiCol: 1, shrink: true });
+    const pages = await expectIdenticalRender(big, { shrink: true });
     expect(pages).toBeGreaterThan(1);
-  });
-
-  it('multi-column slab (shrink:false, multiCol:3) → byte-identical packed columns', async () => {
-    // The proxy's slab combiner packs columns with shrinkWidth:false; mirror it with the
-    // SDK's shrink:false + explicit multiCol to pin renderTextToPngsMultiCol parity.
-    const snippet = Array.from({ length: 60 }, (_, i) => `row ${i} | ${'x'.repeat(20)}`).join('\n');
-    await expectIdenticalRender(snippet, { multiCol: 3, shrink: false });
   });
 
   it('non-atlas codepoints drop identically on both paths', async () => {
     // Glyphs outside the atlas render as blank cells and bump droppedChars; both paths must
     // count them the same or px/token accounting diverges.
     const text = 'plain ascii line\n日本語 ☃ →★ exotic\nmore ascii';
-    await expectIdenticalRender(text, { multiCol: 1, shrink: true });
+    await expectIdenticalRender(text, { shrink: true });
+  });
+
+  it('proxy rendering honors a caller-supplied full canvas width', async () => {
+    const text = 'width-sensitive content '.repeat(200);
+    const narrow = await textToImageBlocks(text, 80, false);
+    const wide = await textToImageBlocks(text, 120, false);
+    expect(narrow.dims[0]?.width).toBeLessThan(wide.dims[0]?.width ?? 0);
   });
 });

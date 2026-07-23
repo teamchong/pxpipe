@@ -26,15 +26,15 @@ describe('symmetric warm-cache burn (anti-flapping)', () => {
     // A clearly-profitable case (large text, few images) must still
     // come out as `true` when no warm-cache burn is supplied.
     const text = 'x'.repeat(50_000);
-    expect(isCompressionProfitable(text, 100, undefined, 2, 4)).toBe(true);
+    expect(isCompressionProfitable(text, 100, undefined, 4)).toBe(true);
   });
 
   it('priorWarmTokens alone penalises compressing when text is warm', () => {
     // Borderline-profitable text length — small enough that adding any
     // image-side burn flips the verdict to "not profitable".
     const text = 'x'.repeat(12_000);
-    const cold = isCompressionProfitable(text, 100, undefined, 2, 4, 0, 0);
-    const warm = isCompressionProfitable(text, 100, undefined, 2, 4, 50_000, 0);
+    const cold = isCompressionProfitable(text, 100, undefined, 4, 0, 0);
+    const warm = isCompressionProfitable(text, 100, undefined, 4, 50_000, 0);
     // If the cold gate says compress, the warm-text gate must NOT (asymmetric
     // burn now pins the session in text mode).
     if (cold) expect(warm).toBe(false);
@@ -50,16 +50,16 @@ describe('symmetric warm-cache burn (anti-flapping)', () => {
     // verdict to "profitable" so we stay in image mode rather than
     // re-creating the text cache.
     const text = 'hello'.repeat(500); // 2500 chars
-    const cold = isCompressionProfitable(text, 100, undefined, 1, 50, 0, 0);
-    const warmImage = isCompressionProfitable(text, 100, undefined, 1, 50, 0, 60_000);
+    const cold = isCompressionProfitable(text, 100, undefined, 50, 0, 0);
+    const warmImage = isCompressionProfitable(text, 100, undefined, 50, 0, 60_000);
     expect(cold).toBe(false);
     expect(warmImage).toBe(true);
   });
 
   it('warm on BOTH sides cancels out (no asymmetric bias)', () => {
     const text = 'x'.repeat(12_000);
-    const cold = isCompressionProfitable(text, 100, undefined, 2, 4, 0, 0);
-    const both = isCompressionProfitable(text, 100, undefined, 2, 4, 25_000, 25_000);
+    const cold = isCompressionProfitable(text, 100, undefined, 4, 0, 0);
+    const both = isCompressionProfitable(text, 100, undefined, 4, 25_000, 25_000);
     expect(both).toBe(cold);
   });
 });
@@ -73,8 +73,8 @@ describe('evalCompressionProfitability observability', () => {
       { text: 'x'.repeat(12_000), pw: 25_000, pwi: 25_000 },
     ];
     for (const s of samples) {
-      const verdict = isCompressionProfitable(s.text, 100, undefined, 2, 4, s.pw, s.pwi);
-      const evaled = evalCompressionProfitability(s.text, 100, undefined, 2, 4, s.pw, s.pwi);
+      const verdict = isCompressionProfitable(s.text, 100, undefined, 4, s.pw, s.pwi);
+      const evaled = evalCompressionProfitability(s.text, 100, undefined, 4, s.pw, s.pwi);
       expect(evaled).not.toBeNull();
       expect(evaled!.profitable).toBe(verdict);
     }
@@ -85,7 +85,6 @@ describe('evalCompressionProfitability observability', () => {
       'x'.repeat(12_000),
       100,
       undefined,
-      2,
       4,
       40_000,
       60_000,

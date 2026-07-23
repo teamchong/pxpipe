@@ -93,6 +93,10 @@ const GROK_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
   { id: 'grok-4.5', label: 'Grok 4.5' },
 ];
 
+const GEMINI_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
+  { id: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash' },
+];
+
 export function renderModelsFragment(
   active: string[],
   configured: string[],
@@ -102,17 +106,18 @@ export function renderModelsFragment(
   const m = t(lang);
   const on = new Set(active);
   const labelOf = new Map(
-    [...MODEL_CATALOG, ...GPT_MODEL_CATALOG, ...GROK_MODEL_CATALOG].map((m) => [m.id, m.label]),
+    [...MODEL_CATALOG, ...GPT_MODEL_CATALOG, ...GROK_MODEL_CATALOG, ...GEMINI_MODEL_CATALOG].map((m) => [m.id, m.label]),
   );
   // Union the catalog with env-configured + active ids so PXPIPE_MODELS-enabled
-  // families always show as toggles, then split into two chip rows (Claude /
-  // OpenAI Responses) plus the PXPIPE_MODELS CSV textbox that mirrors the scope.
+  // families always show as toggles, then split into chip rows (Claude /
+  // OpenAI Responses / Gemini) plus the PXPIPE_MODELS CSV textbox that mirrors the scope.
   const ids: string[] = [];
   const seen = new Set<string>();
   for (const id of [
     ...MODEL_CATALOG.map((m) => m.id),
     ...GPT_MODEL_CATALOG.map((m) => m.id),
     ...GROK_MODEL_CATALOG.map((m) => m.id),
+    ...GEMINI_MODEL_CATALOG.map((m) => m.id),
     ...configured,
     ...active,
   ]) {
@@ -131,10 +136,11 @@ export function renderModelsFragment(
     );
   };
   const claudeChips = ids.filter((id) => id.startsWith('claude')).map(chipFor).join('');
+  const geminiChips = ids.filter((id) => id.includes('gemini')).map(chipFor).join('');
   const gptChips = ids.filter((id) => id.startsWith('gpt')).map(chipFor).join('');
   const grokChips = ids.filter((id) => id.startsWith('grok')).map(chipFor).join('');
   const otherChips = ids
-    .filter((id) => !id.startsWith('claude') && !id.startsWith('gpt') && !id.startsWith('grok'))
+    .filter((id) => !id.startsWith('claude') && !id.startsWith('gpt') && !id.startsWith('grok') && !id.includes('gemini'))
     .map(chipFor)
     .join('');
   const moot = enabled
@@ -146,6 +152,11 @@ export function renderModelsFragment(
     `<span class="models-label">${m.imageClaudeModels}</span>` +
     claudeChips +
     `<span class="hint">${m.unlistedModelsHint}</span>` +
+    `</div>` +
+    `<div class="models">` +
+    `<span class="models-label">${m.imageGeminiModels}</span>` +
+    geminiChips +
+    `<span class="hint">${m.geminiModelsHint}</span>` +
     `</div>` +
     `<div class="models">` +
     `<span class="models-label">${m.imageOpenAIModels}</span>` +
@@ -245,6 +256,11 @@ function statTile(
 export function renderHeaderFragment(s: StatsPayload, port: number, lang: Lang = DEFAULT_LANG): string {
   const m = t(lang);
   const pa = s.pricing_assumptions;
+  const unpricedImaged = Math.max(
+    0,
+    (s.compressed_requests ?? 0) - (s.compressed_paid_requests ?? 0),
+  );
+  const onlyUnpriced = unpricedImaged > 0 && (s.compressed_paid_requests ?? 0) === 0;
 
   // Compare the same imaged requests on both sides. Passthrough requests are
   // generally smaller because the profitability gate selected them, so their
@@ -260,12 +276,38 @@ export function renderHeaderFragment(s: StatsPayload, port: number, lang: Lang =
         cAvg <= withoutAvg ? 'pos' : 'neg',
         m.statCostPerRequestTip,
       )
-    : statTile(
+    : onlyUnpriced
+      ? statTile(
+          m.statCostPerRequest,
+          '—',
+          m.statCostUnpricedSub,
+          'muted-val',
+          m.statCostUnpricedTip,
+        )
+      : statTile(
         m.statCostPerRequest,
         m.statCostCollecting,
         m.statCostCollectingSub,
         'muted-val',
         m.statCostCollectingTip,
+      );
+
+  const savedUsdTile = onlyUnpriced
+    ? statTile(
+        m.statEstSaved,
+        '—',
+        m.statEstSavedUnpricedSub,
+        'muted-val',
+        m.statEstSavedUnpricedTip,
+      )
+    : statTile(
+        m.statEstSaved,
+        `$${(s.saved_usd ?? 0).toFixed(2)}`,
+        unpricedImaged > 0
+          ? m.statEstSavedExcludedSub(unpricedImaged, numFmt(unpricedImaged))
+          : m.statEstSavedSub(`$${pa.input_per_mtok}`),
+        '',
+        m.statEstSavedTip,
       );
 
   const strip =
@@ -278,13 +320,7 @@ export function renderHeaderFragment(s: StatsPayload, port: number, lang: Lang =
       'pos',
       m.statInputSavedTip,
     ) +
-    statTile(
-      m.statEstSaved,
-      `$${(s.saved_usd ?? 0).toFixed(2)}`,
-      m.statEstSavedSub(`$${pa.input_per_mtok}`),
-      '',
-      m.statEstSavedTip,
-    ) +
+    savedUsdTile +
     costTile +
     `</div>`;
 
@@ -298,7 +334,10 @@ export function renderHeaderFragment(s: StatsPayload, port: number, lang: Lang =
     mathRow('saved', s.saved_input_tokens, `<span class="op">=</span> baseline − actual`) +
     `<span class="src">output excluded — identical with/without compression</span>`;
 
-  const usdMath =
+  const usdMath = onlyUnpriced
+    ? `<div><span class="v">Unavailable for this provider.</span></div>` +
+      `<span class="src">Token savings are still reported; Claude pricing is not applied across providers.</span>`
+    :
     `<div><span class="k">formula:</span> <span class="v">$ saved = saved_tokens × $${pa.input_per_mtok}/Mtok</span></div>` +
     `<div class="sp"></div>` +
     mathRow('saved_tokens', s.saved_input_tokens, '(cache-aware, input-side)') +
@@ -493,6 +532,7 @@ export function renderContextMapFragment(
   // request's observed cache state: cache_read > 0 means warm, cache_read === 0
   // means cold. No wall-clock-only counterfactual is credited.
   const warm = showCompare && c.warm;
+  const google = c.model?.startsWith('gemini-') === true;
   const textNoun = warm ? m.ctxCachedText : m.ctxPlainText;
   // Raw count_tokens can grow (imaging bloated a short prompt), so say so rather
   // than rendering a nonsensical "shrank -36%".
@@ -501,13 +541,19 @@ export function renderContextMapFragment(
   const headline = !showCompare
     ? m.ctxHeadlineNoBaseline(kFmt(c.actualInputEff || c.realInput))
     : pct >= 0
-      ? m.ctxHeadlineSmaller(pct, textNoun, kFmt(base), kFmt(real))
-      : m.ctxHeadlineBigger(-pct, kFmt(real), kFmt(base), textNoun);
+      ? google
+        ? m.ctxHeadlineSmallerGoogle(pct, kFmt(base), kFmt(real))
+        : m.ctxHeadlineSmaller(pct, textNoun, kFmt(base), kFmt(real))
+      : google
+        ? m.ctxHeadlineBiggerGoogle(-pct, kFmt(real), kFmt(base))
+        : m.ctxHeadlineBigger(-pct, kFmt(real), kFmt(base), textNoun);
   // Clarifying sub-line. It must match the actual request's cache state: claiming
   // a 0.1× read discount when cache_read===0 would count hypothetical cache as a
   // pxpipe effect, so cold rows price both paths cold.
   const subnote = !showCompare
     ? m.ctxNoTrustworthyBaseline
+    : google
+      ? m.ctxGoogleNote(rawPhrase)
     : !warm
       ? m.ctxColdNote('1.25×', rawPhrase)
       : pct < 0 && rawShrink > 0
@@ -1210,6 +1256,7 @@ export function renderPage(port: number, lang: Lang = DEFAULT_LANG): string {
 
 <details class="models-collapse">
   <summary class="models-summary">${m.modelScopeSummary} <span class="hint">${m.modelScopeHint}</span></summary>
+  <div class="models-warning">${m.modelScopeWarning}</div>
   <div id="frag-models" hx-get="/fragments/models" hx-trigger="load, every 2s [!document.activeElement || document.activeElement.id !== 'models-csv']" hx-swap="innerHTML"></div>
   <div class="models-routing"><span class="hint">${m.routingScopeHint}</span> <button class="mini-btn" type="button" onclick="document.getElementById('routing-help').showModal()">${m.routingHelpBtn}</button></div>
 </details>

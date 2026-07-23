@@ -1096,171 +1096,12 @@ export async function renderTextToPngs(
   return renderTextToPngsWithCharLimit(text, cols, READABLE_CHARS_PER_IMAGE, style, maxHeightPx, slotText);
 }
 
-// --- R2 multi-column rendering --------------------------------------------
-//
-// Packs N columns side-by-side (column-major) so one image covers numCols×linesPerImg
-// wrapped lines. Reduces image count by ~numCols for short-line content.
-// OCR column ordering is the risk — gated behind an opt-in flag pending empirical eval.
-
-const GUTTER_CELLS = 4;
-// Width hard-capped at the API's long-edge bound: anything wider is resampled server-side
-// (measured 2026-07-01: fit-within 1568-edge AND ~1.15 MP, then 28-px patch billing ⌈w/28⌉×⌈h/28⌉).
-const MAX_WIDTH_PX = 1568;
-
-const GUTTER_DIVIDER_INK = 64; // pre-invert → 191 post-invert: light gray column separator
-const GUTTER_DIVIDER_INSET_PX = 2; // keep divider clear of padding rows
-
-/** Pixel width of a multi-col canvas. */
-export function multiColWidth(cols: number, numCols: number): number {
-  const n = Math.max(1, numCols | 0);
-  return 2 * PAD_X + n * cols * CELL_W + (n - 1) * GUTTER_CELLS * CELL_W;
-}
-
-/** Largest numCols fitting within MAX_WIDTH_PX. Used to clamp over-large CLI flags. */
-export function maxFittingCols(cols: number): number {
-  let n = 1;
-  while (multiColWidth(cols, n + 1) <= MAX_WIDTH_PX) n++;
-  return n;
-}
-
-async function renderMultiColChunkFromLines(
-  lines: string[],
-  cols: number,
-  numCols: number,
-  charsCovered: number,
-  linesPerCol: number,
-): Promise<RenderedImage> {
-  const width = multiColWidth(cols, numCols);
-  // Column 0 is always the tallest in column-major packing.
-  const rowsPerCol = Math.max(1, linesPerCol | 0);
-  const usedRows = Math.min(lines.length, rowsPerCol);
-  const height = 2 * PAD_Y + usedRows * CELL_H;
-
-  const fb = new Uint8Array(width * height);
-  let droppedChars = 0;
-  const droppedCodepoints = new Map<number, number>();
-
-  const colStride = cols * CELL_W + GUTTER_CELLS * CELL_W; // pixel stride per column including gutter
-  for (let c = 0; c < numCols; c++) {
-    const colBaseX = PAD_X + c * colStride;
-    const colStart = c * rowsPerCol;
-    if (colStart >= lines.length) break;
-    const colEnd = Math.min(colStart + rowsPerCol, lines.length);
-    for (let r = 0; r < colEnd - colStart; r++) {
-      const line = lines[colStart + r]!;
-      const baseY = PAD_Y + r * CELL_H;
-      let col = 0;
-      for (const ch of line) {
-        if (col >= cols) break;
-        const codepoint = ch.codePointAt(0)!;
-        const baseX = colBaseX + col * CELL_W;
-        const advance = blitGlyph(fb, width, baseX, baseY, codepoint);
-        if (advance === 0) {
-          droppedChars++;
-          droppedCodepoints.set(codepoint, (droppedCodepoints.get(codepoint) ?? 0) + 1);
-          col += 1;
-        } else {
-          col += advance;
-        }
-      }
-    }
-  }
-
-  // Draw faint vertical divider in each gutter before the invert pass (DEFLATE cost ≈ 3-5 bytes).
-  if (numCols >= 2) {
-    const gutterPxPerSide = GUTTER_CELLS * CELL_W;
-    const yStart = GUTTER_DIVIDER_INSET_PX;
-    const yEnd = height - GUTTER_DIVIDER_INSET_PX;
-    for (let c = 0; c < numCols - 1; c++) {
-      const colEndX = PAD_X + c * colStride + cols * CELL_W;
-      const dividerX = colEndX + Math.floor(gutterPxPerSide / 2);
-      for (let y = yStart; y < yEnd; y++) {
-        const idx = y * width + dividerX;
-        if (fb[idx] === 0) fb[idx] = GUTTER_DIVIDER_INK; // background pixels only (defensive)
-      }
-    }
-  }
-
-  for (let i = 0; i < fb.length; i++) fb[i] = 255 - fb[i]! // invert to black-on-white;
-
-  const png = await encodeGrayPng(fb, width, height);
-  return {
-    png,
-    width,
-    height,
-    charsRendered: charsCovered,
-    droppedChars,
-    droppedCodepoints,
-  };
-}
-
-/** Split text into N multi-column PNGs. numCols <= 1 delegates to renderTextToPngs
- *  for byte-identical output (determinism/cache_control preserved when flag is off). */
-export async function renderTextToPngsMultiCol(
-  text: string,
-  cols: number = DEFAULT_COLS,
-  numCols: number = 2,
-): Promise<RenderedImage[]> {
-  if (numCols <= 1) return renderTextToPngs(text, cols);
-  if (multiColWidth(cols, numCols) > MAX_WIDTH_PX) {
-    // Clamp to widest fitting count rather than throw (bad CLI flag recovery).
-    numCols = maxFittingCols(cols);
-    if (numCols <= 1) return renderTextToPngs(text, cols);
-  }
-
-  const lines = wrapLines(text, cols);
-  const hardLinesPerImg = Math.max(1, Math.floor((MAX_HEIGHT_PX - 2 * PAD_Y) / CELL_H));
-  const linesPerImg = Math.min(hardLinesPerImg, readableLinesPerColumn(cols));
-  const linesPerImage = linesPerImg * numCols;
-
-  // Total source codepoints; assigned to the last image to ensure counts sum exactly.
-  let totalChars = 0;
-  for (const _ of text) totalChars++;
-
-  const images: RenderedImage[] = [];
-  let coveredChars = 0;
-  const pages = splitWrappedLinesIntoReadablePages(
-    lines,
-    linesPerImage,
-    READABLE_CHARS_PER_IMAGE * Math.max(1, numCols | 0),
-  );
-  for (let i = 0; i < pages.length; i++) {
-    const slice = pages[i]!;
-    const isLast = i === pages.length - 1;
-    let chars: number;
-    if (isLast) {
-      chars = Math.max(0, totalChars - coveredChars);
-    } else {
-      let n = 0;
-      for (const ln of slice) for (const _ of ln) n++;
-      n += Math.max(0, slice.length - 1);
-      chars = n;
-    }
-    coveredChars += chars;
-    images.push(await renderMultiColChunkFromLines(slice, cols, numCols, chars, linesPerImg));
-  }
-  return images;
-}
-
-/** Reflow-aware variant of renderTextToPngsMultiCol. Falls back to non-reflow on sentinel collision. */
-export async function renderTextToPngsReflowMultiCol(
-  text: string,
-  cols: number = DEFAULT_COLS,
-  numCols: number = 2,
-): Promise<RenderedImage[]> {
-  const packed = reflow(text);
-  return renderTextToPngsMultiCol(packed ?? text, cols, numCols);
-}
-
 export interface RenderDensePagesOptions {
   /** Wrap-width cap in cols. Default DENSE_CONTENT_COLS (384). */
   readonly cols?: number;
   /** Shrink the canvas to the widest actual line (default true). `false` keeps the full
    *  `cols` width — the proxy's eval-backed full-canvas / slab behavior. */
   readonly shrink?: boolean;
-  /** Columns to pack side-by-side. `'auto'` (default) packs as many as fit the width cap;
-   *  a number forces that count. Collapses to 1 when the canvas shrinks below the cap. */
-  readonly multiCol?: number | 'auto';
   /** Reflow (minify + join hard newlines with ↵) before rendering. Default false. Callers
    *  that pre-reflow (the proxy's maybeReflow / history lockstep) pass false; `pxpipe export`
    *  passes true so short lines pack into full-width rows. */
@@ -1276,9 +1117,8 @@ export interface RenderDensePagesOptions {
 /**
  * The single dense-page rendering decision shared by the public SDK primitive
  * `renderTextToImages` (library.ts → `pxpipe export`) AND the proxy's `textToImageBlocks`
- * (transform.ts): optionally reflow, measure the content width, pack as many side-by-side
- * columns as actually fit the width cap (or honor an explicit count, collapsing the wasted
- * divider column when the canvas shrinks), then render. Both callers route through HERE so
+ * (transform.ts): optionally reflow, measure the content width, then render. Both callers
+ * route through HERE so
  * export PNGs and proxy image blocks are produced by the exact same code and cannot drift —
  * `shrinkColsToContent` is `measureContentCols`, so the proxy's old inline path was already
  * identical at the default 384 cols; this makes it identical at every cols. Returns the raw
@@ -1296,15 +1136,8 @@ export async function renderDensePages(
   const source = opts.reflow ? reflow(text) ?? text : text;
   const maxCols = Math.max(1, (opts.cols ?? DENSE_CONTENT_COLS) | 0);
   const cols = opts.shrink === false ? maxCols : measureContentCols(source, maxCols);
-  const requestedCols =
-    opts.multiCol === undefined || opts.multiCol === 'auto'
-      ? Math.max(1, maxFittingCols(cols))
-      : Math.max(1, opts.multiCol | 0);
-  const numCols = cols < maxCols ? 1 : requestedCols;
   const style = opts.style ?? DENSE_RENDER_STYLE;
   const maxChars = opts.maxCharsPerImage ?? DENSE_CONTENT_CHARS_PER_IMAGE;
   const maxHeightPx = opts.maxHeightPx ?? MAX_HEIGHT_PX;
-  return numCols > 1
-    ? renderTextToPngsMultiCol(source, cols, numCols)
-    : renderTextToPngsWithCharLimit(source, cols, maxChars, style, maxHeightPx);
+  return renderTextToPngsWithCharLimit(source, cols, maxChars, style, maxHeightPx);
 }

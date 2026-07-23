@@ -2,9 +2,6 @@ import { describe, expect, it } from 'vitest';
 import {
   renderChunkToPng,
   renderTextToPngs,
-  renderTextToPngsMultiCol,
-  multiColWidth,
-  maxFittingCols,
   expandTabsInLine,
   minifyForRender,
   roleSlotSegment,
@@ -205,180 +202,6 @@ describe('renderer', () => {
     const imgs = await renderTextToPngs(huge);
     expect(imgs.length).toBeGreaterThan(1);
     for (const img of imgs) expect(img.height).toBeLessThanOrEqual(1932);
-  });
-
-  // ---- R2 multi-column renderer ------------------------------------------
-  // The multi-col path packs N source columns side-by-side per image so
-  // each image covers numCols×LINES_PER_IMAGE wrapped lines instead of one.
-  // Off by default (numCols=1) — these tests exercise the new path.
-
-  it('multi-col with numCols=1 is byte-identical to renderTextToPngs (default cache contract)', async () => {
-    // The cache_control story depends on identical bytes for identical
-    // inputs. numCols=1 MUST be a pure passthrough so toggling the flag
-    // back to 1 cannot regress cache hit rate.
-    const text = ('lorem ipsum dolor sit amet\n'.repeat(8)) + 'final line';
-    const single = await renderTextToPngs(text, 100);
-    const passthrough = await renderTextToPngsMultiCol(text, 100, 1);
-    expect(passthrough.length).toBe(single.length);
-    for (let i = 0; i < single.length; i++) {
-      expect(passthrough[i]!.png).toEqual(single[i]!.png);
-    }
-  });
-
-  it('multi-col emits a wider canvas with the predicted dimensions', async () => {
-    const text = ('lorem ipsum dolor sit amet\n'.repeat(8)) + 'final line';
-    const single = await renderTextToPngs(text, 100);
-    const two = await renderTextToPngsMultiCol(text, 100, 2);
-    // numCols=2 with 100-col text content + 4-cell gutter at 5px/cell (5×8 production cell):
-    //   width = 2*PAD_X + 2*100*5 + 1*4*5 = 8 + 1000 + 20 = 1028 px
-    expect(two[0]!.width).toBe(multiColWidth(100, 2));
-    expect(two[0]!.width).toBeGreaterThan(single[0]!.width);
-    expect(two[0]!.width).toBeLessThanOrEqual(2000);
-  });
-
-  it('multi-col halves image count on row-heavy input', async () => {
-    // ~500 lines of narrow content. Single-col packs 240 lines/image →
-    // ~3 images. Two columns should drop that to ~2.
-    const text = ('lorem ipsum dolor sit amet\n'.repeat(500));
-    const single = await renderTextToPngs(text, 100);
-    const two = await renderTextToPngsMultiCol(text, 100, 2);
-    expect(single.length).toBeGreaterThanOrEqual(3);
-    // Two-col image count ≤ ceil(single / 2). The +1 slack handles the
-    // pathological case where the boundary lands awkwardly.
-    expect(two.length).toBeLessThanOrEqual(Math.ceil(single.length / 2));
-    for (const img of two) expect(img.height).toBeLessThanOrEqual(1932);
-  });
-
-  it('multi-col render is deterministic (byte-identical across calls)', async () => {
-    const text = ('alpha beta gamma delta epsilon\n'.repeat(400));
-    const a = await renderTextToPngsMultiCol(text, 100, 2);
-    const b = await renderTextToPngsMultiCol(text, 100, 2);
-    expect(a.length).toBe(b.length);
-    for (let i = 0; i < a.length; i++) expect(a[i]!.png).toEqual(b[i]!.png);
-  });
-
-  it('multi-col per-image charsRendered sums to the input codepoint count', async () => {
-    // The honest-savings math (compressedChars in TransformInfo) relies on
-    // sum(charsRendered) matching the input we paid to render. Off-by-one
-    // here would silently mis-report savings.
-    const text = ('lorem ipsum dolor sit amet\n'.repeat(400));
-    let cpCount = 0;
-    for (const _ of text) cpCount++;
-    const imgs = await renderTextToPngsMultiCol(text, 100, 2);
-    let total = 0;
-    for (const img of imgs) total += img.charsRendered;
-    expect(total).toBe(cpCount);
-  });
-
-  it('estimateImageCount(numCols=2) tracks actual multi-col image count', async () => {
-    const text = ('lorem ipsum dolor sit amet\n'.repeat(500));
-    const actual = (await renderTextToPngsMultiCol(text, 100, 2)).length;
-    const estimated = estimateImageCount(text, 100, 2);
-    expect(estimated).toBe(actual);
-  });
-
-  it('maxFittingCols clamps an over-wide numCols flag instead of producing >2000px canvases', async () => {
-    // At cols=100 (5 px/cell + 4-cell gutter), the math says:
-    //   1: 508 px, 2: 1028, 3: 1548, 4: 2068 → 4 already exceeds 2000.
-    const fits = maxFittingCols(100);
-    expect(fits).toBe(3);
-    const text = 'short\n'.repeat(10);
-    // numCols=10 → should clamp; output canvas width must stay ≤ 2000.
-    const imgs = await renderTextToPngsMultiCol(text, 100, 10);
-    for (const img of imgs) expect(img.width).toBeLessThanOrEqual(2000);
-  });
-
-  it('multi-col preserves CJK wide-glyph wrap math (no dropped chars on Chinese input)', async () => {
-    // Wide glyphs are 2 cells in both layouts; multi-col must not regress
-    // the wrap math or atlas lookup.
-    const text = ('中文测试 mixed ASCII\n'.repeat(100));
-    const imgs = await renderTextToPngsMultiCol(text, 100, 2);
-    let dropped = 0;
-    for (const img of imgs) dropped += img.droppedChars;
-    expect(dropped).toBe(0);
-  });
-
-  it('multi-col draws a light-gray gutter divider (OCR column-boundary cue)', async () => {
-    // Same "visible whitespace" idea as the U+2192 tab arrow: surface the
-    // column boundary explicitly instead of relying on gap-of-whitespace
-    // alone. The pixel sits at MID-GRAY (~191/255), distinct from both
-    // background (255) and glyph ink (~0), so the vision encoder reads it
-    // as a structural cue without competing with text. Cost is ~one
-    // 1-pixel-wide column of identical gray that DEFLATE-collapses to ~5
-    // bytes per gutter.
-    //
-    // Verification: inflate the IDAT chunks of the rendered PNG, locate the
-    // expected divider x-coordinate (middle of the gutter between cols 0
-    // and 1), and assert at least 80% of rows at that x are mid-gray.
-    const zlib = await import('node:zlib');
-    const text = ('lorem ipsum dolor sit amet\n'.repeat(200));
-    const imgs = await renderTextToPngsMultiCol(text, 100, 2);
-    expect(imgs.length).toBeGreaterThan(0);
-    const img = imgs[0]!;
-
-    // PNG layout: 8-byte signature, then chunks of (length-be32, type-4b,
-    // data, crc-be32). IHDR is first; concat all IDATs and inflate. The
-    // inflated stream has a 1-byte filter prefix per row; for grayscale our
-    // encoder always writes filter type 0 (none) so the row body is just
-    // the raw width bytes.
-    const png = img.png;
-    let pos = 8;
-    const idats: Uint8Array[] = [];
-    while (pos < png.length) {
-      const len =
-        (png[pos]! << 24) | (png[pos + 1]! << 16) | (png[pos + 2]! << 8) | png[pos + 3]!;
-      const type = String.fromCharCode(png[pos + 4]!, png[pos + 5]!, png[pos + 6]!, png[pos + 7]!);
-      const dataStart = pos + 8;
-      if (type === 'IDAT') idats.push(png.subarray(dataStart, dataStart + len));
-      if (type === 'IEND') break;
-      pos = dataStart + len + 4;
-    }
-    const concatenated = Buffer.concat(idats.map((u) => Buffer.from(u)));
-    const inflated = zlib.inflateSync(concatenated);
-
-    // Decode: each row is 1 filter byte + width pixel bytes. We expect
-    // filter=0 (none) on every row from our encoder, so the pixel-byte
-    // index for (x, y) is `y * (width + 1) + 1 + x`.
-    const width = img.width;
-    const height = img.height;
-    // Divider X: end of col 0's text area + half the gutter.
-    //   colEnd = PAD_X (4) + 0 * stride + 100 * 7 = 704
-    //   dividerX = 704 + floor((4 * 7) / 2) = 704 + 14 = 718
-    const PAD_X = 4;
-    const GUTTER_CELLS = 4;
-    const cols = 100;
-    const dividerX =
-      PAD_X + 0 + cols * CELL_W + Math.floor((GUTTER_CELLS * CELL_W) / 2);
-    expect(dividerX).toBeLessThan(width);
-
-    let midGrayRows = 0;
-    const rowStride = width + 1;
-    for (let y = 2; y < height - 2; y++) {
-      const px = inflated[y * rowStride + 1 + dividerX];
-      // GUTTER_DIVIDER_INK=64 pre-invert → 191 post-invert. Allow a small
-      // band in case the constant is tuned later — anywhere in [120, 230]
-      // is "mid-gray, not full ink, not background".
-      if (px !== undefined && px >= 120 && px <= 230) midGrayRows++;
-    }
-    // Most rows at the divider column should be mid-gray. The inset trims a
-    // few top/bottom pixels and there might be glyph encroachments on a
-    // handful of rows in pathological content, but >80% is the floor.
-    const liveRows = height - 4;
-    expect(midGrayRows).toBeGreaterThan(liveRows * 0.8);
-  });
-
-  it('multi-col single-column path skips the divider (byte-identical to renderTextToPngs)', async () => {
-    // The divider only paints when numCols >= 2. The numCols=1 passthrough
-    // path must remain byte-identical to the single-col renderer so the
-    // cache-control deterministic-bytes story stays intact for single-col
-    // deployments.
-    const text = ('lorem ipsum dolor sit amet\n'.repeat(100));
-    const passthrough = await renderTextToPngsMultiCol(text, 100, 1);
-    const single = await renderTextToPngs(text, 100);
-    expect(passthrough.length).toBe(single.length);
-    for (let i = 0; i < passthrough.length; i++) {
-      expect(passthrough[i]!.png).toEqual(single[i]!.png);
-    }
   });
 
   // ---- Unicode coverage tests (hybrid atlas fallback) -------------------------------
@@ -1812,9 +1635,8 @@ describe('transform', () => {
 
   it('compresses long <system-reminder> blocks in the first user message', async () => {
     // 'a long policy note. ' = 20 chars. 1550× = 31k chars + reminder tags
-    // — past the 14k minReminderChars threshold AND past the multi-col
-    // 1-image break-even (~30.7k chars at n=2, 7×10 cell).
-    // 1550 × 20 = 31,000 chars → 310 visual rows → 1 image at n=2 (capacity 312 rows)
+    // — past the 14k minReminderChars threshold and the one-image break-even.
+    // 1550 × 20 = 31,000 chars → 310 visual rows → 1 image (capacity 312 rows)
     // image cost 7665 tokens < text cost 31000/4=7750 → profitable.
     const reminder = '<system-reminder>\n' + 'a long policy note. '.repeat(1550) + '\n</system-reminder>';
     const body = new TextEncoder().encode(
@@ -1879,8 +1701,8 @@ describe('transform', () => {
 
   it('compresses large tool_result text content across user messages', async () => {
     // 'output line. ' = 13 chars × 2400 = 31.2k chars — past minToolResultChars
-    // (14k) AND past the multi-col 1-image break-even (~30.7k chars at n=2, 7×10 cell).
-    // 2400 × 13 = 31,200 chars → 312 visual rows → 1 image at n=2 (capacity 312 rows)
+    // (14k) and past the one-image break-even.
+    // 2400 × 13 = 31,200 chars → 312 visual rows → 1 image (capacity 312 rows)
     // image cost 7665 tokens < text cost 31200/4=7800 → profitable.
     const bigResult = 'output line. '.repeat(2400);
     const body = new TextEncoder().encode(
@@ -2083,7 +1905,7 @@ describe('transform', () => {
   // (textEq=42_408) while actual upstream billed 148_891 tokens (ch/tok=
   // 1.14). With the override (1.14 ch/tok), the gate flips to ACCEPT.
 
-  it('isCompressionProfitable: live α≈0.88 (1.14 ch/tok) flips a single-image slab at numCols=1', () => {
+  it('isCompressionProfitable: live α≈0.88 (1.14 ch/tok) flips a single-image slab', () => {
     // A dense 6060-char slab (60 long lines, no big newline penalty) that:
     //   • At default 4 ch/tok: textEq = 6060/4 = 1515 < imgCost 2500 → REJECT
     //   • At live α=1.14:      textEq = 6060/1.14 ≈ 5316 > imgCost 2500 → ACCEPT
@@ -2092,8 +1914,8 @@ describe('transform', () => {
     // pull net-loser blocks across the line on lighter content).
     const line = 'A'.repeat(100) + '\n';
     const slab = line.repeat(60); // 6060 chars, fits in 1 image at cols=100
-    expect(isCompressionProfitable(slab, 100, undefined, 1, 4)).toBe(true);
-    expect(isCompressionProfitable(slab, 100, undefined, 1, 1.14)).toBe(true);
+    expect(isCompressionProfitable(slab, 100, undefined, 4)).toBe(true);
+    expect(isCompressionProfitable(slab, 100, undefined, 1.14)).toBe(true);
   });
 
   it('isCompressionProfitable: defensive clamp on bogus chars/token (≤0 / NaN → falls back to 4)', () => {
@@ -2101,10 +1923,10 @@ describe('transform', () => {
     // decisions. The function falls back to CHARS_PER_TOKEN=4 silently.
     // Confirm: a 5000-char input is rejected at 4 ch/tok regardless of
     // whether we pass 0, -1, NaN, or Infinity.
-    expect(isCompressionProfitable('a'.repeat(5000), 100, undefined, 1, 0)).toBe(true);
-    expect(isCompressionProfitable('a'.repeat(5000), 100, undefined, 1, -1)).toBe(true);
-    expect(isCompressionProfitable('a'.repeat(5000), 100, undefined, 1, NaN)).toBe(true);
-    expect(isCompressionProfitable('a'.repeat(5000), 100, undefined, 1, Infinity)).toBe(true);
+    expect(isCompressionProfitable('a'.repeat(5000), 100, undefined, 0)).toBe(true);
+    expect(isCompressionProfitable('a'.repeat(5000), 100, undefined, -1)).toBe(true);
+    expect(isCompressionProfitable('a'.repeat(5000), 100, undefined, NaN)).toBe(true);
+    expect(isCompressionProfitable('a'.repeat(5000), 100, undefined, Infinity)).toBe(true);
   });
 
   // --- Slab-specific cpt: built-in 2.0 cpt unlocks production-shape slabs ---
@@ -2120,7 +1942,7 @@ describe('transform', () => {
   it('transformRequest: production-shape 161k slab compresses without an explicit cpt override', async () => {
     // Build a dense ~161k-char slab matching the production passthrough event
     // (orig_chars=161101). 60-100 char lines, modest blank density —
-    // representative of system + tool-doc slab shape under multi-col=2.
+    // representative of a production system + tool-doc slab shape.
     const parts: string[] = [];
     let acc = 0;
     const target = 161_101;
@@ -2137,18 +1959,17 @@ describe('transform', () => {
     });
     const bytes = new TextEncoder().encode(req);
 
-    // No host-supplied cpt: built-in SLAB_CHARS_PER_TOKEN flips this to ACCEPT
-    // at multi-col=2 (production default). This is the regression guard for
+    // No host-supplied cpt: built-in SLAB_CHARS_PER_TOKEN flips this to ACCEPT.
+    // This is the regression guard for
     // the 2026-05-20 zero-compression production bug.
-    const out = await transformRequest(bytes, { multiCol: 2 });
+    const out = await transformRequest(bytes);
     expect(out.info.compressed).toBe(true);
     expect(out.info.imageCount ?? 0).toBeGreaterThan(0);
   });
 
   it('isCompressionProfitable: 7x10 atlas makes a 161k production-shape slab profitable at cpt=2', () => {
     // With 7×10 atlas (CELL_H=10): LINES_PER_IMAGE=156, MaxCharsPerImage=15600.
-    // At numCols=2: images = ceil(rows/312). The 161k slab has ~2001 rows →
-    // ceil(2001/312)=7 images. imageCost = 7 × 7665 = 53,655 tokens.
+    // The single-column gate uses the production renderer geometry.
     // At cpt=2 (SLAB_CHARS_PER_TOKEN): text = 161101/2 = 80,550 → profitable.
     // At cpt=4: text = 161101/4 = 40,275 < 53,655 → NOT profitable.
     const parts: string[] = [];
@@ -2159,8 +1980,8 @@ describe('transform', () => {
       acc += len + 1;
     }
     const slab = parts.join('\n').slice(0, 161_101);
-    expect(isCompressionProfitable(slab, 100, undefined, 2, 2)).toBe(true);
-    expect(isCompressionProfitable(slab, 100, undefined, 2, 2.5)).toBe(true);
+    expect(isCompressionProfitable(slab, 100, undefined, 2)).toBe(true);
+    expect(isCompressionProfitable(slab, 100, undefined, 2.5)).toBe(true);
   });
 
   // --- Adaptive break-even: CHARS_PER_IMAGE derived from atlas cell, not hardcoded ---
@@ -2500,17 +2321,17 @@ describe('transform', () => {
     // the *constants*. Refresh the shape constants from a fresh events.jsonl
     // when that happens; see tests/fixtures/real-shapes.ts.
 
-    it('production slab (161k chars, multi-col): ACCEPTED at slab cpt=2.0', () => {
+    it('production slab (161k chars): ACCEPTED at slab cpt=2.0', () => {
       const shape = PRODUCTION_SLAB_161K;
       const text = synthesizeText(shape);
       // The body that motivated the cpt calibration. Conservative cpt=4 would
       // reject many dense slabs under the older geometry; cpt=2.0 reflects
       // Opus 4.7 telemetry and keeps this shape accepted with margin.
       expect(
-        isCompressionProfitable(text, 100, undefined, shape.numCols, SLAB_CHARS_PER_TOKEN),
+        isCompressionProfitable(text, 100, undefined, SLAB_CHARS_PER_TOKEN),
       ).toBe(true);
       // Default cpt=4 must still REJECT — proves the constant is what flips it.
-      expect(isCompressionProfitable(text, 100, undefined, shape.numCols)).toBe(true);
+      expect(isCompressionProfitable(text, 100)).toBe(true);
     });
 
     it('production slab (135k chars, newline-heavy): synthetic shape REJECTED at slab cpt=2.0', () => {
@@ -2523,7 +2344,7 @@ describe('transform', () => {
       // fixture pins the gate's decision on the *synthetic* shape — see the
       // comment in real-shapes.ts for why this divergence is expected.
       expect(
-        isCompressionProfitable(text, 100, undefined, shape.numCols, SLAB_CHARS_PER_TOKEN),
+        isCompressionProfitable(text, 100, undefined, SLAB_CHARS_PER_TOKEN),
       ).toBe(true);
     });
 
@@ -2532,10 +2353,10 @@ describe('transform', () => {
       const text = synthesizeText(shape);
       // The largest real-event shape we logged. Even at cpt=2.0 the body
       // (169632/2.0 = 84816 tok) doesn't clear the image cost (37 imgs × 5500
-      // × 2 = 407k tok at multiCol=2). Gate stays conservative — the
+      // in the production geometry). Gate stays conservative — the
       // regression here pins that the constant doesn't silently overshoot.
       expect(
-        isCompressionProfitable(text, 100, undefined, shape.numCols, SLAB_CHARS_PER_TOKEN),
+        isCompressionProfitable(text, 100, undefined, SLAB_CHARS_PER_TOKEN),
       ).toBe(true);
     });
 

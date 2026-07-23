@@ -295,7 +295,7 @@ export function computeTokenReport(
   model: string,
 ): ExportTokenReport {
   const stripW = 2 * PAD_X + cols * CELL_W;
-  const estImages = estimateImageCount(sourceText, cols, 1, DENSE_CONTENT_CHARS_PER_IMAGE);
+  const estImages = estimateImageCount(sourceText, cols, DENSE_CONTENT_CHARS_PER_IMAGE);
   const perStrip = exportImageTokens(model, stripW, MAX_HEIGHT_PX);
   const imageTokens = Math.round(estImages * perStrip);
   const textTokens = Math.round(sourceText.length / REPORT_CHARS_PER_TOKEN);
@@ -422,13 +422,10 @@ export async function runExportCore(
   const enc = new TextEncoder();
 
   // Render to PNG pages via the public SDK primitive. shrink=true sizes the canvas
-  // to the widest line so short-line code isn't padded to full width; multiCol='auto'
-  // packs as many columns side-by-side as fit. Same render surface shipped to external
-  // SDK consumers (pxpipe-proxy/transform).
+  // to the widest line so short-line code isn't padded to full width.
   const { pages: images } = await renderTextToImages(sourceText, {
     cols: opts.cols,
     shrink: true,
-    multiCol: 'auto',
     reflow: true,
   });
 

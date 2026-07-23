@@ -29,6 +29,7 @@ import {
   DEFAULT_RENDER_FONT,
   type RenderFont,
 } from './render.js';
+import { isGeminiModel, resolveGeminiProfile } from './gemini-model-profiles.js';
 
 export const GPT_MAX_HEIGHT_PX = 1932;
 
@@ -138,6 +139,26 @@ export const DEFAULT_GPT_PROFILE: GptModelProfile = {
   style: BASE_STYLE,
 };
 
+export const CLAUDE_FABLE_PROFILE: GptModelProfile = {
+  // Vision struct unused: visionTokensForModel prices Claude by pixels.
+  vision: { regime: 'tile', base: 85, perTile: 170 },
+  stripCols: ANTHROPIC_STRIP_COLS,
+  maxHeightPx: ANTHROPIC_MAX_HEIGHT_PX,
+  factSheetFormat: 'full',
+  history: BASE_HISTORY,
+  style: { ...BASE_STYLE },
+};
+
+export const CLAUDE_OPUS_PROFILE: GptModelProfile = {
+  // Vision struct unused: visionTokensForModel prices Claude by pixels.
+  vision: { regime: 'tile', base: 85, perTile: 170 },
+  stripCols: ANTHROPIC_STRIP_COLS,
+  maxHeightPx: ANTHROPIC_MAX_HEIGHT_PX,
+  factSheetFormat: 'full',
+  history: BASE_HISTORY,
+  style: { ...BASE_STYLE },
+};
+
 const GPT56_SOL_PROFILE: GptModelProfile = {
   vision: { regime: 'patch', multiplier: 1, patchCap: 10000 },
   // Validated production recipe. Rejected RGB-overprint research lives under
@@ -210,6 +231,16 @@ const BUILTIN_RULES: ProfileRule[] = [
     profile: { vision: { regime: 'tile', base: 75, perTile: 150 }, stripCols: C, maxHeightPx: H, minCompressTokens: 500, factSheetFormat: 'full', history: BASE_HISTORY, style: BASE_STYLE },
   },
 
+  // Claude Opus models (e.g. claude-opus-4-8, claude-opus-4-7, claude-3-5-opus, etc.)
+  {
+    test: (m) => m.includes('opus'),
+    profile: CLAUDE_OPUS_PROFILE,
+  },
+  // Claude Fable models (e.g. claude-fable-5, etc.)
+  {
+    test: (m) => m.includes('fable'),
+    profile: CLAUDE_FABLE_PROFILE,
+  },
   // Claude on the Responses path (Codex-style clients). Selection is by model
   // id, not endpoint: several families share /v1/responses. Anthropic geometry
   // (dense 312-col strips, 728 px height) and pixel billing differ from GPT's
@@ -218,15 +249,7 @@ const BUILTIN_RULES: ProfileRule[] = [
   // text-only and the dashboard leaves As text / Saved blank.
   {
     test: (m) => m.startsWith('claude') || m.includes('anthropic'),
-    profile: {
-      // Vision struct unused: visionTokensForModel prices Claude by pixels.
-      vision: { regime: 'tile', base: 85, perTile: 170 },
-      stripCols: ANTHROPIC_STRIP_COLS,
-      maxHeightPx: ANTHROPIC_MAX_HEIGHT_PX,
-      factSheetFormat: 'full',
-      history: BASE_HISTORY,
-      style: { ...BASE_STYLE },
-    },
+    profile: CLAUDE_FABLE_PROFILE,
   },
 
   // Grok remains opt-in. It shares the 5×8 production stack but uses shorter
@@ -375,6 +398,7 @@ export function resolveGptProfile(model: string | null | undefined): GptModelPro
   // Match applicability.ts: bracketed transport variants (for example [1m])
   // do not define a different visual reader profile.
   const m = (model ?? '').toLowerCase().replace(/\[[^\]]*\]/g, '');
+  if (isGeminiModel(m)) return resolveGeminiProfile();
   const env = envProfiles();
   if (env.size > 0) {
     let best: GptModelProfile | undefined;

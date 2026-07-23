@@ -75,7 +75,6 @@ import {
   isValidModelBaseId,
   setAllowedModelBases,
 } from './core/applicability.js';
-import { persistModelsToConfigFile } from './config-file.js';
 import type {
   StatsPayload,
   RecentPayload,
@@ -244,6 +243,11 @@ interface Totals {
    *  doesn't touch output). Without this the headline ignores half the
    *  bill on output-heavy sessions. */
   outputWeighted: number;
+  /** Claude-priced subset of the measured totals. Google rows contribute to
+   * token savings above, but not to dollar estimates based on Claude rates. */
+  pricedActualInputWeighted: number;
+  pricedBaselineInputWeighted: number;
+  pricedOutputWeighted: number;
   /** Sum of weighted COUNTERFACTUAL input tokens across ALL requests
    *  with a usage block. For measured rows: cache-aware baseline (what the
    *  unproxied path would have billed). For unmeasured/probe-failed rows:
@@ -311,6 +315,9 @@ function emptyTotals(startedAt = Date.now() / 1000): Totals {
     actualInputWeighted: 0,
     baselineInputWeighted: 0,
     outputWeighted: 0,
+    pricedActualInputWeighted: 0,
+    pricedBaselineInputWeighted: 0,
+    pricedOutputWeighted: 0,
     allBaselineEquivalentWeighted: 0,
     allActualInputWeighted: 0,
     allOutputWeighted: 0,
@@ -381,11 +388,49 @@ export const ASSUMED_INPUT_USD_PER_MTOK = 10.0;
  *  Anthropic paths are `/v1/messages[/count_tokens]`; neither word appears. */
 function isOpenAIEvent(
   path: string | undefined,
-  accountingProvider?: 'anthropic' | 'openai',
+  accountingProvider?: 'anthropic' | 'openai' | 'google',
 ): boolean {
   if (accountingProvider) return accountingProvider === 'openai';
   if (!path) return false;
   return path.includes('responses') || path.includes('chat/completions');
+}
+
+function googleEff(args: {
+  inputTokens: number;
+  outputTokens: number;
+  compressed: boolean;
+  baselineTokens: number;
+  baselineProbeStatus: string | undefined;
+  imageTokens: number;
+  baselineImagedTokens: number;
+  nativeInjectedTokens: number;
+}): {
+  haveUsage: boolean;
+  haveBaseline: boolean;
+  creditSaving: boolean;
+  actualInputEff: number;
+  baselineInputEff: number;
+} {
+  const { inputTokens: inp, outputTokens: out, compressed } = args;
+  const haveUsage = inp > 0 || out > 0;
+  const measuredBaseline = args.baselineProbeStatus === 'ok' && args.baselineTokens > 0
+    ? args.baselineTokens
+    : 0;
+  const estimatedBaseline = compressed
+    && args.imageTokens > 0
+    && args.baselineImagedTokens > 0
+    ? Math.max(0, inp - args.imageTokens - args.nativeInjectedTokens + args.baselineImagedTokens)
+    : 0;
+  const baseline = measuredBaseline || estimatedBaseline;
+  const haveBaseline = baseline > 0;
+  const creditSaving = haveBaseline && haveUsage && compressed;
+  return {
+    haveUsage,
+    haveBaseline,
+    creditSaving,
+    actualInputEff: inp,
+    baselineInputEff: creditSaving ? baseline : inp,
+  };
 }
 
 /** Cache-aware eff bundle for one GPT event. Shared by the live `update()`
@@ -521,12 +566,20 @@ export class DashboardState {
    *  the developer's actual Claude Code session files. */
   private readonly ccMapFn: () => Promise<Map<string, ClaudeCodeSessionRef>>;
 
+  /** Host-provided persistence hook for the runtime model scope. The core
+   *  override stays in-memory (Edge-safe); a Node host passes a saver that
+   *  writes the `models` key of the config file so chip toggles survive a
+   *  restart. Best-effort: failures are the hook's problem, never the API's. */
+  private readonly persistModelBases: ((bases: readonly string[]) => void) | undefined;
+
   constructor(
     paths?: SessionsPaths,
     ccMapFn?: () => Promise<Map<string, ClaudeCodeSessionRef>>,
+    persistModelBases?: (bases: readonly string[]) => void,
   ) {
     this.paths = paths;
     this.ccMapFn = ccMapFn ?? (() => claudeCodeMap());
+    this.persistModelBases = persistModelBases;
   }
 
   private totalsForModel(model: string | undefined): Totals {
@@ -592,14 +645,14 @@ export class DashboardState {
   /** Fold one event into the running totals + ring buffer.
    *
    *  Savings math is gated on a per-request `baseline_tokens` measurement
-   *  from the parallel count_tokens probe AND an upstream usage block.
-   *  When either is missing, we still count the request but skip its
-   *  savings contribution — no estimation. */
+   *  from the parallel count_tokens probe or model-profile estimation (Google/GPT),
+   *  plus an upstream usage block. When both probe and estimation are missing,
+   *  we still count the request but skip its savings contribution. */
   update(ev: ProxyEvent): void {
     // Stash the image bytes before they get GC'd by the request finishing.
     // The returned id (if any) is stamped onto this request's RecentRow so
     // the dashboard can pull the exact image that request rendered.
-    const imgIds = ev.info ? this.captureImage(ev.info) : [];
+    const imgIds = ev.info?.compressed ? this.captureImage(ev.info) : [];
     const imgId = imgIds[0];
 
     const u = ev.usage;
@@ -614,6 +667,8 @@ export class DashboardState {
     const cc1h = u?.cache_creation?.ephemeral_1h_input_tokens ?? 0;
     const cr = u?.cache_read_input_tokens ?? 0;
     const gpt = isOpenAIEvent(ev.path, ev.accountingProvider);
+    const google = ev.accountingProvider === 'google'
+      || ev.path.includes('google-ai-studio') || ev.path.includes('generateContent');
 
     // Unified per-row accounting, filled by the provider branch below. The
     // downstream totals / per-session / recent-row code reads only these —
@@ -631,7 +686,31 @@ export class DashboardState {
     let warmForRow: boolean; // did the TEXT baseline read warm? Server-observed:
     // Anthropic cr>0 or GPT cached_tokens>0. Drives Context Map narration.
 
-    if (gpt) {
+    if (google) {
+      const e = googleEff({
+        inputTokens: inp,
+        outputTokens: out,
+        compressed,
+        baselineTokens: info?.baselineTokens ?? 0,
+        baselineProbeStatus: info?.baselineProbeStatus,
+        imageTokens: info?.imageTokens ?? 0,
+        baselineImagedTokens: info?.baselineImagedTokens ?? 0,
+        nativeInjectedTokens: info?.nativeInjectedTokens ?? 0,
+      });
+      haveUsage = e.haveUsage;
+      haveBaseline = e.haveBaseline;
+      creditSaving = e.creditSaving;
+      actualInputEff = e.actualInputEff;
+      baselineInputEff = e.baselineInputEff;
+      outputEquiv = out;
+      rawActual = inp;
+      rawBaseline = creditSaving ? baselineInputEff : inp;
+      baselineForRow = creditSaving ? baselineInputEff : 0;
+      cacheReadForRow = u?.cached_tokens ?? 0;
+      // Google fallback savings are raw provider-token deltas; do not imply
+      // that an unknown cache discount was applied to the counterfactual.
+      warmForRow = false;
+    } else if (gpt) {
       // GPT cost model: no count_tokens probe, no cache-create premium, no
       // per-session warmth — the discount is automatic and folded into the
       // cached-input rate. Baseline is the measured imaged-vs-text delta.
@@ -799,13 +878,20 @@ export class DashboardState {
     totals.requests += 1;
     if (compressed) totals.compressedRequests += 1;
 
-    // Measured headline: only compressed rows with a usable probe. An
+    // Token headline: compressed rows with a usable measured or local
+    // baseline. An
     // uncompressed row contributes zero saved (baseline === actual), so
     // including it here would only dilute the "saved on rows we moved" %.
+    const dollarEligible = !google;
     if (creditSaving) {
       totals.baselineInputWeighted += baselineInputEff;
       totals.actualInputWeighted += actualInputEff;
       totals.outputWeighted += outputEquiv;
+      if (dollarEligible) {
+        totals.pricedBaselineInputWeighted += baselineInputEff;
+        totals.pricedActualInputWeighted += actualInputEff;
+        totals.pricedOutputWeighted += outputEquiv;
+      }
     }
     // All-rows COUNTERFACTUAL spend, ungated on the probe — the honest
     // denominator for "did pxpipe move my real bill". Measured rows
@@ -815,7 +901,7 @@ export class DashboardState {
     // can't measure the counterfactual, so actual ≈ baseline). This
     // keeps the ratio bounded at 100% — you can't save more than you
     // would have paid.
-    if (haveUsage) {
+    if (haveUsage && dollarEligible) {
       // baselineInputEff already folds the uncompressed/probe-failed fallback
       // to actualInputEff, so passthrough rows contribute zero saved here.
       totals.allBaselineEquivalentWeighted += baselineInputEff;
@@ -877,7 +963,7 @@ export class DashboardState {
       // update() so the lifetime totals block (above) and the per-session
       // block (here) read the same values. Re-deriving them here would
       // duplicate the cache-aware-baseline math and invite drift.
-      if (creditSaving) {
+      if (creditSaving && dollarEligible) {
         s.baselineInputWeighted += baselineInputEff;
         s.actualInputWeighted += actualInputEff;
         s.baselineMeasuredCount += 1;
@@ -890,7 +976,7 @@ export class DashboardState {
       // above (allActualInputWeighted / allOutputWeighted). Used as the
       // honest denominator for the session's saved-% so caching wins on
       // unmeasured requests still count toward "what you actually paid".
-      if (haveUsage) {
+      if (haveUsage && dollarEligible) {
         s.allActualInputWeighted += actualInputEff;
         s.allOutputWeighted += outputEquiv;
       }
@@ -967,6 +1053,8 @@ export class DashboardState {
       const cr = t.cache_read_tokens ?? 0;
       const compressed = t.compressed === true;
       const gpt = isOpenAIEvent(t.path, t.accounting_provider);
+      const google = t.accounting_provider === 'google'
+        || t.path.includes('google-ai-studio') || t.path.includes('generateContent');
 
       // Same unified accounting as update(); see the branch comments there.
       let haveUsage: boolean;
@@ -980,7 +1068,31 @@ export class DashboardState {
       let cacheReadForRow: number;
       let warmForRow: boolean; // text-baseline warmth for the Context Map narration
 
-      if (gpt) {
+      if (google) {
+        const e = googleEff({
+          inputTokens: inp,
+          outputTokens: out,
+          compressed,
+          baselineTokens: (t as { baseline_tokens?: number }).baseline_tokens ?? 0,
+          baselineProbeStatus:
+            (t as { baseline_probe_status?: string }).baseline_probe_status,
+          imageTokens: (t as { image_tokens?: number }).image_tokens ?? 0,
+          baselineImagedTokens:
+            (t as { baseline_imaged_tokens?: number }).baseline_imaged_tokens ?? 0,
+          nativeInjectedTokens:
+            (t as { native_injected_tokens?: number }).native_injected_tokens ?? 0,
+        });
+        haveUsage = e.haveUsage;
+        haveBaseline = e.haveBaseline;
+        creditSaving = e.creditSaving;
+        actualInputEff = e.actualInputEff;
+        baselineInputEff = e.baselineInputEff;
+        rawActual = inp;
+        rawBaseline = creditSaving ? baselineInputEff : inp;
+        baselineForRow = creditSaving ? baselineInputEff : 0;
+        cacheReadForRow = (t as { cached_tokens?: number }).cached_tokens ?? 0;
+        warmForRow = false;
+      } else if (gpt) {
         const e = gptEff({
           model: t.model,
           inputTokens: inp,
@@ -1115,7 +1227,7 @@ export class DashboardState {
         input_tokens: t.input_tokens,
         output_tokens: t.output_tokens,
         cache_create: t.cache_create_tokens,
-        cache_read: gpt ? cacheReadForRow : t.cache_read_tokens,
+        cache_read: gpt || google ? cacheReadForRow : t.cache_read_tokens,
         actual_input: haveUsage ? round1(actualInputEff) : undefined,
         baseline_input:
           creditSaving ? round1(baselineInputEff) : undefined,
@@ -1201,10 +1313,15 @@ export class DashboardState {
     const actual = totals.actualInputWeighted;
     const output = totals.outputWeighted; // already × OUTPUT_TOKEN_RATE
     const saved = baseline - actual;
+    const pricedBaseline = totals.pricedBaselineInputWeighted;
+    const pricedActual = totals.pricedActualInputWeighted;
+    const pricedOutput = totals.pricedOutputWeighted;
+    const pricedSaved = pricedBaseline - pricedActual;
     const pctInput = baseline > 0 ? (saved / baseline) * 100 : 0;
     const baselineTotal = baseline + output;
     const actualTotal = actual + output;
-    const pctTotal = baselineTotal > 0 ? (saved / baselineTotal) * 100 : 0;
+    const pricedBaselineTotal = pricedBaseline + pricedOutput;
+    const pctTotal = pricedBaselineTotal > 0 ? (pricedSaved / pricedBaselineTotal) * 100 : 0;
 
     // Share-of-all-spend: honest denominator. The numerator can only credit
     // savings against rows where we have a probe baseline (otherwise it's
@@ -1222,7 +1339,7 @@ export class DashboardState {
     // not 280%.
     const allCounterfactualBill = allBaselineEquiv + allOutput;
     const pctAllSpend =
-      allCounterfactualBill > 0 ? (saved / allCounterfactualBill) * 100 : 0;
+      allCounterfactualBill > 0 ? (pricedSaved / allCounterfactualBill) * 100 : 0;
 
     // Direct observed split — actual $ per request, partitioned by which
     // path ran. Token-equivalent (input × 1.0 + cache_create × 1.25 +
@@ -1294,7 +1411,7 @@ export class DashboardState {
       compressed_minus_passthrough_avg_usd: round4(splitDeltaUsd),
       split_sufficient_sample: splitSufficient,
       split_min_sample_per_bucket: SUFFICIENT,
-      saved_usd: round4((saved * ASSUMED_INPUT_USD_PER_MTOK) / 1e6),
+      saved_usd: round4((pricedSaved * ASSUMED_INPUT_USD_PER_MTOK) / 1e6),
       output_weighted: Math.round(output),
       baseline_token_equivalent: Math.round(baselineTotal),
       actual_token_equivalent: Math.round(actualTotal),
@@ -1512,32 +1629,38 @@ export class DashboardState {
   }
 
   /** POST /fragments/models — add/remove ONE model (Claude or GPT) from the
-   *  runtime compress scope. Applies in-memory immediately and is also
-   *  persisted to the config file so the selection survives a process
-   *  restart (see config-file.ts persistModelsToConfigFile). */
+   *  runtime compress scope. The model checks read this live. Persisted via
+   *  the host's `persistModelBases` hook when provided (Node writes the
+   *  config file); otherwise in-memory only and restart resets to the
+   *  PXPIPE_MODELS env / built-in default. */
   handleModelsToggle(model: string, on: boolean): void {
     const next = new Set(getAllowedModelBases());
     if (on) {
       if (!isValidModelBaseId(model)) return;
       next.add(model);
     } else next.delete(model);
-    const bases = [...next];
-    setAllowedModelBases(bases);
-    persistModelsToConfigFile(bases);
+    this.applyModelBases([...next]);
   }
 
   /** POST /fragments/models with {list} — replace the WHOLE runtime compress
    *  scope from the PXPIPE_MODELS textbox. Same CSV shape as the env var;
-   *  empty or off/false/0/no/none = compress nothing. Persisted to the
-   *  config file, same as handleModelsToggle. */
+   *  empty or off/false/0/no/none = compress nothing. Persistence as above. */
   handleModelsSet(csv: string): void {
     const trimmed = csv.trim();
     const bases =
       !trimmed || /^(0|false|no|off|none)$/i.test(trimmed)
         ? []
         : trimmed.split(',').map((s) => s.trim()).filter(Boolean).filter(isValidModelBaseId);
+    this.applyModelBases(bases);
+  }
+
+  private applyModelBases(bases: string[]): void {
     setAllowedModelBases(bases);
-    persistModelsToConfigFile(bases);
+    try {
+      this.persistModelBases?.(bases);
+    } catch {
+      // Persistence is best-effort; the live flip already took effect.
+    }
   }
 }
 

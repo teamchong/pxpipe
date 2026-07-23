@@ -27,8 +27,11 @@ export interface Messages {
   // ---- model scope ------------------------------------------------------
   modelScopeSummary: string;
   modelScopeHint: string;
+  modelScopeWarning: string;
   compressionOffNoEffect: string;
   imageClaudeModels: string;
+  imageGeminiModels: string;
+  geminiModelsHint: string;
   imageOpenAIModels: string;
   unlistedModelsHint: string;
   openAIModelsHint: string;
@@ -68,6 +71,11 @@ export interface Messages {
   statCostCollecting: string;
   statCostCollectingSub: string;
   statCostCollectingTip: string;
+  statCostUnpricedSub: string;
+  statCostUnpricedTip: string;
+  statEstSavedUnpricedSub: string;
+  statEstSavedUnpricedTip: string;
+  statEstSavedExcludedSub: (n: number, nFmt: string) => string;
 
   // ---- math drawer --------------------------------------------------------
   showTheMath: string;
@@ -104,6 +112,10 @@ export interface Messages {
   ctxHeadlineSmaller: (pct: number, textNoun: string, baseTokens: string, realTokens: string) => string;
   /** Images billed bigger than the text counterfactual. */
   ctxHeadlineBigger: (pct: number, realTokens: string, baseTokens: string, textNoun: string) => string;
+  /** Google/Gemini variants: tokens are accounted, not billed. */
+  ctxHeadlineSmallerGoogle: (pct: number, baseTokens: string, realTokens: string) => string;
+  ctxHeadlineBiggerGoogle: (pct: number, realTokens: string, baseTokens: string) => string;
+  ctxGoogleNote: (phrase: string) => string;
   rcCompositionTitle: string;
   rcInstructions: string;
   rcSystemDeveloper: string;
@@ -232,9 +244,13 @@ export const en: Messages = {
   killSwitchHint: 'kill switch · resets to on when you restart',
 
   modelScopeSummary: 'Image model scope',
-  modelScopeHint: 'Expand to choose which models are included in imaging',
+  modelScopeHint: 'Fable 5 and Gemini 3.6 Flash by default · expand to experiment with other families',
+  modelScopeWarning:
+    '⚠ Image compression is validated for Fable 5 and Gemini 3.6 Flash — other families can use <strong>more</strong> tokens, not less. Opt in only for deliberate experiments.',
   compressionOffNoEffect: 'compression is off — these settings have no effect right now',
   imageClaudeModels: 'Image Claude models',
+  imageGeminiModels: 'Image Gemini models',
+  geminiModelsHint: 'enabled by default · 100/100 vision reader',
   imageOpenAIModels: 'Image OpenAI Responses models',
   unlistedModelsHint: 'unlisted models get plain text',
   openAIModelsHint: 'opt-in · no Anthropic cache_control',
@@ -281,6 +297,13 @@ export const en: Messages = {
   statCostCollecting: 'collecting…',
   statCostCollectingSub: 'waiting for a paid imaged request',
   statCostCollectingTip: 'The comparison appears after an imaged request returns provider usage.',
+  statCostUnpricedSub: 'provider pricing not configured',
+  statCostUnpricedTip:
+    'Token savings are available, but this provider is excluded from Claude-priced dollar estimates.',
+  statEstSavedUnpricedSub: 'provider pricing not configured',
+  statEstSavedUnpricedTip:
+    'Token savings are shown separately. Dollar estimates require provider-specific pricing and are not inferred from Claude rates.',
+  statEstSavedExcludedSub: (n, nFmt) => `${nFmt} provider-priced request${n === 1 ? '' : 's'} excluded`,
 
   showTheMath: 'Show the math & honesty receipts',
   drawerIntro:
@@ -315,6 +338,11 @@ export const en: Messages = {
     `<span class="ctx-big">${pct}%</span> smaller — ${textNoun} would bill as <strong>${baseTokens}</strong> input tokens; images billed as <strong>${realTokens}</strong>`,
   ctxHeadlineBigger: (pct, realTokens, baseTokens, textNoun) =>
     `<span class="ctx-big">${pct}%</span> bigger — images billed as <strong>${realTokens}</strong> input tokens vs <strong>${baseTokens}</strong> for ${textNoun}`,
+  ctxHeadlineSmallerGoogle: (pct, baseTokens, realTokens) =>
+    `<span class="ctx-big">${pct}%</span> smaller — text would account as <strong>${baseTokens}</strong> input tokens; images account as <strong>${realTokens}</strong>`,
+  ctxHeadlineBiggerGoogle: (pct, realTokens, baseTokens) =>
+    `<span class="ctx-big">${pct}%</span> bigger — images account as <strong>${realTokens}</strong> input tokens vs <strong>${baseTokens}</strong> for text`,
+  ctxGoogleNote: (phrase) => `Same provider-token basis as the Saved column. The gap is token count. ${phrase}`,
   rcCompositionTitle: 'Original Responses composition (local o200k estimate)',
   rcInstructions: 'Instructions',
   rcSystemDeveloper: 'System / developer items',

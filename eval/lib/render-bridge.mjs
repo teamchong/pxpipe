@@ -38,8 +38,6 @@ const pngModule    = await import(PNG_PATH);
 export const {
   renderTextToPngs,
   renderTextToPngsReflow,
-  renderTextToPngsReflowMultiCol,
-  renderTextToPngsMultiCol,
   minifyForRender,
   reflow,
   dereflow,

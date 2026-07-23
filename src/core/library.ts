@@ -2,9 +2,7 @@ import { isPxpipeSupportedModel } from './applicability.js';
 import { countCacheControlMarkers } from './measurement.js';
 import {
   renderTextToPngsWithCharLimit,
-  renderTextToPngsMultiCol,
   measureContentCols,
-  maxFittingCols,
   reflow,
   DENSE_CONTENT_COLS,
   DENSE_CONTENT_CHARS_PER_IMAGE,
@@ -154,9 +152,6 @@ export interface RenderTextToImagesOptions {
   /** Shrink the canvas to the widest actual line (default true). `false` keeps the
    *  full `cols` width — the proxy's eval-backed full-canvas behavior. */
   readonly shrink?: boolean;
-  /** Columns to pack side-by-side. `'auto'` (default) packs as many as fit the width
-   *  cap; a number forces that count (clamped to what fits). */
-  readonly multiCol?: number | 'auto';
   /** Reflow the text before rendering (minify + join hard newlines with the ↵ sentinel so
    *  short lines pack into full-width rows). This is the proxy's dense history format and is
    *  what `pxpipe export` uses. Default false (raw one-line-per-row). */
@@ -185,9 +180,8 @@ export interface RenderTextToImagesResult {
 
 /**
  * Render arbitrary text to dense PNG pages — the public, documented entry for the
- * renderer the proxy uses internally. Sizes a narrow canvas to the content (`shrink`)
- * and packs multiple columns (`multiCol`) so short-line content isn't priced at full
- * width. Returns raw PNG bytes + pixel dimensions, ready to write to disk or wrap in
+ * renderer the proxy uses internally. Sizes a narrow canvas to the content (`shrink`).
+ * Returns raw PNG bytes + pixel dimensions, ready to write to disk or wrap in
  * image blocks. This is the surface SDK consumers should use instead of reaching into
  * the internal leaf renderers in `render.ts`.
  */
@@ -210,21 +204,10 @@ export async function renderTextToImages(
   // bails (→ raw text) only if the source already contains ↵, which is vanishingly rare.
   const source = opts.reflow ? reflow(text) ?? text : text;
 
-  // Width/columns: measure the content, then pack as many side-by-side columns as fit the
-  // width cap (auto) or the caller's explicit count. Reflowed source is one ↵-joined full-
-  // width line, so this collapses to a single dense 384-col column — byte-identical to the
-  // proxy's history render (renderTextToPngsWithCharLimit at DENSE_CONTENT_COLS).
+  // Measure the content width. Reflowed source is one joined full-width line, so this is
+  // byte-identical to the proxy's history render.
   const cols = opts.shrink === false ? maxCols : measureContentCols(source, maxCols);
-  const requestedCols =
-    opts.multiCol === undefined || opts.multiCol === 'auto'
-      ? Math.max(1, maxFittingCols(cols))
-      : Math.max(1, opts.multiCol | 0);
-  const numCols = cols < maxCols ? 1 : requestedCols;
-
-  const imgs =
-    numCols > 1
-      ? await renderTextToPngsMultiCol(source, cols, numCols)
-      : await renderTextToPngsWithCharLimit(source, cols, maxChars, style, maxHeightPx);
+  const imgs = await renderTextToPngsWithCharLimit(source, cols, maxChars, style, maxHeightPx);
 
   let droppedChars = 0;
   let pixels = 0;

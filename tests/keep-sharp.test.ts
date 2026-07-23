@@ -64,7 +64,7 @@ describe('keepSharp fidelity hint', () => {
   it('images a large tool_result by default (baseline, no hint)', async () => {
     const { body, info } = await transformRequest(
       makeReq([{ type: 'tool_result', tool_use_id: 'toolu_a', content: BIG }]),
-      { multiCol: 1, charsPerToken: 2 },
+      { charsPerToken: 2 },
     );
     expect(info.compressed).toBe(true);
     expect(info.toolResultImgs ?? 0).toBeGreaterThan(0);
@@ -83,7 +83,6 @@ describe('keepSharp fidelity hint', () => {
     const { body, info } = await transformRequest(
       makeReq([{ type: 'tool_result', tool_use_id: 'toolu_a', content: BIG }]),
       {
-        multiCol: 1,
         charsPerToken: 2,
         keepSharp: (blk) => blk.kind === 'tool_result',
       },
@@ -107,7 +106,6 @@ describe('keepSharp fidelity hint', () => {
     await transformRequest(
       makeReq([{ type: 'tool_result', tool_use_id: 'toolu_z', content: BIG }]),
       {
-        multiCol: 1,
         charsPerToken: 2,
         keepSharp: (blk) => {
           seen.push({ kind: blk.kind, toolUseId: blk.toolUseId, len: blk.text.length });
@@ -128,7 +126,6 @@ describe('keepSharp fidelity hint', () => {
         { type: 'tool_result', tool_use_id: 'image_me', content: BIG },
       ]),
       {
-        multiCol: 1,
         charsPerToken: 2,
         keepSharp: (blk) => blk.toolUseId === 'keep_me',
       },
@@ -157,7 +154,6 @@ describe('keepSharp fidelity hint', () => {
     const { body, info } = await transformRequest(
       makeReq([{ type: 'tool_result', tool_use_id: 'toolu_a', content: BIG }]),
       {
-        multiCol: 1,
         charsPerToken: 2,
         keepSharp: () => {
           throw new Error('caller bug');
@@ -184,7 +180,6 @@ describe('keepSharp fidelity hint', () => {
       ),
       model: 'claude-fable-5',
       options: {
-        // multiCol defaults to 1; PxpipeOptions intentionally narrows the
         // library surface to charsPerToken / historyAmortizationHorizon / keepSharp.
         charsPerToken: 2,
         keepSharp: (blk) => blk.kind === 'tool_result',

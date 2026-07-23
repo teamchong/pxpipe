@@ -53,7 +53,7 @@ describe('findClosedPrefixBoundary', () => {
     expect(findClosedPrefixBoundary(msgs, 3)).toBe(2);
   });
 
-  it('returns the last-closed boundary, not the cutoff itself, when there are mid-flight tool_uses', () => {
+  it('keeps an adjacent closed pair with the following mid-flight tool_use', () => {
     const msgs: Message[] = [
       usr('do thing'),
       asst([{ type: 'tool_use', id: 'A', name: 't', input: {} }]),
@@ -62,10 +62,9 @@ describe('findClosedPrefixBoundary', () => {
       asst([{ type: 'tool_use', id: 'B', name: 't', input: {} }]),
       usr('plain text'), // no tool_result for B → B is open
     ];
-    // Cutoff exclusive=5 → scan all 5 messages. After msg 2, openSet={}.
-    // After msg 3, openSet={B}. After msg 4 (plain user, no tool_result),
-    // openSet still {B}. Last closed index = 2.
-    expect(findClosedPrefixBoundary(msgs, 5)).toBe(2);
+    // The closed A pair is immediately followed by B. That shape may be a
+    // serialized parallel round, so only the pre-round user message is safe.
+    expect(findClosedPrefixBoundary(msgs, 5)).toBe(0);
   });
 
   it('handles parallel tool calls in one assistant turn', () => {
@@ -85,6 +84,25 @@ describe('findClosedPrefixBoundary', () => {
     // reverse order — order doesn't matter for openSet). After msg 3: still
     // closed. Last index = 3.
     expect(findClosedPrefixBoundary(msgs, 4)).toBe(3);
+  });
+
+  it('does not split a parallel round serialized as adjacent call/result pairs', () => {
+    const msgs: Message[] = [
+      usr('parallel work'),
+      asst([{ type: 'tool_use', id: 'A', name: 't', input: {} }]),
+      usr([{ type: 'tool_result', tool_use_id: 'A', content: 'a' }]),
+      asst([{ type: 'tool_use', id: 'B', name: 't', input: {} }]),
+      usr([{ type: 'tool_result', tool_use_id: 'B', content: 'b' }]),
+      asst('done'),
+    ];
+
+    // Although A is closed at index 2, index 3 continues the same serialized
+    // parallel round. The only safe prefix before a cutoff there is index 0.
+    expect(findClosedPrefixBoundary(msgs, 3)).toBe(0);
+    expect(findClosedPrefixBoundary(msgs, 4)).toBe(0);
+    // Once B is answered, the complete round may be collapsed.
+    expect(findClosedPrefixBoundary(msgs, 5)).toBe(4);
+    expect(findClosedPrefixBoundary(msgs, 6)).toBe(5);
   });
 
   it('returns -1 when the very first message opens a tool_use that never closes', () => {
@@ -447,7 +465,7 @@ describe('collapseHistory', () => {
 
   it('preserves a tool_use sequence that straddles the live-tail boundary', async () => {
     // 14 turns: 10 closed turns, then an open tool_use at index 10 that closes at index 12.
-    // Per-turn body bumped to 4200 chars so the row-aware gate (numCols=1) clears
+    // Per-turn body bumped to 4200 chars so the row-aware gate clears
     // the per-block break-even point. The tool_use/tool_result block labels
     // add ~65 chars of header overhead that pushes a tighter fixture under
     // the boundary; 4200-char turns leave headroom.
@@ -812,7 +830,7 @@ describe('isCompressionProfitableAmortized — multi-turn horizon gate', () => {
     // Synthetic text big enough to render to ≥1 image. Use a string so both
     // gates take the row-aware path.
     const text = 'word '.repeat(20_000);
-    expect(amort(text, 100, undefined, 1, 1.5, 1)).toBe(cold(text, 100, undefined, 1, 1.5));
+    expect(amort(text, 100, undefined, 1.5, 1)).toBe(cold(text, 100, undefined, 1.5));
   });
 
   it('flips a per-turn-rejected collapse to accepted at horizon=10', async () => {
@@ -832,10 +850,10 @@ describe('isCompressionProfitableAmortized — multi-turn horizon gate', () => {
     const text = 'a'.repeat(8_000);
     // At single-col cols=100 with row-aware estimate this is a single image
     // with image_tokens ~= 2500 vs text_tokens = 8000/1.5 ~= 5333. Cold
-    // accepts. Push image cost up by forcing numCols=1 and a much higher
+    // accepts. Push image cost up with a much higher
     // cpt so text_tokens are small.
-    const coldResult = cold(text, 100, undefined, 1, 4 /* English */);
-    const amortResult = amort(text, 100, undefined, 1, 4, 10);
+    const coldResult = cold(text, 100, undefined, 4 /* English */);
+    const amortResult = amort(text, 100, undefined, 4, 10);
     // Cold gate at cpt=4: text_tokens = 2000, image_tokens = 2500 → reject.
     // Amortized gate at N=10: image_lifetime = 2500*(1.25+0.1*9)=5375;
     // text_lifetime = 2000*0.1*10 = 2000. 5375 < 2000 is FALSE — so
@@ -849,8 +867,8 @@ describe('isCompressionProfitableAmortized — multi-turn horizon gate', () => {
     // textTokens = textLen/cpt. Pick cpt=1.5, textLen needed = 8065.
     // That's 8065 chars in a single image at cols=100, which is plausible.
     const text2 = 'a'.repeat(8500);
-    const coldResult2 = cold(text2, 100, undefined, 1, 1.5);
-    const amortResult2 = amort(text2, 100, undefined, 1, 1.5, 10);
+    const coldResult2 = cold(text2, 100, undefined, 1.5);
+    const amortResult2 = amort(text2, 100, undefined, 1.5, 10);
     // Document the per-turn behaviour so this regression is loud if the
     // gate semantics change.
     expect(typeof coldResult).toBe('boolean');

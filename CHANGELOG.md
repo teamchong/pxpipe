@@ -4,17 +4,55 @@ All notable changes to pxpipe are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features /
 behavioral changes, patch = fixes).
 
-## Unreleased — 2026-07-19
+## 0.10.0 — 2026-07-22
+
+### Added
+- Gemini 3.6 Flash support through Google AI Studio, including static-context,
+  tool-result, and completed-history compression. Gemini joins Fable 5 in the
+  default model set after scoring 100/100 novel arithmetic, 98/98 gist recall,
+  18/18 state tracking, and 14/15 controlled dense-hex reads.
+- Messages-to-OpenAI Responses and Messages-to-Chat Completions bridges, plus
+  exact-model routing to OpenAI and Cloudflare. Routed models appear through
+  reversible Claude-safe discovery aliases and use provider-aware accounting.
+- Completed tool-call rounds can now be compressed on Gemini and OpenAI while
+  open calls, malformed protocol state, and the recent working tail stay native.
+
+### Changed
+- Missing atlas glyphs are escaped as `[U+HEX]` instead of silently dropped.
+- Models are instructed not to guess exact identifiers, paths, hashes, versions,
+  or numbers that are visible only in an image and absent from the factsheet.
+- Anthropic profitability and export reports now use the documented 28-pixel
+  patch billing model instead of an area approximation.
+- Dashboard savings compare the same measured requests, account for one-hour
+  cache writes, and exclude current and legacy Google traffic from Claude-priced
+  dollar totals.
+- Dashboard model-scope changes persist in the Node config file across restarts.
+- 4xx request and upstream error-body persistence is opt-in rather than enabled
+  by default; telemetry, config, and debug files use private filesystem modes.
+- Dashboard routes remain loopback-only even when the proxy API binds externally,
+  and browser mutations reject cross-origin requests.
+- Compatibility: removed the pre-1.0 `multiCol` SDK option and Worker setting;
+  rendering is now single-column in every runtime.
 
 ### Fixed
-- **Glyph surgery: the Spleen 5×8 `K` no longer reads as `H`.** The stock font
-  rendered `K` as `H` with a single crossbar pixel removed — Hamming distance 1,
-  the worst confusable pair in the atlas
-  ([legibility audit §2](docs/LEGIBILITY-AUDIT-2026-07-01.md)). `gen-atlas.ts`
-  now repaints `K` with a diagonal-legged bitmap (Hamming 8 from `H`; no
-  alphanumeric pair below d=2). Scoped to the narrow Spleen 5×8 primary cell, so
-  the JetBrains-Mono and CJK-fallback atlases are untouched. Zero token-cost
-  change (same 5×8 box). Regression-guarded in `tests/render.test.ts`.
+- History-only OpenAI requests now receive the planned synthetic history
+  images instead of rendering them and returning the original request.
+- Gemini preserves full native tool documentation when static tool imaging is
+  not profitable, even if history or tool-result compression still applies.
+- Routed model discovery includes configured OpenAI and Cloudflare models and
+  falls back to normal upstream discovery when no routed models are configured.
+- Claude Code OAuth credentials never cross to the OpenAI upstream, appended
+  system blocks stay live, deferred/native tools pass through safely, and
+  schema stripping preserves `$schema` and draft-07 tuple items.
+- Responses assistant text uses `output_text`, transactional factsheet anchors
+  are retained, and Node stream/error handling no longer leaks listeners or
+  crashes on drain errors.
+- Dashboard model IDs are escaped before entering `hx-vals`.
+- Windows builds no longer fail when invoking pnpm from the build script.
+
+### Rendering
+- The Spleen 5×8 `K` glyph now uses a diagonal-legged bitmap after a Fable 5 A/B
+  reduced H/K errors from 47.2% to 18.7%, with no token-cost or geometry change.
 
 ### Known limitations / evidence
 - **Model-level A/B validation (2026-07-19, `claude-fable-5`, direct API):**
@@ -30,6 +68,12 @@ behavioral changes, patch = fixes).
   (stock font) and after (shipped atlas) with their Hamming distance.
 - The known `,`/`;` and `.`/`:` pairs remain 1 px apart and are out of scope; the
   new regression guard enforces d≥2 across letters and digits only.
+- A production-faithful Gemini positional-retrieval sweep used the actual
+  transformer and 6, 18, and 30 history images (within the 32-image cap).
+  Pxpipe/raw row localization was 18/30 versus 17/30, semantic recognition was
+  11/30 versus 13/30, and exact retrieval tied at 3/30. This is directional
+  evidence, not a broad Lost-in-the-Middle win or loss; see
+  `eval/gemini-profile/QUALITY_RESULTS.md`.
 
 ## 0.9.0 — 2026-07-14
 

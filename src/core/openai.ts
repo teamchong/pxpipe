@@ -20,8 +20,10 @@ import {
 } from './render.js';
 import {
   resolveGptProfile,
+  type GptModelProfile,
   type GptVisionCost,
 } from './gpt-model-profiles.js';
+import { isGeminiModel, geminiVisionTokens } from './gemini-model-profiles.js';
 import { bytesToBase64 } from './png.js';
 import {
   compactSlabWhitespace,
@@ -127,9 +129,12 @@ export function isGrokModel(model: string | null | undefined): boolean {
 export const GROK_TOKENS_PER_MEGAPIXEL = 1000;
 
 /** Per-image vision-token cost for the model actually serving the request.
- *  Claude: Anthropic pixel formula. Grok: measured tok/MPix. GPT/o-series:
- *  OpenAI tile/patch formula. Model-based, not endpoint-based. */
+ *  Claude: Anthropic pixel formula. Grok: measured tok/MPix. Gemini: 1,078 at 1568×728.
+ *  GPT/o-series: OpenAI tile/patch formula. Model-based, not endpoint-based. */
 export function visionTokensForModel(model: string, w: number, h: number): number {
+  if (isGeminiModel(model)) {
+    return geminiVisionTokens(model, w, h);
+  }
   if (isClaudeModel(model)) {
     // Anthropic's documented 28-px patch model (tier-aware downscale). This is the
     // exact provider cost; the gate applies its own margin separately.
@@ -227,7 +232,6 @@ interface OpenAIResolvedOptions {
   compressTools: boolean;
   minCompressChars: number;
   cols?: number;
-  multiCol: number;
   charsPerToken: number;
   reflow: boolean;
   collapseHistory: boolean;
@@ -239,7 +243,6 @@ const DEFAULTS: OpenAIResolvedOptions = {
   compressTools: true,
   minCompressChars: 2000,
   cols: undefined,
-  multiCol: 1,
   charsPerToken: 4, // conservative OpenAI default; override after telemetry
   reflow: true,
   collapseHistory: true,
@@ -251,7 +254,6 @@ function resolveOptions(opts: TransformOptions): OpenAIResolvedOptions {
     compressTools: opts.compressTools ?? DEFAULTS.compressTools,
     minCompressChars: opts.minCompressChars ?? DEFAULTS.minCompressChars,
     cols: opts.cols,
-    multiCol: opts.multiCol ?? DEFAULTS.multiCol,
     charsPerToken: opts.charsPerToken ?? DEFAULTS.charsPerToken,
     reflow: opts.reflow ?? DEFAULTS.reflow,
     collapseHistory: opts.collapseHistory ?? DEFAULTS.collapseHistory,
@@ -307,7 +309,7 @@ function emptyInfo(reason?: string): TransformInfo {
   };
 }
 
-function prepareImagedRenderText(text: string, reflowEnabled: boolean): string {
+export function prepareImagedRenderText(text: string, reflowEnabled: boolean): string {
   return maybeReflow(text.trimEnd(), reflowEnabled);
 }
 
@@ -396,9 +398,9 @@ function isFlatFunctionTool(tool: unknown): tool is ResponsesFlatTool {
   );
 }
 
-/** Render only schema annotations removed from the native tool definition.
- * Structural JSON and the top-level tool description remain native, so putting
- * them in the image too spends vision tokens without replacing any text. */
+/** Render schema annotations removed from the native tool definition. The full
+ * top-level description rides in the same image and is replaced by a short
+ * per-tool pointer, matching the Anthropic tool-reference approach. */
 function schemaAnnotationLines(node: unknown, path = '$', depth = 0): string[] {
   if (!node || typeof node !== 'object' || depth > 20) return [];
   if (Array.isArray(node)) {
@@ -440,15 +442,15 @@ function schemaAnnotationLines(node: unknown, path = '$', depth = 0): string[] {
 function renderToolDoc(tool: OpenAIFunctionTool): string {
   const f = tool.function;
   const annotations = schemaAnnotationLines(f.parameters);
-  return annotations.length
-    ? [`## Tool parameter annotations: ${f.name ?? '?'}`, ...annotations].join('\n')
+  return f.description || annotations.length
+    ? [`## Tool: ${f.name ?? '?'}`, f.description ?? '', ...annotations].filter(Boolean).join('\n')
     : '';
 }
 
 function renderFlatToolDoc(tool: ResponsesFlatTool): string {
   const annotations = schemaAnnotationLines(tool.parameters);
-  return annotations.length
-    ? [`## Tool parameter annotations: ${tool.name ?? '?'}`, ...annotations].join('\n')
+  return tool.description || annotations.length
+    ? [`## Tool: ${tool.name ?? '?'}`, tool.description ?? '', ...annotations].filter(Boolean).join('\n')
     : '';
 }
 
@@ -469,6 +471,7 @@ function rewriteToolsForGpt(tools: unknown[] | undefined): {
       ...tool,
       function: {
         ...tool.function,
+        description: `Full docs: see "## Tool: ${tool.function.name ?? '?'}" in the rendered context image.`,
         parameters: stripSchemaDescriptions(tool.function.parameters),
       },
     };
@@ -491,6 +494,7 @@ function rewriteFlatToolsForGpt(tools: unknown[] | undefined): {
     changed = true;
     return {
       ...tool,
+      description: `Full docs: see "## Tool: ${tool.name ?? '?'}" in the rendered context image.`,
       parameters: stripSchemaDescriptions(tool.parameters),
     };
   });
@@ -671,7 +675,6 @@ function evalOpenAIGate(
   const estImages = estimateImageCount(
     renderedText,
     cols,
-    1,
     maxCharsPerImage,
     maxLines,
   );
@@ -809,12 +812,124 @@ function foldGptHistory(
   info.bucketChars = { ...(info.bucketChars ?? {}), history: plan.collapsedChars };
 }
 
-const CHAT_HEADER =
+async function applyChatHistoryCollapse(
+  req: OpenAIChatRequest,
+  info: TransformInfo,
+  o: OpenAIResolvedOptions,
+  profile: GptModelProfile,
+  protectedPrefix: number,
+): Promise<boolean> {
+  const profitable = (text: string, cols: number, baselineTextTokens?: number) =>
+    evalOpenAIGate(req.model, text, cols, o.charsPerToken, baselineTextTokens).profitable;
+  const plan = await planGptCollapse(
+    chatMessagesToTurns(req.messages),
+    protectedPrefix,
+    profitable,
+    gptHistoryOpts(req.model, o, profile),
+  );
+  foldGptHistory(info, req.model, plan);
+  const allImages = [...plan.images, ...plan.imagesAfter];
+  if (allImages.length === 0) return false;
+
+  const compactFraming = profile.history.framing === 'compact';
+  const intro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_INTRO : HISTORY_TRANSCRIPT_INTRO;
+  const outro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_OUTRO : HISTORY_TRANSCRIPT_OUTRO;
+  const histFactSheet = factSheetText(plan.text, profile.factSheetFormat);
+  const content: OpenAIContentPart[] = [{ type: 'text', text: intro }];
+  for (const img of plan.images) content.push(openAIImagePart(img));
+  if (plan.pinText !== undefined) {
+    content.push({ type: 'text', text: pinnedRequestBlock(plan.pinText) });
+    for (const img of plan.imagesAfter) content.push(openAIImagePart(img));
+  }
+  if (histFactSheet) content.push({ type: 'text', text: histFactSheet });
+  content.push({ type: 'text', text: outro });
+  const guard = buildLiveRequestGuard(plan.pinText);
+  req.messages = [
+    ...req.messages.slice(0, plan.start),
+    { role: 'user', content },
+    { role: 'developer', content: guard },
+    ...req.messages.slice(plan.endExclusive),
+  ];
+  info.nativeInjectedTokens = (info.nativeInjectedTokens ?? 0)
+    + gptTextTokens(intro + histFactSheet + outro + guard);
+  info.historyImageSha = await sha8(allImages.map((i) => bytesToBase64(i.png)).join(''));
+  return true;
+}
+
+async function applyResponsesHistoryCollapse(
+  req: ResponsesRequest,
+  inputItems: Array<ResponsesInputItem | Record<string, unknown>>,
+  info: TransformInfo,
+  o: OpenAIResolvedOptions,
+  profile: GptModelProfile,
+): Promise<boolean> {
+  const profitable = (text: string, cols: number, baselineTextTokens?: number) =>
+    evalOpenAIGate(req.model, text, cols, o.charsPerToken, baselineTextTokens).profitable;
+  const plan = await planResponsesPairCollapse(
+    inputItems,
+    profitable,
+    gptHistoryOpts(req.model, o, profile),
+  );
+  const ps = plan.pairState;
+  const rc = info.responsesComposition!;
+  rc.completedFunctionPairs = ps.completedPairs;
+  rc.recentNativeFunctionPairs = ps.recentCompletedPairs;
+  rc.oldFunctionPairs = ps.oldCompletedPairs;
+  rc.openFunctionCalls = ps.openCalls;
+  rc.orphanFunctionOutputs = ps.orphanOutputs;
+  rc.malformedFunctionItems = ps.malformedItems;
+  rc.imageableFunctionCalls = ps.imageableFunctionCallTokens;
+  rc.imageableFunctionOutputs = ps.imageableFunctionOutputTokens;
+  rc.collapsedFunctionPairs = ps.collapsedPairs;
+  rc.collapsedFunctionCalls = ps.collapsedFunctionCallTokens;
+  rc.collapsedFunctionOutputs = ps.collapsedFunctionOutputTokens;
+
+  foldGptHistory(info, req.model, plan);
+  if (plan.segments.length === 0) return false;
+
+  const replacements = new Map<number, ResponsesInputItem>();
+  const compactFraming = profile.history.framing === 'compact';
+  const intro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_INTRO : HISTORY_TRANSCRIPT_INTRO;
+  const outro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_OUTRO : HISTORY_TRANSCRIPT_OUTRO;
+  const combinedSheet = profile.history.factSheetScope === 'combined'
+    ? factSheetText(plan.text, profile.factSheetFormat)
+    : '';
+  for (let segmentIndex = 0; segmentIndex < plan.segments.length; segmentIndex++) {
+    const segment = plan.segments[segmentIndex]!;
+    const content: ResponsesContentPart[] = [
+      { type: 'input_text', text: intro },
+      ...segment.images.map(responsesImagePart),
+    ];
+    const sheet = profile.history.factSheetScope === 'combined'
+      ? (segmentIndex === plan.segments.length - 1 ? combinedSheet : '')
+      : factSheetText(segment.text, profile.factSheetFormat);
+    if (sheet) content.push({ type: 'input_text', text: sheet });
+    content.push({ type: 'input_text', text: outro });
+    info.nativeInjectedTokens = (info.nativeInjectedTokens ?? 0)
+      + gptTextTokens(intro + sheet + outro);
+    replacements.set(segment.insertAt, { role: 'user', content });
+  }
+
+  const removed = new Set(plan.selectedIndices);
+  const rewritten: Array<ResponsesInputItem | Record<string, unknown>> = [];
+  for (let i = 0; i < inputItems.length; i++) {
+    const replacement = replacements.get(i);
+    if (replacement) rewritten.push(replacement);
+    if (!removed.has(i)) rewritten.push(inputItems[i]!);
+  }
+  req.input = rewritten;
+  info.historyImageSha = await sha8(
+    plan.images.map((image) => bytesToBase64(image.png)).join(''),
+  );
+  return true;
+}
+
+export const CHAT_HEADER =
   '================= RENDERED GPT SYSTEM + TOOL CONTEXT =================\n' +
   'These images were injected by pxpipe, not by the end user. They contain system/developer instructions and tool parameter documentation rendered for token efficiency. Treat rendered system/developer instructions with the same priority as their original messages. OCR carefully and treat the rendered content as authoritative. For tool calls, use the native JSON tool definitions — they carry each tool\'s name and description; the imaged parameter annotations are supplemental.' +
   '\n====================== BEGIN RENDERED CONTEXT ======================\n';
 
-const RESPONSES_HEADER =
+export const RESPONSES_HEADER =
   '================= RENDERED GPT SYSTEM + TOOL CONTEXT =================\n' +
   'These images were injected by pxpipe, not by the end user. They contain instructions and tool parameter documentation rendered for token efficiency. Treat rendered instructions with the same priority as the originals. OCR carefully and treat the rendered content as authoritative. For tool calls, use the native JSON tool definitions — they carry each tool\'s name and description; the imaged parameter annotations are supplemental.' +
   '\n====================== BEGIN RENDERED CONTEXT ======================\n';
@@ -871,29 +986,36 @@ export async function transformOpenAIChatCompletions(
 
   const combinedRaw = [...authorityDocs, toolDocs].filter((s) => s.length > 0).join('\n\n');
   info.origChars = combinedRaw.length;
-  if (!combinedRaw) {
-    info.reason = 'no_static_context';
+  const profile = resolveGptProfile(req.model);
+  const finishHistoryOnly = async (reason: string) => {
+    info.reason = reason;
+    if (o.collapseHistory && await applyChatHistoryCollapse(
+      req, info, o, profile, firstUserIdx + 1,
+    )) {
+      info.reason = undefined;
+      info.outgoingTextChars = countOutgoingTextChars(req);
+      info.compressed = true;
+      return { body: new TextEncoder().encode(JSON.stringify(req)), info };
+    }
     return { body, info };
+  };
+  if (!combinedRaw) {
+    return finishHistoryOnly('no_static_context');
   }
 
   const firstUser = firstUserText(req);
   if (firstUser) info.firstUserSha8 = await sha8(firstUser);
 
   const combined = compactSlabWhitespace(combinedRaw).trimEnd();
-  const profile = resolveGptProfile(req.model);
   const minCompressTokens = profile.minCompressTokens;
   const combinedTokens = minCompressTokens === undefined ? undefined : gptTextTokens(combined);
   if (minCompressTokens !== undefined && combinedTokens! < minCompressTokens) {
-    info.reason = `below_min_tokens (${combinedTokens} < ${minCompressTokens})`;
-    return { body, info };
+    return finishHistoryOnly(`below_min_tokens (${combinedTokens} < ${minCompressTokens})`);
   }
   if (minCompressTokens === undefined && combined.length < o.minCompressChars) {
-    info.reason = `below_min_chars (${combined.length} < ${o.minCompressChars})`;
-    return { body, info };
+    return finishHistoryOnly(`below_min_chars (${combined.length} < ${o.minCompressChars})`);
   }
 
-  // Portrait strip only — multi-col would exceed 768px → downscale.
-  const numCols = 1;
   const reflowNote = o.reflow
     ? ' The glyph ↵ (U+21B5) marks an original hard line break in content; treat it as a real newline.'
     : '';
@@ -924,9 +1046,8 @@ export async function transformOpenAIChatCompletions(
     profitable: gate.profitable,
   };
   if (!gate.profitable) {
-    info.reason = `not_profitable (slab=${combined.length} chars)`;
     info.passthroughReasons = { not_profitable: 1 };
-    return { body, info };
+    return finishHistoryOnly(`not_profitable (slab=${combined.length} chars)`);
   }
 
   const images = await renderTextToPngs(renderedText, cols, profile.style, profile.maxHeightPx);
@@ -990,58 +1111,7 @@ export async function transformOpenAIChatCompletions(
   // item carries static images and is protected; the original opening user prompt
   // remains collapsible history instead of looking like the live request.
   if (o.collapseHistory) {
-    const turns = chatMessagesToTurns(req.messages);
-    const profitable = (text: string, cols: number, baselineTextTokens?: number) =>
-      evalOpenAIGate(req.model, text, cols, o.charsPerToken, baselineTextTokens).profitable;
-    const plan = await planGptCollapse(
-      turns,
-      firstUserIdx + 1,
-      profitable,
-      gptHistoryOpts(req.model, o, profile),
-    );
-    foldGptHistory(info, req.model, plan);
-    const allImages = [...plan.images, ...plan.imagesAfter];
-    if (allImages.length > 0) {
-      // [intro][before-images][pinned request as TEXT][after-images][outro] —
-      // chronological, with the live ask legible (not OCR-only) in its real slot.
-      const compactFraming = profile.history.framing === 'compact';
-      const content: OpenAIContentPart[] = [{
-        type: 'text',
-        text: compactFraming ? COMPACT_HISTORY_TRANSCRIPT_INTRO : HISTORY_TRANSCRIPT_INTRO,
-      }];
-      for (const img of plan.images) content.push(openAIImagePart(img));
-      if (plan.pinText !== undefined) {
-        content.push({ type: 'text', text: pinnedRequestBlock(plan.pinText) });
-        for (const img of plan.imagesAfter) content.push(openAIImagePart(img));
-      }
-      // Verbatim fact-sheet for the imaged transcript (exact ids survive OCR loss).
-      const histFactSheet = factSheetText(plan.text, profile.factSheetFormat);
-      if (histFactSheet) content.push({ type: 'text', text: histFactSheet });
-      content.push({
-        type: 'text',
-        text: compactFraming ? COMPACT_HISTORY_TRANSCRIPT_OUTRO : HISTORY_TRANSCRIPT_OUTRO,
-      });
-      const synthetic: OpenAIChatMessage = { role: 'user', content };
-      const guard: OpenAIChatMessage = {
-        role: 'developer',
-        content: buildLiveRequestGuard(plan.pinText),
-      };
-      info.nativeInjectedTokens = (info.nativeInjectedTokens ?? 0) + gptTextTokens(
-        (compactFraming ? COMPACT_HISTORY_TRANSCRIPT_INTRO : HISTORY_TRANSCRIPT_INTRO)
-        + histFactSheet
-        + (compactFraming ? COMPACT_HISTORY_TRANSCRIPT_OUTRO : HISTORY_TRANSCRIPT_OUTRO)
-        + buildLiveRequestGuard(plan.pinText),
-      );
-      req.messages = [
-        ...req.messages.slice(0, plan.start),
-        synthetic,
-        guard,
-        ...req.messages.slice(plan.endExclusive),
-      ];
-      info.historyImageSha = await sha8(
-        allImages.map((i) => bytesToBase64(i.png)).join(''),
-      );
-    }
+    await applyChatHistoryCollapse(req, info, o, profile, firstUserIdx + 1);
   }
 
   if (rewrittenTools !== undefined) req.tools = rewrittenTools;
@@ -1124,25 +1194,34 @@ export async function transformOpenAIResponses(
 
   const combinedRaw = [...authorityDocs, toolDocs].filter((s) => s.length > 0).join('\n\n');
   info.origChars = combinedRaw.length;
-  if (!combinedRaw) {
-    info.reason = 'no_static_context';
+  const profile = resolveGptProfile(req.model);
+  const finishHistoryOnly = async (reason: string) => {
+    info.reason = reason;
+    if (o.collapseHistory && !inputWasString && await applyResponsesHistoryCollapse(
+      req, inputItems, info, o, profile,
+    )) {
+      info.reason = undefined;
+      info.outgoingTextChars = countResponsesOutgoingTextChars(req);
+      info.compressed = true;
+      return { body: new TextEncoder().encode(JSON.stringify(req)), info };
+    }
     return { body, info };
+  };
+  if (!combinedRaw) {
+    return finishHistoryOnly('no_static_context');
   }
 
   const firstUser = firstResponsesUserText(inputWasString, originalInputString, inputItems);
   if (firstUser) info.firstUserSha8 = await sha8(firstUser);
 
   const combined = compactSlabWhitespace(combinedRaw).trimEnd();
-  const profile = resolveGptProfile(req.model);
   const minCompressTokens = profile.minCompressTokens;
   const combinedTokens = minCompressTokens === undefined ? undefined : gptTextTokens(combined);
   if (minCompressTokens !== undefined && combinedTokens! < minCompressTokens) {
-    info.reason = `below_min_tokens (${combinedTokens} < ${minCompressTokens})`;
-    return { body, info };
+    return finishHistoryOnly(`below_min_tokens (${combinedTokens} < ${minCompressTokens})`);
   }
   if (minCompressTokens === undefined && combined.length < o.minCompressChars) {
-    info.reason = `below_min_chars (${combined.length} < ${o.minCompressChars})`;
-    return { body, info };
+    return finishHistoryOnly(`below_min_chars (${combined.length} < ${o.minCompressChars})`);
   }
 
   const reflowNote = o.reflow
@@ -1175,9 +1254,8 @@ export async function transformOpenAIResponses(
     profitable: gate.profitable,
   };
   if (!gate.profitable) {
-    info.reason = `not_profitable (slab=${combined.length} chars)`;
     info.passthroughReasons = { not_profitable: 1 };
-    return { body, info };
+    return finishHistoryOnly(`not_profitable (slab=${combined.length} chars)`);
   }
 
   const images = await renderTextToPngs(renderedText, cols, profile.style, profile.maxHeightPx);
@@ -1278,64 +1356,7 @@ export async function transformOpenAIResponses(
   // The profile selects pair-only legacy coverage or mixed safe-message coverage;
   // both preserve recent/open/malformed calls and opaque protocol barriers.
   if (o.collapseHistory && !inputWasString) {
-    const profitable = (text: string, cols: number, baselineTextTokens?: number) =>
-      evalOpenAIGate(req.model, text, cols, o.charsPerToken, baselineTextTokens).profitable;
-    const plan = await planResponsesPairCollapse(
-      inputItems,
-      profitable,
-      gptHistoryOpts(req.model, o, profile),
-    );
-    const ps = plan.pairState;
-    const rc = info.responsesComposition!;
-    rc.completedFunctionPairs = ps.completedPairs;
-    rc.recentNativeFunctionPairs = ps.recentCompletedPairs;
-    rc.oldFunctionPairs = ps.oldCompletedPairs;
-    rc.openFunctionCalls = ps.openCalls;
-    rc.orphanFunctionOutputs = ps.orphanOutputs;
-    rc.malformedFunctionItems = ps.malformedItems;
-    rc.imageableFunctionCalls = ps.imageableFunctionCallTokens;
-    rc.imageableFunctionOutputs = ps.imageableFunctionOutputTokens;
-    rc.collapsedFunctionPairs = ps.collapsedPairs;
-    rc.collapsedFunctionCalls = ps.collapsedFunctionCallTokens;
-    rc.collapsedFunctionOutputs = ps.collapsedFunctionOutputTokens;
-
-    foldGptHistory(info, req.model, plan);
-    if (plan.segments.length > 0) {
-      const replacements = new Map<number, ResponsesInputItem>();
-      const compactFraming = profile.history.framing === 'compact';
-      const intro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_INTRO : HISTORY_TRANSCRIPT_INTRO;
-      const outro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_OUTRO : HISTORY_TRANSCRIPT_OUTRO;
-      const combinedSheet = profile.history.factSheetScope === 'combined'
-        ? factSheetText(plan.text, profile.factSheetFormat)
-        : '';
-      for (let segmentIndex = 0; segmentIndex < plan.segments.length; segmentIndex++) {
-        const segment = plan.segments[segmentIndex]!;
-        const content: ResponsesContentPart[] = [
-          { type: 'input_text', text: intro },
-          ...segment.images.map(responsesImagePart),
-        ];
-        const sheet = profile.history.factSheetScope === 'combined'
-          ? (segmentIndex === plan.segments.length - 1 ? combinedSheet : '')
-          : factSheetText(segment.text, profile.factSheetFormat);
-        if (sheet) content.push({ type: 'input_text', text: sheet });
-        content.push({ type: 'input_text', text: outro });
-        info.nativeInjectedTokens = (info.nativeInjectedTokens ?? 0)
-          + gptTextTokens(intro + sheet + outro);
-        replacements.set(segment.insertAt, { role: 'user', content });
-      }
-
-      const removed = new Set(plan.selectedIndices);
-      const rewritten: Array<ResponsesInputItem | Record<string, unknown>> = [];
-      for (let i = 0; i < inputItems.length; i++) {
-        const replacement = replacements.get(i);
-        if (replacement) rewritten.push(replacement);
-        if (!removed.has(i)) rewritten.push(inputItems[i]!);
-      }
-      req.input = rewritten;
-      info.historyImageSha = await sha8(
-        plan.images.map((image) => bytesToBase64(image.png)).join(''),
-      );
-    }
+    await applyResponsesHistoryCollapse(req, inputItems, info, o, profile);
   }
 
   if (rewrittenTools !== undefined) req.tools = rewrittenTools;

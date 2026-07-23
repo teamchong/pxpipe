@@ -28,8 +28,6 @@ export interface RealShape {
   readonly name: string;
   /** Total source text chars across system + tool docs + history slabs that hit the call site. */
   readonly origChars: number;
-  /** Static `numCols` setting that was active when the event was recorded. */
-  readonly numCols: number;
   /** Approximate average chars per text-row (after `renderTextToPngs` wraps at `cols`). */
   readonly approxCharsPerRow: number;
   /** What the gate decided. `'accept'` = compress; `'reject'` = pass through as text. */
@@ -53,9 +51,8 @@ export interface RealShape {
  * we don't risk net-losers.
  */
 export const PRODUCTION_SLAB_161K: RealShape = {
-  name: 'production slab (161k chars, multi-col)',
+  name: 'production slab (161k chars)',
   origChars: 161101,
-  numCols: 2,
   approxCharsPerRow: 52, // 8 images × 195 lines/image × 2 cols ≈ 3120 rows
   decision: 'accept',
   gate: 'slab',
@@ -86,7 +83,6 @@ export const PRODUCTION_SLAB_161K: RealShape = {
 export const PRODUCTION_SLAB_135K_DENSE: RealShape = {
   name: 'production slab (135k chars, newline-heavy)',
   origChars: 130665,
-  numCols: 2,
   approxCharsPerRow: 19, // ~6877 rows → ~18 images at 195 lines/image × 2 cols
   decision: 'reject',
   gate: 'slab',
@@ -108,9 +104,7 @@ export const PRODUCTION_SLAB_135K_DENSE: RealShape = {
 export const PRODUCTION_SLAB_169K_HEAVY: RealShape = {
   name: 'production slab (169k chars, very dense)',
   origChars: 169632,
-  numCols: 2,
   approxCharsPerRow: 16, // ~10602 rows → ~28 images at 195 lines/image × 2 cols
-  // At numCols=2 the gate uses `numCols × imageCount × 5500` so the threshold
   // doubles — and even the built-in 2.0 cpt estimate doesn't clear it. Pass-through.
   decision: 'reject',
   gate: 'slab',
@@ -129,7 +123,6 @@ export const PRODUCTION_SLAB_169K_HEAVY: RealShape = {
 export const BELOW_MIN_CHARS_TINY: RealShape = {
   name: 'below MIN_COMPRESS_CHARS (tiny user turn)',
   origChars: 142,
-  numCols: 2,
   approxCharsPerRow: 60,
   decision: 'reject', // pre-filter, not the gate
   gate: 'slab',
@@ -144,7 +137,6 @@ export const BELOW_MIN_CHARS_TINY: RealShape = {
 export const BELOW_MIN_CHARS_BORDERLINE: RealShape = {
   name: 'below MIN_COMPRESS_CHARS (borderline)',
   origChars: 1123,
-  numCols: 2,
   approxCharsPerRow: 60,
   decision: 'reject', // pre-filter
   gate: 'slab',
@@ -163,7 +155,6 @@ export const BELOW_MIN_CHARS_BORDERLINE: RealShape = {
 export const HISTORY_COLLAPSED_LONG_SESSION: RealShape = {
   name: 'history collapsed (549 turns, 537k chars)',
   origChars: 161101, // post-collapse static slab size
-  numCols: 2,
   approxCharsPerRow: 52,
   decision: 'accept',
   gate: 'history',

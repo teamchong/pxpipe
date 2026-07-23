@@ -26,9 +26,13 @@ export const it: Messages = {
   killSwitchHint: 'interruttore di emergenza · torna attivo al riavvio',
 
   modelScopeSummary: 'Ambito modelli da imaging',
-  modelScopeHint: 'Espandi per scegliere quali modelli includere nell’imaging',
+  modelScopeHint: 'Fable 5 e Gemini 3.6 Flash per impostazione predefinita · espandi per sperimentare con altre famiglie',
+  modelScopeWarning:
+    '⚠ La compressione in immagini è validata per Fable 5 e Gemini 3.6 Flash — altre famiglie possono usare <strong>più</strong> token, non meno. Attivala solo per esperimenti deliberati.',
   compressionOffNoEffect: 'la compressione è disattivata — queste impostazioni non hanno effetto al momento',
   imageClaudeModels: 'Modelli Claude da trasformare in immagine',
+  imageGeminiModels: 'Modelli Gemini da trasformare in immagine',
+  geminiModelsHint: 'attivi per impostazione predefinita · lettore visivo 100/100',
   imageOpenAIModels: 'Modelli OpenAI Responses da trasformare in immagine',
   unlistedModelsHint: 'i modelli non elencati restano testo semplice',
   openAIModelsHint: 'opt-in · nessun cache_control Anthropic',
@@ -75,6 +79,14 @@ export const it: Messages = {
   statCostCollecting: 'raccolta in corso…',
   statCostCollectingSub: 'in attesa di una richiesta a pagamento trasformata in immagine',
   statCostCollectingTip: 'Il confronto appare dopo che una richiesta in immagine restituisce l\'uso riportato dal provider.',
+  statCostUnpricedSub: 'prezzi del provider non configurati',
+  statCostUnpricedTip:
+    'Il risparmio in token è disponibile, ma questo provider è escluso dalle stime in dollari basate sui prezzi Claude.',
+  statEstSavedUnpricedSub: 'prezzi del provider non configurati',
+  statEstSavedUnpricedTip:
+    'Il risparmio in token è mostrato separatamente. Le stime in dollari richiedono prezzi specifici del provider e non sono dedotte dalle tariffe Claude.',
+  statEstSavedExcludedSub: (n, nFmt) =>
+    `${nFmt} ${n === 1 ? 'richiesta con prezzi del provider esclusa' : 'richieste con prezzi del provider escluse'}`,
 
   showTheMath: 'Mostra i calcoli e le ricevute di trasparenza',
   drawerIntro:
@@ -109,6 +121,12 @@ export const it: Messages = {
     `<span class="ctx-big">${pct}%</span> più piccola — il ${textNoun} corrisponderebbe a <strong>${baseTokens}</strong> token di input; le immagini corrispondono a <strong>${realTokens}</strong>`,
   ctxHeadlineBigger: (pct, realTokens, baseTokens, textNoun) =>
     `<span class="ctx-big">${pct}%</span> più grande — le immagini corrispondono a <strong>${realTokens}</strong> token di input contro <strong>${baseTokens}</strong> per il ${textNoun}`,
+  ctxHeadlineSmallerGoogle: (pct, baseTokens, realTokens) =>
+    `<span class="ctx-big">${pct}%</span> più piccola — il testo corrisponderebbe a <strong>${baseTokens}</strong> token di input; le immagini corrispondono a <strong>${realTokens}</strong>`,
+  ctxHeadlineBiggerGoogle: (pct, realTokens, baseTokens) =>
+    `<span class="ctx-big">${pct}%</span> più grande — le immagini corrispondono a <strong>${realTokens}</strong> token di input contro <strong>${baseTokens}</strong> per il testo`,
+  ctxGoogleNote: (phrase) =>
+    `Stessa base di token del provider della colonna Risparmiato. La differenza è il conteggio dei token. ${phrase}`,
   rcCompositionTitle: 'Composizione Responses originale (stima locale o200k)',
   rcInstructions: 'Istruzioni',
   rcSystemDeveloper: 'Elementi system / developer',

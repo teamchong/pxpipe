@@ -13,8 +13,8 @@
  *  - Text points: window tokens × 4 chars/token (the standard English-prose
  *    rule of thumb; token-dense content like code/JSON tokenizes *worse*,
  *    ~2-2.5, so 4 is the generous assumption for the text series).
- *  - Fable pxpipe point: window tokens × measured chars-per-vision-token via
- *    Claude dense geometry + Anthropic 750 px/token pricing.
+ *  - pxpipe points: window tokens × measured chars-per-vision-token using the
+ *    shipped 312-column geometry and each provider's image-token accounting.
  *
  * Window sizes (announcement-era frontier defaults), with release dates used
  * for x-axis placement:
@@ -36,7 +36,7 @@ const OUT = join(ROOT, 'docs/assets/context-window-chars.png');
 const README_EXAMPLE = join(ROOT, 'docs/assets/example-render.png');
 
 const TEXT_CPT = 4; // chars per text token, prose rule of thumb
-const PX_PER_VISION_TOKEN = 750; // Anthropic image pricing: tokens = w*h/750
+const GEMINI_TOKENS_PER_FULL_PAGE = 1078; // measured at 1568x728
 
 interface Density {
   /** chars per vision-token for this family's render+billing profile */
@@ -70,11 +70,29 @@ async function measureFableDensity(fixture: string): Promise<Density> {
   if (r.droppedChars > 0) {
     throw new Error(`fable fixture dropped ${r.droppedChars} chars — atlas gap, fix before charting`);
   }
-  const visionTokens = Math.ceil(r.pixels / PX_PER_VISION_TOKEN);
+  const visionTokens = r.pages.reduce(
+    (total, page) => total + Math.ceil(page.width / 28) * Math.ceil(page.height / 28),
+    0,
+  );
   const cpt = fixture.length / visionTokens;
   console.log(
     `Fable density: ${fixture.length} chars → ${r.pages.length} pages, ` +
       `${r.pixels} px = ${visionTokens} vision tokens → ${cpt.toFixed(2)} chars/vision-token`,
+  );
+  return { cpt, pages: r.pages.length, pixels: r.pixels, visionTokens };
+}
+
+async function measureGeminiDensity(fixture: string): Promise<Density> {
+  // Widescreen geometry (312-col Spleen): measured 1078 tokens per page.
+  const r = await renderTextToImages(fixture, { reflow: true });
+  if (r.droppedChars > 0) {
+    throw new Error(`gemini fixture dropped ${r.droppedChars} chars — atlas gap, fix before charting`);
+  }
+  const visionTokens = r.pages.length * GEMINI_TOKENS_PER_FULL_PAGE;
+  const cpt = fixture.length / visionTokens;
+  console.log(
+    `Gemini density: ${fixture.length} chars → ${r.pages.length} pages, ` +
+      `${visionTokens} vision tokens → ${cpt.toFixed(2)} chars/vision-token`,
   );
   return { cpt, pages: r.pages.length, pixels: r.pixels, visionTokens };
 }
@@ -100,7 +118,7 @@ interface Point {
   dy?: number;
 }
 
-function points(fableCpt: number): Point[] {
+function points(fableCpt: number, geminiCpt: number): Point[] {
   const t = (
     kind: Point['kind'],
     name: string,
@@ -133,6 +151,8 @@ function points(fableCpt: number): Point[] {
     t('openai', 'GPT-5.6', 2026.52, 1_050_000, 'right'),
     // the model powering this session: claude-fable-5[1m], 1M-token window
     t('claude', 'Fable 5 [1m]', 2026.05, 1_000_000, 'below'),
+    // Gemini 3.6 Flash 1M window
+    t('gemini', 'Gemini 3.6 Flash', 2026.50, 1_000_000, 'below'),
     // Grok 4.5: text-window only (opt-in; no pxpipe overlay on this chart).
     // Window = xAI docs maxPromptLength for grok-4.5 (500000).
     t('grok', 'Grok 4.5', 2026.42, 500_000, 'below', 10),
@@ -141,6 +161,14 @@ function points(fableCpt: number): Point[] {
       x: 2026.05,
       tokens: 1_000_000,
       chars: Math.round(1_000_000 * fableCpt),
+      kind: 'pxpipe',
+      label: 'above',
+    },
+    {
+      name: 'Gemini 3.6 Flash + pxpipe',
+      x: 2026.50,
+      tokens: 1_000_000,
+      chars: Math.round(1_000_000 * geminiCpt),
       kind: 'pxpipe',
       label: 'above',
     },
@@ -175,7 +203,7 @@ function pngWidth(path: string): number {
   return png.readUInt32BE(16);
 }
 
-function draw(data: Point[], fableCpt: number): Buffer {
+function draw(data: Point[], fableCpt: number, geminiCpt: number): Buffer {
   const logicalWidth = 1180;
   const logicalHeight = 1000;
   const outputWidth = pngWidth(README_EXAMPLE);
@@ -208,7 +236,7 @@ function draw(data: Point[], fableCpt: number): Buffer {
   ctx.font = '400 14px sans-serif';
   ctx.fillText(
     `each point: model · context window (tokens) → characters it holds · text at ~${TEXT_CPT} chars/token · ` +
-      `Fable pxpipe measured at ${fableCpt.toFixed(1)} chars/vision-token (px ÷ ${PX_PER_VISION_TOKEN})`,
+      `pxpipe uses shipped 312-column pages · Fable ${fableCpt.toFixed(1)} · Gemini ${geminiCpt.toFixed(1)} chars/vision-token`,
     36,
     68,
   );
@@ -220,7 +248,7 @@ function draw(data: Point[], fableCpt: number): Buffer {
   const bottom = 1000 - 72;
   // Linear scale — log gave every decade equal height, which flattened the whole
   // point of the chart: 18M must physically tower ~4.5× over the 4M pack.
-  const Y_MAX = 20_000_000;
+  const Y_MAX = 24_000_000;
   const X_MIN = 2018;
   const X_MAX = 2027.25;
   const y = (v: number) => bottom - (v / Y_MAX) * (bottom - top);
@@ -277,10 +305,11 @@ function draw(data: Point[], fableCpt: number): Buffer {
     ctx.stroke();
   }
 
-  // Dashed vertical connector: Fable text window → same window imaged (pxpipe).
+  // Dashed vertical connector: Fable / Gemini text window → same window imaged (pxpipe).
   // Grok is plotted as a text series only (no pxpipe overlay).
   const overlays: Array<{ textName: string; pxName: string }> = [
     { textName: 'Fable 5 [1m]', pxName: 'Fable 5 [1m] + pxpipe' },
+    { textName: 'Gemini 3.6 Flash', pxName: 'Gemini 3.6 Flash + pxpipe' },
   ];
   for (const o of overlays) {
     const base = data.find((p) => p.name === o.textName)!;
@@ -384,7 +413,7 @@ function draw(data: Point[], fableCpt: number): Buffer {
     [colors.gemini, 'Google · Gemini'],
     [colors.claude, 'Anthropic · Claude → Fable'],
     [colors.grok, 'xAI · Grok 4.5'],
-    [colors.pxpipe, 'Fable 5 [1m] · same 1M window · pxpipe images (measured)'],
+    [colors.pxpipe, 'pxpipe images (measured overlays)'],
   ];
   ctx.font = '400 13px sans-serif';
   let ly = top + 20;
@@ -413,7 +442,8 @@ function draw(data: Point[], fableCpt: number): Buffer {
 // ---------------------------------------------------------------------------
 const fixture = loadFixture();
 const fable = await measureFableDensity(fixture);
-const data = points(fable.cpt);
+const gemini = await measureGeminiDensity(fixture);
+const data = points(fable.cpt, gemini.cpt);
 
 console.log('\n  model                released   window (tokens)   chars in window');
 for (const p of data) {
@@ -423,10 +453,16 @@ for (const p of data) {
 }
 const fableText = data.find((p) => p.name === 'Fable 5 [1m]')!;
 const fablePx = data.find((p) => p.name === 'Fable 5 [1m] + pxpipe')!;
+const geminiText = data.find((p) => p.name === 'Gemini 3.6 Flash')!;
+const geminiPx = data.find((p) => p.name === 'Gemini 3.6 Flash + pxpipe')!;
+
 console.log(
   `\n  Fable pxpipe multiplier on the same window: ${(fablePx.chars / fableText.chars).toFixed(2)}×`,
 );
+console.log(
+  `  Gemini 3.6 Flash pxpipe multiplier on the same window: ${(geminiPx.chars / geminiText.chars).toFixed(2)}×`,
+);
 
 mkdirSync(dirname(OUT), { recursive: true });
-writeFileSync(OUT, draw(data, fable.cpt));
+writeFileSync(OUT, draw(data, fable.cpt, gemini.cpt));
 console.log(`\nwrote ${OUT}`);

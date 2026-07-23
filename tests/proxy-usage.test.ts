@@ -5,7 +5,7 @@ import { createProxy, type ProxyEvent } from '../src/core/proxy.js';
 let ambientPxpipeModels: string | undefined;
 beforeAll(() => {
   ambientPxpipeModels = process.env.PXPIPE_MODELS;
-  process.env.PXPIPE_MODELS = 'claude-fable-5,gpt-5.6-sol';
+  process.env.PXPIPE_MODELS = 'claude-fable-5,gpt-5.6-sol,gemini-3.6-flash';
 });
 afterAll(() => {
   if (ambientPxpipeModels === undefined) delete process.env.PXPIPE_MODELS;
@@ -81,6 +81,214 @@ describe('proxy usage extraction', () => {
     expect(captured!.usage?.output_tokens).toBe(7);
     expect(captured!.usage?.cache_read_input_tokens).toBe(100);
     expect(captured!.firstByteMs).toBeTypeOf('number');
+  });
+
+  it('extracts Gemini usage from a streamed JSON array response', async () => {
+    const restore = mockUpstream(
+      () =>
+        new Response(
+          JSON.stringify([
+            { candidates: [{ content: { parts: [{ text: 'hello' }, { text: 'thinking', thought: true }] } }] },
+            {
+              candidates: [{ content: { parts: [{ text: ' world' }, { functionCall: { name: 'f', args: {} } }] }, finishReason: 'STOP' }],
+              usageMetadata: {
+                promptTokenCount: 2048,
+                candidatesTokenCount: 9,
+                thoughtsTokenCount: 11,
+                cachedContentTokenCount: 100,
+              },
+            },
+          ]),
+          { status: 200, headers: { 'content-type': 'application/json; charset=UTF-8' } },
+        ),
+    );
+
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      upstream: 'http://ocproxy.test',
+      transform: { compress: false },
+      onRequest: (event) => {
+        captured = event;
+      },
+    });
+    const res = await proxy(
+      new Request(
+        'http://localhost/google-ai-studio/v1beta/models/gemini-3.6-flash:streamGenerateContent',
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'hi' }] }] }),
+        },
+      ),
+    );
+    await res.text();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    restore();
+
+    expect(captured?.model).toBe('gemini-3.6-flash');
+    expect(captured?.accountingProvider).toBe('google');
+    expect(captured?.usage?.input_tokens).toBe(2048);
+    expect(captured?.usage?.output_tokens).toBe(20);
+    expect(captured?.usage?.cached_tokens).toBe(100);
+    expect(captured?.measurement?.textChars).toBe(11);
+    expect(captured?.measurement?.thinkingChars).toBe(8);
+    expect(captured?.measurement?.toolUseChars).toBeGreaterThan(0);
+    expect(captured?.stopReason).toBe('STOP');
+  });
+
+  it('uses Gemini countTokens for the gate and measured text baseline', async () => {
+    const upstreamRequests: Request[] = [];
+    const restore = mockUpstream(async (req) => {
+      upstreamRequests.push(req.clone());
+      if (req.url.includes(':countTokens')) {
+        const body = await req.clone().json() as {
+          generateContentRequest?: { model?: string; contents?: unknown; systemInstruction?: unknown };
+        };
+        expect(body.generateContentRequest?.model).toBe('models/gemini-3.6-flash');
+        expect(body.generateContentRequest?.contents).toBeDefined();
+        return new Response(JSON.stringify({
+          totalTokens: JSON.stringify(body.generateContentRequest).includes('inlineData') ? 120 : 400,
+        }), { headers: { 'content-type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({
+        candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
+        usageMetadata: { promptTokenCount: 120, candidatesTokenCount: 1 },
+      }), { headers: { 'content-type': 'application/json' } });
+    });
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      upstream: 'http://ocproxy.test',
+      transform: { compress: true },
+      onRequest: (event) => { captured = event; },
+    });
+    const body = JSON.stringify({
+      model: 'gemini-body-must-not-win',
+      systemInstruction: { parts: [{ text: 'System instruction. '.repeat(300) }] },
+      contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
+    });
+    const res = await proxy(new Request(
+      'http://localhost/google-ai-studio/v1beta/models/gemini-3.6-flash:streamGenerateContent?alt=sse&key=test',
+      { method: 'POST', headers: { 'content-type': 'application/json' }, body },
+    ));
+    await res.text();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    restore();
+
+    expect(upstreamRequests.filter((req) => req.url.includes(':countTokens'))).toHaveLength(2);
+    expect(upstreamRequests[0]!.url).toContain(':countTokens?key=test');
+    expect(upstreamRequests[0]!.url).not.toContain('alt=sse');
+    expect(captured?.accountingProvider).toBe('google');
+    expect(captured?.info?.compressed).toBe(true);
+    expect(captured?.info?.baselineTokens).toBe(400);
+    expect(captured?.info?.baselineImagedTokens).toBeGreaterThan(0);
+    expect(captured?.info?.baselineImagedTokens).not.toBe(400);
+    expect(captured?.info?.nativeInjectedTokens).toBeGreaterThan(0);
+    expect(captured?.info?.baselineProbeStatus).toBe('ok');
+  });
+
+  it('fails Gemini compression closed when countTokens validation fails', async () => {
+    const forwardedBodies: string[] = [];
+    const restore = mockUpstream(async (req) => {
+      if (req.url.includes(':countTokens')) return new Response('no', { status: 503 });
+      forwardedBodies.push(await req.clone().text());
+      return new Response(JSON.stringify({
+        candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
+        usageMetadata: { promptTokenCount: 400, candidatesTokenCount: 1 },
+      }), { headers: { 'content-type': 'application/json' } });
+    });
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      upstream: 'http://ocproxy.test',
+      transform: { compress: true },
+      onRequest: (event) => { captured = event; },
+    });
+    const body = JSON.stringify({
+      systemInstruction: { parts: [{ text: 'System instruction. '.repeat(300) }] },
+      contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
+    });
+    const res = await proxy(new Request(
+      'http://localhost/google-ai-studio/v1beta/models/gemini-3.6-flash:generateContent',
+      { method: 'POST', headers: { 'content-type': 'application/json' }, body },
+    ));
+    await res.text();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    restore();
+
+    expect(forwardedBodies).toHaveLength(1);
+    expect(forwardedBodies[0]).not.toContain('inlineData');
+    expect(captured?.info?.compressed).toBe(false);
+    expect(captured?.info?.reason).toBe('count_tokens_failed');
+    expect(captured?.info?.baselineProbeStatus).toBe('failed');
+    expect(captured?.info?.imagePngs).toBeUndefined();
+    expect(captured?.info?.imageDims).toBeUndefined();
+    expect(captured?.info?.compressedChars).toBe(0);
+    expect(captured?.info?.bucketChars).toBeUndefined();
+  });
+
+  it('does not apply the 3.6 Flash profile to an unvalidated Gemini alias', async () => {
+    const upstreamRequests: Request[] = [];
+    const restore = mockUpstream(async (req) => {
+      upstreamRequests.push(req.clone());
+      return new Response(JSON.stringify({
+        candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
+        usageMetadata: { promptTokenCount: 400, candidatesTokenCount: 1 },
+      }), { headers: { 'content-type': 'application/json' } });
+    });
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      upstream: 'http://ocproxy.test',
+      transform: { compress: true },
+      onRequest: (event) => { captured = event; },
+    });
+    const body = JSON.stringify({
+      systemInstruction: { parts: [{ text: 'System instruction. '.repeat(300) }] },
+      contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
+    });
+    const res = await proxy(new Request(
+      'http://localhost/google-ai-studio/v1beta/models/gemini-3.6-flash-preview:generateContent',
+      { method: 'POST', headers: { 'content-type': 'application/json' }, body },
+    ));
+    await res.text();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    restore();
+
+    expect(upstreamRequests).toHaveLength(1);
+    expect(await upstreamRequests[0]!.text()).toBe(body);
+    expect(captured?.info?.compressed).toBe(false);
+    expect(captured?.info?.reason).toBe('unsupported_model');
+  });
+
+  it('classifies bypassed Gemini traffic as Google without probing', async () => {
+    const upstreamRequests: Request[] = [];
+    const restore = mockUpstream(async (req) => {
+      upstreamRequests.push(req.clone());
+      return new Response(JSON.stringify({
+        candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
+        usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 1 },
+      }), { headers: { 'content-type': 'application/json' } });
+    });
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      upstream: 'http://ocproxy.test',
+      onRequest: (event) => { captured = event; },
+    });
+    const body = JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'hi' }] }] });
+    const res = await proxy(new Request(
+      'http://localhost/google-ai-studio/v1beta/models/gemini-3.6-flash:generateContent',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-pxpipe-bypass': '1' },
+        body,
+      },
+    ));
+    await res.text();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    restore();
+
+    expect(upstreamRequests).toHaveLength(1);
+    expect(await upstreamRequests[0]!.text()).toBe(body);
+    expect(captured?.model).toBe('gemini-3.6-flash');
+    expect(captured?.accountingProvider).toBe('google');
   });
 
   it('never calls Anthropic count_tokens for Sol Responses', async () => {
@@ -195,7 +403,7 @@ describe('proxy usage extraction', () => {
       onRequest: (e) => { captured = e; },
     });
     const body = JSON.stringify({
-      model: 'gpt-5.6-sol', max_tokens: 16,
+      model: 'claude-gpt-5.6-sol', max_tokens: 16,
       system: 'System instruction. '.repeat(900),
       messages: [
         { role: 'user', content: [
@@ -230,6 +438,7 @@ describe('proxy usage extraction', () => {
     expect(upstreamRequests[0]!.headers.has('anthropic-beta')).toBe(false);
     expect(upstreamRequests.some((r) => r.url.includes('/count_tokens'))).toBe(false);
     const sent = JSON.parse(await upstreamRequests[0]!.text()) as any;
+    expect(sent.model).toBe('gpt-5.6-sol');
     expect(sent.max_output_tokens).toBe(16);
     expect(sent.tools[0]).toMatchObject({ type: 'function', name: 'search' });
     expect(sent.input).toContainEqual(expect.objectContaining({
@@ -526,11 +735,33 @@ describe('proxy usage extraction', () => {
     });
   });
 
-  it('returns an empty discovery list when Cloudflare has no configured model', async () => {
+  it('uses normal upstream discovery when Cloudflare has no configured model', async () => {
+    let upstreamUrl = '';
+    const restore = mockUpstream(async (req) => {
+      upstreamUrl = req.url;
+      return new Response(JSON.stringify({ data: [{ id: 'claude-fable-5' }] }), {
+        headers: { 'content-type': 'application/json' },
+      });
+    });
     const proxy = createProxy({ cloudflareUpstream: 'https://chat.test/v1' });
     expect(await (await proxy(new Request('http://localhost/v1/models'))).json()).toEqual({
-      data: [], has_more: false, first_id: '', last_id: '',
+      data: [{ id: 'claude-fable-5' }],
     });
+    restore();
+    expect(upstreamUrl).toBe('https://api.anthropic.com/v1/models');
+  });
+
+  it('advertises OpenAI and Cloudflare routed models together', async () => {
+    const proxy = createProxy({
+      openAIModels: ['gpt-5.6-sol'],
+      cloudflareUpstream: 'https://chat.test/v1',
+      cloudflareModels: ['moonshotai/kimi-k3'],
+    });
+    const body = await (await proxy(new Request('http://localhost/v1/models'))).json() as any;
+    expect(body.data.map((model: any) => model.id)).toEqual([
+      'claude-gpt-5.6-sol',
+      'claude-moonshotai/kimi-k3',
+    ]);
   });
 
   it('uses the resolved Kimi model for compression eligibility and telemetry', async () => {
@@ -1096,6 +1327,7 @@ describe('proxy usage extraction', () => {
     let captured: ProxyEvent | undefined;
     const proxy = createProxy({
       transform: {},
+      captureErrorReqBody: true,
       onRequest: (e) => {
         captured = e;
       },
@@ -1134,6 +1366,7 @@ describe('proxy usage extraction', () => {
     let captured: ProxyEvent | undefined;
     const proxy = createProxy({
       transform: {},
+      captureErrorReqBody: true,
       onRequest: (e) => {
         captured = e;
       },
@@ -1219,8 +1452,8 @@ describe('proxy usage extraction', () => {
   });
 
   it('does NOT capture the 4xx request body by default (privacy, issue #69)', async () => {
-    // Request bodies hold full prompts + any secrets in context, so raw-body
-    // capture is opt-in only. errorBody (the upstream error) still lands.
+    // Either side of a custom gateway error may echo prompts or credentials,
+    // so both request and upstream error-body persistence are opt-in only.
     const restore = mockUpstream(
       () =>
         new Response(JSON.stringify({ error: { type: 'bad' } }), {
@@ -1251,7 +1484,7 @@ describe('proxy usage extraction', () => {
     expect(captured!.status).toBe(400);
     expect(captured!.reqBodySha8).toMatch(/^[0-9a-f]{8}$/); // hash still lands
     expect(captured!.reqBodyGz).toBeUndefined(); // but not the raw body
-    expect(captured!.errorBody).toBeDefined(); // upstream error still captured
+    expect(captured!.errorBody).toBeUndefined();
   });
 
   it('does NOT gzip the request body on 2xx (but still sets reqBodySha8)', async () => {

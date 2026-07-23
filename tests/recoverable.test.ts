@@ -55,7 +55,7 @@ describe('emitRecoverable recovery channel', () => {
   it('emits no recovery map by default, even when content is imaged', async () => {
     const { info } = await transformRequest(
       makeReq([{ type: 'tool_result', tool_use_id: 'toolu_a', content: BIG }]),
-      { multiCol: 1, charsPerToken: 2 },
+      { charsPerToken: 2 },
     );
     // The block WAS imaged...
     expect(info.toolResultImgs ?? 0).toBeGreaterThan(0);
@@ -66,7 +66,7 @@ describe('emitRecoverable recovery channel', () => {
   it('records an imaged tool_result with byte-exact original text + provenance', async () => {
     const { body, info } = await transformRequest(
       makeReq([{ type: 'tool_result', tool_use_id: 'toolu_a', content: BIG }]),
-      { multiCol: 1, charsPerToken: 2, emitRecoverable: true },
+      { charsPerToken: 2, emitRecoverable: true },
     );
 
     // The block was imaged out of the body...
@@ -87,7 +87,7 @@ describe('emitRecoverable recovery channel', () => {
   });
 
   it('derives a stable content id (same content → same id)', async () => {
-    const opts = { multiCol: 1, charsPerToken: 2, emitRecoverable: true } as const;
+    const opts = { charsPerToken: 2, emitRecoverable: true } as const;
     const a = await transformRequest(
       makeReq([{ type: 'tool_result', tool_use_id: 'toolu_a', content: BIG }]),
       opts,
@@ -113,7 +113,6 @@ describe('emitRecoverable recovery channel', () => {
     const { info } = await transformRequest(
       makeReq([{ type: 'tool_result', tool_use_id: 'keep_me', content: BIG }]),
       {
-        multiCol: 1,
         charsPerToken: 2,
         emitRecoverable: true,
         keepSharp: (blk) => blk.toolUseId === 'keep_me',
@@ -132,7 +131,6 @@ describe('emitRecoverable recovery channel', () => {
         { type: 'tool_result', tool_use_id: 'image_me', content: BIG },
       ]),
       {
-        multiCol: 1,
         charsPerToken: 2,
         emitRecoverable: true,
         keepSharp: (blk) => blk.toolUseId === 'keep_me',

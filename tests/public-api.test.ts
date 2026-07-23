@@ -32,6 +32,9 @@ describe('public library API', () => {
   it('recognizes Fable 5 (with suffix aliases) as the default scope; Opus is OFF by default', () => {
     expect(isPxpipeSupportedModel('claude-fable-5')).toBe(true);
     expect(isPxpipeSupportedModel('claude-fable-5-high')).toBe(true);
+    expect(isPxpipeSupportedModel('google/gemini-3.6-flash')).toBe(true);
+    expect(isPxpipeSupportedModel('gemini-3.6-flash-preview')).toBe(false);
+    expect(isPxpipeSupportedModel('untrusted/google/gemini-3.6-flash')).toBe(false);
     // Opus 4.8 is OPT-IN, not in the default scope — same pipeline/render as
     // Fable, but it reads imaged content at a tax (FINDINGS.md 2026-06-16), so
     // the default doesn't silently compress the operator's main driver. Enable
@@ -121,7 +124,7 @@ describe('public library API', () => {
       expect(isPxpipeSupportedGptModel('grok-4')).toBe(false);
       expect(isPxpipeSupportedGptModel('grok-4.20')).toBe(false);
       expect(getAllowedModelBases()).not.toContain('grok-4.5');
-      expect(getAllowedModelBases()).toEqual(['claude-fable-5']);
+      expect(getAllowedModelBases()).toEqual(['claude-fable-5', 'gemini-3.6-flash']);
 
       process.env.PXPIPE_MODELS = 'claude-fable-5,gpt-5.6-sol,grok-4.5';
       expect(isPxpipeSupportedGptModel('grok-4.5')).toBe(true);
@@ -377,7 +380,7 @@ describe('public library API', () => {
     expect(firstUser.content[0].type).toBe('image_url');
     expect(firstUser.content[0].image_url.url).toMatch(/^data:image\/png;base64,/);
     expect(out.messages[0].content).toContain('rendered into image');
-    expect(out.tools[0].function.description).toBe('Read a file from disk. '.repeat(100));
+    expect(out.tools[0].function.description).toBe('Full docs: see "## Tool: read_file" in the rendered context image.');
     expect(out.tools[0].function.parameters.description).toBeUndefined();
     expect(out.tools[0].function.parameters.properties.path.description).toBeUndefined();
     expect(JSON.stringify(out)).not.toContain('cache_control');

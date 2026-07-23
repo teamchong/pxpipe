@@ -36,9 +36,6 @@ export interface Env {
   MIN_REMINDER_CHARS?: string;
   MIN_TOOL_RESULT_CHARS?: string;
   COLS?: string;
-  /** R2 multi-column packing — default 1 (off). 2 squeezes ~2× source rows
-   *  per image; OCR-verify before flipping in production. */
-  MULTI_COL?: string;
   /** When "0" / "false", disable per-request event JSON logs. Default-on.
    *  Cloudflare ingests console.log as Workers Logs; pipe via Logpush to
    *  R2/S3 for the same JSONL shape Node writes to disk. */
@@ -115,9 +112,6 @@ export default {
       // Omit by default so OpenAI-shaped requests use their exact model profile;
       // COLS remains an explicit operator override for every family.
       ...(env.COLS ? { cols: Number(env.COLS) } : {}),
-      // R2 multi-column ON (2 cols) — single-col drops below break-even on
-      // real tool-doc slabs. Override via MULTI_COL=1 if OCR misreads layout.
-      multiCol: env.MULTI_COL ? Math.max(1, Number(env.MULTI_COL) | 0) : 2,
     };
     const trackingOn = truthy(env.PXPIPE_TRACK, true);
     // Workers Logs ingests stdout as separate log lines. Emit one JSON line
@@ -149,7 +143,9 @@ export default {
         const tag = e.info?.compressed
           ? `compressed ${e.info.origChars}ch → ${e.info.imageCount}img/${e.info.imageBytes}B`
           : e.info?.reason
-            ? `savings:skip(${e.info.reason})`
+            ? e.info.reason === 'unsupported_model' && e.model
+              ? `skip(unsupported=${e.model})`
+              : `skip(${e.info.reason})`
             : '';
         const cacheRead = e.usage?.cache_read_input_tokens ?? 0;
         console.log(`${e.method} ${e.path} → ${e.status} (${e.durationMs}ms) ${tag} cache_read=${cacheRead}`);

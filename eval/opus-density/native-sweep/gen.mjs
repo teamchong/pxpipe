@@ -12,7 +12,7 @@
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomInt } from 'node:crypto';
 import { renderTextToImages } from '../../../src/core/library.js';
 import { renderCellWidth, renderCellHeight } from '../../../src/core/render.js';
 
@@ -27,11 +27,11 @@ const R = (n) => randomBytes(n).toString('hex').slice(0, n);
 const WORDS = ['ledger', 'shard', 'queue', 'render', 'atlas', 'token', 'commit',
   'stripe', 'glyph', 'patch', 'vision', 'cursor', 'buffer', 'stream', 'digest',
   'anchor', 'cache', 'probe', 'sweep', 'retune', 'baseline', 'profile'];
-const w = () => WORDS[randomBytes(1)[0] % WORDS.length];
-const d = (n) => Array.from({ length: n }, () => randomBytes(1)[0] % 10).join('');
+const w = () => WORDS[randomInt(WORDS.length)];
+const d = (n) => Array.from({ length: n }, () => randomInt(10)).join('');
 const cap = (s) => s[0].toUpperCase() + s.slice(1);
 const B64 = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
-const b64 = (n) => Array.from({ length: n }, () => B64[randomBytes(1)[0] % B64.length]).join('');
+const b64 = (n) => Array.from({ length: n }, () => B64[randomInt(B64.length)]).join('');
 
 const targets = [
   { key: 'hex12',  anchor: `trace=`,               value: R(12),
@@ -40,7 +40,7 @@ const targets = [
     q: `The camelCase symbol name right after "export function " (before the "(").` },
   { key: 'path',   anchor: `wrote `,                value: `/Users/${w()}/repos/${w()}/src/core/${w()}${d(2)}.ts`,
     q: `The full file path right after "wrote " (ends in .ts).` },
-  { key: 'semver', anchor: `pxpipe-proxy@`,         value: `${1 + randomBytes(1)[0] % 9}.${randomBytes(1)[0] % 40}.${randomBytes(1)[0] % 99}`,
+  { key: 'semver', anchor: `pxpipe-proxy@`,         value: `${1 + randomInt(9)}.${randomInt(40)}.${randomInt(99)}`,
     q: `The version string right after "pxpipe-proxy@".` },
   { key: 'bytes',  anchor: `flushed `,              value: d(11),
     q: `The integer immediately after "flushed " (before " bytes").` },

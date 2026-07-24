@@ -1102,6 +1102,9 @@ describe('resolveGptProfile (Claude on Responses)', () => {
       expect(notSol.factSheetFormat, model).toBe('full');
     }
     expect(resolveGptProfile('claude-fable-5').style.font).toBe('spleen-5x8');
+    expect(resolveGptProfile('claude-fable-5').maxSerializedRequestBytes).toBe(768 * 1024);
+    expect(resolveGptProfile('claude-opus-4-8').maxSerializedRequestBytes).toBe(768 * 1024);
+    expect(resolveGptProfile('gpt-5.6-sol').maxSerializedRequestBytes).toBe(1024 * 1024);
   });
 
   it('isolates Opus profile overrides from Fable profile', () => {
@@ -1139,6 +1142,7 @@ describe('resolveGptProfile (Grok)', () => {
     expect(p.stripCols).toBe(84);
     expect(p.maxHeightPx).toBe(512);
     expect(p.minCompressTokens).toBe(500);
+    expect(p.maxSerializedRequestBytes).toBe(128 * 1024);
     expect(p.style.font).toBe('jetbrains-mono-14');
     expect(p.style.cellWBonus).toBe(0);
     expect(p.style.cellHBonus).toBe(0);

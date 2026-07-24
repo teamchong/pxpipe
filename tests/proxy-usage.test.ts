@@ -2343,4 +2343,82 @@ describe('proxy usage extraction', () => {
     expect(captured).toBeDefined();
     expect(captured!.stopReason).toBeUndefined();
   });
+
+  it('rejects a compressed final provider body above its profile byte cap', async () => {
+    const prev = process.env.PXPIPE_GPT_PROFILES;
+    let upstreamCalls = 0;
+    const restore = mockUpstream(() => {
+      upstreamCalls++;
+      return new Response('{}', { headers: { 'content-type': 'application/json' } });
+    });
+    try {
+      process.env.PXPIPE_GPT_PROFILES = JSON.stringify({
+        'gpt-5.6-sol': { maxSerializedRequestBytes: 1 },
+      });
+      let captured: ProxyEvent | undefined;
+      const proxy = createProxy({
+        upstream: 'http://mock',
+        transform: { charsPerToken: 1, minCompressChars: 1 },
+        onRequest: (event) => { captured = event; },
+      });
+      const body = JSON.stringify({
+        model: 'gpt-5.6-sol',
+        instructions: 'System instruction. '.repeat(900),
+        input: [{ role: 'user', content: 'hi' }],
+      });
+      const res = await proxy(new Request('http://localhost/openai/responses', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body,
+      }));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      expect(res.status).toBe(413);
+      expect(upstreamCalls).toBe(0);
+      expect(captured?.status).toBe(413);
+      expect(captured?.info?.compressed).toBe(true);
+      expect(captured?.info?.serializedRequestBytes).toBeGreaterThan(1);
+      expect(captured?.info?.sizeLimitOutcome).toBe('rejected');
+    } finally {
+      restore();
+      if (prev === undefined) delete process.env.PXPIPE_GPT_PROFILES;
+      else process.env.PXPIPE_GPT_PROFILES = prev;
+    }
+  });
+
+  it('does not apply the profile byte cap to an uncompressed pass-through body', async () => {
+    const prev = process.env.PXPIPE_GPT_PROFILES;
+    let forwarded = '';
+    const restore = mockUpstream(async (req) => {
+      forwarded = await req.text();
+      return new Response('{}', { headers: { 'content-type': 'application/json' } });
+    });
+    try {
+      process.env.PXPIPE_GPT_PROFILES = JSON.stringify({
+        'gpt-5.6-sol': { maxSerializedRequestBytes: 1 },
+      });
+      const proxy = createProxy({
+        openAIUpstream: 'http://mock',
+        transform: { compress: false },
+      });
+      const body = JSON.stringify({
+        model: 'gpt-5.6-sol',
+        instructions: 'unchanged',
+        input: [{ role: 'user', content: [{ type: 'input_text', text: 'hello' }] }],
+      });
+      const res = await proxy(new Request('http://localhost/v1/responses', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body,
+      }));
+      await res.text();
+
+      expect(res.status).toBe(200);
+      expect(forwarded).toBe(body);
+    } finally {
+      restore();
+      if (prev === undefined) delete process.env.PXPIPE_GPT_PROFILES;
+      else process.env.PXPIPE_GPT_PROFILES = prev;
+    }
+  });
 });

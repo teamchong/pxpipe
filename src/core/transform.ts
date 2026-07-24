@@ -502,6 +502,10 @@ export interface EnvFields {
 export interface TransformInfo {
   compressed: boolean;
   reason?: string;
+  /** Exact UTF-8 byte length of the final serialized provider request. */
+  serializedRequestBytes?: number;
+  /** Result of the profile-level serialized request guard. */
+  sizeLimitOutcome?: 'within_limit' | 'rejected';
   origChars: number;
   /** Total source chars image-encoded this request (static slab + reminders + tool_results).
    *  Unlike `origChars` (static slab + tool docs only), reflects what `imageCount` replaced. */

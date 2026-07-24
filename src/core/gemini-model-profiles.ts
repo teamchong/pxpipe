@@ -33,6 +33,7 @@ export const GEMINI_3_6_FLASH_PROFILE: GptModelProfile = {
     markerRed: false,
     inkDilate: 0,
   },
+  maxSerializedRequestBytes: 512 * 1024,
 };
 
 export function isGeminiModel(model: string | null | undefined): boolean {

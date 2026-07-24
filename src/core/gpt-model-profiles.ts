@@ -93,6 +93,9 @@ export interface GptModelProfile {
   history: GptHistoryProfile;
   /** Complete model-specific font, cell spacing, color, and marker style. */
   style: GptRenderStyle;
+  /** Maximum serialized provider request produced by pxpipe. Undefined leaves
+   *  legacy behavior unchanged. Enforced after the final wire transform. */
+  maxSerializedRequestBytes?: number;
 }
 
 /** Default downscale-safe strip width (768px). Exported as the global cols default. */
@@ -144,6 +147,7 @@ export const CLAUDE_FABLE_PROFILE: GptModelProfile = {
   factSheetFormat: 'full',
   history: BASE_HISTORY,
   style: { ...BASE_STYLE },
+  maxSerializedRequestBytes: 768 * 1024,
 };
 
 export const CLAUDE_OPUS_PROFILE: GptModelProfile = {
@@ -156,6 +160,7 @@ export const CLAUDE_OPUS_PROFILE: GptModelProfile = {
   factSheetFormat: 'full',
   history: BASE_HISTORY,
   style: { ...BASE_STYLE, font: 'jetbrains-mono-14' },
+  maxSerializedRequestBytes: 768 * 1024,
 };
 
 const GPT56_SOL_PROFILE: GptModelProfile = {
@@ -188,6 +193,7 @@ const GPT56_SOL_PROFILE: GptModelProfile = {
     cellWBonus: 0,
     cellHBonus: 0,
   },
+  maxSerializedRequestBytes: 1024 * 1024,
 };
 
 interface ProfileRule {
@@ -281,6 +287,7 @@ const BUILTIN_RULES: ProfileRule[] = [
         grid: false,
         gridCols: 0,
       },
+      maxSerializedRequestBytes: 128 * 1024,
     },
   },
 ];
@@ -395,6 +402,9 @@ function parseEnvProfiles(raw: string): Map<string, GptModelProfile> {
       factSheetFormat: factSheetFormat(p.factSheetFormat, base.factSheetFormat),
       history,
       style,
+      maxSerializedRequestBytes: p.maxSerializedRequestBytes === undefined
+        ? base.maxSerializedRequestBytes
+        : posInt(p.maxSerializedRequestBytes, base.maxSerializedRequestBytes ?? 0) || undefined,
     });
   }
   return out;

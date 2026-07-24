@@ -25,6 +25,7 @@ export const CLAUDE_PROFILE: GptModelProfile = {
   factSheetFormat: 'full',
   history: BASE_HISTORY,
   style: { ...BASE_STYLE },
+  maxSerializedRequestBytes: 768 * 1024,
 };
 
 /** Pre-4.7 Claude: same render geometry, standard image-resolution tier. */

@@ -22,6 +22,7 @@ import {
 } from './messages-chat-bridge.js';
 import { parseGoogleModelFromPath, transformGoogleGenerateContent } from './google.js';
 import { isGeminiModel } from './gemini-model-profiles.js';
+import { resolveGptProfile } from './gpt-model-profiles.js';
 
 export interface ProxyConfig {
   /** 'cloudflare-ai-gateway': routes both families through gatewayBaseUrl;
@@ -1090,8 +1091,26 @@ export function createProxy(config: ProxyConfig = {}) {
         bodyOut = r.body as unknown as BodyInit; // TS narrows Uint8Array away from BodyInit
         info = r.info;
         reqBodyBytes = r.body;
+        r.info.serializedRequestBytes = r.body.byteLength;
         if (r.body.byteLength > 0) {
           reqBodySha8 = await sha8Bytes(r.body);
+        }
+        const requestByteLimit = requestModel
+          ? resolveGptProfile(requestModel).maxSerializedRequestBytes
+          : undefined;
+        if (r.info.compressed && requestByteLimit !== undefined) {
+          if (r.body.byteLength > requestByteLimit) {
+            r.info.sizeLimitOutcome = 'rejected';
+            const message = `pxpipe serialized request exceeds model limit (${r.body.byteLength} > ${requestByteLimit} bytes)`;
+            fire(413, r.info, message);
+            return new Response(JSON.stringify({
+              error: { type: 'request_too_large', message },
+            }), {
+              status: 413,
+              headers: { 'content-type': 'application/json' },
+            });
+          }
+          r.info.sizeLimitOutcome = 'within_limit';
         }
 
         if (isMessages && messagesAnthropic) {

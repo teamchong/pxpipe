@@ -232,12 +232,75 @@ edge/Workers); `@napi-rs/canvas` is build-time only. Full API:
 
 ## Development
 
+Prerequisites: [pnpm](https://pnpm.io) (this repo pins `packageManager: pnpm@10.21.0` in
+`package.json`, so plain `npm install` won't pick up the right version — install pnpm first,
+e.g. `corepack enable` or `npm install -g pnpm`) and Node.js `>=18` (`engines.node` in
+`package.json`; developed/tested with Node 24).
+
 ```bash
 pnpm install && pnpm test
 pnpm run build                # regenerates dist/
 ```
 
+If you don't want to go through `claude-pxpipe.ps1` (or you're not on Windows), you can run
+the same steps it wraps by hand:
+
+```bash
+pnpm install && pnpm test     # install deps, run the test suite
+pnpm run build                # regenerate dist/
+pnpm run restart              # kill any orphaned proxy, rebuild, start proxy + Claude Code locally
+```
+
+`pnpm run restart` is exactly what `claude-pxpipe.ps1 -Local` calls under the hood — same
+proxy start-up, just without the Windows-specific job-object cleanup and claude-mem check
+described below.
+
 Windows is community-supported: primary development targets macOS/Linux, and Windows-specific fixes rely on contributor PRs (thanks @makoribrian).
+
+### Windows launcher + claude-mem compatibility
+
+The repo ships a Windows launcher, [`claude-pxpipe.ps1`](claude-pxpipe.ps1), which starts the proxy and launches Claude Code through it. If you use [claude-mem](https://github.com/thedotmack/claude-mem), its background hooks would otherwise be routed through the pxpipe proxy and break: the launcher fixes this via [`claude-noproxy.exe`](claude-noproxy.cs), a tiny wrapper that strips the proxy environment variables before invoking Claude Code. On every startup the script runs a fast (<50 ms) check: if claude-mem is installed it makes sure `CLAUDE_CODE_PATH` in `~/.claude-mem/settings.json` points to `claude-noproxy.exe`, and if the exe is missing it recompiles it on the fly from `claude-noproxy.cs` using the `csc` compiler bundled with the .NET Framework. Windows-only; on other platforms the check is skipped.
+
+Launcher modes:
+
+- **Default (npx)** — runs `npx pxpipe-proxy@latest`. Note that npx may serve a cached, out-of-date package; the launcher prunes stale `pxpipe-proxy` entries from the npx cache on startup to mitigate this, but if you need the very latest code use `-Local`.
+- **`-Local`** — runs the local repo checkout via `pnpm run restart` (kills orphans, rebuilds, starts) instead of npx. Use this to test local changes; the npx cache is irrelevant in this mode.
+- **`-DebugCapture`** — full debug chain: routes traffic through pre/post-transform taps, enables `PXPIPE_DEBUG_CAPTURE_4XX=1` (4xx bodies saved under `~/.pxpipe`), and launches Claude Code with `--debug`.
+- Any other arguments are passed through to `claude` as-is, e.g. `claude-pxpipe.ps1 --resume <id> --debug`.
+
+**Prerequisite:** Claude Code must be installed via winget
+(`winget install --id Anthropic.ClaudeCode -e`), not just made available through `npx`.
+The launcher resolves the `claude` command from `PATH` and needs a real `claude.exe` there;
+if Claude Code is only reachable through `npx @anthropic-ai/claude-code`, the script won't
+find an executable to launch.
+
+The live dashboard ships in English and Italian, and picks a language from the browser automatically. See [docs/TRANSLATING.md](docs/TRANSLATING.md) if you want to add another one.
+
+### Windows: run `claude-pxpipe` from anywhere via `$PROFILE`
+
+To avoid typing the full path to the script every time, add a shortcut to your PowerShell
+profile:
+
+1. Confirm Claude Code is installed via winget (see prerequisite above) — the launcher won't
+   work without a real `claude.exe` on `PATH`.
+2. Open (or create) your profile file:
+   ```powershell
+   if (-not (Test-Path $PROFILE)) { New-Item -ItemType File -Path $PROFILE -Force }
+   notepad $PROFILE
+   ```
+3. Add a function that points at your local checkout, e.g.:
+   ```powershell
+   function claude-pxpipe { & "D:\path\to\pxpipe\claude-pxpipe.ps1" @args }
+   ```
+   Alternatively, create a real symbolic link on your `PATH` instead of a profile function:
+   ```powershell
+   New-Item -ItemType SymbolicLink -Path "$HOME\bin\claude-pxpipe.ps1" -Target "D:\path\to\pxpipe\claude-pxpipe.ps1"
+   ```
+   (`$HOME\bin` must already be on your `PATH`; creating a symlink needs an elevated
+   PowerShell, or Developer Mode enabled under Settings → Privacy & security → For developers.)
+4. Reload the profile (`. $PROFILE`) or open a new terminal — you can now run
+   `claude-pxpipe` (with the same `-Local` / `-DebugCapture` / passthrough arguments
+   described above) from any directory.
 
 ## FAQ
 

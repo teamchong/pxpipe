@@ -99,6 +99,14 @@ async function startNode(extraEnv: Record<string, string> = {}): Promise<{
   return { base: `http://127.0.0.1:${port}`, eventsFile, configFile };
 }
 
+/** NTFS: Node's chmod emulation cannot represent POSIX group/other bits, so
+ *  exact-mode assertions are only meaningful on POSIX platforms. */
+const isWin = process.platform === 'win32';
+function expectMode(p: string, mode: number): void {
+  if (isWin) return;
+  expect(fs.statSync(p).mode & 0o777).toBe(mode);
+}
+
 describe('Node dashboard security', () => {
   it('rejects cross-origin mutations and accepts same-origin mutations', async () => {
     const { base, configFile } = await startNode();
@@ -124,8 +132,8 @@ describe('Node dashboard security', () => {
       body: 'list=claude-fable-5',
     });
     expect(allowed.status).toBe(200);
-    expect(fs.statSync(configFile).mode & 0o777).toBe(0o600);
-    expect(fs.statSync(path.dirname(configFile)).mode & 0o777).toBe(0o700);
+    expectMode(configFile, 0o600);
+    expectMode(path.dirname(configFile), 0o700);
   });
 
   it('rejects dashboard requests with a non-loopback Host header', async () => {
@@ -157,8 +165,8 @@ describe('Node dashboard security', () => {
     for (let i = 0; i < 100 && !fs.existsSync(eventsFile); i++) {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
-    expect(fs.statSync(eventsFile).mode & 0o777).toBe(0o600);
-    expect(fs.statSync(path.dirname(eventsFile)).mode & 0o777).toBe(0o700);
+    expectMode(eventsFile, 0o600);
+    expectMode(path.dirname(eventsFile), 0o700);
   });
 
   it('creates rendered PNG dumps with private permissions', async () => {
@@ -179,9 +187,9 @@ describe('Node dashboard security', () => {
       files = fs.readdirSync(dumpDir);
       if (files.length === 0) await new Promise((resolve) => setTimeout(resolve, 10));
     }
-    expect(fs.statSync(dumpDir).mode & 0o777).toBe(0o700);
+    expectMode(dumpDir, 0o700);
     expect(files.length).toBeGreaterThan(0);
-    expect(fs.statSync(path.join(dumpDir, files[0]!)).mode & 0o777).toBe(0o600);
+    expectMode(path.join(dumpDir, files[0]!), 0o600);
     fs.rmSync(dumpDir, { recursive: true, force: true });
   });
 });

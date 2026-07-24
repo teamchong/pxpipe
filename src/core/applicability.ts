@@ -76,6 +76,17 @@ export function setAllowedModelBases(list: readonly string[] | null): void {
   runtimeModelBases = list === null ? null : list.map((s) => s.trim()).filter(Boolean);
 }
 
+/** Loose shape check for a model *base* id before the dashboard persists it to
+ *  config.json (see dashboard.ts handleModelsToggle / handleModelsSet). This is
+ *  NOT a catalog-membership check — the CSV textbox is deliberately as flexible
+ *  as the PXPIPE_MODELS env var, so it must keep accepting a base that isn't in
+ *  the dashboard's static chip catalog yet. It only rejects empty/whitespace,
+ *  control characters, and unreasonably long values so an unauthenticated
+ *  local POST can't stuff arbitrary junk into the config file. */
+export function isValidModelBaseId(id: string): boolean {
+  return /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?$/.test(id);
+}
+
 /** Membership test against the single allowed scope. Matches exact base or `-suffix`
  *  alias; [variant] tags stripped first. */
 function isAllowed(model: string | null | undefined): boolean {

@@ -120,6 +120,112 @@ EOF
   if [ -n "${KEEP_SANDBOX:-}" ]; then echo "    [keep] $sandbox"; else rm -rf "$sandbox"; fi
 }
 
+# --- Windows-path harness --------------------------------------------------
+# Same idea as run_test, but simulates a Windows/Git Bash host: no pgrep,
+# no lsof, no kill shim — instead uname reports MINGW and we shim the
+# Windows-native tools restart.sh falls back to (powershell.exe, taskkill,
+# tasklist, netstat). Unlike `kill`, `taskkill` is a plain external command
+# (not a shell builtin), so — unlike the POSIX SIGTERM/SIGKILL path noted
+# below — the escalation sequence IS observable here via the call log.
+run_test_windows() {
+  local name="$1"; shift
+  local sandbox; sandbox=$(mktemp -d)
+  local logf="$sandbox/calls.log"
+
+  mkdir -p "$sandbox/bin"
+
+  cat > "$sandbox/bin/uname" <<'EOF'
+#!/usr/bin/env bash
+echo "MINGW64_NT-10.0-19045"
+EOF
+
+  # powershell.exe: prints the contents of $sandbox/win_pids (proxy PIDs).
+  cat > "$sandbox/bin/powershell.exe" <<EOF
+#!/usr/bin/env bash
+echo "powershell.exe \$*" >> "$logf"
+if [ -f "$sandbox/win_pids" ]; then cat "$sandbox/win_pids"; fi
+EOF
+
+  # taskkill: records the call. Without //F it's the "graceful" attempt —
+  # removes the PID from win_pids immediately, unless stubborn_term mode
+  # is set (then it's a no-op, forcing escalation). //F always removes it.
+  cat > "$sandbox/bin/taskkill" <<EOF
+#!/usr/bin/env bash
+echo "taskkill \$*" >> "$logf"
+forced=0
+pid=""
+prev=""
+for a in "\$@"; do
+  case "\$a" in
+    //F) forced=1 ;;
+  esac
+  if [ "\$prev" = "//PID" ]; then pid="\$a"; fi
+  prev="\$a"
+done
+if [ -f "$sandbox/stubborn_term" ] && [ "\$forced" -eq 0 ]; then
+  exit 0
+fi
+if [ -f "$sandbox/win_pids" ] && [ -n "\$pid" ]; then
+  grep -vx "\$pid" "$sandbox/win_pids" > "$sandbox/win_pids.new" || true
+  mv "$sandbox/win_pids.new" "$sandbox/win_pids"
+fi
+EOF
+
+  # tasklist: used for the "is it still alive?" check and the port-holder
+  # diagnostic. Reports the PID as present iff it's still in win_pids.
+  cat > "$sandbox/bin/tasklist" <<EOF
+#!/usr/bin/env bash
+echo "tasklist \$*" >> "$logf"
+filt="\$2"
+pid=\$(echo "\$filt" | sed -n 's/.*PID eq \([0-9]*\).*/\1/p')
+if [ -f "$sandbox/win_pids" ] && grep -qx "\$pid" "$sandbox/win_pids"; then
+  echo "node.exe                     \$pid Console                    1     12,345 K"
+fi
+EOF
+
+  # netstat: reports a LISTENING line for $sandbox/netstat_port iff
+  # $sandbox/netstat_pid is set (empty = port free).
+  cat > "$sandbox/bin/netstat" <<EOF
+#!/usr/bin/env bash
+echo "netstat \$*" >> "$logf"
+if [ -f "$sandbox/netstat_pid" ]; then
+  port=\$(cat "$sandbox/netstat_port" 2>/dev/null || echo 47821)
+  pid=\$(cat "$sandbox/netstat_pid")
+  echo "  TCP    0.0.0.0:\$port          0.0.0.0:0              LISTENING       \$pid"
+fi
+EOF
+
+  cat > "$sandbox/bin/pnpm" <<EOF
+#!/usr/bin/env bash
+echo "pnpm \$*" >> "$logf"
+if [ -f "$sandbox/pnpm_fail" ]; then exit 1; fi
+exit 0
+EOF
+
+  cat > "$sandbox/bin/node" <<EOF
+#!/usr/bin/env bash
+echo "node \$*" >> "$logf"
+exit 0
+EOF
+
+  chmod +x "$sandbox/bin"/*
+
+  export PATH="$sandbox/bin:$PATH"
+
+  if "$@" "$sandbox" "$logf"; then
+    PASS=$((PASS+1))
+    echo "  ✓ $name"
+  else
+    FAIL=$((FAIL+1))
+    echo "  ✗ $name"
+    echo "    --- call log ---"
+    sed 's/^/    /' "$logf" || true
+    echo "    ----------------"
+  fi
+
+  if [ -n "${KEEP_SANDBOX:-}" ]; then echo "    [keep] $sandbox"; else rm -rf "$sandbox"; fi
+}
+
 # ---- Test 1: no proxy running, default flags ----------------------------
 test_no_running() {
   local sandbox="$1" logf="$2"
@@ -132,15 +238,18 @@ test_no_running() {
   return 0
 }
 
-# NOTE: tests for SIGTERM / SIGKILL signaling are intentionally NOT included
-# here. `kill` is a bash builtin (with the same name as the external binary),
-# so the shell uses its builtin and never invokes our PATH shim. We'd need to
-# either (a) wrap restart.sh's kill calls behind a shimmable function, or
-# (b) run the test in a different shell, both of which are heavier than the
-# value they buy. The remaining tests still cover the higher-risk paths:
-# flag parsing, build-vs-no-build, port-already-in-use, and arg passthrough
-# — these are where regressions are most likely. Signal escalation is small
-# enough (~15 lines of shell) to eyeball-review.
+# NOTE: tests for SIGTERM / SIGKILL signaling on the POSIX path are
+# intentionally NOT included here. `kill` is a bash builtin (with the same
+# name as the external binary), so the shell uses its builtin and never
+# invokes our PATH shim. We'd need to either (a) wrap restart.sh's kill
+# calls behind a shimmable function, or (b) run the test in a different
+# shell, both of which are heavier than the value they buy. The remaining
+# POSIX tests still cover the higher-risk paths: flag parsing,
+# build-vs-no-build, port-already-in-use, and arg passthrough — these are
+# where regressions are most likely. Signal escalation is small enough
+# (~15 lines of shell) to eyeball-review. The equivalent Windows path
+# (taskkill graceful → forced escalation, see run_test_windows below) IS
+# fully covered, since taskkill isn't a shell builtin.
 
 # ---- Test 5: build fails → no fresh proxy ------------------------------
 test_build_failure() {
@@ -179,10 +288,61 @@ test_rejects_unknown_args() {
   return 0
 }
 
+# ---- Test 8: Windows — no proxy running, discovered via PowerShell -----
+test_windows_no_running() {
+  local sandbox="$1" logf="$2"
+  # No $sandbox/win_pids file → powershell.exe prints nothing.
+  ( cd "$REPO" && "$SCRIPT" --no-build >/dev/null 2>&1 || true )
+  grep -q "powershell.exe" "$logf" || return 1
+  grep -q "node bin/cli.js" "$logf" || return 1
+  grep -q "taskkill" "$logf" && return 1  # nothing to kill
+  return 0
+}
+
+# ---- Test 9: Windows — graceful taskkill stops the proxy ---------------
+test_windows_graceful_stop() {
+  local sandbox="$1" logf="$2"
+  echo "4242" > "$sandbox/win_pids"
+  ( cd "$REPO" && "$SCRIPT" --no-build >/dev/null 2>&1 )
+  grep -q "taskkill //PID 4242" "$logf" || return 1
+  grep -q "taskkill //F //PID 4242" "$logf" && return 1  # no escalation needed
+  grep -q "node bin/cli.js" "$logf" || return 1
+  return 0
+}
+
+# ---- Test 10: Windows — stubborn PID escalates to forced taskkill ------
+test_windows_escalation() {
+  local sandbox="$1" logf="$2"
+  echo "4242" > "$sandbox/win_pids"
+  touch "$sandbox/stubborn_term"
+  ( cd "$REPO" && "$SCRIPT" --no-build >/dev/null 2>&1 )
+  grep -q "taskkill //PID 4242" "$logf" || return 1
+  grep -q "taskkill //F //PID 4242" "$logf" || return 1
+  grep -q "node bin/cli.js" "$logf" || return 1
+  return 0
+}
+
+# ---- Test 11: Windows — port in use, detected via netstat ---------------
+test_windows_port_in_use() {
+  local sandbox="$1" logf="$2"
+  echo "47821" > "$sandbox/netstat_port"
+  echo "99999" > "$sandbox/netstat_pid"
+  if ( cd "$REPO" && "$SCRIPT" --no-build >/dev/null 2>&1 ); then
+    return 1
+  fi
+  grep -q "netstat" "$logf" || return 1
+  grep -q "node bin/cli.js" "$logf" && return 1
+  return 0
+}
+
 run_test "no proxy running"        test_no_running
 run_test "build failure aborts"    test_build_failure
 run_test "port-in-use aborts"      test_port_in_use
 run_test "rejects unknown args"    test_rejects_unknown_args
+run_test_windows "windows: no proxy running"       test_windows_no_running
+run_test_windows "windows: graceful stop"          test_windows_graceful_stop
+run_test_windows "windows: stubborn PID escalates" test_windows_escalation
+run_test_windows "windows: port-in-use aborts"     test_windows_port_in_use
 
 echo ""
 echo "$PASS passed, $FAIL failed"

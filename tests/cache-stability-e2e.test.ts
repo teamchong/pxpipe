@@ -390,35 +390,37 @@ describe('e2e cache alignment — Anthropic /v1/messages through the real proxy'
     expect(a.length).toBeGreaterThan(0);
     expect(b).toEqual(a);
 
-    // Not dropped: the volatile section re-enters as trailing TEXT on the LAST
-    // user message (per-turn live tail), so the model still sees the current
-    // git state. It must NOT ride in system: system bytes sit BEFORE the slab
-    // anchor in Anthropic's prefix order (tools → system → messages), so any
-    // env change there cold-restarts the entire anchored prefix (48.8% of
-    // telemetry-era cold-create waste).
+    // Not dropped: the volatile section re-enters as trailing TEXT on the
+    // FIRST user message (position-stable slot: the last-user slot roams
+    // forward each turn and cache-busted everything past the anchor — see
+    // transform.ts step 5c), so the model still sees the current git state.
+    // It must NOT ride in system: system bytes sit BEFORE the slab anchor in
+    // Anthropic's prefix order (tools → system → messages), so any env change
+    // there cold-restarts the entire anchored prefix (48.8% of telemetry-era
+    // cold-create waste).
     const sysText = (bodyText: string): string => {
       const sys = JSON.parse(bodyText).system;
       return Array.isArray(sys) ? sys.map((s: any) => s?.text ?? '').join('\n') : String(sys ?? '');
     };
-    const lastUserText = (bodyText: string): string => {
+    const firstUserText = (bodyText: string): string => {
       const msgs = JSON.parse(bodyText).messages as Array<{ role: string; content: unknown }>;
-      const m = [...msgs].reverse().find((x) => x.role === 'user')!;
+      const m = msgs.find((x) => x.role === 'user')!;
       return Array.isArray(m.content)
         ? m.content.map((c: any) => (c?.type === 'text' ? c.text : '')).join('\n')
         : String(m.content ?? '');
     };
-    expect(lastUserText(cap2.main[0]!.body)).toContain('modified: src/pricing.ts');
-    expect(lastUserText(cap1.main[0]!.body)).toContain('Git status:\nclean');
+    expect(firstUserText(cap2.main[0]!.body)).toContain('modified: src/pricing.ts');
+    expect(firstUserText(cap1.main[0]!.body)).toContain('Git status:\nclean');
     // And the section left both the imaged region AND system entirely — nothing
     // upstream of the anchor may depend on git state. (Byte-equality above is
     // the load-bearing check; this pins the mechanism.)
-    expect(lastUserText(cap2.main[0]!.body)).toContain('# Environment');
+    expect(firstUserText(cap2.main[0]!.body)).toContain('# Environment');
     expect(sysText(cap2.main[0]!.body)).not.toContain('modified: src/pricing.ts');
     expect(sysText(cap2.main[0]!.body)).not.toContain('# Environment');
     // Regression (2026-07): the relocated block must be delimited as injected
     // context, never blended into user prose — undelimited, it can BECOME the
     // entire visible message on an empty/short user turn (observed live).
-    expect(lastUserText(cap2.main[0]!.body)).toMatch(
+    expect(firstUserText(cap2.main[0]!.body)).toMatch(
       /<system-reminder>[\s\S]*relocated by pxpipe[\s\S]*# Environment[\s\S]*<\/system-reminder>/,
     );
   });
@@ -448,10 +450,10 @@ describe('e2e cache alignment — Anthropic /v1/messages through the real proxy'
       ? sys.map((s: any) => s?.text ?? '').join('\n')
       : String(sys ?? '');
     const msgs = JSON.parse(bodyText).messages as Array<{ role: string; content: unknown }>;
-    const lastUser = [...msgs].reverse().find((x) => x.role === 'user')!;
-    const lastUserStr = Array.isArray(lastUser.content)
-      ? lastUser.content.map((c: any) => (c?.type === 'text' ? c.text : '')).join('\n')
-      : String(lastUser.content ?? '');
+    const firstUser = msgs.find((x) => x.role === 'user')!;
+    const firstUserStr = Array.isArray(firstUser.content)
+      ? firstUser.content.map((c: any) => (c?.type === 'text' ? c.text : '')).join('\n')
+      : String(firstUser.content ?? '');
 
     // Identity/catalog lines: gone from the relocated block — and not moved
     // back into system either (they'd cache-bust the anchored prefix there).
@@ -461,13 +463,14 @@ describe('e2e cache alignment — Anthropic /v1/messages through the real proxy'
       'most recent Claude models',
       'default to the latest and most capable',
     ]) {
-      expect(lastUserStr).not.toContain(needle);
+      expect(firstUserStr).not.toContain(needle);
       expect(sysStr).not.toContain(needle);
     }
-    // Non-identity env lines still reach the model on the live tail.
-    expect(lastUserStr).toContain('# Environment');
-    expect(lastUserStr).toContain('Working directory: /repo');
-    expect(lastUserStr).toContain('Git status:\nclean');
+    // Non-identity env lines still reach the model on the position-stable
+    // slot (first user message — see transform.ts step 5c).
+    expect(firstUserStr).toContain('# Environment');
+    expect(firstUserStr).toContain('Working directory: /repo');
+    expect(firstUserStr).toContain('Git status:\nclean');
   });
 
   it('FIRST COLLAPSE (turn-2 rewrite): no frozen chunk yet → anchor stays on the SLAB image', async () => {

@@ -1104,7 +1104,7 @@ describe('resolveGptProfile (Claude on Responses)', () => {
     expect(resolveGptProfile('claude-fable-5').style.font).toBe('spleen-5x8');
     expect(resolveGptProfile('claude-fable-5').maxSerializedRequestBytes).toBe(768 * 1024);
     expect(resolveGptProfile('claude-opus-4-8').maxSerializedRequestBytes).toBe(768 * 1024);
-    expect(resolveGptProfile('gpt-5.6-sol').maxSerializedRequestBytes).toBe(1024 * 1024);
+    expect(resolveGptProfile('gpt-5.6-sol').maxSerializedRequestBytes).toBeUndefined();
   });
 
   it('isolates Opus profile overrides from Fable profile', () => {

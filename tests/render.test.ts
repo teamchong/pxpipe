@@ -43,17 +43,21 @@ import {
 } from './fixtures/real-shapes.js';
 
 describe('model-selectable font atlases', () => {
-  it('uses the JetBrains Mono 10 cell geometry without changing the default atlas', async () => {
+  it('uses native JetBrains Mono cell geometry without changing the default atlas', async () => {
     expect(renderCellWidth({ aa: true })).toBe(5);
     expect(renderCellHeight({ aa: true })).toBe(8);
     expect(renderCellWidth({ font: 'jetbrains-mono-10', aa: true })).toBe(6);
     expect(renderCellHeight({ font: 'jetbrains-mono-10', aa: true })).toBe(11);
+    expect(renderCellWidth({ font: 'jetbrains-mono-12', aa: true })).toBe(8);
+    expect(renderCellHeight({ font: 'jetbrains-mono-12', aa: true })).toBe(13);
+    expect(renderCellWidth({ font: 'jetbrains-mono-14', aa: true })).toBe(9);
+    expect(renderCellHeight({ font: 'jetbrains-mono-14', aa: true })).toBe(16);
 
     const text = 'tokenLedgerShard a3f9c1e0b7d2';
     const defaultImg = await renderChunkToPng(text, 40, { aa: true });
-    const solImg = await renderChunkToPng(text, 40, { font: 'jetbrains-mono-10', aa: true });
+    const solImg = await renderChunkToPng(text, 40, { font: 'jetbrains-mono-12', aa: true });
     expect(defaultImg.width).toBe(208);
-    expect(solImg.width).toBe(248);
+    expect(solImg.width).toBe(328);
     expect(solImg.height).toBeGreaterThan(defaultImg.height);
     expect(Buffer.from(solImg.png)).not.toEqual(Buffer.from(defaultImg.png));
   });
@@ -64,6 +68,12 @@ describe('model-selectable font atlases', () => {
       aa: true,
     });
     expect(img.droppedChars).toBe(0);
+
+    const largerImg = await renderChunkToPng('한글 test', 20, {
+      font: 'jetbrains-mono-12',
+      aa: true,
+    });
+    expect(largerImg.droppedChars).toBe(0);
   });
 
 });

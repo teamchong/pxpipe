@@ -36,10 +36,17 @@ the model level, not just in atlas Hamming distance.
 
 ## Update (2026-07-17) — Sol 5×8 evaluated, remains opt-in
 
-The exact `gpt-5.6-sol` profile now uses Spleen 5×8 at 152 columns. It remains
-an explicit opt-in. Fresh novel arithmetic scored 96/100 pure-image and 98/100
+The 2026-07-17 `gpt-5.6-sol` evaluation used Spleen 5×8 at 152 columns. A
+2026-07-23 raw-image pilot of native 14px JetBrains Mono scored 3/4 exact on
+alpha and 4/4 on beta, with no unsupported inventions; both gist and guard
+checks passed. One identifier was truncated, so Sol remains an explicit opt-in.
+Fresh novel arithmetic scored 96/100 pure-image and 98/100
 with the production factsheet. Matched input usage was 5,300 text tokens versus
 7,000 production-image tokens, 32% more on this short workload.
+
+A same-day genuine 13px follow-up rasterized to 8×14 and regressed to 1/4 exact
+on each fixture, with three confabulations per fixture and a beta gist miss. It
+was rejected. The opt-in profile uses 14px 9×16.
 
 On the portable gist corpus, Sol scored 83/98 answerable probes, 17/18 state
 probes, and 4/16 never-stated confabulations. All sessions completed without

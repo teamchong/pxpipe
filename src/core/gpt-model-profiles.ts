@@ -17,11 +17,8 @@
 
 /**
  * GPT strip height, DECOUPLED from render.ts's MAX_HEIGHT_PX (which is Anthropic's
- * 1568-edge / ~1.15 MP clamp). OpenAI's pre-tokenize resize is different: fit within
- * 2048×2048, then shortest side → 768. A 768-px-wide portrait strip up to 2048 px tall
- * survives un-resampled, so GPT keeps the taller page. Every built-in cost number below
- * (1190 / 1445 / 2372 / 1464 / 630 …) was calibrated at this height — do not re-link to
- * the Anthropic constant.
+ * 1568-edge / ~1.15 MP clamp). Named profiles may override this where their image
+ * sizing and font geometry differ.
  */
 import {
   MAX_HEIGHT_PX as ANTHROPIC_MAX_HEIGHT_PX,
@@ -33,10 +30,10 @@ import { isGeminiModel, resolveGeminiProfile } from './gemini-model-profiles.js'
 
 export const GPT_MAX_HEIGHT_PX = 1932;
 
-/** Image-token cost model (mirrors OpenAI's mandatory pre-tokenize resize). */
+/** Image-token cost model. An omitted patchCap means original dimensions are billed. */
 export type GptVisionCost =
   | { regime: 'tile'; base: number; perTile: number }
-  | { regime: 'patch'; multiplier: number; patchCap: number };
+  | { regime: 'patch'; multiplier: number; patchCap?: number };
 
 export interface GptRenderStyle {
   /** Rasterized font atlas. */
@@ -96,6 +93,9 @@ export interface GptModelProfile {
   history: GptHistoryProfile;
   /** Complete model-specific font, cell spacing, color, and marker style. */
   style: GptRenderStyle;
+  /** Maximum serialized provider request produced by pxpipe. Undefined leaves
+   *  legacy behavior unchanged. Enforced after the final wire transform. */
+  maxSerializedRequestBytes?: number;
 }
 
 /** Default downscale-safe strip width (768px). Exported as the global cols default. */
@@ -147,24 +147,31 @@ export const CLAUDE_FABLE_PROFILE: GptModelProfile = {
   factSheetFormat: 'full',
   history: BASE_HISTORY,
   style: { ...BASE_STYLE },
+  maxSerializedRequestBytes: 768 * 1024,
 };
 
 export const CLAUDE_OPUS_PROFILE: GptModelProfile = {
   // Vision struct unused: visionTokensForModel prices Claude by pixels.
   vision: { regime: 'tile', base: 85, perTile: 170 },
-  stripCols: ANTHROPIC_STRIP_COLS,
+  // 86 × 9px + padding = 782px. Native 14px was the smallest blind-read
+  // candidate with zero exact-string errors across the Opus density sweep.
+  stripCols: 86,
   maxHeightPx: ANTHROPIC_MAX_HEIGHT_PX,
   factSheetFormat: 'full',
   history: BASE_HISTORY,
-  style: { ...BASE_STYLE },
+  style: { ...BASE_STYLE, font: 'jetbrains-mono-14' },
+  maxSerializedRequestBytes: 768 * 1024,
 };
 
 const GPT56_SOL_PROFILE: GptModelProfile = {
-  vision: { regime: 'patch', multiplier: 1, patchCap: 10000 },
-  // Validated production recipe. Rejected RGB-overprint research lives under
-  // eval/sol-profile and is not shipped in the runtime renderer.
-  stripCols: C,
-  maxHeightPx: H,
+  // GPT-5.6 original detail bills the submitted 32px patches without a patch cap.
+  vision: { regime: 'patch', multiplier: 1 },
+  // Match the native 14px reader profile. Sol remains opt-in: its two-fixture
+  // pilot retained gist/guard and had no unsupported inventions, but one exact
+  // identifier was truncated.
+  stripCols: 84,
+  // 1954px permits 149 rows at an actual 1945px, filling 61 patch rows.
+  maxHeightPx: 1954,
   minCompressTokens: 500,
   factSheetFormat: 'full',
   history: {
@@ -180,7 +187,12 @@ const GPT56_SOL_PROFILE: GptModelProfile = {
     framing: 'compact',
     factSheetScope: 'combined',
   },
-  style: { ...BASE_STYLE, font: 'spleen-5x8' },
+  style: {
+    ...BASE_STYLE,
+    font: 'jetbrains-mono-14',
+    cellWBonus: 0,
+    cellHBonus: 0,
+  },
 };
 
 interface ProfileRule {
@@ -252,25 +264,29 @@ const BUILTIN_RULES: ProfileRule[] = [
     profile: CLAUDE_FABLE_PROFILE,
   },
 
-  // Grok remains opt-in. It shares the 5×8 production stack but uses shorter
-  // pages because its dense-image recall falls with taller strips.
+  // Grok remains opt-in. Native 14px / 84 cols / maxH 512 is the densest best
+  // rung from the JB Mono 8–16px blind sweep (eval/grok-density/native-sweep).
   {
     test: (m) => /^grok-/.test(m),
     profile: {
       // Vision struct unused: visionTokensForModel prices Grok by pixels.
       vision: { regime: 'tile', base: 85, perTile: 170 },
-      // 152 cols × 5px + pad = 768px short-side floor.
-      stripCols: C,
+      // Native 14px was the densest best rung on the Grok JB Mono 8–16px blind
+      // sweep (4/8 exact, 4 confab, 48% savings). 84 × 9px + pad = 764px ≤ 768.
+      // No rung was fully clean; 14px tied 15/16px on exact and beat smaller cells.
+      stripCols: 84,
       maxHeightPx: 512,
       minCompressTokens: 500,
       factSheetFormat: 'full',
       history: { ...BASE_HISTORY, maxImages: 24 },
       style: {
         ...BASE_STYLE,
+        font: 'jetbrains-mono-14',
         aa: true,
         grid: false,
         gridCols: 0,
       },
+      maxSerializedRequestBytes: 128 * 1024,
     },
   },
 ];
@@ -291,7 +307,10 @@ function isValidVision(v: unknown): v is GptVisionCost {
   if (!v || typeof v !== 'object') return false;
   const o = v as Record<string, unknown>;
   if (o.regime === 'tile') return Number.isFinite(o.base) && Number.isFinite(o.perTile);
-  if (o.regime === 'patch') return Number.isFinite(o.multiplier) && Number.isFinite(o.patchCap);
+  if (o.regime === 'patch') {
+    return Number.isFinite(o.multiplier) &&
+      (o.patchCap === undefined || (Number.isFinite(o.patchCap) && (o.patchCap as number) > 0));
+  }
   return false;
 }
 
@@ -304,7 +323,9 @@ function nonNegativeInt(v: unknown, fallback: number): number {
 }
 
 function renderFont(v: unknown, fallback: RenderFont): RenderFont {
-  return v === 'spleen-5x8' || v === 'jetbrains-mono-10' ? v : fallback;
+  return v === 'spleen-5x8' || v === 'jetbrains-mono-10' || v === 'jetbrains-mono-12' || v === 'jetbrains-mono-14'
+    ? v
+    : fallback;
 }
 
 function factSheetFormat(v: unknown, fallback: GptModelProfile['factSheetFormat']): GptModelProfile['factSheetFormat'] {
@@ -380,6 +401,9 @@ function parseEnvProfiles(raw: string): Map<string, GptModelProfile> {
       factSheetFormat: factSheetFormat(p.factSheetFormat, base.factSheetFormat),
       history,
       style,
+      maxSerializedRequestBytes: p.maxSerializedRequestBytes === undefined
+        ? base.maxSerializedRequestBytes
+        : posInt(p.maxSerializedRequestBytes, base.maxSerializedRequestBytes ?? 0) || undefined,
     });
   }
   return out;

@@ -31,7 +31,7 @@ let runtimeModelBases: readonly string[] | null = null;
  *  - GPT 5.5 — degrades on imaged history/context.
  *  - GPT 5.6 Sol — 98/100 production arithmetic, but 79/93 completed gist,
  *    4/15 completed guard confabulations, and 0/15 dense hex.
- *  - Grok 4.5 — 82/100 arithmetic, 83/98 gist, and 13/18 state tracking.
+ *  - Grok 4.5 — native 14px: 100/100 arithmetic, 97/98 gist, 17/18 state; hex 0/15.
  *  Both profiles remain available for explicit opt-in.
  *  Silently imaging weak or unvalidated readers is the wrong default. */
 const DEFAULT_MODEL_BASES = ['claude-fable-5', 'gemini-3.6-flash'];

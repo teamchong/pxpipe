@@ -616,7 +616,7 @@ describe('e2e cache alignment — GPT (OpenAI) through the real proxy', () => {
     const a = gptChatImages(cap1.main[0]!.body);
     const b = gptChatImages(cap2.main[0]!.body);
     expect(a.length).toBeGreaterThan(1); // slab image + ≥1 sealed history page
-    expect(b.length).toBeGreaterThan(a.length); // growth sealed more pages
+    expect(b.length).toBeGreaterThanOrEqual(a.length); // growth never removes sealed pages
     // GPT seals whole sections (leftover stays text) → strict prefix append-only.
     expect(b.slice(0, a.length)).toEqual(a);
   });

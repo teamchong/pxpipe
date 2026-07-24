@@ -170,8 +170,9 @@ describe('transformOpenAIChatCompletions (gpt-5.6-sol)', () => {
     expect(parts[0]!.type).toBe('image_url');
     expect(parts[0]!.image_url!.url).toMatch(/^data:image\/png;base64,/);
 
-    // Sol uses the native 5×8 Spleen profile at the 768px short-side edge.
-    expect(result.info.firstImageWidth).toBe(768);
+    // Sol uses native JetBrains Mono 14 in a 9x16 cell at 84 columns.
+    expect(result.info.firstImageWidth).toBe(764);
+    expect(result.info.gateEval?.imageTokens).toBe(result.info.imageTokens);
 
     // System message replaced with pointer.
     const sysMsg = messages.find((m) => m.role === 'system')!;
@@ -987,26 +988,26 @@ describe('GPT history collapse — pins the live request as text (autonomous sha
 });
 
 // ── Vision cost: gpt-5.x FLAGSHIP patch model (multiplier 1.0, original detail) ──
-// Per OpenAI docs (patch tokenization): flagship gpt-5.4/5.5/5.6 have NO listed
-// multiplier (= 1.0); the 1.62/2.46 values are mini/nano ONLY. And `detail:original`
-// (gpt-5.5's default) gives a 10,000-patch / 6000px budget vs `high`'s 2,500 / 2048px.
-// pxpipe renders dense text, so it must use the LARGER budget or OpenAI downscales
-// the image and the text becomes unreadable.
+// Per OpenAI docs (patch tokenization), GPT-5.6 `detail:original` bills the original
+// 32px patch count without resizing or a patch cap. Older flagship and mini/nano
+// profiles retain their documented caps.
 describe('openAIVisionTokens — gpt-5.x flagship patch model', () => {
   it('flagship multiplier is 1.0, not the mini 1.62', () => {
     // 768x1932 → patches = ceil(768/32)*ceil(1932/32) = 24*61 = 1464; ×1.0 = 1464.
     expect(openAIVisionTokens('gpt-5.6-sol', 768, 1932)).toBe(1464);
     expect(openAIVisionTokens('gpt-5.5', 768, 1932)).toBe(1464);
+    // Sol's native 12px profile: ceil(680/32) * ceil(1945/32) = 22 * 61.
+    expect(openAIVisionTokens('gpt-5.6-sol', 680, 1945)).toBe(1342);
   });
 
-  it('flagship patch budget is 10,000 (original detail), not 2,500', () => {
-    // 4000x4000 → patches = 125*125 = 15625, capped at the budget.
-    // Pre-fix (cap 2500, ×1.62) this returned 4050; correct is min(15625,10000)=10000.
-    expect(openAIVisionTokens('gpt-5.6-sol', 4000, 4000)).toBe(10000);
+  it('GPT-5.6 original detail does not cap or resize the submitted patch count', () => {
+    // 4000x4000 → 125*125 = 15625 original patches.
+    expect(openAIVisionTokens('gpt-5.6-sol', 4000, 4000)).toBe(15625);
+    expect(openAIVisionTokens('gpt-5.5', 4000, 4000)).toBe(10000);
   });
 
-  it('resolveVisionCost flagship = patch, multiplier 1, cap 10000; mini stays 1.62/1536', () => {
-    expect(resolveVisionCost('gpt-5.6-sol')).toMatchObject({ regime: 'patch', multiplier: 1, patchCap: 10000 });
+  it('resolves uncapped GPT-5.6 separately from capped older and mini profiles', () => {
+    expect(resolveVisionCost('gpt-5.6-sol')).toEqual({ regime: 'patch', multiplier: 1 });
     expect(resolveVisionCost('gpt-5.5')).toMatchObject({ regime: 'patch', multiplier: 1, patchCap: 10000 });
     expect(resolveVisionCost('gpt-5.6-mini')).toMatchObject({ regime: 'patch', multiplier: 1.62, patchCap: 1536 });
     expect(resolveVisionCost('gpt-5.6-nano')).toMatchObject({ regime: 'patch', multiplier: 2.46, patchCap: 1536 });
@@ -1054,14 +1055,15 @@ describe('image parts request detail = "original" (avoid downscale of dense text
 
 describe('resolveGptProfile (Claude on Responses)', () => {
   it('uses Anthropic geometry by model id, not the GPT Responses defaults', () => {
-    // Several families share /v1/responses. Claude must not inherit GPT's
-    // 152-col / 1932 px profile: Anthropic dense pages are 312 cols × 728 px.
+    // Several families share /v1/responses. Claude profiles must retain
+    // Anthropic's 728px no-resize height while selecting model-specific fonts.
     // Wrong geometry overstates image tokens and leaves As text / Saved blank.
     const p = resolveGptProfile('claude-opus-4-8');
     expect(p.maxHeightPx).toBe(728);
-    expect(p.stripCols).toBe(312);
+    expect(p.stripCols).toBe(86);
+    expect(p.style.font).toBe('jetbrains-mono-14');
     expect(resolveGptProfile('claude-3-5-opus').maxHeightPx).toBe(728);
-    expect(resolveGptProfile('claude-3-5-opus').stripCols).toBe(312);
+    expect(resolveGptProfile('claude-3-5-opus').stripCols).toBe(86);
     expect(resolveGptProfile('claude-fable-5').maxHeightPx).toBe(728);
     expect(resolveGptProfile('claude-fable-5').stripCols).toBe(312);
     expect(resolveGptProfile('claude-fable-5').minCompressTokens).toBeUndefined();
@@ -1073,10 +1075,12 @@ describe('resolveGptProfile (Claude on Responses)', () => {
       'gpt-5.6-sol-2026-07-09',
     ]) {
       const sol = resolveGptProfile(model);
-      expect(sol.maxHeightPx, model).toBe(1932);
-      expect(sol.stripCols, model).toBe(152);
+      expect(sol.maxHeightPx, model).toBe(1954);
+      expect(sol.stripCols, model).toBe(84);
       expect(sol.minCompressTokens, model).toBe(500);
-      expect(sol.style.font, model).toBe('spleen-5x8');
+      expect(sol.style.font, model).toBe('jetbrains-mono-14');
+      expect(sol.style.cellWBonus, model).toBe(0);
+      expect(sol.style.cellHBonus, model).toBe(0);
       expect(sol.style.aa, model).toBe(true);
       expect(sol.history, model).toMatchObject({
         responsesMode: 'mixed',
@@ -1098,6 +1102,9 @@ describe('resolveGptProfile (Claude on Responses)', () => {
       expect(notSol.factSheetFormat, model).toBe('full');
     }
     expect(resolveGptProfile('claude-fable-5').style.font).toBe('spleen-5x8');
+    expect(resolveGptProfile('claude-fable-5').maxSerializedRequestBytes).toBe(768 * 1024);
+    expect(resolveGptProfile('claude-opus-4-8').maxSerializedRequestBytes).toBe(768 * 1024);
+    expect(resolveGptProfile('gpt-5.6-sol').maxSerializedRequestBytes).toBeUndefined();
   });
 
   it('isolates Opus profile overrides from Fable profile', () => {
@@ -1128,24 +1135,25 @@ describe('resolveGptProfile (Claude on Responses)', () => {
 });
 
 describe('resolveGptProfile (Grok)', () => {
-  it('uses pure-image 5x8 packing with shorter white pages under 768px short side', () => {
-    // Production uses the pure-image 5x8 white AA profile.
-    // (7/7 retest). No grid; paperGray 240 confabulates ports. Width stays 768.
+  it('uses native 14px packing with shorter pages under 768px short side', () => {
+    // Native 14px was the densest best rung on the Grok JB Mono blind sweep.
+    // 84 × 9px + pad = 764px ≤ 768. No grid. maxH 512 keeps pages short.
     const p = resolveGptProfile('grok-4.5');
-    expect(p.stripCols).toBe(152);
+    expect(p.stripCols).toBe(84);
     expect(p.maxHeightPx).toBe(512);
     expect(p.minCompressTokens).toBe(500);
-    expect(p.style.font).toBe('spleen-5x8');
+    expect(p.maxSerializedRequestBytes).toBe(128 * 1024);
+    expect(p.style.font).toBe('jetbrains-mono-14');
     expect(p.style.cellWBonus).toBe(0);
     expect(p.style.cellHBonus).toBe(0);
     expect(p.style.aa).toBe(true);
     expect(p.style.grid).toBe(false);
     expect(p.style.gridCols).toBe(0);
     expect(p.style.colorCycle).toBe(false);
-    expect(resolveGptProfile('grok-4').stripCols).toBe(152);
+    expect(resolveGptProfile('grok-4').stripCols).toBe(84);
   });
 
-  it('renders the opt-in profile at 768px wide (no short-side resize)', async () => {
+  it('renders the opt-in profile at 764px wide (no short-side resize)', async () => {
     const body = enc.encode(JSON.stringify({
       model: 'grok-4.5',
       instructions: BIG_INSTRUCTIONS,
@@ -1153,8 +1161,8 @@ describe('resolveGptProfile (Grok)', () => {
     }));
     const result = await transformOpenAIResponses(body, { charsPerToken: 1, minCompressChars: 1 });
     expect(result.info.compressed).toBe(true);
-    // 152 cols × 5px + padding = 768px short-side floor.
-    expect(result.info.firstImageWidth).toBe(768);
+    // 84 cols × 9px + padding = 764px short-side floor.
+    expect(result.info.firstImageWidth).toBe(764);
     expect(result.info.firstImageHeight ?? 0).toBeLessThanOrEqual(512);
   });
 });
@@ -1225,12 +1233,15 @@ describe('resolveGptProfile style overrides', () => {
 describe('Grok no-resize geometry', () => {
   it('keeps rendered short side at or below 768px for slab and history packing', async () => {
     const profile = resolveGptProfile('grok-4.5');
-    const cellW = 5 + (profile.style.cellWBonus ?? 0);
+    // jetbrains-mono-14 native cell is 9×16; bonuses stay 0.
+    const cellW = 9 + (profile.style.cellWBonus ?? 0);
     const stripW = 8 + profile.stripCols * cellW; // 2*PAD_X=8
     expect(stripW).toBeLessThanOrEqual(768);
-    expect(profile.stripCols).toBe(152);
-    expect(cellW).toBe(5);
+    expect(profile.stripCols).toBe(84);
+    expect(profile.style.font).toBe('jetbrains-mono-14');
+    expect(cellW).toBe(9);
     expect(profile.maxHeightPx).toBe(512);
+    expect(stripW).toBe(764);
 
     // End-to-end: rendered PNG width matches the no-resize strip.
     const body = enc.encode(JSON.stringify({
@@ -1240,7 +1251,7 @@ describe('Grok no-resize geometry', () => {
     }));
     const result = await transformOpenAIResponses(body, { charsPerToken: 1, minCompressChars: 1 });
     expect(result.info.firstImageWidth ?? 0).toBeLessThanOrEqual(768);
-    expect(result.info.firstImageWidth).toBe(768);
+    expect(result.info.firstImageWidth).toBe(764);
     expect(result.info.firstImageHeight ?? 0).toBeLessThanOrEqual(512);
   });
 });
@@ -1287,14 +1298,19 @@ describe('Grok history compression under default gate', () => {
       { role: 'user', content: `remember ${earlyHex} and path src/core/anthropic-vision.ts port 47821` },
     ];
     // Long enough that a single-pass factsheet scan would miss the head.
+    // Filler must stay high-entropy: o200k compresses long runs of "x" so hard
+    // that the 14px image bill (fewer chars/page than old 5×8) looks unprofitable.
     for (let i = 0; i < 80; i++) {
       const id = `call_${i}`;
-      items.push({ role: 'assistant', content: `Working on step ${i}. `.repeat(30) });
+      items.push({
+        role: 'assistant',
+        content: `Working on step ${i} for module src/pkg/mod${i}/handler.ts with checksum ${i.toString(16).padStart(8, '0')}ab. `.repeat(40),
+      });
       items.push({ type: 'function_call', call_id: id, name: 'read', arguments: `{"path":"src/f${i}.ts"}` });
       items.push({
         type: 'function_call_output',
         call_id: id,
-        output: (`result ${i} blob=` + 'x'.repeat(400) + ' ').repeat(8),
+        output: (`result ${i} path=/tmp/out${i}.json status=ok note=step-${i}-detail `).repeat(80),
       });
     }
     const body = enc.encode(JSON.stringify({

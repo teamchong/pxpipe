@@ -12,7 +12,7 @@
  */
 
 import type { CacheControl, ContentBlock, ImageBlock, Message, TextBlock, ToolUseBlock, ToolResultBlock } from './types.js';
-import { DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_CONTENT_COLS, DENSE_RENDER_STYLE, neutralizeSentinel, reflow, renderTextToPngsWithCharLimit, roleSlotSegment, SLOT_MARK_ASSISTANT, SLOT_MARK_USER } from './render.js';
+import { DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_RENDER_STYLE, MAX_HEIGHT_PX, neutralizeSentinel, reflow, renderTextToPngsWithCharLimit, roleSlotSegment, SLOT_MARK_ASSISTANT, SLOT_MARK_USER, type RenderStyle } from './render.js';
 import { factSheetText } from './factsheet.js';
 import { bytesToBase64 } from './png.js';
 
@@ -71,6 +71,10 @@ export interface HistoryCollapseOptions {
    *  identical — it just removes the blank-row waste. `collapsedChars` still
    *  reports the ORIGINAL transcript length. Default true. */
   reflow: boolean;
+  /** Model-profile render style. */
+  style: RenderStyle;
+  /** Model-profile page-height cap. */
+  maxHeightPx: number;
 }
 
 export const HISTORY_DEFAULTS: HistoryCollapseOptions = {
@@ -81,6 +85,8 @@ export const HISTORY_DEFAULTS: HistoryCollapseOptions = {
   freezeChunk: 10,
   protectedPrefix: 0,
   reflow: true,
+  style: DENSE_RENDER_STYLE,
+  maxHeightPx: MAX_HEIGHT_PX,
 };
 
 /** Per-request telemetry surfaced back to TransformInfo. */
@@ -637,10 +643,10 @@ export async function collapseHistory(
     // byte depth) and carries the serialize-time slot string instead of re-parsing.
     const imgs = await renderTextToPngsWithCharLimit(
       chunkRender,
-      DENSE_CONTENT_COLS,
+      o.cols,
       DENSE_CONTENT_CHARS_PER_IMAGE,
-      { ...DENSE_RENDER_STYLE, colorByRole: true },
-      undefined,
+      { ...o.style, colorByRole: true },
+      o.maxHeightPx,
       chunkSlot,
     );
     const markerCC = markerByEnd.get(chunkEnd);

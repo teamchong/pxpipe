@@ -32,6 +32,9 @@ import {
   DENSE_RENDER_STYLE,
   ANTHROPIC_SLAB_COLS,
   renderTextToPngsWithCharLimit,
+  renderCellHeight,
+  renderCellWidth,
+  type RenderStyle,
 } from './render.js';
 import { factSheetText } from './factsheet.js';
 import { stripSchemaDescriptions, schemaHasStructure } from './schema-strip.js';
@@ -40,6 +43,7 @@ import { collapseHistory, HISTORY_SYNTHETIC_INTRO } from './history.js';
 import type { GptHistoryOptions } from './openai-history.js';
 import { CACHE_CREATE_RATE, CACHE_READ_RATE } from './baseline.js';
 import { patchTokens } from './anthropic-vision.js';
+import { resolveGptProfile } from './gpt-model-profiles.js';
 
 /** Per-block descriptor passed to `TransformOptions.keepSharp`. */
 export interface KeepSharpBlock {
@@ -65,6 +69,8 @@ export interface RecoverableBlock {
 }
 
 export interface TransformOptions {
+  /** Resolved model id. Its profile supplies font, columns, height, and history defaults. */
+  model?: string;
   /** Master switch — false makes this a no-op pass-through. */
   compress?: boolean;
   /** Move tool descriptions into the same image (and stub the originals). */
@@ -143,6 +149,7 @@ const DEFAULTS: Required<TransformOptions> = {
   // GPT-only knobs; the Anthropic transform ignores them but Required<> needs them.
   collapseHistory: true,
   gptHistory: {},
+  model: '',
 };
 
 /**
@@ -189,8 +196,15 @@ export const REPORT_CHARS_PER_TOKEN = 3.7;
 export const ANTHROPIC_GATE_MARGIN = 1.10;
 
 /** Width in px of a single-col PNG. Must stay in sync with `renderChunkToPng` (render.ts). */
-function singleColWidthPx(cols: number): number {
-  return 2 * PAD_X + cols * CELL_W;
+interface AnthropicRenderGeometry {
+  cols: number;
+  maxHeightPx: number;
+  maxChars: number;
+  style: RenderStyle;
+}
+
+function singleColWidthPx(cols: number, style: RenderStyle): number {
+  return 2 * PAD_X + cols * renderCellWidth(style);
 }
 
 /** Exact image-token cost for `visualRows` at the production geometry.
@@ -201,10 +215,17 @@ function imageTokensForRows(
   cols: number,
   imageCountCap?: number,
   maxCharsPerImage: number = READABLE_CHARS_PER_IMAGE,
+  geometry: AnthropicRenderGeometry = {
+    cols: DENSE_CONTENT_COLS,
+    maxHeightPx: MAX_HEIGHT_PX,
+    maxChars: DENSE_CONTENT_CHARS_PER_IMAGE,
+    style: DENSE_RENDER_STYLE,
+  },
 ): number {
   if (!Number.isFinite(visualRows) || visualRows <= 0) return 0;
-  const widthPx = singleColWidthPx(cols);
-  const hardLinesPerImg = Math.max(1, Math.floor((MAX_HEIGHT_PX - 2 * PAD_Y) / CELL_H));
+  const widthPx = singleColWidthPx(cols, geometry.style);
+  const cellH = renderCellHeight(geometry.style);
+  const hardLinesPerImg = Math.max(1, Math.floor((geometry.maxHeightPx - 2 * PAD_Y) / cellH));
   const readableLinesPerCol = Math.max(1, Math.floor(maxCharsPerImage / Math.max(1, cols)));
   const linesPerImg = Math.min(hardLinesPerImg, readableLinesPerCol);
   const rowsPerImage = linesPerImg; // pixel rows per image (height)
@@ -216,8 +237,8 @@ function imageTokensForRows(
   const fullImages = Math.max(0, imagesNeeded - 1);
   const linesInLast = visualRows - fullImages * linesPerImage;
   const rowsInLast = Math.min(Math.max(1, linesInLast), rowsPerImage);
-  const fullImageHeight = 2 * PAD_Y + rowsPerImage * CELL_H;
-  const lastImageHeight = 2 * PAD_Y + rowsInLast * CELL_H;
+  const fullImageHeight = 2 * PAD_Y + rowsPerImage * cellH;
+  const lastImageHeight = 2 * PAD_Y + rowsInLast * cellH;
   // Anthropic bills per-image by 28-px patches (not by summed pixel area), so
   // count each image separately. pxpipe pages are ≤ 1568×728, so no tier
   // downscale applies and the raw patch count is tier-agnostic.
@@ -235,15 +256,22 @@ function imageTokensCost(
   imageCountCap?: number,
   shrinkWidth: boolean = true,
   maxCharsPerImage: number = READABLE_CHARS_PER_IMAGE,
+  geometry?: AnthropicRenderGeometry,
 ): number {
-  const effectiveCols = shrinkWidth ? shrinkColsToContent(text, cols) : cols;
+  const effectiveCols = shrinkWidth ? shrinkColsToContent(text, cols, 1, geometry?.style.font) : cols;
   const rows = countVisualRows(text, effectiveCols);
-  return imageTokensForRows(rows, effectiveCols, imageCountCap, maxCharsPerImage);
+  return imageTokensForRows(rows, effectiveCols, imageCountCap, maxCharsPerImage, geometry);
 }
 
 /** Gate geometry for dense tool-result, reminder, and history pages. */
-function denseGateGeometry(): { cols: number; maxChars: number } {
-  return { cols: DENSE_CONTENT_COLS, maxChars: DENSE_CONTENT_CHARS_PER_IMAGE };
+function denseGateGeometry(o?: Required<TransformOptions>): AnthropicRenderGeometry {
+  const profile = o?.model ? resolveGptProfile(o.model) : undefined;
+  return {
+    cols: o?.cols ?? profile?.stripCols ?? DENSE_CONTENT_COLS,
+    maxHeightPx: profile?.maxHeightPx ?? MAX_HEIGHT_PX,
+    maxChars: DENSE_CONTENT_CHARS_PER_IMAGE,
+    style: profile?.style ?? DENSE_RENDER_STYLE,
+  };
 }
 
 /** Visual rows per image: `floor((MAX_HEIGHT_PX − 2·PAD_Y) / CELL_H)`. Derived
@@ -304,6 +332,7 @@ export function evalCompressionProfitability(
   priorWarmTokens: number = 0,
   priorWarmImageTokens: number = 0,
   shrinkWidth: boolean = true,
+  geometry?: AnthropicRenderGeometry,
 ): {
   imageTokens: number;
   textTokens: number;
@@ -315,7 +344,7 @@ export function evalCompressionProfitability(
   const cpt = Number.isFinite(charsPerToken) && charsPerToken > 0
     ? charsPerToken
     : CHARS_PER_TOKEN;
-  const imageTokens = imageTokensCost(text, cols, imageCountCap, shrinkWidth);
+  const imageTokens = imageTokensCost(text, cols, imageCountCap, shrinkWidth, READABLE_CHARS_PER_IMAGE, geometry);
   const textTokens = text.length / cpt;
   const burnImageSide = Number.isFinite(priorWarmTokens) && priorWarmTokens > 0
     ? priorWarmTokens * (CACHE_CREATE_RATE - CACHE_READ_RATE)
@@ -341,12 +370,13 @@ export function isCompressionProfitable(
   priorWarmImageTokens: number = 0,
   shrinkWidth: boolean = true,
   maxCharsPerImage: number = READABLE_CHARS_PER_IMAGE,
+  geometry?: AnthropicRenderGeometry,
 ): boolean {
   if (typeof text !== 'string' || text.length === 0) return false;
   const cpt = Number.isFinite(charsPerToken) && charsPerToken > 0
     ? charsPerToken
     : CHARS_PER_TOKEN;
-  const imageTokensCost_ = imageTokensCost(text, cols, imageCountCap, shrinkWidth, maxCharsPerImage);
+  const imageTokensCost_ = imageTokensCost(text, cols, imageCountCap, shrinkWidth, maxCharsPerImage, geometry);
   const textTokensEquivalent = text.length / cpt;
   // Symmetric burn penalty (anti-flapping): switching modes invalidates the warm
   // cache on whichever side was warm, paying cache_create. Burn is added to the
@@ -380,16 +410,17 @@ export function isCompressionProfitableAmortized(
   priorWarmImageTokens: number = 0,
   shrinkWidth: boolean = true,
   maxCharsPerImage: number = READABLE_CHARS_PER_IMAGE,
+  geometry?: AnthropicRenderGeometry,
 ): boolean {
   if (!Number.isFinite(horizon) || horizon <= 1) {
-    return isCompressionProfitable(text, cols, imageCountCap, charsPerToken, priorWarmTokens, priorWarmImageTokens, shrinkWidth, maxCharsPerImage);
+    return isCompressionProfitable(text, cols, imageCountCap, charsPerToken, priorWarmTokens, priorWarmImageTokens, shrinkWidth, maxCharsPerImage, geometry);
   }
   const N = Math.max(2, Math.floor(horizon));
   if (typeof text !== 'string' || text.length === 0) return false;
   const cpt = Number.isFinite(charsPerToken) && charsPerToken > 0
     ? charsPerToken
     : CHARS_PER_TOKEN;
-  const imageTokens = imageTokensCost(text, cols, imageCountCap, shrinkWidth, maxCharsPerImage);
+  const imageTokens = imageTokensCost(text, cols, imageCountCap, shrinkWidth, maxCharsPerImage, geometry);
   const textTokens = text.length / cpt;
   // Worst-case-for-image vs best-case-for-text (conservative, on purpose).
   const imageLifetime = imageTokens * (CACHE_CREATE_RATE + CACHE_READ_RATE * (N - 1));
@@ -471,6 +502,10 @@ export interface EnvFields {
 export interface TransformInfo {
   compressed: boolean;
   reason?: string;
+  /** Exact UTF-8 byte length of the final serialized provider request. */
+  serializedRequestBytes?: number;
+  /** Result of the profile-level serialized request guard. */
+  sizeLimitOutcome?: 'within_limit' | 'rejected';
   origChars: number;
   /** Total source chars image-encoded this request (static slab + reminders + tool_results).
    *  Unlike `origChars` (static slab + tool docs only), reflects what `imageCount` replaced. */
@@ -1392,11 +1427,12 @@ export function truncateForBudget(
   maxImages: number,
   cols: number,
   maxCharsPerImage: number = DENSE_CONTENT_CHARS_PER_IMAGE,
+  linesPerImage: number = LINES_PER_IMAGE,
 ): { text: string; omittedChars: number; truncated: boolean } {
-  const estImages = estimateImageCount(text, cols, maxCharsPerImage);
+  const estImages = estimateImageCount(text, cols, maxCharsPerImage, linesPerImage);
   if (estImages <= maxImages) return { text, omittedChars: 0, truncated: false };
   const readableLinesPerCol = Math.max(1, Math.floor(maxCharsPerImage / Math.max(1, cols)));
-  const totalRowBudget = Math.max(8, maxImages * Math.min(LINES_PER_IMAGE, readableLinesPerCol) - 6);
+  const totalRowBudget = Math.max(8, maxImages * Math.min(linesPerImage, readableLinesPerCol) - 6);
   const totalCharBudget = Math.max(128, maxImages * maxCharsPerImage - 512);
   const shape = classifyContent(text);
   // Reflowed text uses NL_SENTINEL (↵ U+21B5) as line separator instead of \n.
@@ -1520,6 +1556,8 @@ export async function textToImageBlocks(
   cols: number,
   /** Shrink canvas to the longest wrapped line. Default `true`. */
   shrinkWidth: boolean = true,
+  style: RenderStyle = DENSE_RENDER_STYLE,
+  maxHeightPx: number = MAX_HEIGHT_PX,
 ): Promise<{
   blocks: ImageBlock[];
   /** Raw PNG bytes parallel to `blocks` (avoids re-decoding base64 for dashboard). */
@@ -1532,12 +1570,13 @@ export async function textToImageBlocks(
   pixels: number;
 }> {
   const renderText = text;
-  const effectiveCols = shrinkWidth ? shrinkColsToContent(renderText, cols) : cols;
+  const effectiveCols = shrinkWidth ? shrinkColsToContent(renderText, cols, 1, style.font) : cols;
   const imgs = await renderTextToPngsWithCharLimit(
     renderText,
     effectiveCols,
     DENSE_CONTENT_CHARS_PER_IMAGE,
-    DENSE_RENDER_STYLE,
+    style,
+    maxHeightPx,
   );
   let droppedChars = 0;
   let pixels = 0;
@@ -1598,14 +1637,12 @@ async function runHistoryCollapseAndFinalize(
     // symmetric burn would have kept the slab gate in. Production data
     // 2026-05-23 showed three-turn sessions paying cache_create every
     // turn because the history gate ignored priorWarmImageTokens.
+    const historyGeometry = denseGateGeometry(o);
     const historyProfitable = (text: string, cols: number): boolean => {
-      // History always renders single-col at the dense 384-col / 240-row page
-      // (history.ts → renderTextToPngsWithCharLimit with DENSE_CONTENT_COLS /
-      // DENSE_CONTENT_CHARS_PER_IMAGE), so gate at THAT geometry, not o.cols.
-      const g = denseGateGeometry();
+      // Gate with the same model profile used by the history renderer.
       return isCompressionProfitableAmortized(
-        text, g.cols, undefined, historyCpt, horizon,
-        o.priorWarmTokens, o.priorWarmImageTokens, true, g.maxChars,
+        text, historyGeometry.cols, undefined, historyCpt, horizon,
+        o.priorWarmTokens, o.priorWarmImageTokens, true, historyGeometry.maxChars, historyGeometry,
       );
     };
     // No protectedPrefix here: this path runs only when the slab did NOT image
@@ -1614,7 +1651,13 @@ async function runHistoryCollapseAndFinalize(
     const { messages: newMessages, info: histInfo } = await collapseHistory(
       req.messages,
       historyProfitable,
-      { cols: o.cols, protectedPrefix: 0, reflow: o.reflow },
+      {
+        cols: o.cols,
+        protectedPrefix: 0,
+        reflow: o.reflow,
+        style: historyGeometry.style,
+        maxHeightPx: historyGeometry.maxHeightPx,
+      },
     );
     if (histInfo.collapsedTurns > 0) {
       req.messages = newMessages;
@@ -1656,16 +1699,25 @@ export async function transformRequest(
   body: Uint8Array,
   opts: TransformOptions = {},
 ): Promise<{ body: Uint8Array; info: TransformInfo }> {
+  const profile = opts.model ? resolveGptProfile(opts.model) : undefined;
+  const profileDefaults: TransformOptions = profile
+    ? { cols: profile.stripCols, model: opts.model }
+    : {};
   // Merge caller opts over DEFAULTS, but treat explicit `undefined` as "not
   // provided" so it falls through to the default. Without this, a caller that
   // passes `{ minToolResultChars: undefined }` (common when forwarding partial
   // options from upstream — e.g. ocproxy's handler) would silently disable the
   // tool_result text-passthrough gate and route everything through the
   // renderer.
-  const merged: TransformOptions = { ...DEFAULTS, ...opts };
+  const definedOpts = Object.fromEntries(
+    Object.entries(opts).filter(([, value]) => value !== undefined),
+  ) as TransformOptions;
+  const merged: TransformOptions = { ...DEFAULTS, ...profileDefaults, ...definedOpts };
   for (const k of Object.keys(merged) as (keyof TransformOptions)[]) {
     if (merged[k] === undefined) {
-      (merged as Record<string, unknown>)[k] = (DEFAULTS as Record<string, unknown>)[k];
+      (merged as Record<string, unknown>)[k] =
+        (profileDefaults as Record<string, unknown>)[k]
+        ?? (DEFAULTS as Record<string, unknown>)[k];
     }
   }
   const o: Required<TransformOptions> = merged as Required<TransformOptions>;
@@ -1871,7 +1923,7 @@ export async function transformRequest(
   }
 
   // Break-even check guards even the slab (rare edge: tiny tool docs + tiny slab < 10k chars).
-  const denseGeo = denseGateGeometry();
+  const denseGeo = denseGateGeometry(o);
   // Use slab cpt (2.0) unless host pinned charsPerToken explicitly.
   const slabCpt = opts.charsPerToken !== undefined
     ? o.charsPerToken
@@ -1901,10 +1953,11 @@ export async function transformRequest(
   // so the gate's prediction and the renderer's output agree at the smallest
   // legible width. The banner above sets the natural floor — no separate
   // minWidth knob needed.
-  const slabCols = shrinkColsToContent(combinedWithHeader, o.cols);
+  const slabCols = shrinkColsToContent(combinedWithHeader, o.cols, 1, denseGeo.style.font);
   const slabGateEval = evalCompressionProfitability(
     combinedWithHeader, slabCols, undefined, slabCpt, o.priorWarmTokens, o.priorWarmImageTokens,
     false, // already shrunk — don't double-shrink
+    denseGeo,
   );
   if (slabGateEval) {
     info.gateEval = {
@@ -1916,7 +1969,17 @@ export async function transformRequest(
       profitable: slabGateEval.profitable,
     };
   }
-  if (!isCompressionProfitable(combinedWithHeader, slabCols, undefined, slabCpt, o.priorWarmTokens, o.priorWarmImageTokens, false)) {
+  if (!isCompressionProfitable(
+    combinedWithHeader,
+    slabCols,
+    undefined,
+    slabCpt,
+    o.priorWarmTokens,
+    o.priorWarmImageTokens,
+    false,
+    READABLE_CHARS_PER_IMAGE,
+    denseGeo,
+  )) {
     info.reason = `not_profitable (slab=${combined.length} chars)`;
     bumpPassthrough(info, 'not_profitable');
     // Slab not profitable but history may still be collapsable — try before returning.
@@ -1932,7 +1995,12 @@ export async function transformRequest(
   // single-modal framing keeps encoder in image-reading mode for both header + content).
   // Header text is continuous prose (no hard \n) so the renderer soft-wraps densely.
   // 3. Render to PNGs at slabCols width (banner sets natural floor).
-  const images = await renderTextToPngs(combinedWithHeader, slabCols);
+  const images = await renderTextToPngs(
+    combinedWithHeader,
+    slabCols,
+    denseGeo.style,
+    denseGeo.maxHeightPx,
+  );
   const imageBlocks: ImageBlock[] = [];
   for (let i = 0; i < images.length; i++) {
     const img = images[i]!;
@@ -2050,13 +2118,19 @@ export async function transformRequest(
           // model reads.
           const reminderRaw = (blk as TextBlock).text;
           const reminderText = maybeReflow(compactSlabWhitespace(reminderRaw), o.reflow);
-          if (!isCompressionProfitable(reminderText, denseGeo.cols, undefined, o.charsPerToken, 0, 0, true, denseGeo.maxChars)) {
+          if (!isCompressionProfitable(reminderText, denseGeo.cols, undefined, o.charsPerToken, 0, 0, true, denseGeo.maxChars, denseGeo)) {
             bumpPassthrough(info, 'not_profitable');
             processedExisting.push(blk);
             continue;
           }
           const { blocks: imgs, pngs: rawPngs, dims: rawDims, droppedChars, droppedCodepoints: dcp, pixels } =
-            await textToImageBlocks(reminderText, o.cols);
+            await textToImageBlocks(
+              reminderText,
+              o.cols,
+              true,
+              denseGeo.style,
+              denseGeo.maxHeightPx,
+            );
           (info.imagePngs ??= []).push(...rawPngs);
           (info.imageDims ??= []).push(...rawDims);
           const srcCacheControl = demoteRelocatedCacheControl((blk as { cache_control?: unknown }).cache_control);
@@ -2128,18 +2202,34 @@ export async function transformRequest(
               if (innerR.length < o.minToolResultChars) {
                 bumpPassthrough(info, 'below_threshold');
                 rewritten.push(blk);
-              } else if (!isCompressionProfitable(innerR, denseGeo.cols, o.maxImagesPerToolResult, o.charsPerToken, 0, 0, true, denseGeo.maxChars)) {
+              } else if (!isCompressionProfitable(innerR, denseGeo.cols, o.maxImagesPerToolResult, o.charsPerToken, 0, 0, true, denseGeo.maxChars, denseGeo)) {
                 bumpPassthrough(info, 'not_profitable');
                 rewritten.push(blk);
               } else {
                 // Paging: truncate before render if it would blow the image cap.
-                const paged = truncateForBudget(innerR, o.maxImagesPerToolResult, denseGeo.cols, denseGeo.maxChars);
+                const linesPerImage = Math.max(
+                  1,
+                  Math.floor((denseGeo.maxHeightPx - 2 * PAD_Y) / renderCellHeight(denseGeo.style)),
+                );
+                const paged = truncateForBudget(
+                  innerR,
+                  o.maxImagesPerToolResult,
+                  denseGeo.cols,
+                  denseGeo.maxChars,
+                  linesPerImage,
+                );
                 if (paged.truncated) {
                   info.truncatedToolResults = (info.truncatedToolResults ?? 0) + 1;
                   info.omittedChars = (info.omittedChars ?? 0) + paged.omittedChars;
                 }
                 const { blocks: imgs, pngs: rawPngs, dims: rawDims, droppedChars, droppedCodepoints: dcp, pixels } =
-                  await textToImageBlocks(paged.text, o.cols);
+                  await textToImageBlocks(
+                    paged.text,
+                    o.cols,
+                    true,
+                    denseGeo.style,
+                    denseGeo.maxHeightPx,
+                  );
                 (info.imagePngs ??= []).push(...rawPngs);
                 (info.imageDims ??= []).push(...rawDims);
                 for (const img of imgs) info.imageBytes += approxBlockBytes(img);
@@ -2194,18 +2284,34 @@ export async function transformRequest(
                   newInner.push(ib as TextBlock | ImageBlock);
                   continue;
                 }
-                if (!isCompressionProfitable(innerTextR, denseGeo.cols, o.maxImagesPerToolResult, o.charsPerToken, 0, 0, true, denseGeo.maxChars)) {
+                if (!isCompressionProfitable(innerTextR, denseGeo.cols, o.maxImagesPerToolResult, o.charsPerToken, 0, 0, true, denseGeo.maxChars, denseGeo)) {
                   bumpPassthrough(info, 'not_profitable');
                   newInner.push(ib as TextBlock | ImageBlock);
                   continue;
                 }
-                const paged = truncateForBudget(innerTextR, o.maxImagesPerToolResult, denseGeo.cols, denseGeo.maxChars);
+                const linesPerImage = Math.max(
+                  1,
+                  Math.floor((denseGeo.maxHeightPx - 2 * PAD_Y) / renderCellHeight(denseGeo.style)),
+                );
+                const paged = truncateForBudget(
+                  innerTextR,
+                  o.maxImagesPerToolResult,
+                  denseGeo.cols,
+                  denseGeo.maxChars,
+                  linesPerImage,
+                );
                 if (paged.truncated) {
                   info.truncatedToolResults = (info.truncatedToolResults ?? 0) + 1;
                   info.omittedChars = (info.omittedChars ?? 0) + paged.omittedChars;
                 }
                 const { blocks: imgs, pngs: rawPngs, dims: rawDims, droppedChars, droppedCodepoints: dcp, pixels } =
-                  await textToImageBlocks(paged.text, o.cols);
+                  await textToImageBlocks(
+                    paged.text,
+                    o.cols,
+                    true,
+                    denseGeo.style,
+                    denseGeo.maxHeightPx,
+                  );
                 (info.imagePngs ??= []).push(...rawPngs);
                 (info.imageDims ??= []).push(...rawDims);
                 const srcCacheControl = demoteRelocatedCacheControl((ib as { cache_control?: unknown }).cache_control);
@@ -2266,19 +2372,25 @@ export async function transformRequest(
       ? o.charsPerToken
       : HISTORY_CHARS_PER_TOKEN;
     const horizon = Math.max(1, Math.floor(o.historyAmortizationHorizon));
+    const historyGeometry = denseGateGeometry(o);
     const historyProfitable = (text: string, cols: number): boolean => {
-      // Gate at dense 384-col/240-row geometry (matches history.ts renderer).
-      const g = denseGateGeometry();
+      // Gate with the same model profile used by the history renderer.
       return isCompressionProfitableAmortized(
-        text, g.cols, undefined, historyCpt, horizon,
-        o.priorWarmTokens, o.priorWarmImageTokens, true, g.maxChars,
+        text, historyGeometry.cols, undefined, historyCpt, horizon,
+        o.priorWarmTokens, o.priorWarmImageTokens, true, historyGeometry.maxChars, historyGeometry,
       );
     };
     const slabAnchorIdx = (req.messages ?? []).findIndex((m) => m.role === 'user');
     const { messages: newMessages, info: histInfo } = await collapseHistory(
       req.messages,
       historyProfitable,
-      { cols: o.cols, protectedPrefix: slabAnchorIdx >= 0 ? slabAnchorIdx + 1 : 0, reflow: o.reflow },
+      {
+        cols: o.cols,
+        protectedPrefix: slabAnchorIdx >= 0 ? slabAnchorIdx + 1 : 0,
+        reflow: o.reflow,
+        style: historyGeometry.style,
+        maxHeightPx: historyGeometry.maxHeightPx,
+      },
     );
     if (histInfo.collapsedTurns > 0) {
       req.messages = newMessages;

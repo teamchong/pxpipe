@@ -311,6 +311,23 @@ describe('public library API', () => {
     expect(transformed.cache.markerCount).toBe(0);
   });
 
+  it('applies the Opus profile to direct Anthropic Messages rendering', async () => {
+    process.env.PXPIPE_MODELS = 'claude-fable-5,claude-opus-4-8';
+    const body = enc.encode(JSON.stringify({
+      model: 'claude-opus-4-8',
+      system: Array.from({ length: 1800 }, (_, i) => `setting_${i}=value_${i * 7919}`).join('\n'),
+      messages: [{ role: 'user', content: 'continue' }],
+    }));
+    const transformed = await transformAnthropicMessages({
+      body,
+      model: 'claude-opus-4-8',
+      options: { charsPerToken: 1, minCompressChars: 1, cols: undefined },
+    });
+    expect(transformed.applied).toBe(true);
+    expect(transformed.info.firstImageWidth).toBeLessThanOrEqual(782);
+    expect(transformed.info.firstImageHeight).toBeLessThanOrEqual(728);
+  });
+
   it('preserves the exact Claude Code OAuth identity as the first system block', async () => {
     const identity = "You are Claude Code, Anthropic's official CLI for Claude.";
     const body = enc.encode(JSON.stringify({

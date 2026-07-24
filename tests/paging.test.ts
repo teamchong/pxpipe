@@ -418,6 +418,20 @@ describe('paging end-to-end (transformRequest)', () => {
     expect(info.toolResultImgs).toBeLessThanOrEqual(3); // 2 + slack
   });
 
+  it('uses Opus profile rows when enforcing the tool-result image cap', async () => {
+    const log = Array.from(
+      { length: 10_000 },
+      (_, i) => `2026-05-18T12:00:00Z entry ${i} payload content here`,
+    ).join('\n');
+    const { info } = await transformRequest(makeReq(log), {
+      model: 'claude-opus-4-8',
+      charsPerToken: 2,
+      maxImagesPerToolResult: 2,
+    });
+    expect(info.truncatedToolResults).toBe(1);
+    expect(info.toolResultImgs).toBeLessThanOrEqual(3);
+  });
+
   it('counts multiple tool_results that all exceed the budget', async () => {
     const lines: string[] = [];
     for (let i = 0; i < 10_000; i++) {

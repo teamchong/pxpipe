@@ -103,7 +103,8 @@ function buildLiveRequestGuard(pinText?: string): string {
 export function openAIVisionTokens(model: string, w: number, h: number): number {
   const c = resolveVisionCost(model);
   if (c.regime === 'patch') {
-    const patches = Math.min(c.patchCap, Math.ceil(w / 32) * Math.ceil(h / 32));
+    const rawPatches = Math.ceil(w / 32) * Math.ceil(h / 32);
+    const patches = c.patchCap === undefined ? rawPatches : Math.min(c.patchCap, rawPatches);
     return Math.ceil(patches * c.multiplier);
   }
   let W = w, H = h;
@@ -506,7 +507,7 @@ function openAIImagePart(img: RenderedImage): OpenAIImagePart {
     type: 'image_url',
     image_url: {
       url: `data:image/png;base64,${bytesToBase64(img.png)}`,
-      detail: 'original', // gpt-5.x: 'original' = 10k-patch/6000px budget; 'high' (2.5k/2048px) downscales dense text
+      detail: 'original', // GPT-5.6 preserves submitted dimensions; older profiles retain their own cost caps.
     },
   };
 }
@@ -663,6 +664,7 @@ function evalOpenAIGate(
   const cellH = renderCellHeight(style);
   const stripW = 2 * PAD_X + cols * cellW;
   const canvasRows = Math.max(1, Math.floor((profile.maxHeightPx - 2 * PAD_Y) / cellH));
+  const fullPageHeight = 2 * PAD_Y + canvasRows * cellH;
   const maxLines = canvasRows;
   const maxCharsPerImage = Math.min(
     READABLE_CHARS_PER_IMAGE,
@@ -690,7 +692,7 @@ function evalOpenAIGate(
     profile.maxHeightPx,
     2 * PAD_Y + lastPageLines * cellH,
   );
-  const fullPageTokens = visionTokensForModel(model, stripW, profile.maxHeightPx);
+  const fullPageTokens = visionTokensForModel(model, stripW, fullPageHeight);
   const lastPageTokens = visionTokensForModel(model, stripW, lastPageHeight);
   const imageTokens =
     estImages <= 1
@@ -707,6 +709,10 @@ function evalOpenAIGate(
 function usesExactStaticBaseline(model: string): boolean {
   const normalized = model.toLowerCase().replace(/\[[^\]]*\]/g, '');
   return normalized === 'gpt-5.6-sol' || normalized.startsWith('gpt-5.6-sol-');
+}
+
+function serializedHistoryByteLimit(model: string, profile: GptModelProfile): number | undefined {
+  return usesExactStaticBaseline(model) ? profile.maxSerializedRequestBytes : undefined;
 }
 
 /** Shared image-part accumulation from rendered PNGs. */
@@ -1195,15 +1201,28 @@ export async function transformOpenAIResponses(
   const combinedRaw = [...authorityDocs, toolDocs].filter((s) => s.length > 0).join('\n\n');
   info.origChars = combinedRaw.length;
   const profile = resolveGptProfile(req.model);
+  const finishSerialized = () => {
+    const encoded = new TextEncoder().encode(JSON.stringify(req));
+    const serializedByteLimit = serializedHistoryByteLimit(req.model, profile);
+    if (serializedByteLimit !== undefined && encoded.byteLength > serializedByteLimit) {
+      if (body.byteLength > serializedByteLimit) {
+        info.reason = 'serialized_request_limit';
+        info.compressed = true;
+        return { body, info };
+      }
+      return { body, info: emptyInfo('serialized_request_limit') };
+    }
+    info.outgoingTextChars = countResponsesOutgoingTextChars(req);
+    info.compressed = true;
+    return { body: encoded, info };
+  };
   const finishHistoryOnly = async (reason: string) => {
     info.reason = reason;
     if (o.collapseHistory && !inputWasString && await applyResponsesHistoryCollapse(
       req, inputItems, info, o, profile,
     )) {
       info.reason = undefined;
-      info.outgoingTextChars = countResponsesOutgoingTextChars(req);
-      info.compressed = true;
-      return { body: new TextEncoder().encode(JSON.stringify(req)), info };
+      return finishSerialized();
     }
     return { body, info };
   };
@@ -1363,7 +1382,5 @@ export async function transformOpenAIResponses(
 
   // Regression denominator, same as the Chat path — Responses was the only
   // transform that never recorded it.
-  info.outgoingTextChars = countResponsesOutgoingTextChars(req);
-  info.compressed = true;
-  return { body: new TextEncoder().encode(JSON.stringify(req)), info };
+  return finishSerialized();
 }

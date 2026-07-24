@@ -4,6 +4,20 @@ All notable changes to pxpipe are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features /
 behavioral changes, patch = fixes).
 
+## Unreleased
+
+### Changed
+- Opt-in Claude Opus now uses native 14px JetBrains Mono at 86 columns. It was
+  the smallest blind-read candidate with 8/8 exact values and no confabulations,
+  retaining 33% estimated savings on the evaluation fixture.
+- Opt-in `gpt-5.6-sol` uses the same native 14px glyphs at 84 columns. Its paid
+  pilot preserved gist and guard checks, read 7/8 exact values, and produced no
+  unsupported inventions; Sol remains off by default.
+- Opt-in Grok 4.5 moves from Spleen 5×8/152 cols to native 14px/84 cols at
+  maxH 512 (best rung on the JB Mono 8–16px blind sweep: 4/8 exact, 48% save).
+  No rung was fully clean; Grok stays opt-in. Gate and vision math still use
+  the measured 1000 tok/MPix rate on the new 764×≤512 geometry.
+
 ## 0.10.0 — 2026-07-22
 
 ### Added
@@ -18,6 +32,12 @@ behavioral changes, patch = fixes).
   open calls, malformed protocol state, and the recent working tail stay native.
 
 ### Changed
+- Opt-in `gpt-5.6-sol` now uses genuine 12px JetBrains Mono glyphs in a native
+  8×13 cell at 84 columns, replacing 10px glyphs padded to an effective 9×12
+  cell. The resulting full strip is 680px wide; its raw pilot scored 7/8 exact
+  fields with one confabulation.
+- A genuine 13px/8×14 Sol follow-up regressed to 2/8 aggregate exact fields and
+  was rejected; production remains on the 12px/8×13 profile.
 - Missing atlas glyphs are escaped as `[U+HEX]` instead of silently dropped.
 - Models are instructed not to guess exact identifiers, paths, hashes, versions,
   or numbers that are visible only in an image and absent from the factsheet.
@@ -81,9 +101,8 @@ behavioral changes, patch = fixes).
 - `gpt-5.6-sol` is now opt-in rather than silently enabled. Its exact profile
   remains available when selected, and sibling 5.6 variants do not inherit it.
 - Complete per-model render profiles now drive font atlas, cell spacing,
-  geometry, style, history pages, and profitability math. Sol uses a 6×11
-  JetBrains Mono atlas; opt-in Grok uses the measured effective 9×12 arm plus
-  the factsheet.
+  geometry, style, history pages, and profitability math. Sol and opt-in Grok
+  use native 14px JetBrains Mono (9×16); Grok keeps maxH 512 and the factsheet.
 - Dashboard exposes the GPT model row and `?` controls now show accessible
   hover/focus tooltips.
 - Dashboard overall totals now include only currently enabled models. Traffic

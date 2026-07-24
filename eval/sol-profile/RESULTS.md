@@ -1,5 +1,75 @@
 # GPT-5.6 Sol raw image-recall pilot
 
+## Native font-size sweep (2026-07-23)
+
+All candidates used genuinely rasterized JetBrains Mono glyphs with zero cell
+bonuses, 84 columns, and a 1954px page cap.
+
+| font | native cell | alpha exact/confab | beta exact/confab | gist alpha/beta | guard alpha/beta | savings alpha/beta | decision |
+|---|---|---:|---:|:---:|:---:|---:|---|
+| 11px | 7×12 | 2/4, 2 | 1/4, 3 | pass/fail | pass/pass | 65.8%/65.7% | reject |
+| 12px | 8×13 | 4/4, 0 | 3/4, 1 | pass/pass | pass/pass | 56.8%/56.7% | reject: invented port |
+| 13px | 8×14 | 1/4, 3 | 1/4, 3 | pass/fail | pass/pass | 53.2%/53.1% | reject |
+| **14px** | **9×16** | **3/4, 0** | **4/4, 0** | **pass/pass** | **pass/pass** | **42.0%/42.0%** | **use for opt-in profile** |
+| 15px | 9×17 | not called | not called | — | — | 38.6%/38.5% | dry-run only; below 40% floor |
+
+This table is the complete native Sol sweep: every tested size from 11px through
+15px is shown, including the 15px preflight that was not sent to the model.
+There are no Sol results for native 8–10px or 16px. The earlier 10px/6×11 pilot
+used a different 126-column geometry and is documented separately below, so it
+is not presented as part of this controlled 84-column sweep.
+
+Failure details by native size:
+
+| font | alpha misses | beta misses |
+|---|---|---|
+| 11px | path changed `releases`→`release`; port `47831`→`41837` | fingerprint reordered; `maxVisualTokens`→`AvisuaTokens`; path punctuation/extension changed |
+| 12px | none | port `18082`→`41825` (unsupported value) |
+| 13px | fingerprint, camelCase, and path changed | fingerprint, path, and port changed |
+| 14px | `retryBudgetSeconds` truncated to visible-looking `retryBudgetSec` | none |
+| 15px | not called | not called |
+
+The 14px miss truncated `retryBudgetSeconds` to `retryBudgetSec`; beta passed
+4/4. It did not achieve perfect exact recall, but unlike 12px it produced no
+unsupported values while preserving gist and guard results on both fixtures.
+The opt-in Sol profile therefore uses native 14px. Raw 11px and 14px results are in
+`results-jbmono11.json` and `results-jbmono14.json`; the 15px geometry is in
+`preflight-jbmono15.json`.
+
+## Rejected native 13px follow-up (2026-07-23)
+
+JetBrains Mono 13px rasterized to an 8×14 cell. Both fixtures used `680×1954`
+and `680×1324` pages, estimated at 2,288 image tokens per call.
+
+| fixture | exact | confabulations | gist | guard | verdict |
+|---|---:|---:|:---:|:---:|---|
+| alpha | **1/4** | **3** | pass | pass | **fail** |
+| beta | **1/4** | **3** | fail | pass | **fail** |
+
+The 13px profile regressed from the 12px profile's 7/8 aggregate exact result,
+so it was rejected. Complete scoring and provider
+usage are in `results-jbmono13.json`, with raw bodies and receipts under the
+`raw/jbmono13-*` names.
+
+## Native 12px/8×13 comparison (2026-07-23)
+
+JetBrains Mono 12px was tested at 84 columns with
+`680×1945` and `680×1100` pages per fixture.
+
+| fixture | exact | confabulations | gist | guard | estimated image tokens | verdict |
+|---|---:|---:|:---:|:---:|---:|---|
+| alpha | **4/4** | **0** | pass | pass | 2,112 | pass |
+| beta | **3/4** | **1** | pass | pass | 2,112 | **fail** |
+
+Beta returned port `41825` instead of `18082`. Provider input usage was 2,728
+tokens for alpha and 2,726 for beta. The paired alpha Spleen 5×8 control scored
+0/4 exact with four confabulations. The production candidate therefore improved
+substantially over the control but did not clear the strict two-fixture bar.
+
+Raw follow-up receipts are `raw/01-alpha-current_sol.*`,
+`raw/02-alpha-old_shared.*`, and `raw/03-beta-current_sol.*`; complete scoring is
+in `results.json`.
+
 Live run: **2026-07-09**
 
 Model: **`gpt-5.6-sol`**

@@ -127,16 +127,16 @@ without running the proxy.
   and allows 64 images, while Grok allows 24 images. Opt-in long-session
   coverage can be changed (defensive cap 100) with
   `PXPIPE_GPT_HISTORY_MAX_IMAGES=48` after validating the provider's request cap.
-- **Per-model rendering:** opt-in `gpt-5.6-sol` uses a 152-column,
-  768px-wide 5×8 Spleen profile; Claude keeps its 312-column, 1568×728
-  5×8 Spleen profile. These
+- **Per-model rendering:** opt-in Opus, Sol, and Grok use native 14px
+  JetBrains Mono glyphs in a 9×16 cell. Opus 86 cols; Sol/Grok 84 cols.
+  Fable keeps its 312-column, 1568×728 5×8 Spleen profile. These
   are selected by exact model id, including history pages and profitability
   math. Recognized IDs can ride in the bounded factsheet, and
   recent/open tool state stays native.
   [Sol receipts](eval/sol-profile/QUALITY_RESULTS.md) and
   [profile evidence](docs/MODEL_RENDER_PROFILES.md).
-- **Grok 4.5 (opt-in):** same production recipe as Sol (5×8 Spleen, IDS, text
-  factsheet; Grok strip maxH 512). Off by default (not Fable-level pure-image).
+- **Grok 4.5 (opt-in):** native 14px / 84 cols / maxH 512 (100/100 arith, 97/98 gist).
+  Off by default (dense hex still 0/15).
   Enable with
   `PXPIPE_MODELS=claude-fable-5,grok-4.5` or the dashboard chip.
   [eval/grok-density/QUALITY_RESULTS.md](eval/grok-density/QUALITY_RESULTS.md).
@@ -156,10 +156,27 @@ is confabulations, so lower is better.
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
 | `claude-fable-5` | **100/100** | **98/98** | **18/18** | **0/16** | **13/15** | June 2026 production profiles: [arithmetic + hex](FINDINGS.md), [gist/state/guards](eval/gist-recall/) |
 | `google/gemini-3.6-flash` | **100/100** | **98/98** | **18/18** | **0/16** | **14/15** | current shipped profile: [quality results](eval/gemini-profile/QUALITY_RESULTS.md) |
-| `gpt-5.6-sol` | **98/100** | 83/98 | 17/18 | 4/16 | 0/15 | current shipped profile: [quality results](eval/sol-profile/QUALITY_RESULTS.md) |
-| `claude-opus-4-8` | 93/100 | — | — | — | 0/15 | historical profile: [arithmetic](eval/gsm8k/), [dense hex](eval/needle-haystack/) |
-| `grok-4.5` | 82/100 | 83/98 | 13/18 | **0/16** | 0/15 | current shipped profile: [quality results](eval/grok-density/QUALITY_RESULTS.md) |
+| `gpt-5.6-sol` | **98/100** | 83/98 | 17/18 | 4/16 | 0/15 | prior 5×8 broad suite; native 14px pilot: 7/8 exact, 0 inventions, gist/guard pass: [pilot](eval/sol-profile/README.md) |
+| `claude-opus-4-8` | 93/100 | 59/98 | 12/18 | 7/16 | 0/15 | dense-hex from native 14px blind sweep (8/8 exact, 0 confab); gist/state/never-stated from full gist-recall image arm at Opus's own 14px profile (782px pages, jetbrains-mono-14, upstream-bypassed :8082, preflight-guarded); [receipts](eval/gist-recall/OPUS_14PX.md) |
+| `grok-4.5` | **100/100** | **97/98** | 17/18 | **0/16** | 0/15 | native 14px/84 quality suite (live profile); [quality](eval/grok-density/QUALITY_RESULTS.md), [native-sweep](eval/grok-density/native-sweep/RESULTS.md) |
 | `moonshotai/kimi-k3` | 79/100 | 84/98 | 15/18 | 1/16 | 0/15 | generic GPT profile: [quality results](eval/sol-profile/KIMI_K3_QUALITY_RESULTS.md) |
+
+### Native-profile cost check
+
+Offline export of the same deterministic 454,045-character dense record corpus
+through each complete profile produced:
+
+| model profile | pages | text estimate | image tokens | savings |
+|---|---:|---:|---:|---:|
+| Fable, Spleen 5×8 | 17 | 122,715 | 23,856 | 80.6% |
+| Opus, JetBrains Mono 14px | 118 | 122,715 | 85,428 | 30.4% |
+| Sol, JetBrains Mono 14px | 45 | 122,715 | 65,424 | 46.7% |
+
+The text estimate uses 3.7 characters/token; image tokens use each model's
+provider formula and actual rendered page dimensions. These figures establish
+profile cost on this corpus, not a universal workload savings rate. Opus's
+separate blind fixture retained 33% while reading 8/8 exact; Sol's paid fixtures
+estimated 42% while reading 7/8 exact with no unsupported inventions.
 
 The runs use different transports and profile generations, not one identical
 image geometry. Fable and Opus use Claude; Gemini uses Google AI Studio; Sol

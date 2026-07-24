@@ -1,5 +1,38 @@
 # Opus 4.8 lower-density read sweep — results (answers issue #6)
 
+## Native JetBrains Mono 8–16px blind sweep (2026-07-23)
+
+The follow-up used genuine rasterized glyphs, not cell padding. A fresh hidden
+fixture was rendered at 86 columns and a 728px page cap. Answers were read from
+PNG pages and locked before `truth.json` was revealed. Savings use the local
+tokenizer baseline and Anthropic's 28px patch accounting.
+
+| font | native cell | savings | exact | confabulations | abstentions |
+|---|---|---:|---:|---:|---:|
+| 8px | 5×10 | 76% | 2/8 | 0 | 6 |
+| 9px | 6×10 | 72% | 2/8 | 0 | 6 |
+| 10px | 6×11 | 69% | 2/8 | 0 | 6 |
+| 11px | 7×12 | 61% | 6/8 | 2 | 0 |
+| 12px | 8×13 | 51% | 6/8 | 2 | 0 |
+| 13px | 8×14 | 47% | 6/8 | 2 | 0 |
+| **14px** | **9×16** | **33%** | **8/8** | **0** | **0** |
+| 15px | 9×17 | 28% | 8/8 | 0 | 0 |
+| 16px | 10×17 | 20% | 8/8 | 0 | 0 |
+
+Native 14px is the smallest clean rung and is now the Opus profile. At 11–13px,
+the reader silently changed `7.11.13` to `7.17.13` and
+`200608c7-3e28` to `2006d0c7-3e28`. Those confident digit/hex substitutions
+disqualify the smaller cells despite their larger savings. The complete locked
+answers, truth, scorer, dimensions, and token accounting are under
+`native-sweep/`. This resolves the density question in GitHub issue #6.
+
+This is the complete native Opus sweep: every integer size from 8px through
+16px was rendered and read. The 8–10px answers were explicit abstentions for
+six precision fields rather than guesses; 11–13px made the same two silent
+substitutions; 14–16px were fully exact. Per-rung locked answer JSON, PNG pages,
+cell geometry, token costs, fixture, hidden truth, and scorer are retained under
+`native-sweep/`.
+
 Live run of `run.mjs`, 2026-07-05. `results.json` is this run. Two harness bugs
 found and fixed along the way (see below), so fixes and numbers are reported together.
 

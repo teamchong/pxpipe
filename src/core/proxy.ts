@@ -22,6 +22,7 @@ import {
 } from './messages-chat-bridge.js';
 import { parseGoogleModelFromPath, transformGoogleGenerateContent } from './google.js';
 import { isGeminiModel } from './gemini-model-profiles.js';
+import { resolveGptProfile } from './gpt-model-profiles.js';
 
 export interface ProxyConfig {
   /** 'cloudflare-ai-gateway': routes both families through gatewayBaseUrl;
@@ -138,14 +139,18 @@ async function gzipBytes(body: Uint8Array): Promise<Uint8Array> {
   return new Uint8Array(buf);
 }
 
-/** sha256[0..8] hex of a byte buffer. */
-async function sha8Bytes(body: Uint8Array): Promise<string> {
+/** SHA-256 hex of a byte buffer. */
+async function sha256Bytes(body: Uint8Array): Promise<string> {
   // Cast: Web Crypto accepts Uint8Array at runtime despite the BufferSource type.
   const digest = await crypto.subtle.digest('SHA-256', body as BufferSource);
   const bytes = new Uint8Array(digest);
   let hex = '';
-  for (let i = 0; i < 4; i++) hex += bytes[i]!.toString(16).padStart(2, '0');
+  for (const byte of bytes) hex += byte.toString(16).padStart(2, '0');
   return hex;
+}
+
+async function sha256Text(value: string): Promise<string> {
+  return sha256Bytes(new TextEncoder().encode(value));
 }
 
 /**
@@ -793,6 +798,7 @@ export function parseGatewayHeaders(spec: string | undefined): Record<string, st
 /** Build the proxy fetch handler. */
 export function createProxy(config: ProxyConfig = {}) {
   const modelRoutes = new Map<string, 'openai' | 'cloudflare'>();
+  const inFlight = new Map<string, symbol>();
   // Explicit precedence: Cloudflare > OpenAI > normal family routing.
   for (const model of config.openAIModels ?? []) {
     const id = model.trim();
@@ -845,6 +851,7 @@ export function createProxy(config: ProxyConfig = {}) {
     // reqBodyBytes: kept for lazy gzip on 4xx. reqBodySha8: computed eagerly for correlation.
     let reqBodyBytes: Uint8Array | undefined;
     let reqBodySha8: string | undefined;
+    let reqBodySha256: string | undefined;
 
     const fire = (
       status: number,
@@ -1045,7 +1052,7 @@ export function createProxy(config: ProxyConfig = {}) {
               ? await transformOpenAIResponses(bridgeBody, effectiveOpts)
               : bridgedChatMessages
                 ? await transformOpenAIChatCompletions(bridgeBody, effectiveOpts)
-                : await transformRequest(bodyIn, effectiveOpts)
+                : await transformRequest(bodyIn, { ...effectiveOpts, model: effectiveModel ?? undefined })
             : isOpenAIChat
               ? await transformOpenAIChatCompletions(bodyIn, effectiveOpts)
               : await transformOpenAIResponses(bodyIn, effectiveOpts);
@@ -1090,8 +1097,29 @@ export function createProxy(config: ProxyConfig = {}) {
         bodyOut = r.body as unknown as BodyInit; // TS narrows Uint8Array away from BodyInit
         info = r.info;
         reqBodyBytes = r.body;
+        r.info.serializedRequestBytes = r.body.byteLength;
         if (r.body.byteLength > 0) {
-          reqBodySha8 = await sha8Bytes(r.body);
+          reqBodySha256 = await sha256Bytes(r.body);
+          reqBodySha8 = reqBodySha256.slice(0, 8);
+        }
+        const requestByteLimit = requestModel
+          ? resolveGptProfile(requestModel).maxSerializedRequestBytes
+          : undefined;
+        if (r.info.compressed && requestByteLimit !== undefined) {
+          if (r.body.byteLength > requestByteLimit) {
+            r.info.sizeLimitOutcome = 'rejected';
+            const message = `pxpipe serialized request exceeds model limit (${r.body.byteLength} > ${requestByteLimit} bytes)`;
+            fire(413, r.info, message);
+            const error = isMessages
+              ? { type: 'error', error: { type: 'request_too_large', message } }
+              : { error: { type: 'request_too_large', message } };
+            return new Response(JSON.stringify(error), {
+              status: 413,
+              headers: { 'content-type': 'application/json' },
+            });
+          } else {
+            r.info.sizeLimitOutcome = 'within_limit';
+          }
         }
 
         if (isMessages && messagesAnthropic) {
@@ -1177,6 +1205,34 @@ export function createProxy(config: ProxyConfig = {}) {
       const requestUpstreamBase = bridgedGptMessages ? openAIUpstream : upstreamBase;
       upstreamUrl = requestUpstreamBase + outPath;
     }
+    let releaseInFlight = (): void => {};
+    if (reqBodySha256) {
+      const headers: [string, string][] = [];
+      outHeaders.forEach((value, name) => { headers.push([name, value]); });
+      headers.sort(([a], [b]) => a.localeCompare(b));
+      const key = await sha256Text(JSON.stringify([
+        req.method,
+        upstreamUrl,
+        headers,
+        reqBodySha256,
+      ]));
+      if (inFlight.has(key)) {
+        const message = 'An identical request is already in progress';
+        fire(409, undefined, 'duplicate_request_in_flight');
+        const error = isMessages
+          ? { type: 'error', error: { type: 'duplicate_request_in_flight', message } }
+          : { error: { type: 'duplicate_request_in_flight', message } };
+        return new Response(JSON.stringify(error), {
+          status: 409,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      const lease = Symbol();
+      inFlight.set(key, lease);
+      releaseInFlight = () => {
+        if (inFlight.get(key) === lease) inFlight.delete(key);
+      };
+    }
     let upstreamRes: Response;
     try {
       upstreamRes = await fetch(upstreamUrl, {
@@ -1192,6 +1248,7 @@ export function createProxy(config: ProxyConfig = {}) {
         upstreamRes = await openAIChatToAnthropicResponse(upstreamRes, requestModel ?? '');
       }
     } catch (e) {
+      releaseInFlight();
       fire(502, info, `upstream_error: ${(e as Error).message}`);
       return new Response(JSON.stringify({ error: 'pxpipe upstream unreachable' }), {
         status: 502,
@@ -1202,8 +1259,18 @@ export function createProxy(config: ProxyConfig = {}) {
     const firstByteMs = Date.now() - t0;
 
     // Tee: client gets one side; scanner reads the other for usage/measurement/error body.
-    const { response: teed, usagePromise, errorBodyPromise, measurementPromise, stopReasonPromise } =
-      teeForUsage(upstreamRes);
+    let teed: Response;
+    let usagePromise: Promise<Usage | undefined>;
+    let errorBodyPromise: Promise<string | undefined>;
+    let measurementPromise: Promise<OutputMeasurement | undefined>;
+    let stopReasonPromise: Promise<string | undefined>;
+    try {
+      ({ response: teed, usagePromise, errorBodyPromise, measurementPromise, stopReasonPromise } =
+        teeForUsage(upstreamRes));
+    } catch (e) {
+      releaseInFlight();
+      throw e;
+    }
 
     // Fire event in background once all four resolve (all share the same stream read).
     void Promise.all([
@@ -1211,7 +1278,7 @@ export function createProxy(config: ProxyConfig = {}) {
       errorBodyPromise.catch(() => undefined),
       measurementPromise.catch(() => undefined),
       stopReasonPromise.catch(() => undefined),
-    ]).then(([usage, errorBody, measurement, stopReason]) =>
+    ]).then(([usage, errorBody, measurement, stopReason]) => {
       fire(
         upstreamRes.status,
         info,
@@ -1221,8 +1288,8 @@ export function createProxy(config: ProxyConfig = {}) {
         config.captureErrorReqBody ? errorBody : undefined,
         measurement,
         stopReason,
-      ),
-    );
+      );
+    }).finally(releaseInFlight);
 
     return new Response(teed.body, {
       status: upstreamRes.status,

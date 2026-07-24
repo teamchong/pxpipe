@@ -19,6 +19,7 @@ import { describe, expect, it } from 'vitest';
 import { renderTextToImages } from '../src/core/library.js';
 import { textToImageBlocks } from '../src/core/transform.js';
 import { DENSE_CONTENT_COLS } from '../src/core/render.js';
+import { resolveGptProfile } from '../src/core/gpt-model-profiles.js';
 
 function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length !== b.length) return false;
@@ -102,4 +103,23 @@ describe('export ⇄ proxy render alignment', () => {
     const wide = await textToImageBlocks(text, 120, false);
     expect(narrow.dims[0]?.width).toBeLessThan(wide.dims[0]?.width ?? 0);
   });
+
+  for (const model of ['claude-opus-4-8', 'gpt-5.6-sol']) {
+    it(`${model} export and proxy use the same complete 14px profile`, async () => {
+      const profile = resolveGptProfile(model);
+      const text = Array.from({ length: 300 }, (_, i) => `id_${i}=c00e1efdd526/${i}`).join('\n');
+      const exported = await renderTextToImages(text, { model, shrink: false });
+      const proxied = await textToImageBlocks(
+        text,
+        profile.stripCols,
+        false,
+        profile.style,
+        profile.maxHeightPx,
+      );
+      expect(exported.pages.map(({ width, height }) => ({ width, height }))).toEqual(proxied.dims);
+      expect(exported.pages.map(({ png }) => png)).toEqual(proxied.pngs);
+      expect(exported.pages[0]?.width).toBe(8 + profile.stripCols * 9);
+      expect(exported.pages.every(({ height }) => height <= profile.maxHeightPx)).toBe(true);
+    });
+  }
 });

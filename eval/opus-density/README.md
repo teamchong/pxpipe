@@ -5,9 +5,9 @@ at the production **5×8** cell density. If the same text is rendered *less dens
 (bigger cells → fewer chars/page → more pages), does Opus 4.8 read exact strings
 reliably enough to be worth enabling — and at what token cost?
 
-This harness answers that with a measurement, **not** a default change. It does
-not touch production code or the model allowlist. Fable 5 stays the only default
-reader unless the numbers below clear the acceptance bar.
+This harness answers that with a measurement. The native follow-up cleared the
+bar at 14px, which is now used whenever an operator opts Opus into pxpipe. Fable
+and its profile are unchanged.
 
 ## What it does
 
@@ -63,6 +63,15 @@ ANTHROPIC_API_KEY=sk-ant-... pnpm exec tsx eval/opus-density/run.mjs
 ```
 
 Results are written to `eval/opus-density/results.json`.
+
+## Native-font follow-up (2026-07-23)
+
+A fresh blind sweep tested every genuine JetBrains Mono size from 8px through
+16px at 86 columns. Native 14px (9×16) was the smallest rung with 8/8 exact
+values and zero confabulations, retaining 33% estimated savings. Native 11–13px
+all produced the same two silent digit/hex substitutions. Opus therefore uses
+14px when opted in; Fable remains unchanged. See [`RESULTS.md`](./RESULTS.md)
+and the locked artifacts under `native-sweep/`.
 
 A first live run (2026-07-05) is committed here: `results.json` plus a write-up in
 [`RESULTS.md`](./RESULTS.md). Short version — Opus reads **4/4 exact, 0 confab** at

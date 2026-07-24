@@ -149,7 +149,6 @@ const GPT56_SOL_PROFILE: GptModelProfile = {
     cellWBonus: 0,
     cellHBonus: 0,
   },
-  maxSerializedRequestBytes: 1024 * 1024,
 };
 
 interface ProfileRule {

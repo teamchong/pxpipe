@@ -28,14 +28,14 @@ param(
     # -DebugCapture: modalita' debug completa. Catena:
     #   claude -> tap1:47820 -> pxpipe:47821 -> tap2:47822 -> api.anthropic.com
     #  - tap1 (pxpipe-tap.js) salva OGNI request/response PRE-transform
-    #    in D:\Esperimenti\pxpipe-tap\
+    #    nella cartella "pxpipe-tap\" accanto allo script (vedi $PxpipeTapScript)
     #  - tap2 (pxpipe-tap2.js) salva OGNI request/response POST-transform
-    #    in D:\Esperimenti\pxpipe-tap2\ (pxpipe parte con ANTHROPIC_UPSTREAM=tap2)
+    #    nella cartella "pxpipe-tap2\" accanto allo script (vedi $PxpipeTap2Script; pxpipe parte con ANTHROPIC_UPSTREAM=tap2)
     #  - attiva PXPIPE_DEBUG_CAPTURE_4XX=1 sul proxy (body dei 4xx in ~/.pxpipe)
     #  - lancia claude con --debug e ANTHROPIC_BASE_URL puntato a tap1
     [switch]$DebugCapture,
 
-    # -Local: avvia il repo locale (D:\Esperimenti\pxpipe) con `pnpm run restart`
+    # -Local: avvia il repo locale (vedi $PxpipeLocalRepo, default = cartella dello script) con `pnpm run restart`
     # (kill orfani + rebuild + start) invece di npx pxpipe-proxy@latest. Utile per testare modifiche a
     # src/core/transform.ts (es. DYNAMIC_BLOCK_TAGS). Salta anche la pulizia
     # della cache npx, inutile in questa modalita'.
@@ -52,9 +52,9 @@ $ErrorActionPreference = "Stop"
 # ============================================================
 # === CONFIG: modifica qui i path locali ======================
 # ============================================================
-$PxpipeLocalRepo  = "D:\Esperimenti\pxpipe"              # repo locale (-Local)
-$PxpipeTapScript  = "D:\Esperimenti\pxpipe-tap.js"        # tap PRE-transform (-DebugCapture)
-$PxpipeTap2Script = "D:\Esperimenti\pxpipe-tap2.js"       # tap POST-transform (-DebugCapture)
+$PxpipeLocalRepo  = $PSScriptRoot                         # repo locale (-Local) - default: cartella di questo script
+$PxpipeTapScript  = "C:\path\to\pxpipe-tap.js"             # tap PRE-transform (-DebugCapture) - script esterno al repo, personalizza il path
+$PxpipeTap2Script = "C:\path\to\pxpipe-tap2.js"            # tap POST-transform (-DebugCapture) - script esterno al repo, personalizza il path
 $ClaudeExePath    = "claude"                              # eseguibile claude (nome nel PATH o path assoluto)
 # ============================================================
 

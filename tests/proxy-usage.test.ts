@@ -2421,4 +2421,68 @@ describe('proxy usage extraction', () => {
       else process.env.PXPIPE_GPT_PROFILES = prev;
     }
   });
+
+  it('rejects an identical in-flight request without duplicating the upstream stream', async () => {
+    const encoder = new TextEncoder();
+    let upstreamCalls = 0;
+    let finish!: () => void;
+    const restore = mockUpstream(() => {
+      upstreamCalls++;
+      return new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode('data: {"type":"response.output_text.delta","delta":"ok"}\n\n'));
+          finish = () => {
+            controller.enqueue(encoder.encode('data: {"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":1}}}\n\n'));
+            controller.close();
+          };
+        },
+      }), { headers: { 'content-type': 'text/event-stream' } });
+    });
+    try {
+      const events: ProxyEvent[] = [];
+      const proxy = createProxy({
+        openAIUpstream: 'http://mock',
+        transform: { compress: false },
+        onRequest: (event) => { events.push(event); },
+      });
+      const body = JSON.stringify({
+        model: 'gpt-5.6-sol',
+        input: [{ role: 'user', content: [{ type: 'input_text', text: 'hello' }] }],
+      });
+      const request = () => new Request('http://localhost/v1/responses', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: 'Bearer test' },
+        body,
+      });
+
+      const first = await proxy(request());
+      const duplicate = await proxy(request());
+      expect(duplicate.status).toBe(409);
+      expect(await duplicate.json()).toEqual({
+        error: {
+          type: 'duplicate_request_in_flight',
+          message: 'An identical request is already in progress',
+        },
+      });
+      expect(upstreamCalls).toBe(1);
+
+      finish();
+      const firstText = await first.text();
+      expect(firstText).toContain('response.output_text.delta');
+      expect(firstText).toContain('response.completed');
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      const later = await proxy(request());
+      expect(upstreamCalls).toBe(2);
+      finish();
+      await later.text();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      const duplicateEvent = events.find((event) => event.status === 409);
+      expect(duplicateEvent?.error).toBe('duplicate_request_in_flight');
+      expect(duplicateEvent?.usage).toBeUndefined();
+    } finally {
+      restore();
+    }
+  });
 });

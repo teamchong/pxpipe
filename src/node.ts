@@ -1224,9 +1224,10 @@ async function main(): Promise<void> {
         await writeWebResponse(webRes, res);
       })
       .catch((err) => {
+        if (isConnectionAbort(err) && (req.aborted || res.destroyed)) return;
         console.error('[pxpipe] handler error:', err);
         if (!res.headersSent) res.statusCode = 500;
-        res.end();
+        if (!res.writableEnded) res.end();
       });
   });
 

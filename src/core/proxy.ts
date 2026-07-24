@@ -1103,14 +1103,16 @@ export function createProxy(config: ProxyConfig = {}) {
             r.info.sizeLimitOutcome = 'rejected';
             const message = `pxpipe serialized request exceeds model limit (${r.body.byteLength} > ${requestByteLimit} bytes)`;
             fire(413, r.info, message);
-            return new Response(JSON.stringify({
-              error: { type: 'request_too_large', message },
-            }), {
+            const error = isMessages
+              ? { type: 'error', error: { type: 'request_too_large', message } }
+              : { error: { type: 'request_too_large', message } };
+            return new Response(JSON.stringify(error), {
               status: 413,
               headers: { 'content-type': 'application/json' },
             });
+          } else {
+            r.info.sizeLimitOutcome = 'within_limit';
           }
-          r.info.sizeLimitOutcome = 'within_limit';
         }
 
         if (isMessages && messagesAnthropic) {

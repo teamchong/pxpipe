@@ -711,6 +711,10 @@ function usesExactStaticBaseline(model: string): boolean {
   return normalized === 'gpt-5.6-sol' || normalized.startsWith('gpt-5.6-sol-');
 }
 
+function serializedHistoryByteLimit(model: string, profile: GptModelProfile): number | undefined {
+  return usesExactStaticBaseline(model) ? profile.maxSerializedRequestBytes : undefined;
+}
+
 /** Shared image-part accumulation from rendered PNGs. */
 function accumulateRenderedImages(
   images: RenderedImage[],
@@ -1197,15 +1201,28 @@ export async function transformOpenAIResponses(
   const combinedRaw = [...authorityDocs, toolDocs].filter((s) => s.length > 0).join('\n\n');
   info.origChars = combinedRaw.length;
   const profile = resolveGptProfile(req.model);
+  const finishSerialized = () => {
+    const encoded = new TextEncoder().encode(JSON.stringify(req));
+    const serializedByteLimit = serializedHistoryByteLimit(req.model, profile);
+    if (serializedByteLimit !== undefined && encoded.byteLength > serializedByteLimit) {
+      if (body.byteLength > serializedByteLimit) {
+        info.reason = 'serialized_request_limit';
+        info.compressed = true;
+        return { body, info };
+      }
+      return { body, info: emptyInfo('serialized_request_limit') };
+    }
+    info.outgoingTextChars = countResponsesOutgoingTextChars(req);
+    info.compressed = true;
+    return { body: encoded, info };
+  };
   const finishHistoryOnly = async (reason: string) => {
     info.reason = reason;
     if (o.collapseHistory && !inputWasString && await applyResponsesHistoryCollapse(
       req, inputItems, info, o, profile,
     )) {
       info.reason = undefined;
-      info.outgoingTextChars = countResponsesOutgoingTextChars(req);
-      info.compressed = true;
-      return { body: new TextEncoder().encode(JSON.stringify(req)), info };
+      return finishSerialized();
     }
     return { body, info };
   };
@@ -1365,7 +1382,5 @@ export async function transformOpenAIResponses(
 
   // Regression denominator, same as the Chat path — Responses was the only
   // transform that never recorded it.
-  info.outgoingTextChars = countResponsesOutgoingTextChars(req);
-  info.compressed = true;
-  return { body: new TextEncoder().encode(JSON.stringify(req)), info };
+  return finishSerialized();
 }

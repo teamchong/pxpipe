@@ -55,6 +55,17 @@ export interface ProxyConfig {
   /** Persist 4xx diagnostics: the gzipped request body plus the upstream error
    *  body. Off by default because either side may contain prompts or secrets. */
   captureErrorReqBody?: boolean;
+  /** Abort the upstream request if response headers have not arrived within this
+   *  many ms. Cleared once headers land, so long generations are unaffected.
+   *  0 disables. */
+  upstreamHeadersTimeoutMs?: number;
+  /** Abort the upstream response if no bytes arrive for this many ms. This is the
+   *  stall guard: a wedged connection can otherwise be held open forever. 0 disables. */
+  upstreamIdleTimeoutMs?: number;
+  /** How long an in-flight request may reject an identical retry before the dedupe
+   *  fails open. Prevents one stalled request from permanently 409-ing its retries.
+   *  0 disables dedupe entirely. */
+  duplicateHoldMs?: number;
 }
 
 export interface ProxyEvent {
@@ -95,6 +106,93 @@ export interface ProxyEvent {
 
 /** Max chars of 4xx error body captured on ProxyEvent — enough for Anthropic's full error JSON. */
 const ERROR_BODY_MAX = 2048;
+
+/** Headers should arrive well inside this; generous enough for slow reasoning starts. */
+const DEFAULT_UPSTREAM_HEADERS_TIMEOUT_MS = 300_000;
+/** No bytes for this long means the connection is wedged, not slow. */
+const DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS = 120_000;
+/** Past this, an in-flight entry is treated as stale and a retry is let through. */
+const DEFAULT_DUPLICATE_HOLD_MS = 60_000;
+
+/**
+ * Abort the response if no chunk arrives for `ms`. Wraps the raw upstream stream so
+ * the watchdog sees real network activity rather than post-transform output.
+ */
+function withIdleTimeout(res: Response, ms: number, onIdle: () => void): Response {
+  if (!res.body || ms <= 0) return res;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const clear = (): void => {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      timer = undefined;
+    }
+  };
+  // The watchdog errors its own controller rather than relying on the fetch
+  // implementation to tear the body down when the signal aborts.
+  let ctl: TransformStreamDefaultController<Uint8Array> | undefined;
+  const arm = (): void => {
+    clear();
+    timer = setTimeout(() => {
+      timer = undefined;
+      onIdle();
+      try {
+        ctl?.error(new Error(`pxpipe: upstream stalled for ${ms}ms`));
+      } catch {
+        /* already errored or closed */
+      }
+    }, ms);
+  };
+  const watched = res.body.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      start(controller) {
+        ctl = controller;
+        arm();
+      },
+      transform(chunk, controller) {
+        arm();
+        controller.enqueue(chunk);
+      },
+      flush() {
+        clear();
+      },
+    }),
+  );
+  return new Response(watched, {
+    status: res.status,
+    statusText: res.statusText,
+    headers: res.headers,
+  });
+}
+
+/**
+ * Passthrough that notifies on client disconnect. `cancel` deliberately does not await
+ * the inner cancel: with a wedged upstream that call can hang, which would in turn hang
+ * the caller's `body.cancel()`.
+ */
+function withClientDisconnect(
+  body: ReadableStream<Uint8Array>,
+  onCancel: (reason: unknown) => void,
+): ReadableStream<Uint8Array> {
+  const reader = body.getReader();
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(value);
+      } catch (e) {
+        controller.error(e);
+      }
+    },
+    cancel(reason) {
+      onCancel(reason);
+      void reader.cancel(reason).catch(() => undefined);
+    },
+  });
+}
 
 /** Read the actual top-level `model` field. The body is already buffered for
  * transformation, so parsing it is both safer and simpler than a prefix regex
@@ -798,7 +896,10 @@ export function parseGatewayHeaders(spec: string | undefined): Record<string, st
 /** Build the proxy fetch handler. */
 export function createProxy(config: ProxyConfig = {}) {
   const modelRoutes = new Map<string, 'openai' | 'cloudflare'>();
-  const inFlight = new Map<string, symbol>();
+  const inFlight = new Map<string, { lease: symbol; startedAt: number }>();
+  const headersTimeoutMs = config.upstreamHeadersTimeoutMs ?? DEFAULT_UPSTREAM_HEADERS_TIMEOUT_MS;
+  const idleTimeoutMs = config.upstreamIdleTimeoutMs ?? DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS;
+  const duplicateHoldMs = config.duplicateHoldMs ?? DEFAULT_DUPLICATE_HOLD_MS;
   // Explicit precedence: Cloudflare > OpenAI > normal family routing.
   for (const model of config.openAIModels ?? []) {
     const id = model.trim();
@@ -1206,7 +1307,7 @@ export function createProxy(config: ProxyConfig = {}) {
       upstreamUrl = requestUpstreamBase + outPath;
     }
     let releaseInFlight = (): void => {};
-    if (reqBodySha256) {
+    if (reqBodySha256 && duplicateHoldMs > 0) {
       const headers: [string, string][] = [];
       outHeaders.forEach((value, name) => { headers.push([name, value]); });
       headers.sort(([a], [b]) => a.localeCompare(b));
@@ -1216,7 +1317,10 @@ export function createProxy(config: ProxyConfig = {}) {
         headers,
         reqBodySha256,
       ]));
-      if (inFlight.has(key)) {
+      const existing = inFlight.get(key);
+      // Fail open once the holder is older than the window: a retry that arrives this
+      // late is the client recovering from a stall, not an accidental double-send.
+      if (existing && Date.now() - existing.startedAt < duplicateHoldMs) {
         const message = 'An identical request is already in progress';
         fire(409, undefined, 'duplicate_request_in_flight');
         const error = isMessages
@@ -1228,27 +1332,77 @@ export function createProxy(config: ProxyConfig = {}) {
         });
       }
       const lease = Symbol();
-      inFlight.set(key, lease);
+      inFlight.set(key, { lease, startedAt: Date.now() });
       releaseInFlight = () => {
-        if (inFlight.get(key) === lease) inFlight.delete(key);
+        if (inFlight.get(key)?.lease === lease) inFlight.delete(key);
       };
     }
+    // One controller for the whole exchange: headers timeout, stall watchdog and client
+    // disconnect all abort through it, so nothing can hold the socket open indefinitely.
+    const upstreamAbort = new AbortController();
+    let timeoutKind: 'headers' | 'idle' | undefined;
+    let headersTimer: ReturnType<typeof setTimeout> | undefined;
+    // Raced explicitly rather than trusting the fetch implementation to reject on
+    // abort — the headers phase must be bounded even if the signal is ignored.
+    const HEADERS_TIMEOUT = Symbol('headers-timeout');
+    const headersDeadline = new Promise<typeof HEADERS_TIMEOUT>((resolve) => {
+      if (headersTimeoutMs <= 0) return;
+      headersTimer = setTimeout(() => {
+        headersTimer = undefined;
+        timeoutKind = 'headers';
+        upstreamAbort.abort(new Error('pxpipe: upstream headers timeout'));
+        resolve(HEADERS_TIMEOUT);
+      }, headersTimeoutMs);
+    });
+    const clearHeadersTimer = (): void => {
+      if (headersTimer !== undefined) {
+        clearTimeout(headersTimer);
+        headersTimer = undefined;
+      }
+    };
+
     let upstreamRes: Response;
     try {
-      upstreamRes = await fetch(upstreamUrl, {
+      const upstreamFetch = fetch(upstreamUrl, {
         method: req.method,
         headers: outHeaders,
         body: bodyOut,
+        signal: upstreamAbort.signal,
         // duplex is required by spec when sending a stream as body
         ...(bodyOut instanceof ReadableStream ? { duplex: 'half' } : {}),
       } as RequestInit);
+      const raced =
+        headersTimeoutMs > 0 ? await Promise.race([upstreamFetch, headersDeadline]) : await upstreamFetch;
+      clearHeadersTimer();
+      if (raced === HEADERS_TIMEOUT) {
+        // Abandoned: keep its eventual rejection from surfacing as unhandled.
+        void upstreamFetch.catch(() => undefined);
+        throw new Error('pxpipe: upstream headers timeout');
+      }
+      upstreamRes = raced;
+      // Watch the raw upstream stream, before any bridge re-encodes it.
+      upstreamRes = withIdleTimeout(upstreamRes, idleTimeoutMs, () => {
+        timeoutKind = 'idle';
+        upstreamAbort.abort(new Error('pxpipe: upstream stalled'));
+      });
       if (bridgedGptMessages) {
         upstreamRes = await openAIResponsesToAnthropicResponse(upstreamRes, requestModel ?? '');
       } else if (bridgedChatMessages) {
         upstreamRes = await openAIChatToAnthropicResponse(upstreamRes, requestModel ?? '');
       }
     } catch (e) {
+      clearHeadersTimer();
       releaseInFlight();
+      if (timeoutKind) {
+        const detail = timeoutKind === 'headers'
+          ? `no response headers within ${headersTimeoutMs}ms`
+          : `no upstream bytes for ${idleTimeoutMs}ms`;
+        fire(504, info, `upstream_timeout: ${detail}`);
+        return new Response(JSON.stringify({ error: `pxpipe upstream timeout (${detail})` }), {
+          status: 504,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
       fire(502, info, `upstream_error: ${(e as Error).message}`);
       return new Response(JSON.stringify({ error: 'pxpipe upstream unreachable' }), {
         status: 502,
@@ -1289,9 +1443,24 @@ export function createProxy(config: ProxyConfig = {}) {
         measurement,
         stopReason,
       );
-    }).finally(releaseInFlight);
+    }).finally(() => {
+      clearHeadersTimer();
+      releaseInFlight();
+    });
 
-    return new Response(teed.body, {
+    // Client disconnect: drop the lease immediately and abort upstream, rather than
+    // waiting on scanner promises that a wedged connection would never settle.
+    const clientBody = teed.body
+      ? withClientDisconnect(teed.body, () => {
+          clearHeadersTimer();
+          releaseInFlight();
+          if (!upstreamAbort.signal.aborted) {
+            upstreamAbort.abort(new Error('pxpipe: client disconnected'));
+          }
+        })
+      : null;
+
+    return new Response(clientBody, {
       status: upstreamRes.status,
       statusText: upstreamRes.statusText,
       headers: filterHeaders(upstreamRes.headers, STRIP_RES_HEADERS),

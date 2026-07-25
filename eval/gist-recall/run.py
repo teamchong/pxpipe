@@ -33,11 +33,11 @@ def one(job):
                   + ' '.join(pngs) + ". Read all of them in order; do not use any other tool "
                   "or write code, just read the images visually.") + suffix
     ans = ask(prompt)
-    return dict(arm=arm, **p, answer=ans)
+    return dict(arm=arm, model=MODEL, **p, answer=ans)
 
 jobs = [(arm, p) for arm in ['text', 'image'] for p in probes]
 print(f'{len(jobs)} calls, model {MODEL}', flush=True)
-out = open(f'{WORK}/results.jsonl', 'w')
+out = open(f'{WORK}/results_{MODEL}.jsonl', 'w')
 with ThreadPoolExecutor(max_workers=6) as ex:
     for i, res in enumerate(ex.map(one, jobs)):
         out.write(json.dumps(res) + '\n'); out.flush()

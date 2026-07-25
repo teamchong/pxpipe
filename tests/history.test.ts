@@ -1105,7 +1105,16 @@ describe('collapseHistory — opening task carried verbatim from the demoted hea
     const headText = (out[0]!.content as Array<Record<string, unknown>>).filter(
       (c) => c.type === 'text',
     ) as Array<{ text: string }>;
-    expect(headText[0]!.text).toContain('PRIOR CONTEXT ONLY');
+    // Stale request prose is tombstoned …
+    expect(headText.some((t) => t.text.includes('PRIOR CONTEXT ONLY'))).toBe(true);
+    expect(headText.some((t) => t.text.includes(TASK))).toBe(false);
+    // … but standing instructions ride through verbatim: they govern the LIVE turn,
+    // and the 300-char preview cap would truncate long CLAUDE.md bodies.
+    expect(
+      headText.some(
+        (t) => t.text === '<system-reminder>claudeMd noise — not the task</system-reminder>',
+      ),
+    ).toBe(true);
 
     // The pointer in the synthetic message carries the task VERBATIM — including
     // everything past the 300-char preview cap: the questions and the format.
@@ -1152,5 +1161,84 @@ describe('collapseHistory — opening task carried verbatim from the demoted hea
     expect(pointer.text).toContain('middle elided');
     expect(pointer.text).toContain('SETUP: '); // head kept
     expect(pointer.text).toContain('Reply as: balance=<n>, count=<m>, final=<n+m>.'); // tail kept
+  });
+});
+
+describe('project instructions survive history collapse', () => {
+  function mkBody(messages: Message[], systemText: string) {
+    return new TextEncoder().encode(
+      JSON.stringify({ model: 'claude-3-5-sonnet', system: systemText, messages }),
+    );
+  }
+
+  const RULE = 'NEVER add a Claude attribution footer to commit messages.';
+
+  it('keeps the first user message as TEXT when it carries a <system-reminder>', async () => {
+    // Claude Code injects CLAUDE.md into the FIRST user message wrapped in
+    // <system-reminder>. History collapse used to start at index 0, so the
+    // rules turned into a PNG on the first collapse — readable to a human
+    // reviewing the transcript, but no longer instructions the model obeys.
+    const msgs: Message[] = [
+      // Real CLAUDE.md is thousands of chars and the rule that matters is
+      // rarely in the first line. The collapser emits a TRUNCATED preview of
+      // the message it images, so a short fixture passes even when the body
+      // is pixels — the rule must sit past the preview window to have teeth.
+      usr(
+        '<system-reminder>\n# CLAUDE.md\n'
+        + '- house style note.\n'.repeat(400)
+        + `${RULE}\n</system-reminder>\n\nfix the parser`,
+      ),
+    ];
+    for (let i = 0; i < 14; i++) {
+      msgs.push(i % 2 === 0 ? asst('y'.repeat(4000)) : usr('z'.repeat(4000)));
+    }
+
+    const { body, info } = await transformRequest(mkBody(msgs, 'x'.repeat(80_000)));
+    const out = JSON.parse(new TextDecoder().decode(body));
+
+    // Collapse actually fired — otherwise this test proves nothing.
+    expect(info.collapsedTurns).toBeGreaterThan(0);
+    // The rule text is still literally present somewhere in the wire body.
+    expect(JSON.stringify(out.messages)).toContain(RULE);
+    // And specifically as a text block on the untouched first message.
+    const first = out.messages[0];
+    const asText = typeof first.content === 'string'
+      ? first.content
+      : (first.content as any[]).filter((b) => b.type === 'text').map((b) => b.text).join('\n');
+    expect(asText).toContain(RULE);
+  });
+
+  it('still collapses from the head when no <system-reminder> is present', async () => {
+    const msgs: Message[] = [];
+    for (let i = 0; i < 15; i++) {
+      msgs.push(i % 2 === 0 ? usr('z'.repeat(4000)) : asst('y'.repeat(4000)));
+    }
+    const { info } = await transformRequest(mkBody(msgs, 'x'.repeat(80_000)));
+    expect(info.collapsedTurns).toBeGreaterThan(0);
+  });
+
+  // Regression: CLAUDE.md rules ride in the opening user message as a
+  // <system-reminder>. demoteProtectedHeadText used to reduce that whole message to
+  // a 300-char preview, so every rule past the cap silently vanished from the live
+  // request — the model stopped obeying project instructions mid-session.
+  it('keeps CLAUDE.md rules as text through collapse, past the preview cap', async () => {
+    const RULE = 'NEVER add a Claude attribution footer.';
+    const claudeMd =
+      '<system-reminder>\n# CLAUDE.md\n' +
+      '- house style note.\n'.repeat(400) + // pushes RULE far past the 300-char preview
+      RULE +
+      '\n</system-reminder>\n\nfix the parser';
+    const msgs: Message[] = [usr(claudeMd)];
+    for (let i = 0; i < 14; i++) {
+      msgs.push(i % 2 === 0 ? asst('y'.repeat(4000)) : usr('z'.repeat(4000)));
+    }
+
+    // Both slab regimes: system imaged (big) and passed through as text (small).
+    for (const system of ['x'.repeat(80_000), 'you are helpful']) {
+      const { body, info } = await transformRequest(mkBody(msgs, system));
+      const out = JSON.parse(new TextDecoder().decode(body)) as { messages: Message[] };
+      expect(info.collapsedTurns).toBeGreaterThan(0); // collapse really ran
+      expect(JSON.stringify(out.messages)).toContain(RULE);
+    }
   });
 });

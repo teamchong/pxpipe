@@ -405,6 +405,24 @@ function typedUserText(content: string | ContentBlock[]): string {
  * cache_control breakpoint survive; the demotion is a pure function of the message, so
  * the protected prefix stays byte-stable across turns (one-time re-cache on deploy).
  */
+/**
+ * Standing instructions (CLAUDE.md and friends) ride INSIDE the opening user message
+ * as <system-reminder> blocks. They are not conversational content: they govern the
+ * CURRENT turn and every later one, so demoting them to a 300-char preview silently
+ * drops project rules from the live request (the preview truncates long CLAUDE.md
+ * bodies well before their last rule). Carve them out and pass them through verbatim —
+ * same treatment the slab scaffolding gets above. Byte-stability is preserved: the
+ * reminder text is identical turn to turn, so the protected prefix still re-caches
+ * only on deploy.
+ */
+const REMINDER_RE = /<system-reminder>[\s\S]*?<\/system-reminder>/g;
+
+function splitStandingInstructions(text: string): { reminders: string[]; rest: string } {
+  const reminders = text.match(REMINDER_RE) ?? [];
+  if (reminders.length === 0) return { reminders: [], rest: text };
+  return { reminders, rest: text.replace(REMINDER_RE, ' ') };
+}
+
 function demoteProtectedHeadText(head: Message[]): Message[] {
   return head.map((m, idx) => {
     if (m.role !== 'user') return m;
@@ -421,9 +439,22 @@ function demoteProtectedHeadText(head: Message[]): Message[] {
       }
       return t;
     };
+    // Standing instructions survive verbatim; only the stale request prose demotes.
+    const demoteText = (text: string, cc?: CacheControl): ContentBlock[] | undefined => {
+      const { reminders, rest } = splitStandingInstructions(text);
+      const preview = compactPreview(rest);
+      if (reminders.length === 0) return preview ? [tomb(preview, cc)] : undefined;
+      const out: ContentBlock[] = reminders.map((r) => ({ type: 'text', text: r } as TextBlock));
+      if (preview) out.push(tomb(preview));
+      // cache_control rides the LAST block so the breakpoint keeps its position.
+      if (cc !== undefined) {
+        (out[out.length - 1] as TextBlock & { cache_control?: CacheControl }).cache_control = cc;
+      }
+      return out;
+    };
     if (typeof m.content === 'string') {
-      const preview = compactPreview(m.content);
-      return preview ? { ...m, content: [tomb(preview)] } : m;
+      const blocks = demoteText(m.content);
+      return blocks ? { ...m, content: blocks } : m;
     }
     if (!Array.isArray(m.content)) return m;
     // pxpipe's own slab scaffolding (the rendered images, the fact-sheet, and the
@@ -447,9 +478,12 @@ function demoteProtectedHeadText(head: Message[]): Message[] {
         continue;
       }
       if (blk && typeof blk === 'object' && (blk as { type?: string }).type === 'text') {
-        const preview = compactPreview((blk as TextBlock).text);
-        if (preview) {
-          out.push(tomb(preview, (blk as { cache_control?: CacheControl }).cache_control));
+        const blocks = demoteText(
+          (blk as TextBlock).text,
+          (blk as { cache_control?: CacheControl }).cache_control,
+        );
+        if (blocks) {
+          out.push(...blocks);
           changed = true;
           continue;
         }

@@ -989,6 +989,25 @@ export function firstUserText(req: MessagesRequest): string {
   return '';
 }
 
+/**
+ * True when the first message carries a `<system-reminder>` block — the
+ * envelope Claude Code uses to inject CLAUDE.md project instructions. Such a
+ * message must never be rendered to pixels: imaged rules read as description
+ * rather than instruction, so the model stops obeying them mid-session.
+ */
+export function firstMessageHasSystemReminder(messages: Message[] | undefined): boolean {
+  const first = (messages ?? [])[0];
+  if (!first) return false;
+  const has = (s: unknown) => typeof s === 'string' && s.includes('<system-reminder>');
+  if (has(first.content)) return true;
+  if (Array.isArray(first.content)) {
+    for (const block of first.content) {
+      if (block && (block as any).type === 'text' && has((block as any).text)) return true;
+    }
+  }
+  return false;
+}
+
 /** Parse structured fields from the dynamic slab for telemetry. Read-only. */
 export function extractEnvFields(dynamicText: string): EnvFields {
   const out: EnvFields = {};
@@ -1405,13 +1424,19 @@ async function runHistoryCollapseAndFinalize(
         o.priorWarmTokens, o.priorWarmImageTokens, true, g.maxChars,
       );
     };
-    // No protectedPrefix here: this path runs only when the slab did NOT image
-    // (it stays as text in req.system), so there is no slab message to shield —
-    // collapsing from the head is correct.
+    // The slab needs no shield here: this path runs only when the slab did NOT
+    // image (it stays as text in req.system). But project instructions do.
+    // CLAUDE.md arrives in the FIRST user message wrapped in <system-reminder>,
+    // so collapsing from the head images the user's rules on the first collapse
+    // — they survive turn 1 as text, then silently become pixels mid-session.
+    // Rules the model cannot read verbatim are rules it does not follow, so the
+    // message carrying them is protected from collapse the same way the
+    // non-collapse path already keeps <system-reminder> as text below.
+    const protectedPrefix = firstMessageHasSystemReminder(req.messages) ? 1 : 0;
     const { messages: newMessages, info: histInfo } = await collapseHistory(
       req.messages,
       historyProfitable,
-      { cols: o.cols, protectedPrefix: 0, reflow: o.reflow },
+      { cols: o.cols, protectedPrefix, reflow: o.reflow },
     );
     if (histInfo.collapsedTurns > 0) {
       req.messages = newMessages;

@@ -2,9 +2,74 @@
 
 **Status:** ⚠️ **VERDICT REVERSED — see correction below.** Originally ruled "dead"; live measurement shows pxpipe is a working *lossy gist-compressor* saving ~68% on real (dense) Claude Code traffic, with a known verbatim-recall gap.
 **Date:** 2026-05-28 (original) · 2026-05-29 (correction) · 2026-06-09 (Fable 5 update) · 2026-06-10 (gist-recall A/B, SWE-bench pilot) · 2026-06-12 (field observation, n=1) · 2026-06-23 (reframe: correct baseline = /compact) · 2026-07-09 (GPT-5.6 Sol raw-recall pilot) · 2026-07-19 (K/H glyph-surgery model-level A/B)
-**Models tested:** `claude-opus-4-5` (original run), `claude-opus-4-8` (re-test after a model bump), `claude-fable-5` (2026-06-09), `gpt-5.6-sol` (2026-07-09 raw-image pilot)
-**Model scope (current):** Fable 5 and Gemini 3.6 Flash. Sol, Opus, GPT 5.5, and Grok remain explicit opt-ins.
+**Models tested:** `claude-opus-4-5` (original run), `claude-opus-4-8` (re-test after a model bump), `claude-fable-5` (2026-06-09), `gpt-5.6-sol` (2026-07-09 raw-image pilot), `claude-opus-5` (2026-07-20 default-scope evaluation)
+**Model scope (current):** Fable 5, **Opus 5**, and Gemini 3.6 Flash. Sol, GPT 5.5, and Grok remain explicit opt-ins.
 **Harnesses:** Claude/Opus/Fable: `eval/needle-haystack/` (older receipts preserved from `/tmp/needle_eval`); Sol: `eval/sol-profile/` (raw responses and receipts committed)
+
+---
+
+## Update (2026-07-20) — `claude-opus-5` promoted to default scope
+
+**Verdict: ship it as a default, with the recall gap stated up front. Opus 5 is
+measurably worse than Fable 5 at recall. It is good enough for the job pxpipe
+actually does, and it buys a very long session before `/compact`.**
+
+### Scores, side by side
+
+Same harnesses, each model reading renders produced under **its own** profile
+(the arms are per-model, not pixel-identical — see `eval/gsm8k/README.md`).
+
+| suite | `claude-fable-5` | `claude-opus-5` | delta |
+|---|---:|---:|---|
+| arithmetic, novel numbers (N=100) | 100/100 | **100/100** | tie |
+| gist recall (N=98) | 98/98 | 94/98 | **−4** |
+| state tracking (N=18) | 18/18 | 17/18 | **−1** |
+| never-stated guard (N=16) | 0/16 | **0/16** | tie (0 = no confabulation, good) |
+| dense hex verbatim (N=15) | 13/15 | 2/15 | **−11** |
+
+Receipts: [`eval/gist-recall/`](eval/gist-recall/), [`eval/gsm8k/`](eval/gsm8k/)
+(incl. `results_claude-opus-5_novel.json`, all 100 pred/gold pairs),
+[`eval/verbatim-15/`](eval/verbatim-15/).
+
+### What it means
+
+- **Worse at recall than Fable.** Gist gap small (−4/98). Verbatim gap large
+  (2/15 vs 13/15) — Opus 5 mostly fails to resolve glyphs at pxpipe's density.
+  Need verbatim? Read with Fable 5 or Gemini 3.6 Flash.
+- **Good enough for the job.** 100/100 arithmetic through the render, 0/16
+  never-stated (no confabulation), 94/98 gist — fine for summarize / navigate /
+  recall-the-gist, which is what pxpipe is for.
+- **Long sessions before `/compact`.** Fable 5 geometry: ~18.9 c/vt, ~18.9M
+  effective chars on a 1M window, **~4.7×** over text. Geometry, not quality.
+
+### Recommended setting: effort `medium`
+
+- These tasks are **perceptual, not reasoning-limited** (text arm = 100%).
+- Higher effort spends tokens without closing the glyph gap, and eats the
+  long-session headroom that is the reason to pick Opus 5.
+- **No effort-level A/B was run.** Treat `medium` as a default, not a finding.
+
+### Caveats
+
+- Opus 5 **text baseline not re-measured** on arithmetic — delta inferred.
+- Arms are per-model renders — cross-model rows are not pixel-identical.
+- The `src/core/render.ts` colour work shipping alongside is a **refactor with
+  no demonstrated accuracy benefit** — see below.
+
+### Not demonstrated: "colour helps the LLM read better"
+
+Recorded so it is not mistaken for a result.
+
+| | |
+|---|---|
+| Only scored comparison | `ctl` 5/15 = 33.3% vs `cband` 9/45 = 20.0% |
+| Significance | Fisher **p = 0.31** — colour scored *worse* |
+| Confounds | k=5 vs k=3, different fixtures |
+| Decisive matched re-run (`ctl` vs `bgtint`, k=3, same fixture) | **never executed** |
+| Last substantive check | byte-identity refactor proof (BEFORE vs AFTER identical, all 35) — a **no-behaviour-change** result by construction |
+
+**Status: undemonstrated.** The render changes merge as a refactor, not as an
+accuracy improvement.
 
 ---
 

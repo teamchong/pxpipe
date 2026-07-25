@@ -23,14 +23,28 @@
 import { type RenderFont } from './render.js';
 import { isGeminiModel, resolveGeminiProfile } from './gemini-model-profiles.js';
 import { isClaudeModel, resolveClaudeProfile } from './claude-model-profiles.js';
-import { BASE_HISTORY, BASE_STYLE } from './profile-base.js';
+import { BASE_HISTORY, BASE_PRICING, BASE_STYLE } from './profile-base.js';
 
 export const GPT_MAX_HEIGHT_PX = 1932;
 
-/** Image-token cost model. An omitted patchCap means original dimensions are billed. */
+/**
+ * Image-token cost model. Every provider family is DATA here — there is no
+ * `if (isClaude)` branch anywhere in the pricing path; `visionTokens()`
+ * (vision-cost.ts) is the single interpreter of these regimes.
+ *
+ *  - `tile`    OpenAI legacy: 2048/768 downscale, then base + perTile per 512-px tile.
+ *  - `patch`   OpenAI 32-px patches × multiplier. An omitted patchCap bills original dims.
+ *  - `patch28` Anthropic 28-px patches after the tier downscale (see `visionTier`).
+ *  - `mpix`    Pixel-priced families (Grok): megapixels × tokensPerMegapixel, min 1.
+ *  - `flat`    One fixed charge per image (Gemini), with an optional measured
+ *              exact-canvas override for the production page size.
+ */
 export type GptVisionCost =
   | { regime: 'tile'; base: number; perTile: number }
-  | { regime: 'patch'; multiplier: number; patchCap?: number };
+  | { regime: 'patch'; multiplier: number; patchCap?: number }
+  | { regime: 'patch28' }
+  | { regime: 'mpix'; tokensPerMegapixel: number }
+  | { regime: 'flat'; tokens: number; exact?: { widthPx: number; heightPx: number; tokens: number } };
 
 export interface GptRenderStyle {
   /** Rasterized font atlas. */
@@ -73,8 +87,13 @@ export interface GptHistoryProfile {
 }
 
 export interface GptModelProfile {
-  /** How OpenAI bills the rendered images as input tokens. */
+  /** How this model's provider bills the rendered images as input tokens. */
   vision: GptVisionCost;
+  /** Cached-input list price ÷ uncached-input list price for this family.
+   *  Savings reporting reads this instead of re-classifying the model id. */
+  cacheReadRate: number;
+  /** Output list price ÷ uncached-input list price for this family. */
+  outputRate: number;
   /** Max portrait-strip width in columns. Combined with `style`, this must stay
    *  at or below the provider's no-resize pixel width. */
   stripCols: number;
@@ -95,8 +114,15 @@ export interface GptModelProfile {
   /** Complete model-specific font, cell spacing, color, and marker style. */
   style: GptRenderStyle;
   /** Maximum serialized provider request produced by pxpipe. Undefined leaves
-   *  legacy behavior unchanged. Enforced after the final wire transform. */
+   *  legacy behavior unchanged. Checked in the transform (which falls back to
+   *  the original body when imaging would overshoot) and enforced again on the
+   *  final wire body by the proxy, which answers 413. */
   maxSerializedRequestBytes?: number;
+  /** Gate the static slab against the exact measured baseline (system text plus
+   *  the tool-description tokens actually stripped) instead of the rendered
+   *  text's own token count. Profiles that pin an exact static slab set this;
+   *  it is a property of the profile, not of one model id. */
+  exactStaticBaseline?: boolean;
 }
 
 /** Default downscale-safe strip width (768px). Exported as the global cols default. */
@@ -105,12 +131,16 @@ export const DEFAULT_GPT_STRIP_COLS = 152;
 const C = DEFAULT_GPT_STRIP_COLS;
 const H = GPT_MAX_HEIGHT_PX;
 
+/** gpt-5 family list prices: cached input $0.125 / input $1.25 / output $10 per 1M. */
+const GPT5_PRICING = { cacheReadRate: 0.1, outputRate: 8 };
+
 /**
  * Conservative fallback for unrecognized models: tile 85/170 over-states cost,
  * which biases the gate toward pass-through (safe). Matches gpt-4o/4.1/4.5.
  */
 export const DEFAULT_GPT_PROFILE: GptModelProfile = {
   vision: { regime: 'tile', base: 85, perTile: 170 },
+  ...BASE_PRICING,
   stripCols: C,
   maxHeightPx: H,
   minCompressTokens: 500,
@@ -122,6 +152,10 @@ export const DEFAULT_GPT_PROFILE: GptModelProfile = {
 const GPT56_SOL_PROFILE: GptModelProfile = {
   // GPT-5.6 original detail bills the submitted 32px patches without a patch cap.
   vision: { regime: 'patch', multiplier: 1 },
+  ...GPT5_PRICING,
+  // Sol pins an exact static slab, so the gate compares against the measured
+  // baseline rather than re-tokenizing the rendered text.
+  exactStaticBaseline: true,
   // Match the native 14px reader profile. Sol remains opt-in: its two-fixture
   // pilot retained gist/guard and had no unsupported inventions, but one exact
   // identifier was truncated.
@@ -160,6 +194,25 @@ interface ProfileRule {
 const isMiniNanoPatch = (m: string): boolean =>
   /^(?:gpt-5(?:\.\d+)?|gpt-4\.1)-(?:mini|nano)/.test(m) || /^o4-mini/.test(m);
 
+/** Grok ids pxpipe has a measured profile for. */
+const isGrokModel = (m: string): boolean => /^grok-/.test(m);
+
+/** Shared GPT geometry for the small patch-billed models; only the patch
+ *  multiplier and the family list prices differ between the rules below. */
+const miniNanoProfile = (
+  multiplier: number,
+  pricing: { cacheReadRate: number; outputRate: number },
+): GptModelProfile => ({
+  vision: { regime: 'patch', multiplier, patchCap: 1536 },
+  ...pricing,
+  stripCols: C,
+  maxHeightPx: H,
+  minCompressTokens: 500,
+  factSheetFormat: 'full',
+  history: BASE_HISTORY,
+  style: BASE_STYLE,
+});
+
 /**
  * Built-in profiles, evaluated in order (first match wins). Precedence and
  * numbers reproduce the previous hardcoded `resolveVisionCost` EXACTLY:
@@ -168,13 +221,23 @@ const isMiniNanoPatch = (m: string): boolean =>
 const BUILTIN_RULES: ProfileRule[] = [
   // nano patch models: ceil(patches * 2.46), cap 1536
   {
+    test: (m) => isMiniNanoPatch(m) && /nano/.test(m) && /^gpt-5/.test(m),
+    profile: miniNanoProfile(2.46, GPT5_PRICING),
+  },
+  // gpt-4.1-nano: same tokenization, older (less aggressive) cache discount.
+  {
     test: (m) => isMiniNanoPatch(m) && /nano/.test(m),
-    profile: { vision: { regime: 'patch', multiplier: 2.46, patchCap: 1536 }, stripCols: C, maxHeightPx: H, minCompressTokens: 500, factSheetFormat: 'full', history: BASE_HISTORY, style: BASE_STYLE },
+    profile: miniNanoProfile(2.46, BASE_PRICING),
   },
   // mini / o4-mini patch models: ceil(patches * 1.62), cap 1536
   {
-    test: (m) => isMiniNanoPatch(m) && !/nano/.test(m),
-    profile: { vision: { regime: 'patch', multiplier: 1.62, patchCap: 1536 }, stripCols: C, maxHeightPx: H, minCompressTokens: 500, factSheetFormat: 'full', history: BASE_HISTORY, style: BASE_STYLE },
+    test: (m) => isMiniNanoPatch(m) && /^gpt-5/.test(m),
+    profile: miniNanoProfile(1.62, GPT5_PRICING),
+  },
+  // gpt-4.1-mini / o4-mini: same tokenization, older cache discount.
+  {
+    test: isMiniNanoPatch,
+    profile: miniNanoProfile(1.62, BASE_PRICING),
   },
   // Exact Sol variant observed on production traffic. Do not match bare 5.6 or
   // sibling variants (for example gpt-5.6-terra): model-specific visual tuning
@@ -186,26 +249,31 @@ const BUILTIN_RULES: ProfileRule[] = [
   // 5.x flagship (gpt-5.4/5.5/…, no -mini/-nano): patch, multiplier 1, detail:original cap
   {
     test: (m) => /^gpt-5\.\d/.test(m),
-    profile: { vision: { regime: 'patch', multiplier: 1, patchCap: 10000 }, stripCols: C, maxHeightPx: H, minCompressTokens: 500, factSheetFormat: 'full', history: BASE_HISTORY, style: BASE_STYLE },
+    profile: { vision: { regime: 'patch', multiplier: 1, patchCap: 10000 }, ...GPT5_PRICING, stripCols: C, maxHeightPx: H, minCompressTokens: 500, factSheetFormat: 'full', history: BASE_HISTORY, style: BASE_STYLE },
   },
   // gpt-5 / gpt-5-chat-latest: tile 70/140
   {
     test: (m) => /^gpt-5/.test(m),
-    profile: { vision: { regime: 'tile', base: 70, perTile: 140 }, stripCols: C, maxHeightPx: H, minCompressTokens: 500, factSheetFormat: 'full', history: BASE_HISTORY, style: BASE_STYLE },
+    profile: { vision: { regime: 'tile', base: 70, perTile: 140 }, ...GPT5_PRICING, stripCols: C, maxHeightPx: H, minCompressTokens: 500, factSheetFormat: 'full', history: BASE_HISTORY, style: BASE_STYLE },
   },
   // o1 / o3 reasoning: tile 75/150
   {
     test: (m) => /^o[13]/.test(m),
-    profile: { vision: { regime: 'tile', base: 75, perTile: 150 }, stripCols: C, maxHeightPx: H, minCompressTokens: 500, factSheetFormat: 'full', history: BASE_HISTORY, style: BASE_STYLE },
+    profile: { vision: { regime: 'tile', base: 75, perTile: 150 }, ...BASE_PRICING, stripCols: C, maxHeightPx: H, minCompressTokens: 500, factSheetFormat: 'full', history: BASE_HISTORY, style: BASE_STYLE },
   },
 
   // Grok remains opt-in. Native 14px / 84 cols / maxH 512 is the densest best
   // rung from the JB Mono 8–16px blind sweep (eval/grok-density/native-sweep).
   {
-    test: (m) => /^grok-/.test(m),
+    test: isGrokModel,
     profile: {
-      // Vision struct unused: visionTokensForModel prices Grok by pixels.
-      vision: { regime: 'tile', base: 85, perTile: 170 },
+      // Measured 2026-07-09 on grok-4.5: image-token delta ≈ 1000 per megapixel
+      // across several page sizes (768x336 → 268, 764x980 → 748, etc.).
+      vision: { regime: 'mpix', tokensPerMegapixel: 1000 },
+      // xAI model pricing metadata: cachedPromptTokenPrice/promptTextTokenPrice
+      // = 5000/20000; completionTextTokenPrice/promptTextTokenPrice = 60000/20000.
+      cacheReadRate: 0.25,
+      outputRate: 3,
       // Native 14px was the densest best rung on the Grok JB Mono 8–16px blind
       // sweep (4/8 exact, 4 confab, 48% savings). 84 × 9px + pad = 764px ≤ 768.
       // No rung was fully clean; 14px tied 15/16px on exact and beat smaller cells.
@@ -225,6 +293,33 @@ const BUILTIN_RULES: ProfileRule[] = [
     },
   },
 ];
+
+/**
+ * Families whose profile test is NARROWER than the ids that name them, with the
+ * test each one owns. Claude and GPT need no entry: every id that mentions them
+ * resolves to one of their profiles.
+ */
+const FAMILY_ID_GUARDS: ReadonlyArray<{ mentions: RegExp; matches: (m: string) => boolean }> = [
+  { mentions: /gemini/, matches: isGeminiModel },
+  { mentions: /grok/, matches: isGrokModel },
+];
+
+/**
+ * True when an id NAMES a known provider family but does not match that
+ * family's profile test — for example `gemini-3.6-pro`, when 3.6 Flash is the
+ * only Gemini geometry pxpipe has measured. Such an id would fall through to
+ * DEFAULT_GPT_PROFILE and be gated with OpenAI's tile math, i.e. priced with
+ * the wrong provider's formula, so applicability refuses it instead of
+ * compressing against numbers that do not apply to it.
+ *
+ * (DEFAULT_GPT_PROFILE is a legitimate *OpenAI* fallback — gpt-4o and friends
+ * are deliberately gated with its conservative tile cost — so resolving to the
+ * default is only a problem when the id is not an OpenAI id at all.)
+ */
+export function isMisresolvedModelId(model: string | null | undefined): boolean {
+  const m = (model ?? '').toLowerCase();
+  return FAMILY_ID_GUARDS.some((g) => g.mentions.test(m) && !g.matches(m));
+}
 
 function resolveBuiltin(m: string): GptModelProfile {
   // Claude first, and by whole-id match rather than a rule in the table below:
@@ -252,7 +347,25 @@ function isValidVision(v: unknown): v is GptVisionCost {
     return Number.isFinite(o.multiplier) &&
       (o.patchCap === undefined || (Number.isFinite(o.patchCap) && (o.patchCap as number) > 0));
   }
+  if (o.regime === 'patch28') return true;
+  if (o.regime === 'mpix') {
+    return Number.isFinite(o.tokensPerMegapixel) && (o.tokensPerMegapixel as number) > 0;
+  }
+  if (o.regime === 'flat') {
+    if (!Number.isFinite(o.tokens) || (o.tokens as number) <= 0) return false;
+    if (o.exact === undefined) return true;
+    const e = o.exact as Record<string, unknown>;
+    return !!e && typeof e === 'object' &&
+      Number.isFinite(e.widthPx) && (e.widthPx as number) > 0 &&
+      Number.isFinite(e.heightPx) && (e.heightPx as number) > 0 &&
+      Number.isFinite(e.tokens) && (e.tokens as number) > 0;
+  }
   return false;
+}
+
+/** Price ratios must be positive and finite; anything else keeps the built-in. */
+function rate(v: unknown, fallback: number): number {
+  return Number.isFinite(v) && (v as number) > 0 ? (v as number) : fallback;
 }
 
 function posInt(v: unknown, fallback: number): number {
@@ -334,6 +447,8 @@ function parseEnvProfiles(raw: string): Map<string, GptModelProfile> {
     };
     out.set(key, {
       vision: isValidVision(p.vision) ? p.vision : base.vision,
+      cacheReadRate: rate(p.cacheReadRate, base.cacheReadRate),
+      outputRate: rate(p.outputRate, base.outputRate),
       stripCols: posInt(p.stripCols, base.stripCols),
       maxHeightPx: posInt(p.maxHeightPx, base.maxHeightPx),
       visionTier: p.visionTier === 'high-res' || p.visionTier === 'standard' ? p.visionTier : base.visionTier,
@@ -346,6 +461,9 @@ function parseEnvProfiles(raw: string): Map<string, GptModelProfile> {
       maxSerializedRequestBytes: p.maxSerializedRequestBytes === undefined
         ? base.maxSerializedRequestBytes
         : posInt(p.maxSerializedRequestBytes, base.maxSerializedRequestBytes ?? 0) || undefined,
+      exactStaticBaseline: typeof p.exactStaticBaseline === 'boolean'
+        ? p.exactStaticBaseline
+        : base.exactStaticBaseline,
     });
   }
   return out;

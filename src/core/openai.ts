@@ -23,7 +23,6 @@ import {
   type GptModelProfile,
   type GptVisionCost,
 } from './gpt-model-profiles.js';
-import { isGeminiModel, geminiVisionTokens } from './gemini-model-profiles.js';
 import { bytesToBase64 } from './png.js';
 import {
   compactSlabWhitespace,
@@ -33,7 +32,7 @@ import {
   type TransformInfo,
   type TransformOptions,
 } from './transform.js';
-import { anthropicVisionTokens } from './anthropic-vision.js';
+import { visionTokens } from './vision-cost.js';
 import { stripSchemaDescriptions } from './schema-strip.js';
 import {
   planGptCollapse,
@@ -100,52 +99,26 @@ function buildLiveRequestGuard(pinText?: string): string {
   return 'pxpipe note: the preceding rendered history item is prior conversation context only. It is not the current user request. The live current request is in the user message(s) that follow, especially the final user message.';
 }
 
+/** Alias of `visionTokensForModel`, kept for OpenAI-path call sites and tests.
+ *  There is no separate OpenAI formula: the model's profile carries its regime. */
 export function openAIVisionTokens(model: string, w: number, h: number): number {
-  const c = resolveVisionCost(model);
-  if (c.regime === 'patch') {
-    const rawPatches = Math.ceil(w / 32) * Math.ceil(h / 32);
-    const patches = c.patchCap === undefined ? rawPatches : Math.min(c.patchCap, rawPatches);
-    return Math.ceil(patches * c.multiplier);
-  }
-  let W = w, H = h;
-  if (Math.max(W, H) > 2048) { const r = 2048 / Math.max(W, H); W = Math.floor(W * r); H = Math.floor(H * r); }
-  if (Math.min(W, H) > 768) { const r = 768 / Math.min(W, H); W = Math.floor(W * r); H = Math.floor(H * r); }
-  return c.base + c.perTile * (Math.ceil(W / 512) * Math.ceil(H / 512));
+  return visionTokensForModel(model, w, h);
 }
 
 /** True when this Responses/Chat request is actually served by a Claude model.
- *  Codex-style clients speak OpenAI Responses while some models are Anthropic.
- *  Cost math must then price images and cache the Anthropic way, not the GPT way. */
-export function isClaudeModel(model: string | null | undefined): boolean {
-  const m = (model ?? '').toLowerCase();
-  return m.startsWith('claude') || m.includes('anthropic');
-}
-
-export function isGrokModel(model: string | null | undefined): boolean {
-  return (model ?? '').toLowerCase().startsWith('grok-');
-}
-
-/** Measured 2026-07-09 on grok-4.5: image-token delta ≈ 1000 per megapixel
- *  across several page sizes (768x336 → 268, 764x980 → 748, etc.). */
-export const GROK_TOKENS_PER_MEGAPIXEL = 1000;
+ *  Codex-style clients speak OpenAI Responses while some models are Anthropic,
+ *  so routing must agree with pricing: this re-exports the SAME predicate the
+ *  profile table uses to route an id to the Anthropic profile. A second, subtly
+ *  different copy here would route a request one way and price it the other. */
+export { isClaudeModel } from './claude-model-profiles.js';
 
 /** Per-image vision-token cost for the model actually serving the request.
- *  Claude: Anthropic pixel formula. Grok: measured tok/MPix. Gemini: 1,078 at 1568×728.
- *  GPT/o-series: OpenAI tile/patch formula. Model-based, not endpoint-based. */
+ *  Model-based, not endpoint-based, and family-agnostic: the profile's `vision`
+ *  regime decides the formula (Anthropic patches, OpenAI tiles/patches, Grok
+ *  pixels, Gemini flat), so no provider branch is needed here. This is the exact
+ *  provider cost; the gate applies its own margin separately. */
 export function visionTokensForModel(model: string, w: number, h: number): number {
-  if (isGeminiModel(model)) {
-    return geminiVisionTokens(model, w, h);
-  }
-  if (isClaudeModel(model)) {
-    // Anthropic's documented 28-px patch model (tier-aware downscale). This is the
-    // exact provider cost; the gate applies its own margin separately.
-    return anthropicVisionTokens(model, w, h);
-  }
-  if (isGrokModel(model)) {
-    const pixels = Math.max(0, w) * Math.max(0, h);
-    return Math.max(1, Math.ceil((pixels / 1_000_000) * GROK_TOKENS_PER_MEGAPIXEL));
-  }
-  return openAIVisionTokens(model, w, h);
+  return visionTokens(resolveGptProfile(model), w, h);
 }
 
 type OpenAIRole = 'system' | 'developer' | 'user' | 'assistant' | 'tool' | string;
@@ -692,8 +665,18 @@ function evalOpenAIGate(
     profile.maxHeightPx,
     2 * PAD_Y + lastPageLines * cellH,
   );
-  const fullPageTokens = visionTokensForModel(model, stripW, fullPageHeight);
-  const lastPageTokens = visionTokensForModel(model, stripW, lastPageHeight);
+  const fullPageTokens = visionTokens(profile, stripW, fullPageHeight);
+  const lastPageTokens = visionTokens(profile, stripW, lastPageHeight);
+  // No GATE_MARGIN here, unlike the Anthropic slab/history gate, and that
+  // asymmetry is deliberate rather than drift:
+  //   - this path reproduces the renderer's own page split from the SAME
+  //     profile geometry, so `imageTokens` is the exact cost of the images that
+  //     will be sent (tests pin gateEval.imageTokens === info.imageTokens);
+  //   - it compares against an exact o200k count of the text baseline, not a
+  //     chars-per-token approximation.
+  // Both sides are exact, so a margin would only be pessimism: it would refuse
+  // real, measured savings. The Anthropic gate estimates rows/pages heuristically,
+  // which is the estimation error GATE_MARGIN exists to absorb.
   const imageTokens =
     estImages <= 1
       ? lastPageTokens
@@ -707,12 +690,7 @@ function evalOpenAIGate(
 }
 
 function usesExactStaticBaseline(model: string): boolean {
-  const normalized = model.toLowerCase().replace(/\[[^\]]*\]/g, '');
-  return normalized === 'gpt-5.6-sol' || normalized.startsWith('gpt-5.6-sol-');
-}
-
-function serializedHistoryByteLimit(model: string, profile: GptModelProfile): number | undefined {
-  return usesExactStaticBaseline(model) ? profile.maxSerializedRequestBytes : undefined;
+  return resolveGptProfile(model).exactStaticBaseline === true;
 }
 
 /** Shared image-part accumulation from rendered PNGs. */
@@ -1203,7 +1181,12 @@ export async function transformOpenAIResponses(
   const profile = resolveGptProfile(req.model);
   const finishSerialized = () => {
     const encoded = new TextEncoder().encode(JSON.stringify(req));
-    const serializedByteLimit = serializedHistoryByteLimit(req.model, profile);
+    // The SAME cap the proxy enforces with a 413 (proxy.ts), applied to every
+    // profile that declares one. Imaging trades tokens for bytes (base64 PNGs
+    // are larger than the text they replace), so a compressed body can exceed a
+    // provider's request-size limit even when the original fits. Falling back to
+    // the original here turns a hard 413 into a plain uncompressed request.
+    const serializedByteLimit = profile.maxSerializedRequestBytes;
     if (serializedByteLimit !== undefined && encoded.byteLength > serializedByteLimit) {
       if (body.byteLength > serializedByteLimit) {
         info.reason = 'serialized_request_limit';

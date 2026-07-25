@@ -10,6 +10,18 @@ import type { GptHistoryProfile, GptRenderStyle } from './gpt-model-profiles.js'
  * out of it would be a cycle, and the profiles are top-level consts, so the
  * cycle would be a load-time TDZ crash rather than a lint warning.
  */
+/**
+ * Conservative list-price ratios for families pxpipe has not priced explicitly.
+ * Deliberately mid-range: an unknown model must not be reported at the most
+ * favourable (gpt-5) cache discount, and must not be priced at Anthropic's.
+ */
+export const BASE_PRICING = {
+  /** cached input ÷ uncached input */
+  cacheReadRate: 0.5,
+  /** output ÷ uncached input */
+  outputRate: 4,
+};
+
 export const BASE_STYLE: GptRenderStyle = {
   font: DEFAULT_RENDER_FONT,
   cellWBonus: 0,

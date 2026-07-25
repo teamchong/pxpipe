@@ -16,9 +16,13 @@ import type { GptModelProfile } from './gpt-model-profiles.js';
  * rule table, so no Claude model can land on a GPT or Gemini profile.
  */
 
-/** Claude 4.7+. Vision struct unused: visionTokensForModel prices Claude by pixels. */
+/** Claude 4.7+. Billed by Anthropic's 28-px patch grid after the high-res
+ *  tier downscale; `visionTier` below is the only knob that varies by release. */
 export const CLAUDE_PROFILE: GptModelProfile = {
-  vision: { regime: 'tile', base: 85, perTile: 170 },
+  vision: { regime: 'patch28' },
+  // Anthropic list prices: cache read $0.10 / input $1.00; output $5.00 / input.
+  cacheReadRate: 0.1,
+  outputRate: 5,
   stripCols: ANTHROPIC_STRIP_COLS,
   maxHeightPx: ANTHROPIC_MAX_HEIGHT_PX,
   visionTier: 'high-res',

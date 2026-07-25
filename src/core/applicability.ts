@@ -1,5 +1,7 @@
 /** Applicability helpers for pxpipe's production-safe model scope. */
 
+import { isMisresolvedModelId } from './gpt-model-profiles.js';
+
 export type PxpipeApplicabilityReason =
   | 'eligible'
   | 'unsupported_model'
@@ -81,10 +83,10 @@ export function setAllowedModelBases(list: readonly string[] | null): void {
 function isAllowed(model: string | null | undefined): boolean {
   if (typeof model !== 'string') return false;
   const base = baseModelId(model).toLowerCase();
-  if (base.includes('gemini')) {
-    const validated = base === 'gemini-3.6-flash' || base === 'google/gemini-3.6-flash';
-    if (!validated) return false;
-  }
+  // Never compress an id that would be priced with another provider's formula
+  // (e.g. an unmeasured Gemini sibling falling through to the OpenAI fallback).
+  // Which ids those are is profile-table knowledge, not a rule maintained here.
+  if (isMisresolvedModelId(base)) return false;
   return allowedModelBases().some((b) => {
     const target = b.toLowerCase();
     return base === target || base.startsWith(`${target}-`) || base === `google/${target}`;

@@ -42,7 +42,8 @@ import { bytesToBase64 } from './png.js';
 import { collapseHistory, HISTORY_SYNTHETIC_INTRO } from './history.js';
 import type { GptHistoryOptions } from './openai-history.js';
 import { CACHE_CREATE_RATE, CACHE_READ_RATE } from './baseline.js';
-import { patchTokens } from './anthropic-vision.js';
+import { visionTokens, type VisionPricing } from './vision-cost.js';
+import { CLAUDE_PROFILE } from './claude-model-profiles.js';
 import { resolveGptProfile } from './gpt-model-profiles.js';
 
 /** Per-block descriptor passed to `TransformOptions.keepSharp`. */
@@ -156,11 +157,12 @@ export const CLAUDE_CODE_OAUTH_IDENTITY =
 
 // --- per-block break-even check ---
 //
-// Image token cost uses Anthropic's documented 28-px patch model (see
-// src/core/anthropic-vision.ts). Constants bias CONSERVATIVE: CHARS_PER_TOKEN=4
-// under-estimates text savings; the gate multiplies the patch count by
-// ANTHROPIC_GATE_MARGIN on top. Mispredictions leave money on the table; they
-// never generate net-loss images.
+// Image token cost is the serving model's DOCUMENTED per-image price, taken
+// from its profile via `visionTokens` (src/core/vision-cost.ts) — never a
+// hardcoded provider formula. Constants bias CONSERVATIVE: CHARS_PER_TOKEN=4
+// under-estimates text savings; the gate multiplies the image cost by
+// GATE_MARGIN on top. Mispredictions leave money on the table; they never
+// generate net-loss images.
 
 /** English ~4 chars per token average (conservative for code/JSON content). */
 const CHARS_PER_TOKEN = 4;
@@ -183,20 +185,28 @@ export const HISTORY_CHARS_PER_TOKEN = 2.0;
  *  of truth — src/core/export.ts imports this rather than redefining it. */
 export const REPORT_CHARS_PER_TOKEN = 3.7;
 
-/** Gate-only conservatism: a 10% upward bias on the patch-count image estimate,
+/** Gate-only conservatism: a 10% upward bias on the estimated image cost,
  *  keeping the gate on the safe (pass-through) side near break-even. This is NOT
- *  part of Anthropic's documented cost — the documented per-image formula lives in
- *  `anthropicVisionTokens` (anthropic-vision.ts); this margin only tunes the gate. */
-export const ANTHROPIC_GATE_MARGIN = 1.10;
+ *  part of any provider's documented cost — those live in `visionTokens`
+ *  (vision-cost.ts); this margin only tunes the gate, and it is deliberately the
+ *  same margin for every model family on this path. The OpenAI/Responses gate
+ *  deliberately applies NO margin: it reproduces the renderer's exact page split
+ *  and compares against an exact o200k baseline, so it has no estimation error
+ *  to absorb (see `evalOpenAIGate`). */
+export const GATE_MARGIN = 1.10;
 
-/** Width in px of a single-col PNG. Must stay in sync with `renderChunkToPng` (render.ts). */
-interface AnthropicRenderGeometry {
+/** Everything the gate needs to price a hypothetical render: page geometry plus
+ *  the serving model's image-cost regime (`vision`/`visionTier`, satisfied by a
+ *  `GptModelProfile`). Defaults to the dense Anthropic page. */
+interface GateGeometry {
   cols: number;
   maxHeightPx: number;
   maxChars: number;
   style: RenderStyle;
+  pricing: VisionPricing;
 }
 
+/** Width in px of a single-col PNG. Must stay in sync with `renderChunkToPng` (render.ts). */
 function singleColWidthPx(cols: number, style: RenderStyle): number {
   return 2 * PAD_X + cols * renderCellWidth(style);
 }
@@ -209,11 +219,12 @@ function imageTokensForRows(
   cols: number,
   imageCountCap?: number,
   maxCharsPerImage: number = READABLE_CHARS_PER_IMAGE,
-  geometry: AnthropicRenderGeometry = {
+  geometry: GateGeometry = {
     cols: DENSE_CONTENT_COLS,
     maxHeightPx: MAX_HEIGHT_PX,
     maxChars: DENSE_CONTENT_CHARS_PER_IMAGE,
     style: DENSE_RENDER_STYLE,
+    pricing: CLAUDE_PROFILE,
   },
 ): number {
   if (!Number.isFinite(visualRows) || visualRows <= 0) return 0;
@@ -233,12 +244,12 @@ function imageTokensForRows(
   const rowsInLast = Math.min(Math.max(1, linesInLast), rowsPerImage);
   const fullImageHeight = 2 * PAD_Y + rowsPerImage * cellH;
   const lastImageHeight = 2 * PAD_Y + rowsInLast * cellH;
-  // Anthropic bills per-image by 28-px patches (not by summed pixel area), so
-  // count each image separately. pxpipe pages are ≤ 1568×728, so no tier
-  // downscale applies and the raw patch count is tier-agnostic.
-  const patchSum =
-    fullImages * patchTokens(widthPx, fullImageHeight) + patchTokens(widthPx, lastImageHeight);
-  return Math.ceil(patchSum * ANTHROPIC_GATE_MARGIN);
+  // Providers bill per IMAGE (patch grid, tile grid, or flat), not by summed
+  // pixel area, so price each page separately and sum.
+  const imageSum =
+    fullImages * visionTokens(geometry.pricing, widthPx, fullImageHeight)
+    + visionTokens(geometry.pricing, widthPx, lastImageHeight);
+  return Math.ceil(imageSum * GATE_MARGIN);
 }
 
 /** Exact image-token cost for `text`. Uses `countVisualRows` and optionally
@@ -250,7 +261,7 @@ function imageTokensCost(
   imageCountCap?: number,
   shrinkWidth: boolean = true,
   maxCharsPerImage: number = READABLE_CHARS_PER_IMAGE,
-  geometry?: AnthropicRenderGeometry,
+  geometry?: GateGeometry,
 ): number {
   const effectiveCols = shrinkWidth ? shrinkColsToContent(text, cols, 1, geometry?.style.font) : cols;
   const rows = countVisualRows(text, effectiveCols);
@@ -258,13 +269,16 @@ function imageTokensCost(
 }
 
 /** Gate geometry for dense tool-result, reminder, and history pages. */
-function denseGateGeometry(o?: Required<TransformOptions>): AnthropicRenderGeometry {
+function denseGateGeometry(o?: Required<TransformOptions>): GateGeometry {
   const profile = o?.model ? resolveGptProfile(o.model) : undefined;
   return {
     cols: o?.cols ?? profile?.stripCols ?? DENSE_CONTENT_COLS,
     maxHeightPx: profile?.maxHeightPx ?? MAX_HEIGHT_PX,
     maxChars: DENSE_CONTENT_CHARS_PER_IMAGE,
     style: profile?.style ?? DENSE_RENDER_STYLE,
+    // No model on the request (Anthropic slab path): price at the Claude
+    // profile, which is what is actually serving it.
+    pricing: profile ?? CLAUDE_PROFILE,
   };
 }
 
@@ -326,7 +340,7 @@ export function evalCompressionProfitability(
   priorWarmTokens: number = 0,
   priorWarmImageTokens: number = 0,
   shrinkWidth: boolean = true,
-  geometry?: AnthropicRenderGeometry,
+  geometry?: GateGeometry,
 ): {
   imageTokens: number;
   textTokens: number;
@@ -364,7 +378,7 @@ export function isCompressionProfitable(
   priorWarmImageTokens: number = 0,
   shrinkWidth: boolean = true,
   maxCharsPerImage: number = READABLE_CHARS_PER_IMAGE,
-  geometry?: AnthropicRenderGeometry,
+  geometry?: GateGeometry,
 ): boolean {
   if (typeof text !== 'string' || text.length === 0) return false;
   const cpt = Number.isFinite(charsPerToken) && charsPerToken > 0
@@ -404,7 +418,7 @@ export function isCompressionProfitableAmortized(
   priorWarmImageTokens: number = 0,
   shrinkWidth: boolean = true,
   maxCharsPerImage: number = READABLE_CHARS_PER_IMAGE,
-  geometry?: AnthropicRenderGeometry,
+  geometry?: GateGeometry,
 ): boolean {
   if (!Number.isFinite(horizon) || horizon <= 1) {
     return isCompressionProfitable(text, cols, imageCountCap, charsPerToken, priorWarmTokens, priorWarmImageTokens, shrinkWidth, maxCharsPerImage, geometry);

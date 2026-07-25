@@ -26,13 +26,17 @@ describe('Gemini Model Profiles & Identification', () => {
     expect(prof1).toBe(GEMINI_3_6_FLASH_PROFILE);
     expect(prof1.stripCols).toBe(312);
     expect(prof1.maxHeightPx).toBe(728);
-    expect(prof1.vision.base).toBe(1078);
+    expect(prof1.vision).toEqual({
+      regime: 'flat',
+      tokens: 1120,
+      exact: { widthPx: 1568, heightPx: 728, tokens: 1078 },
+    });
     expect(prof1.style.font).toBe('spleen-5x8');
 
     const prof2 = resolveGptProfile('google/gemini-3.6-flash');
     expect(prof2.stripCols).toBe(312);
     expect(prof2.maxHeightPx).toBe(728);
-    expect(prof2.vision.base).toBe(1078);
+    expect(prof2.vision).toBe(prof1.vision);
   });
 
   it('uses the measured production-geometry image cost', () => {

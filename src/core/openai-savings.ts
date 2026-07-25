@@ -15,45 +15,26 @@
  * cache (`cached_tokens`, a subset of input_tokens). For the gpt-5 family, cached
  * input is billed at ~0.1× the normal input rate; there is no 1.25× write
  * premium like Anthropic's ephemeral cache.
+ *
+ * The /v1/responses path is shared by several vendors (GPT, Claude, Grok,
+ * Gemini), so the price ratios below are read from the serving model's profile
+ * rather than re-derived from its id here — the same profile the gate prices
+ * images with, so reporting and gating can never disagree about the model.
  */
 
-import { CACHE_READ_RATE } from './baseline.js';
+import { resolveGptProfile } from './gpt-model-profiles.js';
 
-/** gpt-5 cached input list ratio: $0.125 / $1.25 per 1M tokens. */
-export const OPENAI_GPT5_CACHE_READ_RATE = 0.1;
-
-/** gpt-5 output/input list ratio: $10 / $1.25 per 1M tokens. */
-export const OPENAI_GPT5_OUTPUT_RATE = 8;
-
-/** Older OpenAI families use a less aggressive cached-input discount. pxpipe's
- * GPT compression gate is currently gpt-5.x-only, but keep the helper explicit
- * so passthrough telemetry does not accidentally get priced at Anthropic rates. */
-/** Grok cached prompt list ratio from xAI model pricing metadata
- *  (cachedPromptTokenPrice / promptTextTokenPrice = 5000/20000). */
-export const GROK_CACHE_READ_RATE = 0.25;
-
-/** Grok completion/input list ratio (completionTextTokenPrice / promptTextTokenPrice
- *  = 60000/20000). */
-export const GROK_OUTPUT_RATE = 3;
-
+/** Cached-input ÷ uncached-input list-price ratio for the model serving this
+ *  request. The ratio is a PROFILE field (`cacheReadRate`), so a new family is
+ *  a profile entry or a PXPIPE_GPT_PROFILES override — not a regex added here,
+ *  which is how the gate and the savings math previously drifted apart. */
 export function openAICacheReadRate(model: string | undefined): number {
-  const m = (model ?? '').toLowerCase();
-  // Model-based rates on the shared Responses path (several families share /v1/responses).
-  if (m.startsWith('claude') || m.includes('anthropic')) return CACHE_READ_RATE;
-  if (m.startsWith('grok-')) return GROK_CACHE_READ_RATE;
-  if (/^gpt-5/.test(m)) return OPENAI_GPT5_CACHE_READ_RATE;
-  return 0.5;
+  return resolveGptProfile(model).cacheReadRate;
 }
 
+/** Output ÷ uncached-input list-price ratio, from the same profile. */
 export function openAIOutputRate(model: string | undefined): number {
-  const m = (model ?? '').toLowerCase();
-  if (m.startsWith('claude') || m.includes('anthropic')) return 5;
-  if (m.startsWith('grok-')) return GROK_OUTPUT_RATE;
-  if (/^gpt-5/.test(m)) return OPENAI_GPT5_OUTPUT_RATE;
-  // Good-enough fallback for non-compressed OpenAI rows; they normally do not
-  // enter the savings numerator, but the all-usage denominator should still be
-  // roughly dollar-weighted.
-  return 4;
+  return resolveGptProfile(model).outputRate;
 }
 
 /** Weighted input tokens actually paid to OpenAI this turn. `cachedTokens` is a

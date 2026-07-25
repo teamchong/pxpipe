@@ -4,7 +4,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { isPxpipeSupportedGptModel } from '../src/core/applicability.js';
-import { openAIVisionTokens, visionTokensForModel, isClaudeModel, isGrokModel, resolveVisionCost, transformOpenAIChatCompletions, transformOpenAIResponses } from '../src/core/openai.js';
+import { openAIVisionTokens, visionTokensForModel, isClaudeModel, resolveVisionCost, transformOpenAIChatCompletions, transformOpenAIResponses } from '../src/core/openai.js';
 import { resolveGptProfile } from '../src/core/gpt-model-profiles.js';
 
 const enc = new TextEncoder();
@@ -1274,7 +1274,10 @@ describe('Grok history compression under default gate', () => {
     const items: Array<Record<string, unknown>> = [
       { role: 'user', content: 'start the long autonomous run now please' },
     ];
-    for (let i = 0; i < 40; i++) {
+    // Sized to stay inside Grok's 128 KiB profile cap once imaged: base64 PNGs
+    // are ~2.5x the bytes of the text they replace (cheaper in TOKENS, dearer in
+    // BYTES), so the cap bounds how much history Grok can collapse.
+    for (let i = 0; i < 10; i++) {
       const id = `call_${i}`;
       items.push({ role: 'assistant', content: `Working on step ${i}. `.repeat(40) });
       items.push({ type: 'function_call', call_id: id, name: 'read', arguments: `{"path":"src/f${i}.ts"}` });
@@ -1290,6 +1293,31 @@ describe('Grok history compression under default gate', () => {
     expect(result.info.historyReason).toBe('collapsed');
     expect(result.info.collapsedImages ?? 0).toBeGreaterThan(0);
     expect(result.info.imageTokens ?? 0).toBeLessThan(result.info.baselineImagedTokens ?? 0);
+    expect(result.body.byteLength).toBeLessThanOrEqual(128 * 1024);
+  });
+
+  it('passes through instead of emitting a body above the profile byte cap', async () => {
+    // Same shape, 4x the history: imaging it would serialize past Grok's cap,
+    // which the proxy answers with a 413. The transform must fall back to the
+    // original body instead of building a request that cannot be sent.
+    const items: Array<Record<string, unknown>> = [
+      { role: 'user', content: 'start the long autonomous run now please' },
+    ];
+    for (let i = 0; i < 40; i++) {
+      const id = `call_${i}`;
+      items.push({ role: 'assistant', content: `Working on step ${i}. `.repeat(40) });
+      items.push({ type: 'function_call', call_id: id, name: 'read', arguments: `{"path":"src/f${i}.ts"}` });
+      items.push({ type: 'function_call_output', call_id: id, output: (`result ${i} path=/tmp/out${i}.json `).repeat(60) });
+    }
+    const body = enc.encode(JSON.stringify({
+      model: 'grok-4.5',
+      instructions: 'You are a careful coding agent. '.repeat(200),
+      input: items,
+    }));
+    const result = await transformOpenAIResponses(body, { minCompressChars: 1 });
+    expect(result.info.compressed).toBe(false);
+    expect(result.info.reason).toBe('serialized_request_limit');
+    expect(result.body.byteLength).toBe(body.byteLength);
   });
 
   it('pages factsheet across long collapsed history so early exact ids survive', async () => {

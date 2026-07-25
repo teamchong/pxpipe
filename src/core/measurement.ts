@@ -200,6 +200,40 @@ export function countCacheControlMarkers(bytes: BytesLike): number {
   }
 }
 
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a === b) return true;
+  if (a.byteLength !== b.byteLength) return false;
+  for (let i = 0; i < a.byteLength; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+/** True when two count_tokens probe bodies describe the same request, so the second one would only
+ *  buy a duplicate answer. Happens when the last cache_control marker sits on the final content
+ *  block: truncating at it drops nothing, and the cacheable prefix IS the whole body.
+ *  Key order is ignored on purpose — the two builders emit the same fields in different orders
+ *  (baseline follows the caller's body, the prefix builder uses a fixed layout), so a raw byte
+ *  compare would miss real duplicates. Nested values come from the same parse on both sides, so
+ *  comparing them stringified is exact. */
+export function sameCountTokensBody(a: Uint8Array, b: Uint8Array): boolean {
+  if (bytesEqual(a, b)) return true;
+  try {
+    const dec = new TextDecoder();
+    const oa = JSON.parse(dec.decode(a)) as Record<string, unknown>;
+    const ob = JSON.parse(dec.decode(b)) as Record<string, unknown>;
+    const ka = Object.keys(oa).sort();
+    const kb = Object.keys(ob).sort();
+    if (ka.length !== kb.length) return false;
+    for (let i = 0; i < ka.length; i++) {
+      if (ka[i] !== kb[i]) return false;
+    }
+    return ka.every((k) => JSON.stringify(oa[k]) === JSON.stringify(ob[k]));
+  } catch {
+    return false;
+  }
+}
+
 function countCacheControlValue(value: unknown): number {
   if (!value || typeof value !== 'object') return 0;
   let n = hasCacheControl(value) ? 1 : 0;

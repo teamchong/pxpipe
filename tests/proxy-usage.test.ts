@@ -1699,6 +1699,82 @@ describe('proxy usage extraction', () => {
     expect(new Set([full, cacheable])).toEqual(new Set([9000, 6000]));
   });
 
+  // Regression: observed in the wire capture as two count_tokens POSTs of identical
+  // byte length returning the identical input_tokens. When the last cache_control
+  // marker sits on the FINAL content block, truncating at it drops nothing — the
+  // "cacheable prefix" body IS the full body. The second probe buys a duplicate
+  // answer for a full extra round-trip, so it must not be sent at all.
+  it('sends only ONE probe when the last marker is on the final block (prefix == full body)', async () => {
+    const bodiesSeen: string[] = [];
+    const restore = mockUpstream(async (req) => {
+      const url = new URL(req.url);
+      if (url.pathname === '/v1/messages/count_tokens') {
+        bodiesSeen.push(await req.text());
+        return new Response(
+          JSON.stringify({ input_tokens: 7400 }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          id: 'msg_x',
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'text', text: 'ok' }],
+          model: 'claude-opus-4-5',
+          stop_reason: 'end_turn',
+          usage: { input_tokens: 1, output_tokens: 1 },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    });
+
+    // `system` deliberately precedes `messages` here: the two builders emit their
+    // top-level keys in different orders, so this also pins that the duplicate is
+    // detected semantically rather than by a raw byte compare.
+    const markerOnFinalBlock = JSON.stringify({
+      model: 'claude-3-5-haiku-latest',
+      system: 'short',
+      messages: [
+        { role: 'user', content: 'earlier turn' },
+        { role: 'assistant', content: 'earlier reply' },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'latest turn' },
+            { type: 'text', text: 'cache up to here', cache_control: { type: 'ephemeral' } },
+          ],
+        },
+      ],
+    });
+
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      upstream: 'http://mock',
+      onRequest: (e) => { captured = e; },
+    });
+    const res = await proxy(
+      new Request('http://proxy/v1/messages', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: markerOnFinalBlock,
+      }),
+    );
+    await res.text();
+    await new Promise((r) => setTimeout(r, 30));
+    restore();
+
+    // The whole point: exactly one round-trip, not two identical ones.
+    expect(bodiesSeen).toHaveLength(1);
+
+    // Skipping the probe must NOT degrade the row: cacheable is still reported, and
+    // it equals the baseline because the entire body is inside the cacheable prefix.
+    // Reporting it as absent/0 would fabricate a cold tail the request doesn't have.
+    expect(captured!.info?.baselineTokens).toBe(7400);
+    expect(captured!.info?.baselineCacheableTokens).toBe(7400);
+    expect(captured!.info?.baselineProbeStatus).toBe('ok');
+  });
+
   // The two probes are independent. If the cacheable-prefix probe 4xx's
   // (e.g. upstream rejects the synthesized sentinel message), the main
   // forward succeeds and the FULL probe's baseline still lands. The

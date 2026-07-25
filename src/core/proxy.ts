@@ -9,6 +9,7 @@ import { isAnthropicMessagesPath, isPxpipeSupportedGptModel, isPxpipeSupportedMo
 import {
   buildBaselineCountTokensBody,
   buildCacheablePrefixCountTokensBody,
+  sameCountTokensBody,
 } from './measurement.js';
 import type { Usage } from './types.js';
 import {
@@ -1112,11 +1113,13 @@ export function createProxy(config: ProxyConfig = {}) {
             // Null = no markers → cacheable=0 by definition, no probe needed.
             const ctCacheableBody = buildCacheablePrefixCountTokensBody(bodyIn);
             if (ctCacheableBody) {
-              baselineCacheablePromise = countTokensUpstream(
-                ctUrl,
-                ctCacheableBody,
-                new Headers(ctHeaders),
-              );
+              // When the last cache_control marker sits on the final content block, truncating at it
+              // drops nothing: the cacheable-prefix body comes out byte-identical to the full one and
+              // upstream would return the same input_tokens for a second, redundant round-trip.
+              // Reuse the first probe instead — same numbers on the event row, one request less.
+              baselineCacheablePromise = sameCountTokensBody(ctBody, ctCacheableBody)
+                ? baselinePromise
+                : countTokensUpstream(ctUrl, ctCacheableBody, new Headers(ctHeaders));
             }
           }
         }

@@ -248,6 +248,20 @@ interface Totals {
   pricedActualInputWeighted: number;
   pricedBaselineInputWeighted: number;
   pricedOutputWeighted: number;
+  /** RAW, rate-free token counts over the same credited events that feed
+   *  `baselineInputWeighted` — real tokens on the wire vs the identical
+   *  payload as text, with no cache multipliers applied. Mirrors the
+   *  per-session `rawActualTokens` / `rawBaselineTokens` so the lifetime view
+   *  can show the same pair.
+   *
+   *  The SPREAD between the raw % and the weighted % is the cache cost of
+   *  compressing: rewriting the prefix moves tokens out of the 0.1x
+   *  cache-read bucket into 1.0x fresh input and 1.25x cache-create. Quoting
+   *  raw alone flatters pxpipe; quoting weighted alone hides where the win
+   *  went. Both, side by side, is the only honest headline. */
+  rawBaselineTokens: number;
+  rawActualTokens: number;
+  rawOutputTokens: number;
   /** Sum of weighted COUNTERFACTUAL input tokens across ALL requests
    *  with a usage block. For measured rows: cache-aware baseline (what the
    *  unproxied path would have billed). For unmeasured/probe-failed rows:
@@ -318,6 +332,9 @@ function emptyTotals(startedAt = Date.now() / 1000): Totals {
     pricedActualInputWeighted: 0,
     pricedBaselineInputWeighted: 0,
     pricedOutputWeighted: 0,
+    rawBaselineTokens: 0,
+    rawActualTokens: 0,
+    rawOutputTokens: 0,
     allBaselineEquivalentWeighted: 0,
     allActualInputWeighted: 0,
     allOutputWeighted: 0,
@@ -891,6 +908,12 @@ export class DashboardState {
         totals.pricedBaselineInputWeighted += baselineInputEff;
         totals.pricedActualInputWeighted += actualInputEff;
         totals.pricedOutputWeighted += outputEquiv;
+        // Same `creditSaving && dollarEligible` gate the per-session block
+        // uses, so /proxy-stats and /api/current-session.json quote the raw
+        // pair over the same population and stay directly comparable.
+        totals.rawBaselineTokens += rawBaseline;
+        totals.rawActualTokens += rawActual;
+        totals.rawOutputTokens += out;
       }
     }
     // All-rows COUNTERFACTUAL spend, ungated on the probe — the honest
@@ -1318,6 +1341,18 @@ export class DashboardState {
     const pricedOutput = totals.pricedOutputWeighted;
     const pricedSaved = pricedBaseline - pricedActual;
     const pctInput = baseline > 0 ? (saved / baseline) * 100 : 0;
+    // Rate-free twin of pctInput over the same credited events. pctInput
+    // answers "what am I billed"; pctRaw answers "how much text did we
+    // actually take off the wire". They diverge in BOTH directions: cache
+    // re-creation can eat a real raw win, and 2× cache-write weighting can
+    // inflate the baseline so the billed number flatters a smaller real
+    // reduction. Neither one alone is the honest answer — hence both.
+    const rawBaselineTok = totals.rawBaselineTokens;
+    const rawActualTok = totals.rawActualTokens;
+    const pctRaw =
+      rawBaselineTok > 0
+        ? ((rawBaselineTok - rawActualTok) / rawBaselineTok) * 100
+        : 0;
     const baselineTotal = baseline + output;
     const actualTotal = actual + output;
     const pricedBaselineTotal = pricedBaseline + pricedOutput;
@@ -1394,6 +1429,17 @@ export class DashboardState {
       // ask "is pxpipe helping". Negative when flap-pollution from
       // passthrough turns exceeds the collapse win on measured turns.
       saved_pct_of_all_spend: round1(pctAllSpend),
+      // Rate-free pair over the SAME credited events as saved_pct, so the two
+      // are directly comparable. saved_pct is what you are billed after cache
+      // multipliers; saved_pct_raw is the text actually removed from the wire.
+      // cache_weight_drag_pct is the signed gap between them — negative means
+      // the billed figure is flattering the real reduction, positive means
+      // cache re-creation ate it. Publishing saved_pct alone hides both.
+      raw_baseline_tokens: Math.round(rawBaselineTok),
+      raw_actual_tokens: Math.round(rawActualTok),
+      raw_output_tokens: Math.round(totals.rawOutputTokens),
+      saved_pct_raw: round1(pctRaw),
+      cache_weight_drag_pct: round1(pctRaw - pctInput),
       all_baseline_equivalent_weighted: Math.round(allBaselineEquiv),
       all_actual_input_weighted: Math.round(allActual),
       all_output_weighted: Math.round(allOutput),

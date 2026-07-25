@@ -690,7 +690,7 @@ function demoteRelocatedCacheControl<T>(cc: T): T {
 // Per-turn dynamic blocks injected by Claude Code. These drift turn-to-turn and
 // must not be baked into the cached image. Split out so only the stable static
 // slab (CLAUDE.md + tool docs) carries cache_control.
-const DYNAMIC_BLOCK_TAGS = [
+export const DYNAMIC_BLOCK_TAGS = [
   'env',
   'context',
   'git_status',
@@ -706,9 +706,16 @@ const DYNAMIC_BLOCK_TAGS = [
 // Known-static slab tags — suppresses first-sighting `unknownStaticTags` noise
 // only. Correctness doesn't depend on this list: observeStaticTagChurn catches
 // a wrong entry on its second sighting.
-const KNOWN_STATIC_TAGS = [
+export const KNOWN_STATIC_TAGS = [
   // Claude Code
   'types',
+  // Automode blocks (appeared 2026-07). Verified static across 36 consecutive
+  // captured requests: `cc_automode_permissions` is a ~74k-char slab with one
+  // distinct sha, `cc_automode_session_rules` is consistently empty. Both
+  // belong in the cached prefix — listing them here only silences the
+  // first-sighting warning; observeStaticTagChurn still catches drift.
+  'cc_automode_permissions',
+  'cc_automode_session_rules',
   // Nested under <available_skills> (static for a session; churn still observed)
   'skill',
   'name',

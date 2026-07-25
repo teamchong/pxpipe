@@ -14,6 +14,15 @@
 import * as fs from 'node:fs';
 import * as readline from 'node:readline';
 import type { TrackEvent } from './core/tracker.js';
+import { DYNAMIC_BLOCK_TAGS, KNOWN_STATIC_TAGS } from './core/transform.js';
+
+/** Every tag this build knows how to classify — dynamic (split out per turn)
+ *  or known-static (left in the cached slab on purpose). Used to re-check
+ *  `unknown_static_tags` at read time; see the note in `fold`. */
+const CLASSIFIED_TAGS: ReadonlySet<string> = new Set<string>([
+  ...DYNAMIC_BLOCK_TAGS,
+  ...KNOWN_STATIC_TAGS,
+]);
 
 // ---- pure aggregator ------------------------------------------------------
 
@@ -121,6 +130,12 @@ export function fold(s: Summary, ev: TrackEvent): Summary {
 
   if (ev.unknown_static_tags) {
     for (const t of ev.unknown_static_tags) {
+      // Re-check against the CURRENT registries rather than trusting the flag
+      // frozen into the event. events.jsonl is append-only and outlives many
+      // releases: rows logged before a tag was classified keep carrying it,
+      // so without this the warning can only be cleared by wiping the log —
+      // and a genuinely new tag stays buried under the stale ones.
+      if (CLASSIFIED_TAGS.has(t)) continue;
       s.unknownTags.set(t, (s.unknownTags.get(t) ?? 0) + 1);
     }
   }

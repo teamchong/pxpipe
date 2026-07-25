@@ -543,6 +543,46 @@ describe('GPT savings split', () => {
     expect(stats.saved_usd).toBe(0.14);
   });
 
+  // Same row, different question. The billed pair says 73.7% saved; the
+  // rate-free pair says only 70% of the text actually came off the wire. The
+  // 2× weighting on the 1h cache write inflates the baseline, so here the
+  // billed number FLATTERS the real reduction — the drag is negative. This
+  // locks the direction, because a one-sided "always smaller" reading of the
+  // raw number would be just as misleading as publishing saved_pct alone.
+  it('exposes the rate-free raw pair next to the billed one', async () => {
+    setAllowedModelBases(['claude-fable-5']);
+    dash.update({
+      method: 'POST', path: '/v1/messages', model: 'claude-fable-5-20260609', status: 200,
+      durationMs: 1,
+      usage: {
+        input_tokens: 1000,
+        output_tokens: 0,
+        cache_creation_input_tokens: 2000,
+        cache_read_input_tokens: 0,
+        cache_creation: {
+          ephemeral_5m_input_tokens: 0,
+          ephemeral_1h_input_tokens: 2000,
+        },
+      },
+      info: {
+        compressed: true,
+        baselineTokens: 10000,
+        baselineCacheableTokens: 9000,
+        baselineProbeStatus: 'ok',
+        firstUserSha8: 'onehour',
+      },
+    } as never);
+
+    const stats = (await dash.serveStats().json()) as StatsPayload;
+    // raw_actual = input + cache_create + cache_read, unweighted.
+    expect(stats.raw_actual_tokens).toBe(3000);
+    expect(stats.raw_baseline_tokens).toBe(10000);
+    expect(stats.saved_pct_raw).toBe(70);
+    // Billed number over the same single event, for contrast.
+    expect(stats.saved_pct).toBe(73.7);
+    expect(stats.cache_weight_drag_pct).toBe(-3.7);
+  });
+
   it('replay() preserves Anthropic 1-hour cache-write accounting', async () => {
     writeEvents(tmp, [
       ev({

@@ -17,6 +17,19 @@ export interface StatsPayload {
   saved_pct_of_total_bill: number;
   /** Measured-rows savings ÷ ALL paid requests (compressed + passthrough + probe-failed). */
   saved_pct_of_all_spend: number;
+  /** Rate-free counterparts of `baseline_input_weighted` / `actual_input_weighted`,
+   *  over the same credited events: no cache multipliers, no output rate. */
+  raw_baseline_tokens: number;
+  raw_actual_tokens: number;
+  raw_output_tokens: number;
+  /** Text actually removed from the wire: 1 − raw_actual/raw_baseline. The
+   *  rate-free twin of `saved_pct`, over the same events. */
+  saved_pct_raw: number;
+  /** `saved_pct_raw − saved_pct`. Signed, and it goes both ways: positive when
+   *  cache re-creation eats a raw win, negative when cache-write weighting
+   *  inflates the baseline and the billed number flatters the real reduction.
+   *  Either way, quoting `saved_pct` on its own hides this. */
+  cache_weight_drag_pct: number;
   all_baseline_equivalent_weighted: number;
   all_actual_input_weighted: number;
   all_output_weighted: number;

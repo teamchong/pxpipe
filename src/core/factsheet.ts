@@ -18,6 +18,14 @@
  *  longest, most-identifying tokens are kept first when the substring filter runs. */
 const PATTERNS: readonly RegExp[] = [
   /\b[A-Z][A-Z0-9_]{2,}=[^\s)"'<>]+/g, // semantic LABEL=value pair (preserve association)
+  // Same association-preservation for lower/mixed-case `field=value`, which is what logs,
+  // CLI output and JSONL actually emit (`dur=4439`, `gold=c9c947f680ec`, `trial=0`). The
+  // uppercase pattern above skips those entirely, so only the bare value survives the image
+  // and the label↔value binding is lost: a reader keeps `4439` but not what `dur` meant, and
+  // silently rebinds it to a plausible wrong field (elapsed time, not the search key). That
+  // is a binding error, not a legibility one — the glyphs were never in doubt. Value side is
+  // restricted to opaque tokens so prose (`x=y`) and code (`const a=b`) cannot flood the sheet.
+  /\b[A-Za-z][A-Za-z0-9_]{2,}=[A-Za-z0-9_.:/+-]{1,64}/g,
   /\bhttps?:\/\/[^\s)"'<>]+/g, // URLs
   /\b[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+\b/g, // email address
   /\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b/g, // UUID
@@ -69,6 +77,12 @@ const SHAPE_FLAG = /^--?[A-Za-z][\w-]+$/; // CLI flag
 const SHAPE_NUM = /^\d[\d,_]*$|^\d+\.\d+$/; // port / large or separated number / decimal
 const SHAPE_URL = /^https?:\/\//;
 const SHAPE_CAMEL = /^(?:[a-z]+|[A-Z][a-z0-9]+)(?:[A-Z][a-z0-9]*)+$/; // tokenLedgerShard / getUserById
+// Tier-0 assignment is deliberately UPPERCASE-only. Lowercase `field=value` is still
+// captured (see PATTERNS) so the label↔value binding survives, but it stays out of tier 0:
+// log lines carry one on every row, so promoting them floods the top tier, and because the
+// budget fills longest-first the `req=` prefix also inflates an 8-char hex id past a 9-char
+// ticket code — evicting the rare token the sheet exists to preserve. Rarity, not shape, is
+// what makes `dur=4439` worth keeping, and tier 1 is where that trade lands correctly.
 const SHAPE_ASSIGNMENT = /^[A-Z][A-Z0-9_]{2,}=\S+$/; // ACTIVE_MANIFEST=/path
 
 /** Lower tier = higher keep-priority. Pure function of the token → deterministic. */

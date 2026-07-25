@@ -30,6 +30,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createCanvas } from '@napi-rs/canvas';
 import { renderTextToImages } from '../src/core/library.js';
+import { resolveGptProfile } from '../src/core/gpt-model-profiles.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const OUT = join(ROOT, 'docs/assets/context-window-chars.png');
@@ -82,6 +83,33 @@ async function measureFableDensity(fixture: string): Promise<Density> {
   return { cpt, pages: r.pages.length, pixels: r.pixels, visionTokens };
 }
 
+async function measureOpusDensity(fixture: string): Promise<Density> {
+  // Opus 5 is measured, not derived from Fable. The two profiles are currently
+  // byte-identical, so this returns the same cpt — but hardcoding `fableCpt` for
+  // Opus would silently go stale the moment CLAUDE_OPUS_PROFILE diverges.
+  // Render under the resolved profile's own geometry so the chart tracks it.
+  const profile = resolveGptProfile('claude-opus-5');
+  const r = await renderTextToImages(fixture, {
+    reflow: true,
+    cols: profile.stripCols,
+    maxHeightPx: profile.maxHeightPx,
+    style: profile.style,
+  });
+  if (r.droppedChars > 0) {
+    throw new Error(`opus fixture dropped ${r.droppedChars} chars — atlas gap, fix before charting`);
+  }
+  const visionTokens = r.pages.reduce(
+    (total, page) => total + Math.ceil(page.width / 28) * Math.ceil(page.height / 28),
+    0,
+  );
+  const cpt = fixture.length / visionTokens;
+  console.log(
+    `Opus density: ${fixture.length} chars → ${r.pages.length} pages, ` +
+      `${r.pixels} px = ${visionTokens} vision tokens → ${cpt.toFixed(2)} chars/vision-token`,
+  );
+  return { cpt, pages: r.pages.length, pixels: r.pixels, visionTokens };
+}
+
 async function measureGeminiDensity(fixture: string): Promise<Density> {
   // Widescreen geometry (312-col Spleen): measured 1078 tokens per page.
   const r = await renderTextToImages(fixture, { reflow: true });
@@ -118,7 +146,7 @@ interface Point {
   dy?: number;
 }
 
-function points(fableCpt: number, geminiCpt: number): Point[] {
+function points(fableCpt: number, geminiCpt: number, opusCpt: number): Point[] {
   const t = (
     kind: Point['kind'],
     name: string,
@@ -156,6 +184,11 @@ function points(fableCpt: number, geminiCpt: number): Point[] {
     // Grok 4.5: text-window only (opt-in; no pxpipe overlay on this chart).
     // Window = xAI docs maxPromptLength for grok-4.5 (500000).
     t('grok', 'Grok 4.5', 2026.42, 500_000, 'below', 10),
+    // Claude Opus 5: released July 25, 2026. Window = 1M tokens per Anthropic
+    // models overview (tooltip: ~555k words / ~2.5M unicode characters).
+    // The ID is dateless (`claude-opus-5`) — the 4.6-generation convention drops
+    // the YYYYMMDD snapshot — so the date comes from the release, not the ID.
+    t('claude', 'Opus 5', 2026.56, 1_000_000, 'above', -18),
     {
       name: 'Fable 5 [1m] + pxpipe',
       x: 2026.05,
@@ -169,6 +202,17 @@ function points(fableCpt: number, geminiCpt: number): Point[] {
       x: 2026.50,
       tokens: 1_000_000,
       chars: Math.round(1_000_000 * geminiCpt),
+      kind: 'pxpipe',
+      label: 'above',
+    },
+    {
+      // Measures identical to Fable 5 (same resolved profile geometry), so this
+      // lands on the same horizontal line — that equality is the finding, not a
+      // copy: opusCpt comes from its own render pass.
+      name: 'Opus 5 + pxpipe',
+      x: 2026.56,
+      tokens: 1_000_000,
+      chars: Math.round(1_000_000 * opusCpt),
       kind: 'pxpipe',
       label: 'above',
     },
@@ -342,16 +386,15 @@ function draw(data: Point[], fableCpt: number, geminiCpt: number): Buffer {
     ctx.fillText(annLine2, annX, annY + 9);
   }
 
-  // Points + labels
+  const emphasize = (p: Point): boolean =>
+    p.kind === 'pxpipe' || p.name === 'Fable 5 [1m]' || p.name === 'Grok 4.5';
+
+  // Markers first, so no marker is drawn over a neighbouring label.
   for (const p of data) {
     const cx = x(p.x);
     const cy = y(p.chars);
-    const emphasized =
-      p.kind === 'pxpipe' ||
-      p.name === 'Fable 5 [1m]' ||
-      p.name === 'Grok 4.5';
     ctx.beginPath();
-    ctx.arc(cx, cy, emphasized ? 6.5 : 4.5, 0, Math.PI * 2);
+    ctx.arc(cx, cy, emphasize(p) ? 6.5 : 4.5, 0, Math.PI * 2);
     ctx.fillStyle = colors[p.kind];
     ctx.fill();
     // Outer ring on pxpipe overlays so they read as measured, not vendor text.
@@ -362,20 +405,33 @@ function draw(data: Point[], fableCpt: number, geminiCpt: number): Buffer {
       ctx.lineWidth = 2;
       ctx.stroke();
     }
+  }
 
+  // Label placement. Labels are centred on their markers, so points that
+  // coincide in value overprint each other: Fable 5 and Opus 5 resolve to the
+  // same render geometry (identical chars), and Fable 5 / Gemini 3.6 Flash both
+  // sit at 4M. Those markers are ~80px apart while the labels are ~180px wide.
+  // Measure every box and push overlaps apart vertically, rather than hand-
+  // tuning `dy` again each time a model is added.
+  const LABEL_H = 31; // two baselines 15px apart + leading
+  const placed = data.map((p) => {
+    const cx = x(p.x);
+    const cy = y(p.chars);
+    const emphasized = emphasize(p);
     const line1 = p.name;
     // no " tok" — the subtitle defines the pattern, and the ~4M band is crowded
     const line2 = `${fmtTok(p.tokens)} → ${fmt(p.chars)} chars`;
-    const nameColor = colors[p.kind];
     let lx = cx;
     let ly1: number;
     let align: CanvasTextAlign = 'center';
+    let push = -1; // direction a label flees a collision
     switch (p.label) {
       case 'above':
         ly1 = cy - 28;
         break;
       case 'below':
         ly1 = cy + 22;
+        push = 1;
         break;
       case 'left':
         lx = cx - 12;
@@ -389,21 +445,45 @@ function draw(data: Point[], fableCpt: number, geminiCpt: number): Buffer {
         break;
     }
     ly1 += p.dy ?? 0;
-    ctx.textAlign = align;
+    ctx.font = emphasized ? '700 14px sans-serif' : '600 13px sans-serif';
+    const w1 = ctx.measureText(line1).width;
+    ctx.font = '400 12px sans-serif';
+    const w = Math.max(w1, ctx.measureText(line2).width);
+    const x0 = align === 'center' ? lx - w / 2 : align === 'right' ? lx - w : lx;
+    return { p, emphasized, line1, line2, lx, ly1, align, push, x0, x1: x0 + w };
+  });
 
+  // Greedy separation, repeated so a label pushed clear of one neighbour is
+  // re-checked against the rest. Bounded: stops when stable.
+  for (let pass = 0; pass < 8; pass++) {
+    let moved = false;
+    for (const a of placed) {
+      for (const b of placed) {
+        if (a === b) continue;
+        if (a.x1 <= b.x0 + 2 || b.x1 <= a.x0 + 2) continue; // no x overlap
+        if (Math.abs(a.ly1 - b.ly1) >= LABEL_H) continue; // no y overlap
+        a.ly1 = b.ly1 + (a.push < 0 ? -LABEL_H : LABEL_H);
+        moved = true;
+      }
+    }
+    if (!moved) break;
+  }
+
+  for (const q of placed) {
+    ctx.textAlign = q.align;
     // bg-colored glyph halo so crossing series lines never strike through text,
     // without erasing whole rectangles out of neighboring lines/labels
     ctx.lineJoin = 'round';
     ctx.strokeStyle = bg;
     ctx.lineWidth = 5;
-    ctx.font = emphasized ? '700 14px sans-serif' : '600 13px sans-serif';
-    ctx.strokeText(line1, lx, ly1);
-    ctx.fillStyle = nameColor;
-    ctx.fillText(line1, lx, ly1);
+    ctx.font = q.emphasized ? '700 14px sans-serif' : '600 13px sans-serif';
+    ctx.strokeText(q.line1, q.lx, q.ly1);
+    ctx.fillStyle = colors[q.p.kind];
+    ctx.fillText(q.line1, q.lx, q.ly1);
     ctx.font = '400 12px sans-serif';
-    ctx.strokeText(line2, lx, ly1 + 15);
+    ctx.strokeText(q.line2, q.lx, q.ly1 + 15);
     ctx.fillStyle = dim;
-    ctx.fillText(line2, lx, ly1 + 15);
+    ctx.fillText(q.line2, q.lx, q.ly1 + 15);
   }
   ctx.textAlign = 'left';
 
@@ -442,8 +522,9 @@ function draw(data: Point[], fableCpt: number, geminiCpt: number): Buffer {
 // ---------------------------------------------------------------------------
 const fixture = loadFixture();
 const fable = await measureFableDensity(fixture);
+const opus = await measureOpusDensity(fixture);
 const gemini = await measureGeminiDensity(fixture);
-const data = points(fable.cpt, gemini.cpt);
+const data = points(fable.cpt, gemini.cpt, opus.cpt);
 
 console.log('\n  model                released   window (tokens)   chars in window');
 for (const p of data) {

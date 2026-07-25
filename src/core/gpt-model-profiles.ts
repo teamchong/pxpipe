@@ -231,7 +231,7 @@ const BUILTIN_RULES: ProfileRule[] = [
     profile: { vision: { regime: 'tile', base: 75, perTile: 150 }, stripCols: C, maxHeightPx: H, minCompressTokens: 500, factSheetFormat: 'full', history: BASE_HISTORY, style: BASE_STYLE },
   },
 
-  // Claude Opus models (e.g. claude-opus-4-8, claude-opus-4-7, claude-3-5-opus, etc.)
+  // Claude Opus models (e.g. claude-opus-5, claude-3-5-opus, etc.)
   {
     test: (m) => m.includes('opus'),
     profile: CLAUDE_OPUS_PROFILE,

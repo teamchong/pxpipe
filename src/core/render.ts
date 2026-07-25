@@ -682,7 +682,13 @@ function blitGlyph(
 }
 
 /**
- * Blit a grayscale atlas glyph at pixel (x, y) using max-blending. EVAL-ONLY (style.aa).
+ * Blit a grayscale atlas glyph at pixel (x, y) using max-blending. Selected by
+ * `style.aa`, which production sets via DENSE_RENDER_STYLE — this is NOT eval-only.
+ * Measured: the gray atlas is bit-identical to the bitmap atlas across all 95 ASCII
+ * glyphs (0/3800 intermediate coverage bytes) because Spleen-5x8.otb is a bitmap font
+ * at its native 8px, so AA has nothing to smooth. Only the Unifont vector fallback
+ * (CJK, box-drawing, accents) carries real grayscale (~48% intermediate bytes).
+ * Consequence: toggling `aa` cannot change a single pixel of ASCII content.
  * Returns cells advanced (1 or 2), or 0 if absent from the gray atlas.
  */
 function blitGlyphGray(

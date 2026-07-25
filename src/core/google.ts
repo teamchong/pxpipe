@@ -18,6 +18,8 @@ import { bytesToBase64 } from './png.js';
 import { classifyContent, compactSlabWhitespace, type TransformInfo } from './transform.js';
 import {
   prepareImagedRenderText,
+  droppedCodepointsTop,
+  schemaAnnotationLines,
   CHAT_HEADER,
   HISTORY_TRANSCRIPT_INTRO,
   HISTORY_TRANSCRIPT_OUTRO,
@@ -140,44 +142,6 @@ function safeJson(value: unknown): string {
 
 function googleTextTokens(text: string): number {
   return text ? Math.ceil(text.length / 3.5) : 0;
-}
-
-function schemaAnnotationLines(node: unknown, path = '$', depth = 0): string[] {
-  if (!node || typeof node !== 'object' || depth > 20) return [];
-  if (Array.isArray(node)) {
-    return node.flatMap((value, i) => schemaAnnotationLines(value, `${path}[${i}]`, depth + 1));
-  }
-  const obj = node as Record<string, unknown>;
-  const out: string[] = [];
-  for (const key of ['description', 'title', 'examples', 'default', '$comment']) {
-    if (obj[key] !== undefined) out.push(`${path} ${key}: ${safeJson(obj[key])}`);
-  }
-  if (typeof obj.format === 'string' && obj.format.length > 32) {
-    out.push(`${path} format: ${safeJson(obj.format)}`);
-  }
-  for (const key of ['properties', 'patternProperties', 'definitions', '$defs']) {
-    const children = obj[key];
-    if (!children || typeof children !== 'object' || Array.isArray(children)) continue;
-    for (const [name, child] of Object.entries(children as Record<string, unknown>)) {
-      out.push(...schemaAnnotationLines(child, `${path}.${name}`, depth + 1));
-    }
-  }
-  for (const key of ['oneOf', 'anyOf', 'allOf']) {
-    const children = obj[key];
-    if (!Array.isArray(children)) continue;
-    children.forEach((child, i) => {
-      out.push(...schemaAnnotationLines(child, `${path}.${key}[${i}]`, depth + 1));
-    });
-  }
-  for (const key of [
-    'items', 'additionalProperties', 'not', 'contains', 'propertyNames',
-    'unevaluatedItems', 'unevaluatedProperties', 'if', 'then', 'else',
-  ]) {
-    if (obj[key] !== undefined) {
-      out.push(...schemaAnnotationLines(obj[key], `${path}.${key}`, depth + 1));
-    }
-  }
-  return out;
 }
 
 function rewriteGoogleTools(tools: unknown[] | undefined): GoogleToolRewrite {
@@ -574,12 +538,9 @@ export async function transformGoogleGenerateContent(
   }
 
   const toolRewrite = options.compressTools === false
-    ? {
-        tools: req.tools,
-        docs: '',
-        originalTokens: googleTextTokens(safeJson(req.tools ?? [])),
-        rewrittenTokens: googleTextTokens(safeJson(req.tools ?? [])),
-      }
+    // Tools pass through untouched, so the saving is 0 by construction. Don't
+    // pay two full safeJson walks of the tool array to compute `x - x`.
+    ? { tools: req.tools, docs: '', originalTokens: 0, rewrittenTokens: 0 }
     : rewriteGoogleTools(req.tools);
   if (toolRewrite.docs) info.toolDocsChars = toolRewrite.docs.length;
   const authorityText = systemTexts.join('\n\n');
@@ -768,17 +729,8 @@ export async function transformGoogleGenerateContent(
       info.collapsedImages = historyPlan.images.length;
       info.historyReason = 'collapsed';
       info.droppedChars = (info.droppedChars ?? 0) + historyPlan.droppedChars;
-      if (historyPlan.droppedCodepoints.size > 0) {
-        info.droppedCodepointsTop = Object.fromEntries(
-          [...historyPlan.droppedCodepoints.entries()]
-            .sort((a, b) => b[1] - a[1])
-            .slice(0, 20)
-            .map(([codepoint, count]) => [
-              `U+${codepoint.toString(16).toUpperCase().padStart(4, '0')}`,
-              count,
-            ]),
-        );
-      }
+      info.droppedCodepointsTop = droppedCodepointsTop(historyPlan.droppedCodepoints)
+        ?? info.droppedCodepointsTop;
   } else if (options.collapseHistory !== false) {
     info.historyReason = originalContents.length > profile.history.keepTail
       ? 'not_profitable'

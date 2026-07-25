@@ -401,7 +401,7 @@ function isFlatFunctionTool(tool: unknown): tool is ResponsesFlatTool {
 /** Render schema annotations removed from the native tool definition. The full
  * top-level description rides in the same image and is replaced by a short
  * per-tool pointer, matching the Anthropic tool-reference approach. */
-function schemaAnnotationLines(node: unknown, path = '$', depth = 0): string[] {
+export function schemaAnnotationLines(node: unknown, path = '$', depth = 0): string[] {
   if (!node || typeof node !== 'object' || depth > 20) return [];
   if (Array.isArray(node)) {
     return node.flatMap((value, i) => schemaAnnotationLines(value, `${path}[${i}]`, depth + 1));
@@ -633,7 +633,7 @@ function safeStringifyLen(v: unknown): number {
   }
 }
 
-function droppedCodepointsTop(droppedCodepoints: Map<number, number>): Record<string, number> | undefined {
+export function droppedCodepointsTop(droppedCodepoints: Map<number, number>): Record<string, number> | undefined {
   if (droppedCodepoints.size === 0) return undefined;
   const out: Record<string, number> = {};
   for (const [cp, count] of [...droppedCodepoints.entries()]

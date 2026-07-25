@@ -31,6 +31,7 @@ import { fileURLToPath } from 'node:url';
 import { createCanvas } from '@napi-rs/canvas';
 import { renderTextToImages } from '../src/core/library.js';
 import { resolveGptProfile } from '../src/core/gpt-model-profiles.js';
+import { patchTokens } from '../src/core/anthropic-vision.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const OUT = join(ROOT, 'docs/assets/context-window-chars.png');
@@ -71,10 +72,7 @@ async function measureFableDensity(fixture: string): Promise<Density> {
   if (r.droppedChars > 0) {
     throw new Error(`fable fixture dropped ${r.droppedChars} chars — atlas gap, fix before charting`);
   }
-  const visionTokens = r.pages.reduce(
-    (total, page) => total + Math.ceil(page.width / 28) * Math.ceil(page.height / 28),
-    0,
-  );
+  const visionTokens = r.pages.reduce((total, page) => total + patchTokens(page.width, page.height), 0);
   const cpt = fixture.length / visionTokens;
   console.log(
     `Fable density: ${fixture.length} chars → ${r.pages.length} pages, ` +
@@ -98,10 +96,7 @@ async function measureOpusDensity(fixture: string): Promise<Density> {
   if (r.droppedChars > 0) {
     throw new Error(`opus fixture dropped ${r.droppedChars} chars — atlas gap, fix before charting`);
   }
-  const visionTokens = r.pages.reduce(
-    (total, page) => total + Math.ceil(page.width / 28) * Math.ceil(page.height / 28),
-    0,
-  );
+  const visionTokens = r.pages.reduce((total, page) => total + patchTokens(page.width, page.height), 0);
   const cpt = fixture.length / visionTokens;
   console.log(
     `Opus density: ${fixture.length} chars → ${r.pages.length} pages, ` +

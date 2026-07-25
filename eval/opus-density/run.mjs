@@ -52,7 +52,12 @@ const VARIANTS = [
   { name: '7x10', style: { cellWBonus: 2, cellHBonus: 2, aa: true }, cols: colsFor(2) },
   { name: '9x12', style: { cellWBonus: 4, cellHBonus: 4, aa: true }, cols: colsFor(4) },
 ];
-const MODELS = ['claude-opus-4-8', 'claude-fable-5'];
+// Override the model sweep without editing the harness, e.g. to profile a new
+// release against the Fable reference reader:
+//   PXPIPE_EVAL_MODELS=claude-opus-5,claude-fable-5 pnpm exec tsx eval/opus-density/run.mjs
+// Default unchanged so the committed Opus 4.8 receipts stay reproducible.
+const MODELS = (process.env.PXPIPE_EVAL_MODELS ?? 'claude-opus-4-8,claude-fable-5')
+  .split(',').map((s) => s.trim()).filter(Boolean);
 
 const TEXT_TOKENS = Math.ceil(SESSION.length / 3.5); // rough Claude-Code-dense baseline
 

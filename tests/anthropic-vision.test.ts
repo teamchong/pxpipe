@@ -24,12 +24,13 @@ describe('patchTokens — raw 28-px patch count', () => {
 
 describe('anthropicVisionProfile — tier by model', () => {
   it('puts the documented high-res models on the 2576/4784 tier', () => {
-    for (const m of ['claude-fable-5', 'claude-mythos-5', 'claude-opus-4-8', 'claude-opus-4-7', 'claude-sonnet-5']) {
+    for (const m of ['claude-fable-5', 'claude-mythos-5', 'claude-opus-5', 'claude-opus-4-8', 'claude-opus-4-7', 'claude-sonnet-5']) {
       expect(anthropicVisionProfile(m).tier).toBe('high-res');
     }
     // aliases / variant tags tier with their base
     expect(anthropicVisionProfile('claude-fable-5-high').tier).toBe('high-res');
     expect(anthropicVisionProfile('claude-opus-4-8[1m]').tier).toBe('high-res');
+    expect(anthropicVisionProfile('claude-opus-5[1m]').tier).toBe('high-res');
     expect(anthropicVisionProfile('claude-fable-5')).toEqual({ tier: 'high-res', maxLongEdge: 2576, maxVisualTokens: 4784 });
   });
 

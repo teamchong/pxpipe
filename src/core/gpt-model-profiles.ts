@@ -118,12 +118,19 @@ export interface GptModelProfile {
    *  the original body when imaging would overshoot) and enforced again on the
    *  final wire body by the proxy, which answers 413.
    *
-   *  Set this ONLY for a limit the provider has actually shown us (documented or
-   *  observed 413s). A guessed cap makes pxpipe refuse to compress requests the
-   *  provider would have accepted: local telemetry has clean 200s for xAI bodies
-   *  well past 2 MB, so Grok carries no cap, and no Gemini limit has been
-   *  measured either. Env overrides (`PXPIPE_GPT_PROFILES`) stay available for
-   *  per-deployment caps. */
+   *  Set this ONLY for a limit the provider itself has shown us: published docs,
+   *  or a 413 that demonstrably came from the provider. A 413 is NOT evidence on
+   *  its own — an intermediate hop (local gateway daemon, corporate proxy, CDN)
+   *  can impose its own body cap and answer with a provider-shaped
+   *  `payload_too_large` naming ITS limit, for a request the provider never saw.
+   *  Such a cap is also usually deployment config, not a model property, so it
+   *  belongs in `PXPIPE_GPT_PROFILES`, not here.
+   *
+   *  A guessed cap makes pxpipe refuse to compress requests the provider would
+   *  have accepted, which is the opposite of the point. No family currently
+   *  carries one: xAI bodies past 2 MB, Gemini past 7 MB and Claude past 10 MB
+   *  all return clean 200s in local telemetry, and no provider-originated size
+   *  rejection has ever been observed for any of them. */
   maxSerializedRequestBytes?: number;
   /** Gate the static slab against the exact measured baseline (system text plus
    *  the tool-description tokens actually stripped) instead of the rendered

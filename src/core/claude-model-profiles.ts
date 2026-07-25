@@ -29,7 +29,9 @@ export const CLAUDE_PROFILE: GptModelProfile = {
   factSheetFormat: 'full',
   history: BASE_HISTORY,
   style: { ...BASE_STYLE },
-  maxSerializedRequestBytes: 768 * 1024,
+  // No maxSerializedRequestBytes: no Anthropic request-size limit has ever been
+  // sourced. The 768 KiB entry that used to sit here was a guess, and live
+  // traffic contradicted it outright (thousands of clean 200s well above it).
 };
 
 /** Pre-4.7 Claude: same render geometry, standard image-resolution tier. */

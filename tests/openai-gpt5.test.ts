@@ -1102,8 +1102,14 @@ describe('resolveGptProfile (Claude on Responses)', () => {
       expect(notSol.factSheetFormat, model).toBe('full');
     }
     expect(resolveGptProfile('claude-fable-5').style.font).toBe('spleen-5x8');
-    expect(resolveGptProfile('claude-fable-5').maxSerializedRequestBytes).toBe(768 * 1024);
-    expect(resolveGptProfile('claude-opus-4-8').maxSerializedRequestBytes).toBe(768 * 1024);
+    // No built-in byte cap on ANY family: no provider request-size limit has been
+    // sourced for Claude, Grok, Gemini or GPT. A cap here would make pxpipe skip
+    // compression on requests the provider accepts. Deployments pin one via
+    // PXPIPE_GPT_PROFILES (covered by the env-override cases below).
+    expect(resolveGptProfile('claude-fable-5').maxSerializedRequestBytes).toBeUndefined();
+    expect(resolveGptProfile('claude-opus-5').maxSerializedRequestBytes).toBeUndefined();
+    expect(resolveGptProfile('gemini-3.6-flash').maxSerializedRequestBytes).toBeUndefined();
+    expect(resolveGptProfile('grok-4.5').maxSerializedRequestBytes).toBeUndefined();
     expect(resolveGptProfile('gpt-5.6-sol').maxSerializedRequestBytes).toBeUndefined();
   });
 

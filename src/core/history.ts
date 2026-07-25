@@ -12,6 +12,7 @@
  */
 
 import type { CacheControl, ContentBlock, ImageBlock, Message, TextBlock, ToolUseBlock, ToolResultBlock } from './types.js';
+import type { RenderedImage } from './render.js';
 import { DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_CONTENT_COLS, DENSE_RENDER_STYLE, neutralizeSentinel, reflow, renderTextToPngsWithCharLimit, roleSlotSegment, SLOT_MARK_ASSISTANT, SLOT_MARK_USER } from './render.js';
 import { factSheetText } from './factsheet.js';
 import { bytesToBase64 } from './png.js';
@@ -319,7 +320,12 @@ export function messagesToHistorySegments(
   const slotOut: string[] = [];
   for (let i = fromInclusive; i < upToExclusive; i++) {
     const m = messages[i]!;
-    const body = blocksToText(m.content);
+    // The user's typed words are carried as TEXT alongside the image (see
+    // userTurnBlocks) and are deliberately not rasterized. Everything else in the
+    // message — tool_results, system-reminders, slab scaffolding — still renders.
+    const body = blocksToText(
+      m.role === 'user' ? withoutTypedUserText(m.content) : m.content,
+    );
     if (!body.trim()) continue;
     const isAssistant = m.role === 'assistant';
     const tag = isAssistant ? 'assistant' : 'user';
@@ -362,6 +368,17 @@ function verbatimTaskText(text: string): string {
   );
 }
 
+/** A user message's content with the user's typed text blocks removed. */
+function withoutTypedUserText(
+  content: string | ContentBlock[],
+): string | ContentBlock[] {
+  if (typeof content === 'string') return '';
+  if (!Array.isArray(content)) return content;
+  const { typedIdx } = splitUserTyped(content);
+  if (typedIdx.size === 0) return content;
+  return content.filter((_, i) => !typedIdx.has(i));
+}
+
 /**
  * The user's typed words in a user message: text blocks only, excluding
  * <system-reminder> wrappers and (in the opening slab message) everything at or
@@ -369,8 +386,22 @@ function verbatimTaskText(text: string): string {
  * demoteProtectedHeadText, so pxpipe scaffolding is never mistaken for the task.
  */
 function typedUserText(content: string | ContentBlock[]): string {
-  if (typeof content === 'string') return content.trim();
-  if (!Array.isArray(content)) return '';
+  return splitUserTyped(content).text;
+}
+
+/**
+ * Same selection as {@link typedUserText}, but also reports WHICH block indices hold
+ * it. The collapse renders a user message minus these indices, so the user's own
+ * words never enter the history image while the tool_results in the same message —
+ * which pair with an imaged assistant tool_use and must not be orphaned — still do.
+ */
+function splitUserTyped(content: string | ContentBlock[]): {
+  text: string;
+  typedIdx: Set<number>;
+} {
+  const typedIdx = new Set<number>();
+  if (typeof content === 'string') return { text: content.trim(), typedIdx };
+  if (!Array.isArray(content)) return { text: '', typedIdx };
   const boundaryIdx = content.findIndex(
     (b) =>
       b && typeof b === 'object' &&
@@ -387,8 +418,9 @@ function typedUserText(content: string | ContentBlock[]): string {
     if (!text) continue;
     if (text.startsWith('<system-reminder>')) continue;
     parts.push(text);
+    typedIdx.add(i);
   }
-  return parts.join('\n\n');
+  return { text: parts.join('\n\n'), typedIdx };
 }
 
 /**
@@ -492,6 +524,77 @@ function demoteProtectedHeadText(head: Message[]): Message[] {
     }
     return changed ? { ...m, content: out } : m;
   });
+}
+
+// A user prompt is the one thing in the transcript the model cannot reconstruct:
+// assistant prose and tool output are recoverable from the work itself, but the
+// instruction that caused them exists nowhere else. Real prompts are also short —
+// a few hundred chars — so they are NEVER rasterized with the history: they stay
+// native text, at zero OCR risk, on the path that matters most. Past this cap a
+// prompt is a pasted document, not an instruction; that one gets its own image
+// rather than bloating the text, and still does not join the history transcript.
+const USER_TEXT_MAX_CHARS = 2000;
+
+/**
+ * The user's own words for one chunk's message range, as native text — the
+ * counterpart to withoutTypedUserText, which removed them from the render.
+ *
+ * A chunk's blocks are a pure function of its own range, so a frozen chunk emits
+ * identical blocks forever and the cache_read chain across it survives (#11).
+ * Range starts at protectedPrefix, so head turns stay tombstoned (#14).
+ */
+async function userTurnBlocks(
+  messages: Message[],
+  fromInclusive: number,
+  upToExclusive: number,
+  onImage: (img: RenderedImage) => void,
+): Promise<ContentBlock[]> {
+  const out: ContentBlock[] = [];
+  let pending: string[] = [];
+  const flush = () => {
+    if (pending.length === 0) return;
+    out.push({
+      type: 'text',
+      text: `[User turns from this session, verbatim — these are the user's own words, kept as text rather than rendered into the images above. PRIOR context: none of it is the current request unless the live text at the end of this message says to continue it.\n${pending.join('\n')}\n]`,
+    });
+    pending = [];
+  };
+  for (let i = fromInclusive; i < upToExclusive; i++) {
+    const m = messages[i]!;
+    if (m.role !== 'user') continue;
+    const typed = typedUserText(m.content);
+    if (!typed) continue;
+    if (typed.length <= USER_TEXT_MAX_CHARS) {
+      pending.push(`<user t="${i}">${typed}</user>`);
+      continue;
+    }
+    // Over the cap: this one prompt becomes its own image, kept separate from the
+    // history transcript image so it stays independently readable and attributable.
+    flush();
+    const imgs = await renderTextToPngsWithCharLimit(
+      `<user t="${i}">\n${typed}\n</user>`,
+      DENSE_CONTENT_COLS,
+      DENSE_CONTENT_CHARS_PER_IMAGE,
+      DENSE_RENDER_STYLE,
+    );
+    out.push({
+      type: 'text',
+      text: `[<user t="${i}"> was too long to carry as text (${typed.length} chars); it is rendered verbatim in the image(s) immediately below, separate from the history transcript. PRIOR context, not the current request. Preview: ${compactPreview(typed)}]`,
+    });
+    for (const img of imgs) {
+      out.push({
+        type: 'image',
+        source: {
+          type: 'base64',
+          media_type: 'image/png',
+          data: bytesToBase64(img.png),
+        },
+      } as ContentBlock);
+      onImage(img);
+    }
+  }
+  flush();
+  return out;
 }
 
 function latestCollapsedUserPointer(
@@ -636,12 +739,32 @@ export async function collapseHistory(
   for (let e = protectedPrefix + step; e < collapseLen; e += step) carryOverEnd = e;
   let carryOverOrdinal = -1;
 
-  const imageBlocks: Array<ImageBlock & { cache_control?: CacheControl }> = [];
+  const blocks: ContentBlock[] = [];
+  let imageCount = 0;
+  const countImage = (img: RenderedImage) => {
+    imageCount++;
+    info.collapsedImageBytes += img.png.length;
+    info.collapsedImagePixels += img.width * img.height;
+    info.collapsedPngs.push(img.png);
+    info.collapsedImageDims.push({ width: img.width, height: img.height });
+    info.droppedChars += img.droppedChars;
+    for (const [cp, n] of img.droppedCodepoints) {
+      info.droppedCodepoints.set(cp, (info.droppedCodepoints.get(cp) ?? 0) + n);
+    }
+  };
   let chunkStart = protectedPrefix;
   for (const chunkEnd of sortedEnds) {
+    // messagesToHistorySegments already omits the user's typed words; userTurnBlocks
+    // below carries them as text so a prompt is never read back out of pixels.
     const seg = messagesToHistorySegments(messages, chunkEnd, chunkStart);
+    const userFrom = chunkStart;
     chunkStart = chunkEnd;
-    if (!seg.text || seg.text.length === 0) continue;
+    if (!seg.text || seg.text.length === 0) {
+      // Transcript empty (e.g. the chunk was nothing but user prompts) — the
+      // prompts themselves still belong in the output.
+      blocks.push(...(await userTurnBlocks(messages, userFrom, chunkEnd, countImage)));
+      continue;
+    }
     // Reflow the text and its parallel slot string in lockstep so role attribution
     // stays codepoint-aligned with the rendered text. The two have identical newline
     // structure (slot bodies are verbatim copies), so minify/reflow mutate them the
@@ -690,22 +813,18 @@ export async function collapseHistory(
       };
       // Mark the LAST image of a marked segment — the caller's breakpoint anchor.
       if (markerCC !== undefined && k === imgs.length - 1) block.cache_control = markerCC;
-      imageBlocks.push(block);
-      info.collapsedImageBytes += img.png.length;
-      info.collapsedImagePixels += img.width * img.height;
-      info.collapsedPngs.push(img.png);
-      info.collapsedImageDims.push({ width: img.width, height: img.height });
-      info.droppedChars += img.droppedChars;
-      for (const [cp, n] of img.droppedCodepoints) {
-        info.droppedCodepoints.set(cp, (info.droppedCodepoints.get(cp) ?? 0) + n);
-      }
+      blocks.push(block);
+      countImage(img);
     }
     // The carry-over chunk's LAST image is the newest byte-stable history image.
     // Record its ordinal so the relocator pins the cache breakpoint here instead of
     // on the still-growing newest chunk, which busts every window advance (#11).
-    if (chunkEnd === carryOverEnd) carryOverOrdinal = imageBlocks.length - 1;
+    if (chunkEnd === carryOverEnd) carryOverOrdinal = imageCount - 1;
+    // This chunk's user prompts, as text, immediately after the image they were
+    // pulled out of — attribution stays local and the ordering matches the render.
+    blocks.push(...(await userTurnBlocks(messages, userFrom, chunkEnd, countImage)));
   }
-  if (imageBlocks.length === 0) {
+  if (imageCount === 0) {
     info.reason = 'render_empty';
     return { messages, info };
   }
@@ -713,7 +832,7 @@ export async function collapseHistory(
   const historyFactSheet = factSheetText(text);
   const syntheticContent: ContentBlock[] = [
     { type: 'text', text: HISTORY_SYNTHETIC_INTRO },
-    ...imageBlocks,
+    ...blocks,
     ...(latestUserPointer ? [latestUserPointer] : []),
     ...(historyFactSheet ? [{ type: 'text' as const, text: historyFactSheet }] : []),
     { type: 'text', text: HISTORY_SYNTHETIC_OUTRO },
@@ -728,7 +847,7 @@ export async function collapseHistory(
   const tail = messages.slice(collapseLen);
   info.collapsedTurns = collapseLen - protectedPrefix;
   info.collapsedChars = text.length;
-  info.collapsedImages = imageBlocks.length;
+  info.collapsedImages = imageCount;
   if (carryOverOrdinal >= 0) info.carryOverImageOrdinal = carryOverOrdinal;
   // [slab, history image, live tail] — slab cache_control anchor stays at the front.
   return { messages: [...head, syntheticUser, ...tail], info };

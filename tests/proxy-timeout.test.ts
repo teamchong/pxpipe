@@ -70,6 +70,48 @@ describe('upstream stall handling', () => {
     }
   });
 
+  it('lets a slow first chunk through: startup is not a mid-stream stall', async () => {
+    // Reasoning models can sit silent after headers before the first token. Real
+    // traffic has taken >120s just to reach headers, so the pre-first-chunk wait is
+    // charged the headers budget, not the tighter mid-stream idle budget.
+    const encoder = new TextEncoder();
+    const restore = mockUpstream(
+      () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              setTimeout(() => {
+                controller.enqueue(
+                  encoder.encode('data: {"type":"response.output_text.delta","delta":"ok"}\n\n'),
+                );
+                controller.close();
+              }, 600);
+            },
+          }),
+          { headers: { 'content-type': 'text/event-stream' } },
+        ),
+    );
+    try {
+      const proxy = createProxy({
+        openAIUpstream: 'http://mock',
+        transform: { compress: false },
+        upstreamIdleTimeoutMs: 200,
+        upstreamHeadersTimeoutMs: 5000,
+      });
+      const res = await proxy(request());
+      const outcome = await withDeadline(
+        new Response(res.body)
+          .text()
+          .then((t) => (t.includes('delta') ? 'delivered' : `unexpected: ${t}`))
+          .catch((e) => `errored: ${(e as Error).message}`),
+        4000,
+      );
+      expect(outcome).toBe('delivered');
+    } finally {
+      restore();
+    }
+  });
+
   it('returns 504 when response headers never arrive', async () => {
     const restore = mockUpstream(
       () =>

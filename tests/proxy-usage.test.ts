@@ -225,6 +225,61 @@ describe('proxy usage extraction', () => {
     expect(captured?.info?.bucketChars).toBeUndefined();
   });
 
+  it('bounds the countTokens probe and reverts when it times out', async () => {
+    const probeSignals: (AbortSignal | undefined)[] = [];
+    const forwardedBodies: string[] = [];
+    // Local patch: the shared mockUpstream rebuilds a Request, whose `signal` is always
+    // populated — only the raw init reveals whether we actually attached a budget.
+    const realFetch = globalThis.fetch;
+    const restoreFetch = () => { globalThis.fetch = realFetch; };
+    globalThis.fetch = ((input: Request | string | URL, init?: RequestInit) => {
+      const url = String(input instanceof Request ? input.url : input);
+      if (url.includes(':countTokens')) probeSignals.push(init?.signal ?? undefined);
+      const r = input instanceof Request ? input : new Request(url, init);
+      return Promise.resolve(handler(r));
+    }) as typeof fetch;
+    const handler = async (req: Request): Promise<Response> => {
+      if (req.url.includes(':countTokens')) {
+        // What AbortSignal.timeout produces once the budget expires.
+        throw Object.assign(new Error('The operation was aborted'), { name: 'TimeoutError' });
+      }
+      forwardedBodies.push(await req.clone().text());
+      return new Response(JSON.stringify({
+        candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
+        usageMetadata: { promptTokenCount: 400, candidatesTokenCount: 1 },
+      }), { headers: { 'content-type': 'application/json' } });
+    };
+    const restore = restoreFetch;
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      upstream: 'http://ocproxy.test',
+      transform: { compress: true },
+      onRequest: (event) => { captured = event; },
+    });
+    const body = JSON.stringify({
+      systemInstruction: { parts: [{ text: 'System instruction. '.repeat(300) }] },
+      contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
+    });
+    const res = await proxy(new Request(
+      'http://localhost/google-ai-studio/v1beta/models/gemini-3.6-flash:generateContent',
+      { method: 'POST', headers: { 'content-type': 'application/json' }, body },
+    ));
+    await res.text();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    restore();
+
+    // The probe must carry a live budget, or a wedged endpoint hangs the caller's request.
+    expect(probeSignals.length).toBeGreaterThan(0);
+    for (const signal of probeSignals) expect(signal).toBeInstanceOf(AbortSignal);
+    expect(probeSignals.every((s) => s !== undefined)).toBe(true);
+    // Expiring is not an error path for the client: original body, request still served.
+    expect(res.status).toBe(200);
+    expect(forwardedBodies).toHaveLength(1);
+    expect(forwardedBodies[0]).not.toContain('inlineData');
+    expect(captured?.info?.compressed).toBe(false);
+    expect(captured?.info?.reason).toBe('count_tokens_failed');
+  });
+
   it('does not apply the 3.6 Flash profile to an unvalidated Gemini alias', async () => {
     const upstreamRequests: Request[] = [];
     const restore = mockUpstream(async (req) => {

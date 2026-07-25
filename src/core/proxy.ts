@@ -113,6 +113,19 @@ const DEFAULT_UPSTREAM_HEADERS_TIMEOUT_MS = 300_000;
 const DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS = 120_000;
 /** Past this, an in-flight entry is treated as stale and a retry is let through. */
 const DEFAULT_DUPLICATE_HOLD_MS = 60_000;
+/**
+ * Budget for a count-tokens probe. Both probes fail closed (null keeps the original
+ * body), so expiring one costs that request's savings, never correctness. The Google
+ * pair is awaited before the forward, so this is worst-case added latency; the
+ * Anthropic pair only feeds telemetry.
+ *
+ * Neither provider publishes a latency SLO for count-tokens, and we have no probe
+ * timing of our own, so this is not a measured figure. It is bounded by the one number
+ * we do have: p99 time-to-headers for a full generation on the same route (30s over
+ * 2166 Gemini requests in our telemetry). A probe does strictly less work than
+ * first-token generation, so one that misses that mark is wedged rather than slow.
+ */
+const COUNT_TOKENS_TIMEOUT_MS = 30_000;
 /** Sweep the in-flight map early once it grows past plausible real concurrency. */
 const INFLIGHT_SWEEP_SIZE = 256;
 /** Floor between size-triggered sweeps so genuine high concurrency stays O(1)/request. */
@@ -122,7 +135,12 @@ const INFLIGHT_SWEEP_MIN_INTERVAL_MS = 1_000;
  * Abort the response if no chunk arrives for `ms`. Wraps the raw upstream stream so
  * the watchdog sees real network activity rather than post-transform output.
  */
-function withIdleTimeout(res: Response, ms: number, onIdle: () => void): Response {
+function withIdleTimeout(
+  res: Response,
+  firstChunkMs: number,
+  ms: number,
+  onIdle: () => void,
+): Response {
   if (!res.body || ms <= 0) return res;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const clear = (): void => {
@@ -134,26 +152,31 @@ function withIdleTimeout(res: Response, ms: number, onIdle: () => void): Respons
   // The watchdog errors its own controller rather than relying on the fetch
   // implementation to tear the body down when the signal aborts.
   let ctl: TransformStreamDefaultController<Uint8Array> | undefined;
-  const arm = (): void => {
+  const arm = (budget: number): void => {
     clear();
     timer = setTimeout(() => {
       timer = undefined;
       onIdle();
       try {
-        ctl?.error(new Error(`pxpipe: upstream stalled for ${ms}ms`));
+        ctl?.error(new Error(`pxpipe: upstream stalled for ${budget}ms`));
       } catch {
         /* already errored or closed */
       }
-    }, ms);
+    }, budget);
   };
   const watched = res.body.pipeThrough(
     new TransformStream<Uint8Array, Uint8Array>({
       start(controller) {
         ctl = controller;
-        arm();
+        // Nothing has streamed yet: the model may still be starting up, which is the
+        // same wait the headers budget covers. Real traffic has taken >120s just to
+        // return headers (max 146s over 41k requests), so charging the mid-stream idle
+        // budget here would abort healthy slow starts.
+        arm(firstChunkMs);
       },
       transform(chunk, controller) {
-        arm();
+        // Bytes have flowed: from here a long silence means wedged, not slow.
+        arm(ms);
         controller.enqueue(chunk);
       },
       flush() {
@@ -823,6 +846,7 @@ async function countTokensUpstream(
       method: 'POST',
       headers,
       body: body as unknown as BodyInit,
+      signal: AbortSignal.timeout(COUNT_TOKENS_TIMEOUT_MS),
     });
     if (!res.ok) return null;
     const json = (await res.json()) as { input_tokens?: unknown };
@@ -847,6 +871,7 @@ async function countGoogleTokensUpstream(
       method: 'POST',
       headers,
       body: countBody,
+      signal: AbortSignal.timeout(COUNT_TOKENS_TIMEOUT_MS),
     });
     if (!res.ok) return null;
     const json = await res.json() as { totalTokens?: unknown };
@@ -1404,7 +1429,7 @@ export function createProxy(config: ProxyConfig = {}) {
       }
       upstreamRes = raced;
       // Watch the raw upstream stream, before any bridge re-encodes it.
-      upstreamRes = withIdleTimeout(upstreamRes, idleTimeoutMs, () => {
+      upstreamRes = withIdleTimeout(upstreamRes, headersTimeoutMs, idleTimeoutMs, () => {
         timeoutKind = 'idle';
         upstreamAbort.abort(new Error('pxpipe: upstream stalled'));
       });

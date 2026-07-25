@@ -244,9 +244,9 @@ export const en: Messages = {
   killSwitchHint: 'kill switch · resets to on when you restart',
 
   modelScopeSummary: 'Image model scope',
-  modelScopeHint: 'Fable 5 and Gemini 3.6 Flash by default · expand to experiment with other families',
+  modelScopeHint: 'Fable 5, Opus 5 and Gemini 3.6 Flash by default · expand to add more',
   modelScopeWarning:
-    '⚠ Image compression is validated for Fable 5 and Gemini 3.6 Flash — other families can use <strong>more</strong> tokens, not less. Opt in only for deliberate experiments.',
+    'Cost is covered across every Claude family: the image-token estimate follows each model\'s vision tier (high-res 2576px · standard 1568px) and requests fall back to plain text on their own below break-even. What changes outside the default models is <strong>reading</strong>, not price: check it before relying on it.',
   compressionOffNoEffect: 'compression is off — these settings have no effect right now',
   imageClaudeModels: 'Image Claude models',
   imageGeminiModels: 'Image Gemini models',

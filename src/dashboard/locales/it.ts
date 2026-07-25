@@ -26,9 +26,9 @@ export const it: Messages = {
   killSwitchHint: 'interruttore di emergenza · torna attivo al riavvio',
 
   modelScopeSummary: 'Ambito modelli da imaging',
-  modelScopeHint: 'Fable 5 e Gemini 3.6 Flash per impostazione predefinita · espandi per sperimentare con altre famiglie',
+  modelScopeHint: 'Fable 5, Opus 5 e Gemini 3.6 Flash per impostazione predefinita · espandi per aggiungerne altri',
   modelScopeWarning:
-    '⚠ La compressione in immagini è validata per Fable 5 e Gemini 3.6 Flash — altre famiglie possono usare <strong>più</strong> token, non meno. Attivala solo per esperimenti deliberati.',
+    'Sul costo sei coperto su tutte le famiglie Claude: la stima dei token immagine segue il tier visivo del modello (high-res 2576px · standard 1568px) e sotto il pareggio la richiesta passa in chiaro da sola. Quello che cambia fuori dai modelli predefiniti è la <strong>lettura</strong>, non il prezzo: verificala prima di farci affidamento.',
   compressionOffNoEffect: 'la compressione è disattivata — queste impostazioni non hanno effetto al momento',
   imageClaudeModels: 'Modelli Claude da trasformare in immagine',
   imageGeminiModels: 'Modelli Gemini da trasformare in immagine',

@@ -107,6 +107,12 @@ without running the proxy.
 - **`claude-opus-5`:** weaker recall than Fable 5 (verbatim **2/15 vs 13/15**), good
   enough otherwise (100/100 arithmetic, 0/16 never-stated), **~4.7×** context before
   `/compact`. Suggested effort: **medium**. Details: [FINDINGS.md](FINDINGS.md).
+- **Provenance of the Opus 5 reader profile:** it comes from **upstream PR #147**
+  (`teamchong/pxpipe`), which at the time of writing is **still open upstream and
+  not merged there**. This fork pulled it in early (merge commit `36cb19c`) and
+  built on top of it, so `claude-opus-5` ships here as a default reader while
+  upstream `main` does not yet have it. If upstream lands the PR in a different
+  shape, this branch has to be reconciled with whatever they merge.
 - **Model scope:** default `PXPIPE_MODELS=claude-fable-5,claude-opus-5,gemini-3.6-flash`. Sol, GPT 5.5,
   and **Grok** are opt-in only (dashboard chips or
   `PXPIPE_MODELS`). The exact Sol id still matters. Sibling variants such as

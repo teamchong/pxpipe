@@ -3,8 +3,8 @@
 Blind 8–16px ladder (+ shipped spleen-5×8 control) for `grok-4.5`.
 
 Geometry matches production Grok constraints: short-side ≤768px, `maxH=512`.
-Per-rung cols = `floor((768−8)/cellW)`. Image tokens use `GROK_TOKENS_PER_MEGAPIXEL`
-(1000 tok/MPix). Protocol mirrors Opus/Sol native sweeps: crypto-random fixture,
+Per-rung cols = `floor((768−8)/cellW)`. Image tokens use Grok's profile
+vision regime (`mpix`, 1000 tok/MPix). Protocol mirrors Opus/Sol native sweeps: crypto-random fixture,
 atlas swap → rebuild → render, live ask locks answers before truth is scored.
 
 ```bash

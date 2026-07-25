@@ -16,7 +16,8 @@ upstream `:8082`, pxpipe port 47821 rejected by the client).
    Sweet spot = densest clean rung.
 
 Grok image tokens use the measured `1000 tok/MPix` formula
-(`GROK_TOKENS_PER_MEGAPIXEL` in `src/core/openai.ts`).
+(`vision: { regime: 'mpix', tokensPerMegapixel: 1000 }` in
+`src/core/gpt-model-profiles.ts`, priced by `src/core/vision-cost.ts`).
 
 ## Results
 

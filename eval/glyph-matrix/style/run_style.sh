@@ -1,7 +1,11 @@
 #!/bin/bash
 # Constant-cost style A/B reader. Same method as ../sweep/run_sweep.sh:
 # real claude CLI, --disallowedTools Bash so it must read by eye (no upscaling).
-D=/tmp/style; export MODEL="${MODEL:-claude-opus-4-8}"; export TAG="${TAG:-opus}"; PMAX="${PMAX:-4}"
+D=/tmp/style
+# No default: a stale default silently measures a model nobody asked for. TAG
+# follows MODEL so output files can't be labelled for a model that never ran.
+: "${MODEL:?MODEL is not set — refusing to guess. e.g. MODEL=claude-opus-5 ./run_style.sh}"
+export MODEL; export TAG="${TAG:-$MODEL}"; PMAX="${PMAX:-4}"
 export STYLES="${STYLES:-prod onebit color grid cgrid}"
 rm -f $D/HALT
 run_one() {

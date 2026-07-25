@@ -11,7 +11,7 @@
  * was the source of the 1m-vs-200k / MCP-loaded confounds). Auth is untouched
  * (it is not a "setting source"), and no credentials are copied into /tmp.
  *
- *   node demo/cost-ab/setup.mjs
+ *   bash demo/cost-ab/setup.sh [model]   # resolves the model, then runs this
  */
 import { cpSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -20,10 +20,22 @@ import { dirname, join } from 'node:path';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const TEMPLATE = join(HERE, 'template');
 
-// The project cc config both columns run under — explicit and version-controlled
-// here, so the demo doesn't depend on the operator's ~/.claude/settings.json.
-// [1m] matches the real default; MCP intentionally unset (none loaded).
-const PROJECT_CC_SETTINGS = { model: 'claude-opus-4-8[1m]' };
+// The project cc config both columns run under — written here so the demo does not
+// depend on the operator's ~/.claude/settings.json. MCP intentionally unset.
+//
+// The model comes from setup.sh's resolver (demo/models.sh) via $DEMO_MODEL_ID and
+// is NOT a literal. A hardcoded id here outlived the model it named and quietly made
+// every run labelled "opus" measure the wrong model; fail loudly instead of guessing.
+const MODEL = process.env.DEMO_MODEL_ID;
+if (!MODEL) {
+  console.error(
+    'setup.mjs: $DEMO_MODEL_ID is not set — refusing to guess a model.\n' +
+    'Run the demo entrypoint, which resolves it for you:\n' +
+    '  bash demo/cost-ab/setup.sh [model]\n',
+  );
+  process.exit(1);
+}
+const PROJECT_CC_SETTINGS = { model: MODEL };
 
 const SIDES = { left: '/tmp/pp-demo-left', right: '/tmp/pp-demo-right' };
 
@@ -66,8 +78,8 @@ cd /tmp/pp-demo-right && ANTHROPIC_BASE_URL=${ON_PROXY} claude ${FLAGS}
 --- paste this prompt into BOTH Claude columns ---
 ${PROMPT}
 
-Both columns read ONLY the seeded project config (model claude-opus-4-8[1m], no
-MCP) and ignore your global settings — so the only variable is the proxy. Auth is
+Both columns read ONLY the seeded project config (model ${MODEL}, no MCP) and
+ignore your global settings — so the only variable is the proxy. Auth is
 untouched.
 
 --- verify each ---

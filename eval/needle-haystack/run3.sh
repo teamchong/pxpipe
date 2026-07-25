@@ -5,7 +5,8 @@ set -u
 cd "$(dirname "$0")"
 
 PROXY="http://127.0.0.1:47821"
-MODEL="claude-opus-4-8"
+# No default: a stale default silently measures a model nobody asked for.
+: "${MODEL:?MODEL is not set — refusing to guess. e.g. MODEL=claude-opus-5 ./run3.sh}"
 N=15
 RESULTS=results2.tsv
 LOG=runs2.log

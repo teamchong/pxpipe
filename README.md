@@ -44,14 +44,6 @@ and ends the session at **$6.06** with context to spare (73.5k/1M) vs
 **$42.21** at 96% full. One caveat visible in the clip: the pxpipe arm
 needed a nudge to match the requested one-line output format.
 
-**Opus 4.8 (disabled by default) — same layout:**
-
-https://github.com/user-attachments/assets/f4e50137-31b5-426f-a6ed-b83f829b4a2c
-
-Text needles read fine on both arms; the imaged phrase-count doesn't read on
-Opus — and pxpipe **says so instead of fabricating a number**. That misread
-rate is why Opus is opt-in.
-
 ## Try it (30 seconds)
 
 ```bash
@@ -88,7 +80,7 @@ without running the proxy.
 ## The honest part
 
 - **It is lossy.** Exact 12-char hex strings in dense imaged content:
-  **13/15** on Fable 5, **0/15** on Opus, and **0/15** on Sol — misses are *silent
+  **13/15** on Fable 5 and **0/15** on Sol — misses are *silent
   confabulations*, not errors. Byte-exact values (IDs, hashes, secrets)
   must stay text; recent turns do. The factsheet selectively preserves up to
   96 recognized precision-critical tokens, not every identifier. A dedicated
@@ -112,8 +104,11 @@ without running the proxy.
 <details>
 <summary><strong>Model support and rendering details</strong></summary>
 
-- **Model scope:** default `PXPIPE_MODELS=claude-fable-5,gemini-3.6-flash`. Sol, Opus
-  4.7/4.8, GPT 5.5, and **Grok** are opt-in only (dashboard chips or
+- **`claude-opus-5`:** weaker recall than Fable 5 (verbatim **2/15 vs 13/15**), good
+  enough otherwise (100/100 arithmetic, 0/16 never-stated), **~4.7×** context before
+  `/compact`. Suggested effort: **medium**. Details: [FINDINGS.md](FINDINGS.md).
+- **Model scope:** default `PXPIPE_MODELS=claude-fable-5,claude-opus-5,gemini-3.6-flash`. Sol, GPT 5.5,
+  and **Grok** are opt-in only (dashboard chips or
   `PXPIPE_MODELS`). The exact Sol id still matters. Sibling variants such as
   `gpt-5.6-terra` do not
   inherit Sol's allowlist or render profile. `PXPIPE_MODELS=off` disables
@@ -154,10 +149,11 @@ is confabulations, so lower is better.
 
 | model | arithmetic (N=100) | gist (N=98) | state (N=18) | never-stated (N=16) | dense hex (N=15) | profile provenance and receipts |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| `claude-fable-5` | **100/100** | **98/98** | **18/18** | **0/16** | **13/15** | June 2026 production profiles: [arithmetic + hex](FINDINGS.md), [gist/state/guards](eval/gist-recall/) |
+| `claude-fable-5` | **100/100** | **98/98** | **18/18** | **0/16** | 13/15 | June 2026 production profiles: [arithmetic + hex](FINDINGS.md), [gist/state/guards](eval/gist-recall/) |
 | `google/gemini-3.6-flash` | **100/100** | **98/98** | **18/18** | **0/16** | **14/15** | current shipped profile: [quality results](eval/gemini-profile/QUALITY_RESULTS.md) |
-| `gpt-5.6-sol` | **98/100** | 83/98 | 17/18 | 4/16 | 0/15 | current shipped profile: [quality results](eval/sol-profile/QUALITY_RESULTS.md) |
-| `claude-opus-4-8` | 93/100 | — | — | — | 0/15 | historical profile: [arithmetic](eval/gsm8k/), [dense hex](eval/needle-haystack/) |
+| `claude-opus-5` | **100/100** | 94/98 | 17/18 | **0/16** | 2/15 | current profile: [arithmetic](eval/gsm8k/), [gist/state/guards](eval/gist-recall/), [dense hex](eval/verbatim-15/) |
+| `gpt-5.6-sol` | 98/100 | 83/98 | 17/18 | 4/16 | 0/15 | current shipped profile: [quality results](eval/sol-profile/QUALITY_RESULTS.md) |
+| `claude-opus-4-8` | 93/100 | 77/98 | **18/18** | **0/16** | 0/15 | historical profile: [arithmetic](eval/gsm8k/), [gist/state/guards](eval/gist-recall/), [dense hex](eval/needle-haystack/) |
 | `grok-4.5` | 82/100 | 83/98 | 13/18 | **0/16** | 0/15 | current shipped profile: [quality results](eval/grok-density/QUALITY_RESULTS.md) |
 | `moonshotai/kimi-k3` | 79/100 | 84/98 | 15/18 | 1/16 | 0/15 | generic GPT profile: [quality results](eval/sol-profile/KIMI_K3_QUALITY_RESULTS.md) |
 
@@ -190,8 +186,9 @@ chars/vision-token ÷ 4 (prose text baseline). Not a model-quality score.
 
 | family | window | as text (@4 c/tok) | as pxpipe images | density | multiplier |
 |---|---:|---:|---:|---:|---:|
-| **`claude-fable-5[1m]`** (default) | 1M | ~4.0M | **~19.0M** | ~19.0 c/vt (exact 28px patches) | **~4.8×** |
-| **`google/gemini-3.6-flash`** | 1M | ~4.0M | **~21.3M** | ~21.3 c/vt (1,078 tok/page) | **~5.3×** |
+| **`claude-fable-5[1m]`** (default) | 1M | ~4.0M | **~18.9M** | ~18.9 c/vt (exact 28px patches) | **~4.7×** |
+| **`google/gemini-3.6-flash`** | 1M | ~4.0M | **~20.1M** | ~20.1 c/vt (1,078 tok/page) | **~5.0×** |
+| **`claude-opus-5`** | 1M | ~4.0M | **~18.9M** | ~18.9 c/vt (resolves to Fable 5’s geometry) | **~4.7×** |
 
 Regenerate: `npx tsx scripts/gen-context-chart.ts` · chart PNG
 [`docs/assets/context-window-chars.png`](docs/assets/context-window-chars.png).
@@ -390,7 +387,7 @@ with something plausible. Mechanism and receipts:
 No: it proved the channel works, using an encoder/decoder pair trained for
 the job. The skepticism dates from October 2025, when no stock production
 model could read dense renders; that changed with Fable 5 (0/15 verbatim
-hex on Opus 4.8 vs 13/15 on Fable 5, same pages). Timeline and per-model
+hex on the prior Opus generation vs 13/15 on Fable 5, same pages). Timeline and per-model
 numbers: [docs/NOT-OCR.md](docs/NOT-OCR.md).
 
 </details>

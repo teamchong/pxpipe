@@ -1941,7 +1941,10 @@ export async function transformRequest(
   // single-modal framing keeps encoder in image-reading mode for both header + content).
   // Header text is continuous prose (no hard \n) so the renderer soft-wraps densely.
   // 3. Render to PNGs at slabCols width (banner sets natural floor).
-  const images = await renderTextToPngs(combinedWithHeader, slabCols);
+  // Same style as the dense path above, so both Anthropic surfaces resolve the same
+  // atlas. No-op for ASCII (gray and bitmap atlases are bit-identical there); it keeps
+  // non-ASCII glyphs from depending on which code path happened to render them.
+  const images = await renderTextToPngs(combinedWithHeader, slabCols, DENSE_RENDER_STYLE);
   const imageBlocks: ImageBlock[] = [];
   for (let i = 0; i < images.length; i++) {
     const img = images[i]!;

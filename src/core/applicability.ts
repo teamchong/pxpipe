@@ -34,7 +34,7 @@ let runtimeModelBases: readonly string[] | null = null;
  *  - Grok 4.5 — 82/100 arithmetic, 83/98 gist, and 13/18 state tracking.
  *  Both profiles remain available for explicit opt-in.
  *  Silently imaging weak or unvalidated readers is the wrong default. */
-const DEFAULT_MODEL_BASES = ['claude-fable-5', 'gemini-3.6-flash'];
+const DEFAULT_MODEL_BASES = ['claude-fable-5', 'claude-opus-5', 'gemini-3.6-flash'];
 
 function falsey(v: string): boolean {
   return /^(0|false|no|off|none)$/i.test(v.trim());

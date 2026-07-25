@@ -102,9 +102,9 @@ describe('visionTokensForModel (Claude on the Responses path)', () => {
   it('prices claude images by the 28-px patch model, not GPT tiles', () => {
     // Codex speaks OpenAI Responses; some models on that path are Claude, so
     // this path must bill images the Anthropic way: ⌈w/28⌉×⌈h/28⌉ visual tokens.
-    // 768x1932 on the high-res tier (opus-4-8) fits without downscale →
+    // 768x1932 on the high-res tier (opus-5) fits without downscale →
     // ⌈768/28⌉×⌈1932/28⌉ = 28×69 = 1932.
-    expect(visionTokensForModel('claude-opus-4-8', 768, 1932)).toBe(1932);
+    expect(visionTokensForModel('claude-opus-5', 768, 1932)).toBe(1932);
     // GPT models are unchanged (delegates to openAIVisionTokens).
     expect(visionTokensForModel('gpt-5', 768, 1932)).toBe(openAIVisionTokens('gpt-5', 768, 1932));
   });

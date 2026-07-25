@@ -19,13 +19,14 @@ the needle in the noise. `setup.sh` floods ≈200k tokens of inert logs around a
 ```bash
 # Terminal 1 — set up: generates the context, builds, starts BOTH proxies, seeds
 #              two read-only copies, and PRINTS the ground-truth answer.
-bash demo/effective-context/setup.sh   # Fable only (Opus off); 'setup.sh opus' to enable Opus
+bash demo/effective-context/setup.sh        # Fable 5 (production default)
+bash demo/effective-context/setup.sh opus   # ...or arm any other model, once, here
 
 # Terminal 2 — LEFT  = normal   (interactive Claude — may drown and answer wrong)
-bash demo/effective-context/a.sh   # defaults to Fable; `a.sh opus` to use Opus
+bash demo/effective-context/a.sh            # inherits the model setup.sh armed
 
 # Terminal 3 — RIGHT = pxpipe   (interactive Claude — should answer correctly)
-bash demo/effective-context/b.sh   # use the SAME model as a.sh
+bash demo/effective-context/b.sh            # same model, automatically
 ```
 
 `a.sh` / `b.sh` launch a **real interactive Claude session** with the needle prompt
@@ -34,12 +35,22 @@ copies inside a subshell, so your terminal stays in the repo afterward. `claude`
 usually a shell alias; the scripts resolve the real binary, or set
 `CLAUDE_BIN=/path/to/claude`. To redo, re-run `setup.sh`.
 
-**Model:** everything defaults to **Fable 5** — Opus is off by default, matching
-production. To run on another model, pass it to **all three**: `setup.sh opus`
-(adds Opus to the `:47824` proxy's compress scope), then `a.sh opus` / `b.sh opus`
-(also `sonnet`, `haiku`, or a full `claude-…` id), same model on both columns.
-`setup.sh` is what enables compression for that model; you can also toggle it live
-on the dashboard "compress models" chips.
+**Model:** choose it **once**, in `setup.sh`; `a.sh` and `b.sh` inherit it. That is
+the point — an A/B across two *different* models measures nothing, and the old
+"pass it to all three" contract made that mistake one typo away. (It already bit
+this demo once: see [ATTEMPTS.md](ATTEMPTS.md), where the columns silently ran
+different models.)
+
+`setup.sh` takes `fable` (default), `opus`, `sonnet`, `haiku`, or any full
+`claude-…` id; `PXPIPE_DEMO_MODEL=opus bash demo/effective-context/setup.sh` works
+too. The alias table is [`demo/models.sh`](../models.sh) — the single place to edit
+when a new model ships, instead of six scripts.
+
+`setup.sh` adds the model to the `:47824` proxy's compress scope **and records the
+choice**. `a.sh`/`b.sh` default to it, and `b.sh` **refuses to run** a model that
+isn't in scope: pxpipe would pass it through uncompressed, so the run would look
+like a pxpipe result while measuring nothing. You can also toggle scope live on the
+dashboard "compress models" chips.
 
 ## See the result — compare the two integers
 

@@ -448,7 +448,7 @@ export async function planGptCollapse(
     // Readable portrait strips (≤768px wide) — legible to OpenAI vision, same as
     // the static slab. renderTextToPngs caps each PNG at MAX_HEIGHT_PX so a tall
     // section pages into N images, all still well under the 10,000-patch budget.
-    const sectionImgs = await renderTextToPngs(sectionRender, o.cols, o.style ?? {}, o.maxHeightPx);
+    const sectionImgs = await renderTextToPngs(sectionRender, o.cols, o.style ?? DEFAULT_GPT_PROFILE.style, o.maxHeightPx);
     if (imgCount + sectionImgs.length > maxImages) {
       // TRUE cap: keep the sections already selected, leave this and every later
       // section (and the pin, if not yet reached) as normal text in the remainder.
@@ -847,7 +847,7 @@ async function planResponsesMixedCollapse(
     const source = units.map((unit) => unit.text).join('\n\n');
     const safe = neutralizeSentinel(source);
     const renderedText = o.reflow ? reflow(safe) ?? safe : safe;
-    const images = await renderTextToPngs(renderedText, o.cols, o.style ?? {}, o.maxHeightPx);
+    const images = await renderTextToPngs(renderedText, o.cols, o.style ?? DEFAULT_GPT_PROFILE.style, o.maxHeightPx);
     return { source, renderedText, images };
   };
 
@@ -967,7 +967,7 @@ export async function planResponsesPairCollapse(
     const safe = neutralizeSentinel(source);
     let renderedText = o.reflow ? reflow(safe) ?? safe : safe;
     const images = await renderTextToPngs(
-      renderedText, o.cols, o.style ?? {}, o.maxHeightPx,
+      renderedText, o.cols, o.style ?? DEFAULT_GPT_PROFILE.style, o.maxHeightPx,
     );
     return { source, renderedText, images };
   };

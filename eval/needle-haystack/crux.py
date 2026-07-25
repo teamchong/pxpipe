@@ -8,6 +8,14 @@ WORK = "/tmp/needle_eval/crux"
 os.makedirs(WORK, exist_ok=True)
 CCI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib", "cci.py")
 
+# Same knob as sweep.py. This was a bare literal at the call site below, so every
+# crux run measured that model no matter which one was requested. No default: a
+# stale default is how a run gets labelled one model and measures another.
+MODEL = os.environ.get("EVAL_MODEL")
+if not MODEL:
+    sys.exit("crux.py: EVAL_MODEL is not set — refusing to guess a model.\n"
+             "  EVAL_MODEL=claude-opus-5 python3 eval/needle-haystack/crux.py")
+
 def hexneedle():
     return secrets.token_hex(6)  # 12 hex chars
 
@@ -47,7 +55,7 @@ def ask_opus(path, what):
     prompt = (f"Read the image at {path}. {what} "
               "Reply with ONLY the value, no other words, no punctuation.")
     out = subprocess.run(
-        [sys.executable, CCI, "--model", "claude-opus-4-8", "--allowedTools", "Read", prompt],
+        [sys.executable, CCI, "--model", MODEL, "--allowedTools", "Read", prompt],
         capture_output=True, text=True, timeout=120, cwd=WORK,
         env=dict(os.environ, CCI_TIMEOUT="100"),
     ).stdout

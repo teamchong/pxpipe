@@ -34,6 +34,11 @@ CLAUDE = os.environ.get("CCI_CLAUDE_BIN", os.path.expanduser("~/.claude/local/cl
 TIMEOUT = float(os.environ.get("CCI_TIMEOUT", "300"))
 READY_TIMEOUT = float(os.environ.get("CCI_READY_TIMEOUT", "60"))
 QUIET_S = float(os.environ.get("CCI_QUIET_S", "4.0"))
+# Extra wall-clock we're willing to spend when the only thing on screen is a
+# lead-in line ("I'll read the image."). Extended thinking renders no spinner
+# and emits no bytes, so QUIET_S alone can expire mid-turn and score the
+# preamble as the answer. Bounded so a genuinely terse reply can't hang.
+PREAMBLE_GRACE = float(os.environ.get("CCI_PREAMBLE_GRACE", "120"))
 DEBUG = os.environ.get("CCI_DEBUG")
 ROWS = int(os.environ.get("CCI_ROWS", "60"))    # tall buffer (e.g. 1500) for long replies
 COLS = int(os.environ.get("CCI_COLS", "200"))
@@ -107,19 +112,97 @@ def parse_context(text):
 
 def extract_reply(lines):
     """Reply = the last assistant bullet block (lines under a leading '⏺')."""
-    out = []; cap = False
+    def is_boundary(s):
+        return ((not s) or s.startswith("❯") or s.startswith("✻")
+                or s.startswith("⎿") or "bypass permissions" in s
+                or "esc to interrupt" in s or set(s) <= set("─╌╭╮╰╯│ "))
+
+    # Collect EVERY bullet block, then take the last non-empty one. The old
+    # code broke out of the scan at the first boundary line, which is the blank
+    # gap right after a lead-in ("I'll read the image."), so a turn that opened
+    # with a preamble scored the preamble and discarded the real answer.
+    blocks = []; cur = None
     for t in lines:
         s = t.strip()
         if s.startswith("⏺"):
-            cap = True
-            out = [s.lstrip("⏺").strip()]
-        elif cap:
-            if (not s) or s.startswith("❯") or s.startswith("✻") \
-                    or s.startswith("⎿") or "bypass permissions" in s \
-                    or "esc to interrupt" in s or set(s) <= set("─╌╭╮╰╯│ "):
-                break
-            out.append(s)
-    return "\n".join(x for x in out if x).strip()
+            if cur is not None:
+                blocks.append(cur)
+            cur = [s.lstrip("⏺").strip()]
+        elif cur is not None:
+            if is_boundary(s):
+                blocks.append(cur); cur = None
+            else:
+                cur.append(s)
+    if cur is not None:
+        blocks.append(cur)
+    for b in reversed(blocks):
+        # Tool invocations are machinery, not the model's answer. Skipping them
+        # means a turn caught mid-call falls back to the last real prose block
+        # (usually the lead-in), which the caller can then recognise.
+        if b and is_tool_call(b[0]):
+            continue
+        txt = "\n".join(x for x in b if x).strip()
+        if txt:
+            return txt
+    return ""
+
+
+_PREAMBLE_RE = re.compile(
+    r"^(?:I'?ll\b|I will\b|Let me\b|I'?m going to\b|I need to\b|First,|Sure[,.]|Okay[,.])",
+    re.I)
+
+
+def looks_like_preamble(reply):
+    """True if `reply` is a lone lead-in line rather than a real answer.
+
+    A model that says "I'll read the image." and nothing else has announced an
+    action it hasn't reported back on yet -- the turn is still in flight. Empty
+    counts too: we saw a turn start, so nothing on screen means not-done-yet.
+    """
+    s = (reply or "").strip()
+    if not s:
+        return True
+    return len(s.splitlines()) == 1 and bool(_PREAMBLE_RE.match(s))
+
+
+# A tool invocation renders with the SAME '⏺' bullet as assistant prose:
+#
+#     ⏺ Read(/tmp/imgs/q0.png)
+#       ⎿  Read image (980x328)
+#
+# so the block scanner cannot tell them apart on the glyph alone. Two failures
+# follow from that, and both bit us:
+#
+#   1. Mid-call, the last '⏺' block IS the tool line, so extract_reply() would
+#      return the string "Read(/tmp/imgs/q0.png)" as the model's answer.
+#   2. That string is not a lead-in, so looks_like_preamble() said False, the
+#      grace branch was skipped, and the turn was declared complete mid-call.
+#
+# Net effect: a tool whose result took longer than QUIET_S to paint (a large
+# PNG decode reliably does) scored the tool call instead of the answer. That is
+# the whole of the phantom 0/100 on the gsm8k image arm.
+_TOOL_CALL_RE = re.compile(r"^[A-Z][A-Za-z0-9_]*\(")
+
+
+def is_tool_call(head):
+    """True if a '⏺' block head is a tool invocation rather than prose."""
+    return bool(_TOOL_CALL_RE.match((head or "").strip()))
+
+
+def tool_in_flight(lines):
+    """True if the last tool invocation on screen has no '⎿' result yet.
+
+    Positive evidence that the turn is still running, independent of whether
+    the spinner happens to be painted in the current frame.
+    """
+    last = -1
+    for i, t in enumerate(lines):
+        s = t.strip()
+        if s.startswith("⏺") and is_tool_call(s.lstrip("⏺")):
+            last = i
+    if last < 0:
+        return False
+    return not any(t.strip().startswith("⎿") for t in lines[last + 1:])
 
 
 def main():
@@ -240,6 +323,7 @@ def main():
     hard = time.time() + TIMEOUT
     last_active = time.time()
     seen = started
+    grace_left = PREAMBLE_GRACE
     time.sleep(0.5)
     while time.time() < hard:
         g = feed(0.3)
@@ -250,6 +334,21 @@ def main():
         if g:
             last_active = time.time(); continue
         if seen and (time.time() - last_active) > QUIET_S:
+            # Quiet is not proof of completion: during extended thinking the
+            # spinner stops animating and no bytes arrive, so a turn that has
+            # only emitted its lead-in can look finished. Spend bounded grace
+            # waiting for the actual answer instead of returning the preamble.
+            #
+            # tool_in_flight() is the stronger of the two signals: a dispatched
+            # tool with no '⎿' result yet is positive proof the turn is alive,
+            # even when the frame shows no spinner. A big PNG decode blocks the
+            # TUI past QUIET_S with the footer already dropped, which is exactly
+            # the state that used to end the turn early.
+            if grace_left > 0 and (tool_in_flight(disp())
+                                   or looks_like_preamble(extract_reply(disp()))):
+                grace_left -= (time.time() - last_active)
+                last_active = time.time()
+                continue
             break
 
     reply = extract_reply(disp())

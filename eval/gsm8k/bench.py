@@ -6,7 +6,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 N     = int(os.environ.get('N', '100'))
 OFF   = int(os.environ.get('OFF', '100'))
-MODEL = os.environ.get('MODEL', 'claude-opus-4-8')
+MODEL = os.environ.get('MODEL')
+if not MODEL:
+    sys.exit("bench.py: MODEL is not set — refusing to guess a model.\n"
+             "  MODEL=claude-opus-5 python3 eval/gsm8k/bench.py")
 DATA  = os.environ.get('GSM_DATA', '/tmp/gsm8k_test.jsonl')
 IMGS  = os.environ.get('GSM_IMGS', './imgs')
 CCI   = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'lib', 'cci.py')
@@ -25,11 +28,17 @@ def extract(out):
     if m: return m.group(1)
     nums = re.findall(r'-?\d[\d,]*(?:\.\d+)?', out)
     return nums[-1] if nums else None
+# Trials must bypass the pxpipe proxy. If ANTHROPIC_BASE_URL points at the local
+# proxy, each trial's context gets imaged and the measurement is invalid (reads as
+# a near-zero score). Mirrors the guard already present in eval/gist-recall/run.py
+# and eval/verbatim-15/run.py, which strip this var the same way.
+BASE_ENV = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_BASE_URL'}
+
 def claude(prompt, timeout=180):
     try:
         return subprocess.run([sys.executable, CCI, '--model', MODEL, '--allowedTools', 'Read', prompt],
                               capture_output=True, text=True, timeout=timeout,
-                              env=dict(os.environ, CCI_TIMEOUT=str(max(30, timeout - 30)))).stdout
+                              env=dict(BASE_ENV, CCI_TIMEOUT=str(max(30, timeout - 30)))).stdout
     except Exception:
         return ''
 def one(args):

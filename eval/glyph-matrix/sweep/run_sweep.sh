@@ -1,5 +1,9 @@
 #!/bin/bash
-D=/tmp/sweep; export MODEL="${MODEL:-claude-opus-4-8}"; export TAG="${TAG:-opus}"; PMAX="${PMAX:-4}"
+D=/tmp/sweep
+# No default: a stale default silently measures a model nobody asked for. TAG
+# follows MODEL so output files can't be labelled for a model that never ran.
+: "${MODEL:?MODEL is not set — refusing to guess. e.g. MODEL=claude-opus-5 ./run_sweep.sh}"
+export MODEL; export TAG="${TAG:-$MODEL}"; PMAX="${PMAX:-4}"
 export SIZES="${SIZES:-s0 s1 s2 s3 s4}"
 rm -f $D/HALT
 run_one() {

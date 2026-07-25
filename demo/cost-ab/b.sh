@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# RIGHT column = pxpipe (through the proxy on 47824). Launches an INTERACTIVE
+# RIGHT column = pxpipe (through the compress proxy, default :47824). Launches an INTERACTIVE
 # Claude session with the task prompt already submitted — you watch it work in
 # the real CLI. Run `bash demo/cost-ab/setup.sh` first.
 set -uo pipefail
@@ -17,21 +17,22 @@ fi
 
 PROMPT='This project has a failing test suite. Read SPEC.md and the source, then fix src/pricing.js so it follows SPEC.md exactly and the test suite (node --test) passes. Run the tests to confirm.'
 
-# Model: defaults to Fable 5; override with the first arg (friendly name or full id):
-#   ./b.sh        → claude-fable-5[1m]     ./b.sh opus → claude-opus-4-8[1m]
-#   ./b.sh sonnet → claude-sonnet-5[1m]    ./b.sh claude-... → used verbatim
-# NOTE: for pxpipe to actually compress, the :47824 proxy must allow this model
-# (Fable-only by default — see PXPIPE_MODELS or the dashboard "compress models"
-# chips). A model the proxy doesn't cover just passes through uncompressed.
-case "${1:-fable}" in
-  fable)  MODEL=claude-fable-5[1m] ;;
-  opus)   MODEL=claude-opus-4-8[1m] ;;
-  sonnet) MODEL=claude-sonnet-5[1m] ;;
-  haiku)  MODEL=claude-haiku-4-5 ;;
-  *)      MODEL="$1" ;;
-esac
+# Model (resolution rules: demo/models.sh — no model name is hardcoded there or
+# here). Defaults to whatever setup.sh armed, so the usual flow is one
+# `setup.sh <model>` and then a bare `b.sh`:
+#   ./b.sh              → the model setup.sh armed
+#   ./b.sh opus         → unique substring match against the shipping model list
+#   ./b.sh claude-...   → any full id, verbatim   (also: PXPIPE_DEMO_MODEL=... ./b.sh)
+# Hard-fails when the proxy's compress scope does not cover the model: pxpipe would
+# pass it through uncompressed and the arm would look like a pxpipe result while
+# measuring nothing.
+DEMO_NAME=cost-ab
+: "${PXPIPE_DEMO_VARIANT:=[1m]}"   # large-context variant; scope keys ignore [tags]
+. "$(dirname "$0")/../models.sh"
+demo_resolve_column_model "$DEMO_NAME" "${1:-}" || exit 1
+demo_require_scope "$DEMO_NAME" "$DEMO_MODEL_BASE" || exit 1
 
-echo "RIGHT = pxpipe (:47824), model=$MODEL. Launching interactive Claude with the task..."
+echo "RIGHT = pxpipe (:$DEMO_PORT_ON), model=$DEMO_MODEL_ID. Launching interactive Claude with the task..."
 # Run in $DIR via a subshell so your terminal stays in the original dir afterward.
-( cd "$DIR" && exec env ANTHROPIC_BASE_URL=http://127.0.0.1:47824 \
-  "$CB" "$PROMPT" --model "$MODEL" --setting-sources project --strict-mcp-config --no-chrome --dangerously-skip-permissions )
+( cd "$DIR" && exec env ANTHROPIC_BASE_URL="http://127.0.0.1:$DEMO_PORT_ON" \
+  "$CB" "$PROMPT" --model "$DEMO_MODEL_ID" --setting-sources project --strict-mcp-config --no-chrome --dangerously-skip-permissions )

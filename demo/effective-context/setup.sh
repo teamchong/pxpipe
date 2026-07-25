@@ -7,29 +7,33 @@
 set -uo pipefail
 cd "$(dirname "$0")/../.." || exit 1   # -> repo root
 
-PORT_ON=47824          # pxpipe      -> b.sh (right)
-PORT_OFF=47823         # passthrough -> a.sh (left, plain but logged)
+# Model table + ports are shared by all six demo scripts. Sourced repo-relative
+# because line 8 already cd'd to the repo root.
+DEMO_NAME=effective-context
+: "${PXPIPE_DEMO_VARIANT:=[1m]}"   # this demo floods the context, so it wants the
+                                  # large-context variant; scope keys ignore [tags]
+. demo/models.sh
+
+PORT_ON="$DEMO_PORT_ON"    # pxpipe      -> b.sh (right)
+PORT_OFF="$DEMO_PORT_OFF"  # passthrough -> a.sh (left, plain but logged)
 LOG_ON="$HOME/.pxpipe/ec-on.jsonl"
 LOG_OFF="$HOME/.pxpipe/ec-off.jsonl"
 DUMP_DIR="/tmp/ec-png"   # pxpipe arm dumps every rendered PNG here for debug/inspection (wiped each run)
-# Model under test: defaults to Fable 5 — the production default, where Opus is
-# OFF. Pass a model as the first arg to ADD it to the proxy's compress scope:
-#   bash setup.sh           -> Fable only (Opus off, matches production)
-#   bash setup.sh opus      -> Fable + Opus 4.8   (then: a.sh opus / b.sh opus)
-#   bash setup.sh sonnet|haiku|claude-...  -> Fable + that model
-case "${1:-fable}" in
-  fable)  MODEL=claude-fable-5 ;;
-  opus)   MODEL=claude-opus-4-8 ;;
-  sonnet) MODEL=claude-sonnet-5 ;;
-  haiku)  MODEL=claude-haiku-4-5 ;;
-  *)      MODEL="$1" ;;
-esac
-# Compress scope = Fable (production default) + the chosen model (Fable-only by default).
-# Entries are model BASES: the proxy strips [variant] tags (e.g. [1m]) before matching
-# (see src/core/applicability.ts), so base "claude-fable-5" already covers the
-# claude-fable-5[1m] that a.sh/b.sh now request. Do NOT add [1m] here — the stripped
-# incoming base would no longer equal this entry and pxpipe would quietly stop compressing.
-MODELS="claude-fable-5"; [ "$MODEL" = "claude-fable-5" ] || MODELS="claude-fable-5,$MODEL"
+# Model under test. NO model names live in this file — the default and the
+# shorthand matching both come from the product's own DEFAULT_MODEL_BASES, so this
+# demo follows whatever is actually shipping (see demo/models.sh for why).
+#   bash setup.sh                        -> the product's first default model
+#   bash setup.sh opus                   -> unique substring match against that list
+#   bash setup.sh <full-model-id>        -> used verbatim, no matching
+#   PXPIPE_DEMO_MODEL=... bash setup.sh  -> same, via env
+# The choice is ADDED to the compress scope and RECORDED, so a.sh/b.sh inherit it
+# and b.sh refuses to run a model this proxy would silently pass through.
+demo_resolve_model "${1:-}" || exit 1
+# Compress scope entries are model BASES: the proxy strips [variant] tags (e.g. [1m])
+# before matching (see src/core/applicability.ts), so a base already covers its [1m]
+# form. Do NOT add [1m] here — the stripped incoming base would no longer equal this
+# entry and pxpipe would quietly stop compressing.
+MODELS="$(demo_scope_for "$DEMO_MODEL_BASE")"
 EC="demo/effective-context"
 
 kill_port() { local p; p=$(lsof -ti tcp:"$1" 2>/dev/null || true); [ -n "$p" ] && kill "$p" 2>/dev/null || true; }
@@ -56,10 +60,15 @@ mkdir -p /tmp/pp-ec-left /tmp/pp-ec-right
 cp -R "$EC/context" /tmp/pp-ec-left/context
 cp -R "$EC/context" /tmp/pp-ec-right/context
 
+# Record what we actually armed. a.sh/b.sh default to this model and refuse to run
+# one the proxy would pass through uncompressed (which would look like a pxpipe
+# result while measuring nothing).
+demo_write_state "$DEMO_NAME" "$DEMO_MODEL_BASE" "$DEMO_MODEL_ID" "$MODELS" "$ANSWER"
+
 cat <<EOF
 
 Ready. Proxies up: pxpipe :$PORT_ON  ·  passthrough :$PORT_OFF
-Compress scope: $MODELS  (Opus is OFF by default — 'setup.sh opus' to include it; pass the SAME model to a.sh/b.sh)
+MODEL UNDER TEST: $DEMO_MODEL_ID   (compress scope: $MODELS)
 GROUND-TRUTH ANSWER: ${ANSWER:-see /tmp/ec-gen.log}   <- both columns should reply with exactly this
 Rendered PNGs (what the pxpipe model actually sees): $DUMP_DIR   (wiped + refilled each setup; passthrough arm renders none)
 

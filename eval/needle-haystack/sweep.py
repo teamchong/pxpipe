@@ -6,6 +6,12 @@ FONT = "/System/Library/Fonts/SFNSMono.ttf"
 WORK = "/tmp/needle_eval/sweep"
 os.makedirs(WORK, exist_ok=True)
 CCI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib", "cci.py")
+# Model under test. Env-overridable so one harness can compare models under an
+# identical protocol; the historical default is kept so old runs reproduce.
+MODEL = os.environ.get("EVAL_MODEL")
+if not MODEL:
+    sys.exit("sweep.py: EVAL_MODEL is not set — refusing to guess a model.\n"
+             "  EVAL_MODEL=claude-opus-5 python3 eval/needle-haystack/sweep.py")
 W, H = 1568, 1276          # pxpipe-equivalent dims -> ~2668 image tokens
 IMG_TOKENS = round(W*H/750)
 
@@ -45,7 +51,7 @@ def render(pt, path, needle_val):
 def ask(path):
     p=(f"Read the image at {path}. What is the value of SECRET_TOKEN? "
        "Reply with ONLY the value, no other words.")
-    out=subprocess.run([sys.executable,CCI,"--model","claude-opus-4-8",
+    out=subprocess.run([sys.executable,CCI,"--model",MODEL,
         "--allowedTools","Read",p],capture_output=True,text=True,
         timeout=120,cwd=WORK,env=dict(os.environ,CCI_TIMEOUT="100")).stdout
     m=re.search(r'[0-9a-f]{12}',out); return m.group(0) if m else ""

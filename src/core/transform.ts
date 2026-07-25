@@ -43,8 +43,9 @@ import { patchTokens } from './anthropic-vision.js';
 
 /** Per-block descriptor passed to `TransformOptions.keepSharp`. */
 export interface KeepSharpBlock {
-  /** Which live-region path is asking: `reminder`, `tool_result`, or `tool_result_part`. */
-  readonly kind: 'reminder' | 'tool_result' | 'tool_result_part';
+  /** Which live-region path is asking. `<system-reminder>` blocks are never offered:
+   *  they always stay text, so the predicate has nothing to decide. */
+  readonly kind: 'tool_result' | 'tool_result_part';
   /** The block's text exactly as the caller produced it (pre-render, pre-compaction). */
   readonly text: string;
   /** `tool_use_id` of the owning tool_result, when applicable. */
@@ -57,7 +58,7 @@ export interface KeepSharpBlock {
 export interface RecoverableBlock {
   /** `rec_` + 8 hex SHA-256 over kind + toolUseId + original text. */
   readonly id: string;
-  readonly kind: 'reminder' | 'tool_result' | 'tool_result_part';
+  readonly kind: 'tool_result' | 'tool_result_part';
   readonly toolUseId?: string;
   /** Original text before compaction/reflow/paging — the bytes to restore. */
   readonly text: string;

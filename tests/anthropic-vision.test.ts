@@ -24,7 +24,7 @@ describe('patchTokens — raw 28-px patch count', () => {
 
 describe('anthropicVisionProfile — tier by model', () => {
   it('puts the documented high-res models on the 2576/4784 tier', () => {
-    for (const m of ['claude-fable-5', 'claude-mythos-5', 'claude-opus-5']) {
+    for (const m of ['claude-fable-5', 'claude-mythos-5', 'claude-opus-5', 'claude-sonnet-5', 'claude-opus-4-8', 'claude-opus-4-7']) {
       expect(anthropicVisionProfile(m).tier).toBe('high-res');
     }
     // aliases / variant tags tier with their base
@@ -34,7 +34,8 @@ describe('anthropicVisionProfile — tier by model', () => {
   });
 
   it('falls back to the conservative standard 1568/1568 tier otherwise', () => {
-    for (const m of ['claude-opus-4-8', 'claude-opus-4-7', 'claude-sonnet-5', 'claude-opus-4-5', 'claude-sonnet-4-6', 'claude-haiku-4-5', 'claude-3-5-sonnet', '', undefined, null]) {
+    // Pre-4.7 Claude, and anything with no tier of its own.
+    for (const m of ['claude-opus-4-5', 'claude-sonnet-4-6', 'claude-haiku-4-5', 'claude-3-5-sonnet', 'gpt-5', 'my-custom-model', '', undefined, null]) {
       expect(anthropicVisionProfile(m as string).tier).toBe('standard');
     }
     expect(anthropicVisionProfile('claude-opus-4-5')).toEqual({ tier: 'standard', maxLongEdge: 1568, maxVisualTokens: 1568 });

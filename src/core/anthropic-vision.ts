@@ -14,6 +14,8 @@
  * gate, not here, so this stays honest about what Anthropic actually charges.
  */
 
+import { resolveGptProfile } from './gpt-model-profiles.js';
+
 /** One visual token per 28×28-pixel patch. Also the Qwen2-VL grid; NOT OpenAI's
  *  32-px patch / 512-px tile model — keep those on the OpenAI path only. */
 export const ANTHROPIC_PATCH_PX = 28;
@@ -26,25 +28,16 @@ export interface AnthropicVisionProfile {
   readonly maxVisualTokens: number;
 }
 
-/** Model bases on Anthropic's high-resolution tier (max long edge 2576 px, max
- *  4784 visual tokens). Everything else is standard (1568 px / 1568 tokens).
- *  Source: the Vision docs resolution-tier table. */
-const HIGH_RES_BASES = [
-  'claude-fable-5',
-  'claude-mythos-5',
-  'claude-opus-5',
-] as const;
-
 const HIGH_RES: AnthropicVisionProfile = { tier: 'high-res', maxLongEdge: 2576, maxVisualTokens: 4784 };
 const STANDARD: AnthropicVisionProfile = { tier: 'standard', maxLongEdge: 1568, maxVisualTokens: 1568 };
 
-/** Resolve a model's vision tier. Unknown/blank models fall back to the
- *  conservative (smaller) standard tier. Matches exact base or `<base>-suffix` /
- *  `<base>[variant]` so aliases (e.g. `claude-fable-5-high`, `...[1m]`) tier alike. */
+/** Resolve a model's vision tier. Which model sits on which tier is a property
+ *  of the model profile (`visionTier` in gpt-model-profiles.ts), not a list
+ *  maintained here: profile resolution already handles id aliases, `[variant]`
+ *  tags, and PXPIPE_GPT_PROFILES overrides. This module owns only the geometry
+ *  each tier implies. Non-Claude and blank ids have no tier and get standard. */
 export function anthropicVisionProfile(model: string | null | undefined): AnthropicVisionProfile {
-  const m = (model ?? '').toLowerCase();
-  const isHighRes = HIGH_RES_BASES.some((b) => m === b || m.startsWith(`${b}-`) || m.startsWith(`${b}[`));
-  return isHighRes ? HIGH_RES : STANDARD;
+  return resolveGptProfile(model).visionTier === 'high-res' ? HIGH_RES : STANDARD;
 }
 
 /** Raw 28-px patch count for a `w×h` image, i.e. the visual-token cost when the

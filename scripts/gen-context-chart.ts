@@ -30,6 +30,10 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createCanvas } from '@napi-rs/canvas';
 import { renderTextToImages } from '../src/core/library.js';
+import type {
+  RenderTextToImagesOptions,
+  RenderTextToImagesResult,
+} from '../src/core/library.js';
 import { resolveGptProfile } from '../src/core/gpt-model-profiles.js';
 import { patchTokens } from '../src/core/anthropic-vision.js';
 
@@ -66,59 +70,33 @@ function loadFixture(): string {
     .replaceAll('↵', '');
 }
 
-async function measureFableDensity(fixture: string): Promise<Density> {
-  // Claude dense geometry (default library path): 312-col Spleen, Anthropic height.
-  const r = await renderTextToImages(fixture, { reflow: true });
+/** Render the fixture under one model's geometry and report its density.
+ *  `countTokens` differs by provider: Anthropic bills 28-px patches, Gemini a flat
+ *  rate per full page. Default geometry is the library's Claude dense path
+ *  (312-col Spleen, Anthropic height). */
+async function measureDensity(
+  label: string,
+  fixture: string,
+  countTokens: (pages: RenderTextToImagesResult['pages']) => number,
+  geometry: RenderTextToImagesOptions = {},
+): Promise<Density> {
+  const r = await renderTextToImages(fixture, { reflow: true, ...geometry });
   if (r.droppedChars > 0) {
-    throw new Error(`fable fixture dropped ${r.droppedChars} chars — atlas gap, fix before charting`);
+    throw new Error(
+      `${label} fixture dropped ${r.droppedChars} chars — atlas gap, fix before charting`,
+    );
   }
-  const visionTokens = r.pages.reduce((total, page) => total + patchTokens(page.width, page.height), 0);
+  const visionTokens = countTokens(r.pages);
   const cpt = fixture.length / visionTokens;
   console.log(
-    `Fable density: ${fixture.length} chars → ${r.pages.length} pages, ` +
+    `${label} density: ${fixture.length} chars → ${r.pages.length} pages, ` +
       `${r.pixels} px = ${visionTokens} vision tokens → ${cpt.toFixed(2)} chars/vision-token`,
   );
   return { cpt, pages: r.pages.length, pixels: r.pixels, visionTokens };
 }
 
-async function measureOpusDensity(fixture: string): Promise<Density> {
-  // Opus 5 is measured, not derived from Fable. The two profiles are currently
-  // byte-identical, so this returns the same cpt — but hardcoding `fableCpt` for
-  // Opus would silently go stale the moment CLAUDE_OPUS_PROFILE diverges.
-  // Render under the resolved profile's own geometry so the chart tracks it.
-  const profile = resolveGptProfile('claude-opus-5');
-  const r = await renderTextToImages(fixture, {
-    reflow: true,
-    cols: profile.stripCols,
-    maxHeightPx: profile.maxHeightPx,
-    style: profile.style,
-  });
-  if (r.droppedChars > 0) {
-    throw new Error(`opus fixture dropped ${r.droppedChars} chars — atlas gap, fix before charting`);
-  }
-  const visionTokens = r.pages.reduce((total, page) => total + patchTokens(page.width, page.height), 0);
-  const cpt = fixture.length / visionTokens;
-  console.log(
-    `Opus density: ${fixture.length} chars → ${r.pages.length} pages, ` +
-      `${r.pixels} px = ${visionTokens} vision tokens → ${cpt.toFixed(2)} chars/vision-token`,
-  );
-  return { cpt, pages: r.pages.length, pixels: r.pixels, visionTokens };
-}
-
-async function measureGeminiDensity(fixture: string): Promise<Density> {
-  // Widescreen geometry (312-col Spleen): measured 1078 tokens per page.
-  const r = await renderTextToImages(fixture, { reflow: true });
-  if (r.droppedChars > 0) {
-    throw new Error(`gemini fixture dropped ${r.droppedChars} chars — atlas gap, fix before charting`);
-  }
-  const visionTokens = r.pages.length * GEMINI_TOKENS_PER_FULL_PAGE;
-  const cpt = fixture.length / visionTokens;
-  console.log(
-    `Gemini density: ${fixture.length} chars → ${r.pages.length} pages, ` +
-      `${visionTokens} vision tokens → ${cpt.toFixed(2)} chars/vision-token`,
-  );
-  return { cpt, pages: r.pages.length, pixels: r.pixels, visionTokens };
-}
+const patchTokenCount = (pages: RenderTextToImagesResult['pages']): number =>
+  pages.reduce((total, page) => total + patchTokens(page.width, page.height), 0);
 
 
 // ---------------------------------------------------------------------------
@@ -516,9 +494,22 @@ function draw(data: Point[], fableCpt: number, geminiCpt: number): Buffer {
 
 // ---------------------------------------------------------------------------
 const fixture = loadFixture();
-const fable = await measureFableDensity(fixture);
-const opus = await measureOpusDensity(fixture);
-const gemini = await measureGeminiDensity(fixture);
+const fable = await measureDensity('Fable', fixture, patchTokenCount);
+// Opus 5 is measured, not derived from Fable. The two profiles are currently
+// byte-identical, so this returns the same cpt — but hardcoding `fable.cpt` for Opus
+// would silently go stale the moment CLAUDE_OPUS_PROFILE diverges. Render under the
+// resolved profile's own geometry so the chart tracks it.
+const opusProfile = resolveGptProfile('claude-opus-5');
+const opus = await measureDensity('Opus', fixture, patchTokenCount, {
+  cols: opusProfile.stripCols,
+  maxHeightPx: opusProfile.maxHeightPx,
+  style: opusProfile.style,
+});
+const gemini = await measureDensity(
+  'Gemini',
+  fixture,
+  (pages) => pages.length * GEMINI_TOKENS_PER_FULL_PAGE,
+);
 const data = points(fable.cpt, gemini.cpt, opus.cpt);
 
 console.log('\n  model                released   window (tokens)   chars in window');

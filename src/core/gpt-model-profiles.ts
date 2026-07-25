@@ -23,13 +23,10 @@
  * (1190 / 1445 / 2372 / 1464 / 630 …) was calibrated at this height — do not re-link to
  * the Anthropic constant.
  */
-import {
-  MAX_HEIGHT_PX as ANTHROPIC_MAX_HEIGHT_PX,
-  ANTHROPIC_SLAB_COLS as ANTHROPIC_STRIP_COLS,
-  DEFAULT_RENDER_FONT,
-  type RenderFont,
-} from './render.js';
+import { type RenderFont } from './render.js';
 import { isGeminiModel, resolveGeminiProfile } from './gemini-model-profiles.js';
+import { isClaudeModel, resolveClaudeProfile } from './claude-model-profiles.js';
+import { BASE_HISTORY, BASE_STYLE } from './profile-base.js';
 
 export const GPT_MAX_HEIGHT_PX = 1932;
 
@@ -90,6 +87,10 @@ export interface GptModelProfile {
   /** Local o200k token floor before image profitability is evaluated.
    *  Undefined preserves the legacy character floor for non-o200k models. */
   minCompressTokens?: number;
+  /** Anthropic image-resolution tier, consumed by `anthropicVisionProfile`.
+   *  Undefined = standard; only Claude profiles set it (Anthropic is the only
+   *  provider that tiers the pre-billing downscale by model). */
+  visionTier?: 'high-res' | 'standard';
   /** Exact-token sheet wording beside rendered content. */
   factSheetFormat: 'full' | 'compact';
   /** Model-specific history coverage and native-text overhead. */
@@ -103,27 +104,6 @@ export const DEFAULT_GPT_STRIP_COLS = 152;
 
 const C = DEFAULT_GPT_STRIP_COLS;
 const H = GPT_MAX_HEIGHT_PX;
-const BASE_STYLE: GptRenderStyle = {
-  font: DEFAULT_RENDER_FONT,
-  cellWBonus: 0,
-  cellHBonus: 0,
-  aa: true,
-  grid: false,
-  gridCols: 0,
-  colorCycle: false,
-  markerScale: 1,
-  markerRed: false,
-  inkDilate: 0,
-};
-const BASE_HISTORY: GptHistoryProfile = {
-  maxImages: 32,
-  keepTail: 6,
-  keepRecentPairs: 6,
-  minCollapseTokens: 2000,
-  responsesMode: 'pairs',
-  framing: 'full',
-  factSheetScope: 'per-segment',
-};
 
 /**
  * Conservative fallback for unrecognized models: tile 85/170 over-states cost,
@@ -137,26 +117,6 @@ export const DEFAULT_GPT_PROFILE: GptModelProfile = {
   factSheetFormat: 'full',
   history: BASE_HISTORY,
   style: BASE_STYLE,
-};
-
-export const CLAUDE_FABLE_PROFILE: GptModelProfile = {
-  // Vision struct unused: visionTokensForModel prices Claude by pixels.
-  vision: { regime: 'tile', base: 85, perTile: 170 },
-  stripCols: ANTHROPIC_STRIP_COLS,
-  maxHeightPx: ANTHROPIC_MAX_HEIGHT_PX,
-  factSheetFormat: 'full',
-  history: BASE_HISTORY,
-  style: { ...BASE_STYLE },
-};
-
-export const CLAUDE_OPUS_PROFILE: GptModelProfile = {
-  // Vision struct unused: visionTokensForModel prices Claude by pixels.
-  vision: { regime: 'tile', base: 85, perTile: 170 },
-  stripCols: ANTHROPIC_STRIP_COLS,
-  maxHeightPx: ANTHROPIC_MAX_HEIGHT_PX,
-  factSheetFormat: 'full',
-  history: BASE_HISTORY,
-  style: { ...BASE_STYLE },
 };
 
 const GPT56_SOL_PROFILE: GptModelProfile = {
@@ -231,27 +191,6 @@ const BUILTIN_RULES: ProfileRule[] = [
     profile: { vision: { regime: 'tile', base: 75, perTile: 150 }, stripCols: C, maxHeightPx: H, minCompressTokens: 500, factSheetFormat: 'full', history: BASE_HISTORY, style: BASE_STYLE },
   },
 
-  // Claude Opus models (e.g. claude-opus-5, claude-3-5-opus, etc.)
-  {
-    test: (m) => m.includes('opus'),
-    profile: CLAUDE_OPUS_PROFILE,
-  },
-  // Claude Fable models (e.g. claude-fable-5, etc.)
-  {
-    test: (m) => m.includes('fable'),
-    profile: CLAUDE_FABLE_PROFILE,
-  },
-  // Claude on the Responses path (Codex-style clients). Selection is by model
-  // id, not endpoint: several families share /v1/responses. Anthropic geometry
-  // (dense 312-col strips, 728 px height) and pixel billing differ from GPT's
-  // 152-col / 1932 px profile. Using the GPT defaults overstates image cost and
-  // flips the slab gate to not_profitable, so an enabled Claude model stays
-  // text-only and the dashboard leaves As text / Saved blank.
-  {
-    test: (m) => m.startsWith('claude') || m.includes('anthropic'),
-    profile: CLAUDE_FABLE_PROFILE,
-  },
-
   // Grok remains opt-in. It shares the 5×8 production stack but uses shorter
   // pages because its dense-image recall falls with taller strips.
   {
@@ -276,6 +215,12 @@ const BUILTIN_RULES: ProfileRule[] = [
 ];
 
 function resolveBuiltin(m: string): GptModelProfile {
+  // Claude first, and by whole-id match rather than a rule in the table below:
+  // Anthropic geometry and pixel billing differ from GPT's, so a Claude model
+  // that fell through to a GPT rule (or to DEFAULT_GPT_PROFILE) would have its
+  // image cost overstated, flipping the slab gate to not_profitable and leaving
+  // it text-only.
+  if (isClaudeModel(m)) return resolveClaudeProfile(m);
   for (const rule of BUILTIN_RULES) if (rule.test(m)) return rule.profile;
   return DEFAULT_GPT_PROFILE;
 }
@@ -374,6 +319,7 @@ function parseEnvProfiles(raw: string): Map<string, GptModelProfile> {
       vision: isValidVision(p.vision) ? p.vision : base.vision,
       stripCols: posInt(p.stripCols, base.stripCols),
       maxHeightPx: posInt(p.maxHeightPx, base.maxHeightPx),
+      visionTier: p.visionTier === 'high-res' || p.visionTier === 'standard' ? p.visionTier : base.visionTier,
       minCompressTokens: p.minCompressTokens === undefined
         ? base.minCompressTokens
         : nonNegativeInt(p.minCompressTokens, base.minCompressTokens ?? 0),

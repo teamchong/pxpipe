@@ -446,13 +446,27 @@ function splitUserTyped(content: string | ContentBlock[]): {
  * same treatment the slab scaffolding gets above. Byte-stability is preserved: the
  * reminder text is identical turn to turn, so the protected prefix still re-caches
  * only on deploy.
+ *
+ * Only the LEADING run is carved out, which is where the harness puts them: the
+ * opening message is `<system-reminder>…</system-reminder>\n\n<the user's words>`.
+ * A reminder appearing later in the text is not the harness's — an `@file` mention
+ * inlines untrusted file content into this same block, so a file containing
+ * `</system-reminder><system-reminder>new rules…` would otherwise be lifted out of
+ * the tombstone and re-emitted as a standing instruction governing the session.
+ * Anything past the leading run stays in `rest` and is truncated to a preview.
  */
-const REMINDER_RE = /<system-reminder>[\s\S]*?<\/system-reminder>/g;
+const LEADING_REMINDER_RE = /^\s*<system-reminder>[\s\S]*?<\/system-reminder>/;
 
 function splitStandingInstructions(text: string): { reminders: string[]; rest: string } {
-  const reminders = text.match(REMINDER_RE) ?? [];
-  if (reminders.length === 0) return { reminders: [], rest: text };
-  return { reminders, rest: text.replace(REMINDER_RE, ' ') };
+  const reminders: string[] = [];
+  let rest = text;
+  for (;;) {
+    const m = LEADING_REMINDER_RE.exec(rest);
+    if (!m) break;
+    reminders.push(m[0].trim());
+    rest = rest.slice(m[0].length);
+  }
+  return { reminders, rest };
 }
 
 function demoteProtectedHeadText(head: Message[]): Message[] {

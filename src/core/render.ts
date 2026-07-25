@@ -293,10 +293,15 @@ function cellsFor(
 
 const TAB_WIDTH = 4; // standard 4-space tab stops (logs, code, tool output are all 4-oriented)
 
-/** Strip trailing whitespace per line and collapse 4+ consecutive \n to 3.
+/** Normalize line endings, strip trailing whitespace per line, collapse 4+ consecutive \n to 3.
  *  Does NOT touch mid-line spaces or leading indent — structure is preserved. */
 export function minifyForRender(text: string): string {
   return text
+    // CRLF/CR → LF. \r is a C0 control: no atlas glyph and escape-exempt, so on Windows
+    // sources every line ending burned one droppedChars, drowning the real signal
+    // (a genuinely unrenderable glyph) in per-line noise. Normalizing costs nothing —
+    // \r carries no content — and restores droppedChars > 0 as a meaningful alarm.
+    .replace(/\r\n?/g, '\n')
     .split('\n')
     .map((line) => line.replace(/[ \t]+$/, ''))
     .join('\n')

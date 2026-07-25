@@ -116,7 +116,14 @@ export interface GptModelProfile {
   /** Maximum serialized provider request produced by pxpipe. Undefined leaves
    *  legacy behavior unchanged. Checked in the transform (which falls back to
    *  the original body when imaging would overshoot) and enforced again on the
-   *  final wire body by the proxy, which answers 413. */
+   *  final wire body by the proxy, which answers 413.
+   *
+   *  Set this ONLY for a limit the provider has actually shown us (documented or
+   *  observed 413s). A guessed cap makes pxpipe refuse to compress requests the
+   *  provider would have accepted: local telemetry has clean 200s for xAI bodies
+   *  well past 2 MB, so Grok carries no cap, and no Gemini limit has been
+   *  measured either. Env overrides (`PXPIPE_GPT_PROFILES`) stay available for
+   *  per-deployment caps. */
   maxSerializedRequestBytes?: number;
   /** Gate the static slab against the exact measured baseline (system text plus
    *  the tool-description tokens actually stripped) instead of the rendered
@@ -289,7 +296,6 @@ const BUILTIN_RULES: ProfileRule[] = [
         grid: false,
         gridCols: 0,
       },
-      maxSerializedRequestBytes: 128 * 1024,
     },
   },
 ];

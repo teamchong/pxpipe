@@ -128,9 +128,10 @@ export interface GptModelProfile {
    *
    *  A guessed cap makes pxpipe refuse to compress requests the provider would
    *  have accepted, which is the opposite of the point. No family currently
-   *  carries one: xAI bodies past 2 MB, Gemini past 7 MB and Claude past 10 MB
-   *  all return clean 200s in local telemetry, and no provider-originated size
-   *  rejection has ever been observed for any of them. */
+   *  carries one. Largest body each provider has answered 200 for in local
+   *  telemetry, as a lower bound (cacheable prefix already on the wire, so the
+   *  real body was bigger): Claude 11.2 MB, GPT 10.1 MB, Gemini 6.2 MB, Grok
+   *  2.7 MB. No provider-originated size rejection has been observed for any. */
   maxSerializedRequestBytes?: number;
   /** Gate the static slab against the exact measured baseline (system text plus
    *  the tool-description tokens actually stripped) instead of the rendered

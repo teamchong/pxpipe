@@ -113,6 +113,10 @@ const DEFAULT_UPSTREAM_HEADERS_TIMEOUT_MS = 300_000;
 const DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS = 120_000;
 /** Past this, an in-flight entry is treated as stale and a retry is let through. */
 const DEFAULT_DUPLICATE_HOLD_MS = 60_000;
+/** Sweep the in-flight map early once it grows past plausible real concurrency. */
+const INFLIGHT_SWEEP_SIZE = 256;
+/** Floor between size-triggered sweeps so genuine high concurrency stays O(1)/request. */
+const INFLIGHT_SWEEP_MIN_INTERVAL_MS = 1_000;
 
 /**
  * Abort the response if no chunk arrives for `ms`. Wraps the raw upstream stream so
@@ -897,6 +901,12 @@ export function parseGatewayHeaders(spec: string | undefined): Record<string, st
 export function createProxy(config: ProxyConfig = {}) {
   const modelRoutes = new Map<string, 'openai' | 'cloudflare'>();
   const inFlight = new Map<string, { lease: symbol; startedAt: number }>();
+  // Entries are released by their holder on every exit path, but the key space is
+  // unbounded (one per distinct body) and the map outlives every request, so a single
+  // missed release would leak for the daemon's lifetime. An entry past the hold window
+  // is already ignored by the duplicate check below, so expiring it costs nothing and
+  // bounds the map by real in-window concurrency instead of by release correctness.
+  let lastSweptAt = 0;
   const headersTimeoutMs = config.upstreamHeadersTimeoutMs ?? DEFAULT_UPSTREAM_HEADERS_TIMEOUT_MS;
   const idleTimeoutMs = config.upstreamIdleTimeoutMs ?? DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS;
   const duplicateHoldMs = config.duplicateHoldMs ?? DEFAULT_DUPLICATE_HOLD_MS;
@@ -1317,10 +1327,23 @@ export function createProxy(config: ProxyConfig = {}) {
         headers,
         reqBodySha256,
       ]));
+      const now = Date.now();
+      // Time trigger keeps steady state clean; size trigger reclaims promptly if entries
+      // ever strand faster than the window. Both are throttled, so cost stays amortized.
+      const sinceSweep = now - lastSweptAt;
+      if (
+        sinceSweep >= duplicateHoldMs
+        || (inFlight.size > INFLIGHT_SWEEP_SIZE && sinceSweep >= INFLIGHT_SWEEP_MIN_INTERVAL_MS)
+      ) {
+        for (const [k, v] of inFlight) {
+          if (now - v.startedAt >= duplicateHoldMs) inFlight.delete(k);
+        }
+        lastSweptAt = now;
+      }
       const existing = inFlight.get(key);
       // Fail open once the holder is older than the window: a retry that arrives this
       // late is the client recovering from a stall, not an accidental double-send.
-      if (existing && Date.now() - existing.startedAt < duplicateHoldMs) {
+      if (existing && now - existing.startedAt < duplicateHoldMs) {
         const message = 'An identical request is already in progress';
         fire(409, undefined, 'duplicate_request_in_flight');
         const error = isMessages
@@ -1332,7 +1355,7 @@ export function createProxy(config: ProxyConfig = {}) {
         });
       }
       const lease = Symbol();
-      inFlight.set(key, { lease, startedAt: Date.now() });
+      inFlight.set(key, { lease, startedAt: now });
       releaseInFlight = () => {
         if (inFlight.get(key)?.lease === lease) inFlight.delete(key);
       };

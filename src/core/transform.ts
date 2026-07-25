@@ -69,14 +69,10 @@ export interface TransformOptions {
   compress?: boolean;
   /** Move tool descriptions into the same image (and stub the originals). */
   compressTools?: boolean;
-  /** Compress large `<system-reminder>` text blocks in the first user message. */
-  compressReminders?: boolean;
   /** Compress large tool_result text content across all user messages. */
   compressToolResults?: boolean;
   /** Don't compress if total compressible chars below this. */
   minCompressChars?: number;
-  /** Per-block threshold for compressReminders (chars). */
-  minReminderChars?: number;
   /** Per-block threshold for compressToolResults (chars). */
   minToolResultChars?: number;
   /** Soft-wrap width in monospace cells. */
@@ -122,11 +118,8 @@ export interface TransformOptions {
 const DEFAULTS: Required<TransformOptions> = {
   compress: true,
   compressTools: true,
-  compressReminders: true,
   compressToolResults: true,
   minCompressChars: 2000,
-  // Below ~6k chars, per-image cost dominates savings (break-even territory).
-  minReminderChars: 6000,
   minToolResultChars: 6000,
   // system field rejects images (400 system.N.type: Input should be 'text') —
   // images always go into the first user message.
@@ -524,9 +517,6 @@ export interface TransformInfo {
   staticChars: number;
   /** Length of the dynamic (per-turn) slab kept as plain text. */
   dynamicChars: number;
-  /** Chars of volatile env/context text relocated from system to the tail of
-   *  the last user message (absent when kept in system fallback). */
-  envRelocatedChars?: number;
   dynamicBlockCount: number;
   /** Tag-shaped blocks in the static slab not in DYNAMIC_BLOCK_TAGS.
    *  Canary: a new per-turn Claude Code tag would appear here before cache rate collapses. */
@@ -534,15 +524,9 @@ export interface TransformInfo {
   /** Static-slab tags whose content changed within a session — proven dynamic,
    *  busting the image cache each turn. The real alert signal. */
   churningStaticTags?: string[];
-  /** `# Environment` entries that rode the live tail this turn (diff split). */
-  envVolatileKeys?: string[];
-  /** Chars of `# Environment` entries promoted into the imaged slab. */
-  envStaticChars?: number;
   env?: EnvFields;
   /** sha8 of static slab + tool docs (what goes in the image). Repeats across turns → cache hits. */
   systemSha8?: string;
-  /** sha8 of the CLAUDE.md section, for bucketing by project when cwd is absent. */
-  claudeMdSha8?: string;
   /** sha8 of first user message text (first 4 KiB). Rough thread/session id. */
   firstUserSha8?: string;
   /** Raw bytes of the first rendered image. Dashboard preview only; NOT persisted to JSONL. */
@@ -557,7 +541,6 @@ export interface TransformInfo {
   /** Source text parallel to imagePngs/imageDims. One entry per PNG; a multi-page
    *  render may repeat its section source. Dashboard-only; not persisted. */
   imageSourceTexts?: Array<string | undefined>;
-  reminderImgs?: number;
   toolResultImgs?: number;
   /** Chars of tool docs moved to the system-text Tool Reference (not imaged). */
   toolDocsChars?: number;
@@ -977,28 +960,15 @@ async function cachePrefixDigest(
   return { sha8: await sha8(prefix), bytes: prefix.length };
 }
 
-/** Best-effort extraction of the CLAUDE.md slab from a system text (heuristic).
- *  Returns empty string if nothing CLAUDE.md-shaped is detected. */
-export function extractClaudeMdSlab(staticText: string): string {
-  if (!staticText) return '';
-  // Headings Claude Code uses around CLAUDE.md content.
-  const startPatterns = [
-    /^\s*#+\s*Claude\s+Code\s+Rules\s*$/im,
-    /^\s*#+\s*CLAUDE\.md\s*$/im,
-    /^\s*Claude\s+Code\s+Rules:?\s*$/im,
-  ];
-  let startIdx = -1;
-  for (const p of startPatterns) {
-    const m = p.exec(staticText);
-    if (m && (startIdx === -1 || m.index < startIdx)) startIdx = m.index;
-  }
-  if (startIdx === -1) return '';
-  // End at the next top-level heading or EOF.
-  const tail = staticText.slice(startIdx);
-  const endMatch = /\n#\s+\S/.exec(tail.slice(1));
-  const end = endMatch ? endMatch.index + 1 : tail.length;
-  return tail.slice(0, end).trim();
-}
+// Removed: extractClaudeMdSlab(). It scanned the static system text for
+// "# CLAUDE.md" / "# Claude Code Rules" headings, which is both wrong and
+// fragile — wrong because Claude Code does not put CLAUDE.md in the system
+// field at all (it arrives in the first user message, wrapped in
+// <system-reminder>, under a "# claudeMd" heading), and fragile because any
+// pasted file or code comment containing that heading would have been treated
+// as project instructions. Telemetry confirmed it: claude_md_sha8 never once
+// appeared across the whole event log. Project instructions are now kept as
+// text structurally — see the <system-reminder> handling below.
 
 /** First user message text, capped at 4 KiB (stable thread id; hashing large pastes is wasteful). */
 export function firstUserText(req: MessagesRequest): string {
@@ -1064,187 +1034,14 @@ function stripBillingLine(text: string): { kept: string | null; body: string } {
  *  wrapper, so splitStaticDynamic can't catch it — yet its git-status lines
  *  change across sessions, and baking them into the slab PNG busts the cross-
  *  session cache (system_sha8 717f1fce → 5efaa4bb for a one-file edit). Parallel
- *  to stripBillingLine: `kept` re-enters the system tail as plain text — after
- *  splitEnvByVolatility routes its proven-stable entries into the slab. */
+ *  to stripBillingLine: `kept` re-enters the system tail as plain text, after
+ *  the anchor, so the slab bytes stay independent of git state. */
 function stripMarkdownEnvSection(text: string): { kept: string; body: string } {
   const m = /(?:^|\n)(# Environment\b[\s\S]*?)(?=\n#{1,6}\s|$)/.exec(text);
   if (!m) return { kept: '', body: text };
   return {
     kept: m[1]!.trimEnd(),
     body: text.slice(0, m.index) + text.slice(m.index + m[0].length),
-  };
-}
-
-/** Model-identity/catalog lines dropped from RELOCATED env text (field report,
- *  2026-07: higher spend with pxpipe because subagents ran on the parent model).
- *  In the system prompt these lines are static low-salience context; appended to
- *  the LAST user message every turn they read as fresh instructions at the exact
- *  point where the model picks a subagent model — "default to the latest and
- *  most capable Claude models" right next to an Agent call means fable, not
- *  haiku. The live model already knows its identity from its own system prompt,
- *  so relocation loses nothing. Redaction applies ONLY on the relocation path;
- *  the no-user-message fallback keeps env text in system, where these lines
- *  keep their original (harmless) position.
- *
- *  Since the diff-based split (splitEnvByVolatility) this regex is the SECOND
- *  layer: identity entries are byte-stable, so from a session's second project
- *  sighting onward they ride the imaged slab in their original system-derived
- *  position and never reach this filter. It still guards the tail for fresh
- *  sessions/projects and for entries that churn (e.g. a /model switch). */
-const MODEL_IDENTITY_LINE =
-  /you are powered by|exact model id is|most recent claude models|default to the latest and most capable/i;
-
-function redactModelIdentityLines(text: string): string {
-  return text
-    .split('\n')
-    .filter((line) => !MODEL_IDENTITY_LINE.test(line))
-    .join('\n');
-}
-
-/* ── Diff-based static/volatile `# Environment` split ──────────────────────
- * The env section is mostly session-static (cwd, platform, OS, model catalog)
- * with a few churning entries (git state). Blanket relocation to the per-turn
- * tail is cache-safe but pays live-text rates every turn for bytes that never
- * change. The split promotes entries PROVEN stable into the imaged slab and
- * keeps the rest on the tail. Invariants (pinned by cache-stability e2e):
- *   1. No promotion without history — a first-ever sighting is volatile, so a
- *      fresh session/project never bakes git state into the image (the 48.8%
- *      cold-create fix stays intact).
- *   2. The slab NEVER re-renders mid-session — the static side is frozen
- *      byte-exact at the session's first transform. If a promoted entry churns
- *      anyway, the slab keeps its stale bytes and the fresh text re-emits on
- *      the live tail (the later copy supersedes), while history marks it
- *      churned so the NEXT session demotes it.
- *   3. No project key (claudeMdSha absent) → no learning, all volatile: a
- *      shared fallback key would let one project's stable sightings promote
- *      another project's entries. */
-
-/** One env entry: a top-level bullet (` - Key: …`) or bare `Key: …` line plus
- *  its deeper-indented continuation lines. */
-interface EnvEntry {
-  key: string;
-  hash: number;
-  text: string;
-}
-
-const ENV_ENTRY_START = /^ ?- (.{1,200})$|^([A-Za-z][^:\n]{0,63}):(?: |$)/;
-
-function parseEnvEntries(env: string): { header: string; entries: EnvEntry[] } {
-  const headerLines: string[] = [];
-  const entries: EnvEntry[] = [];
-  let cur: string[] | null = null;
-  let curKey = '';
-  const flush = () => {
-    if (cur) {
-      const text = cur.join('\n').trimEnd();
-      entries.push({ key: curKey, hash: fnv1a(text), text });
-    }
-    cur = null;
-  };
-  for (const line of env.split('\n')) {
-    const m = line.startsWith('#') ? null : ENV_ENTRY_START.exec(line);
-    if (m) {
-      flush();
-      const head = (m[1] ?? m[2] ?? '').trim();
-      curKey = head.split(':', 1)[0]!.slice(0, 64).trim();
-      cur = [line];
-    } else if (cur) {
-      cur.push(line); // continuation (nested list item / wrapped prose)
-    } else {
-      headerLines.push(line);
-    }
-  }
-  flush();
-  return { header: headerLines.join('\n').trimEnd(), entries };
-}
-
-/** Cross-session churn history: `${projectKey}\0${entryKey}` → last content
- *  hash + sticky churn flag. Bounded LRU (same pattern as tagObservations). */
-const ENV_HISTORY_MAX = 8192;
-const envEntryHistory = new Map<string, { hash: number; churned: boolean }>();
-
-/** Per-session frozen partition — decided once at the session's first
- *  transform; `frozenStatic` bytes ride the slab unchanged all session. */
-interface EnvPartition {
-  frozenStatic: string;
-  staticHash: Map<string, number>;
-}
-const ENV_PARTITIONS_MAX = 512;
-const envSessionPartitions = new Map<string, EnvPartition>();
-
-/** Test hook: classification state is process-global (learning across
- *  sessions is the point), so suites that replay sessions reset between cases. */
-export function resetEnvSplitState(): void {
-  envEntryHistory.clear();
-  envSessionPartitions.clear();
-}
-
-export function splitEnvByVolatility(
-  env: string,
-  projectKey: string | undefined,
-  sessionKey: string,
-): { staticEnv: string; volatileEnv: string; volatileKeys: string[] } {
-  if (!env) return { staticEnv: '', volatileEnv: '', volatileKeys: [] };
-  if (!projectKey) return { staticEnv: '', volatileEnv: env, volatileKeys: [] };
-
-  const { header, entries } = parseEnvEntries(env);
-
-  // Freeze the partition on the session's first sighting (invariant 2).
-  let part = envSessionPartitions.get(sessionKey);
-  if (!part) {
-    const staticHash = new Map<string, number>();
-    const staticParts: string[] = [];
-    for (const e of entries) {
-      const h = envEntryHistory.get(`${projectKey}\0${e.key}`);
-      if (h && !h.churned && h.hash === e.hash) {
-        staticHash.set(e.key, e.hash);
-        staticParts.push(e.text);
-      }
-    }
-    part = {
-      frozenStatic:
-        staticParts.length > 0
-          ? [header, ...staticParts].filter((s) => s.length > 0).join('\n')
-          : '',
-      staticHash,
-    };
-  } else {
-    envSessionPartitions.delete(sessionKey); // refresh LRU position
-  }
-  envSessionPartitions.set(sessionKey, part);
-  while (envSessionPartitions.size > ENV_PARTITIONS_MAX) {
-    const oldest = envSessionPartitions.keys().next().value;
-    if (oldest === undefined) break;
-    envSessionPartitions.delete(oldest);
-  }
-
-  // Route entries and record churn history (sticky flag, LRU refresh).
-  const volatileParts: string[] = [];
-  const volatileKeys: string[] = [];
-  for (const e of entries) {
-    const key = `${projectKey}\0${e.key}`;
-    const prev = envEntryHistory.get(key);
-    const churned =
-      (prev?.churned ?? false) || (prev !== undefined && prev.hash !== e.hash);
-    if (prev !== undefined) envEntryHistory.delete(key); // refresh LRU position
-    envEntryHistory.set(key, { hash: e.hash, churned });
-    if (part.staticHash.get(e.key) === e.hash) continue; // riding the slab, unchanged
-    volatileParts.push(e.text);
-    volatileKeys.push(e.key);
-  }
-  while (envEntryHistory.size > ENV_HISTORY_MAX) {
-    const oldest = envEntryHistory.keys().next().value;
-    if (oldest === undefined) break;
-    envEntryHistory.delete(oldest);
-  }
-
-  return {
-    staticEnv: part.frozenStatic,
-    volatileEnv:
-      volatileParts.length > 0
-        ? [header, ...volatileParts].filter((s) => s.length > 0).join('\n')
-        : '',
-    volatileKeys,
   };
 }
 
@@ -1704,11 +1501,15 @@ export async function transformRequest(
   //    - staticText: everything else (cacheable, goes into the image).
   const systemStaticCacheControl = lastStaticSystemCacheControl(req.system);
   const { text: rawSysText, kept: sysRemainder } = extractSystemText(req.system);
-  const { kept: billingLine, body: sysBodyWithEnv } = stripBillingLine(rawSysText);
-  // Pull the volatile `# Environment` markdown section out BEFORE the
-  // static/dynamic split so per-session git state never reaches the slab image.
-  const { kept: envMarkdown, body: sysBody } = stripMarkdownEnvSection(sysBodyWithEnv);
-  const splitSystem = splitStaticDynamic(sysBody);
+  const { kept: billingLine, body: sysBody } = stripBillingLine(rawSysText);
+  // `# Environment` (working dir, git status, model ID) churns per turn but has
+  // no XML wrapper, so the static/dynamic split would bake it into the slab PNG
+  // and a one-file edit would re-render the whole prefix. Pull it out first; it
+  // re-enters below as plain system text in its original position (NOT relocated
+  // into the message stream — that surfaced a <system-reminder> in the
+  // conversation as if the user had written it).
+  const { kept: envMarkdown, body: sysBodyNoEnv } = stripMarkdownEnvSection(sysBody);
+  const splitSystem = splitStaticDynamic(sysBodyNoEnv);
   let staticText = splitSystem.staticText;
   const { dynamicText, blockCount: dynBlocks, unknownTags, staticTagContents } = splitSystem;
   const preserveClaudeCodeIdentity = staticText.startsWith(CLAUDE_CODE_OAUTH_IDENTITY);
@@ -1716,8 +1517,6 @@ export async function transformRequest(
     staticText = staticText.slice(CLAUDE_CODE_OAUTH_IDENTITY.length).replace(/^\s+/, '');
   }
   info.staticChars = staticText.length;
-  // dynamicChars is finalized after the env split below — only the VOLATILE
-  // side of `# Environment` counts as dynamic once stable entries ride the slab.
   info.dynamicBlockCount = dynBlocks;
   if (unknownTags.length > 0) info.unknownStaticTags = unknownTags;
   // Parse env fields out of the dynamic slab — telemetry only, never mutates.
@@ -1727,37 +1526,21 @@ export async function transformRequest(
   // Privacy-safe fingerprints that don't depend on tool docs (computed
   // here so they're available even if we below_min_chars out below).
   // systemSha8 is set later, after we know the combined image-bound text.
-  const claudeMdSlab = extractClaudeMdSlab(staticText);
   const firstUser = firstUserText(req);
-  const [claudeMdSha, firstUserSha] = await Promise.all([
-    claudeMdSlab ? sha8(claudeMdSlab) : Promise.resolve(undefined),
-    firstUser ? sha8(firstUser) : Promise.resolve(undefined),
-  ]);
-  if (claudeMdSha) info.claudeMdSha8 = claudeMdSha;
+  const firstUserSha = firstUser ? await sha8(firstUser) : undefined;
   if (firstUserSha) info.firstUserSha8 = firstUserSha;
 
   // Canary: slab tags whose content churns within a session bust the image
   // cache every turn — report them regardless of the hardcoded lists.
   if (staticTagContents.size > 0) {
     const churning = observeStaticTagChurn(
-      firstUserSha ?? claudeMdSha ?? 'global',
+      firstUserSha ?? 'global',
       staticTagContents,
     );
     if (churning.length > 0) info.churningStaticTags = churning;
   }
 
-  // Diff-based `# Environment` split (see splitEnvByVolatility): entries
-  // proven stable across sessions ride the imaged slab; churned/new entries
-  // keep the existing live-tail relocation. Without a user message there is
-  // nowhere to carry the slab or the tail, so the whole section stays
-  // volatile and falls back into system further down, exactly as before.
-  const hasUserMsg = (req.messages ?? []).some((m) => m.role === 'user');
-  const { staticEnv, volatileEnv, volatileKeys: envVolatileKeys } = hasUserMsg
-    ? splitEnvByVolatility(envMarkdown, claudeMdSha, firstUserSha ?? claudeMdSha ?? 'global')
-    : { staticEnv: '', volatileEnv: envMarkdown, volatileKeys: [] as string[] };
-  if (staticEnv) info.envStaticChars = staticEnv.length;
-  if (envVolatileKeys.length > 0) info.envVolatileKeys = envVolatileKeys;
-  info.dynamicChars = dynamicText.length + volatileEnv.length;
+  info.dynamicChars = dynamicText.length;
 
   // 2. Move tool docs into the imaged "Tool Reference", stubbing originals.
   //    Imaged (not text) because that IS the compression — descriptions and
@@ -1841,10 +1624,7 @@ export async function transformRequest(
       toolDocsText +
       '\n=== END TOOL REFERENCE ==='
     : '';
-  // staticEnv: `# Environment` entries proven session-stable (diff split
-  // above) ride the slab at image rates; frozen byte-exact per session so
-  // this never re-renders mid-session.
-  const combinedRaw = [staticText, staticEnv, toolReferenceText]
+  const combinedRaw = [staticText, toolReferenceText]
     .filter((s) => s.length > 0)
     .join('\n\n');
   // Compact then reflow before the gate; gate/renderer/paging all see the same text.
@@ -1968,41 +1748,25 @@ export async function transformRequest(
 
   // 4. Splice images back into the request. OCR framing is baked into the image.
   //
-  // Volatile env/context text (git status, cwd, date) must NOT ride in
-  // req.system: Anthropic's cache prefix order is tools → system → messages,
-  // so system bytes sit BEFORE the slab anchor and any git-state change
-  // cold-restarted the whole anchored prefix (48.8% of cold-create waste,
-  // events.jsonl 2026-06-26..07-02). It is carried instead at the END of the
-  // last user message — the per-turn live tail that re-caches incrementally
-  // anyway — appended late in this function, AFTER history collapse, so it can
-  // never be baked into a frozen history chunk. Only the VOLATILE side of the
-  // env split rides here — stable entries were promoted into the slab above.
-  // Fallback: if no user message exists to carry it, keep it in system rather
-  // than drop content (volatileEnv holds the full section in that case).
-  const volatileEnvParts: string[] = [];
-  if (dynamicText) volatileEnvParts.push(dynamicText);
-  if (volatileEnv) volatileEnvParts.push(volatileEnv);
-  // Redact model-identity/catalog lines ONLY when relocating into a user
-  // message (see MODEL_IDENTITY_LINE — second layer behind the env split):
-  // the !hasUserMsg fallback keeps env text in system, its original position,
-  // where those lines stay harmless.
-  const volatileEnvText = hasUserMsg
-    ? redactModelIdentityLines(volatileEnvParts.join('\n\n')).trim()
-    : '';
-
+  // Volatile env/context text (git status, cwd, date) stays in req.system, its
+  // original position. Relocating it into the last user message traded a real
+  // cache benefit for a visible protocol artifact — a <system-reminder> block
+  // appearing in the conversation as if the user had written it — so the pipe
+  // no longer moves it. Churn on these bytes costs prefix cache reads; that is
+  // accepted rather than rewriting the caller's message stream.
   // Images go into first user message — system field rejects images (400 system.N.type).
   {
     const sysTail: SystemField = [];
     if (preserveClaudeCodeIdentity) {
       sysTail.push({ type: 'text', text: CLAUDE_CODE_OAUTH_IDENTITY });
     }
+    // Session-stable, so it sits ahead of the churny blocks below.
+
     // billingLine is session-stable (warm reads through the anchored prefix
     // confirm it; a per-turn value here would zero every cache read).
     if (billingLine) sysTail.push({ type: 'text', text: billingLine });
-    if (!hasUserMsg) {
-      if (dynamicText) sysTail.push({ type: 'text', text: dynamicText });
-      if (volatileEnv) sysTail.push({ type: 'text', text: volatileEnv });
-    }
+    if (dynamicText) sysTail.push({ type: 'text', text: dynamicText });
+    if (envMarkdown) sysTail.push({ type: 'text', text: envMarkdown });
     if (Array.isArray(sysRemainder)) sysTail.push(...sysRemainder);
     // Tool Reference now rides INSIDE the imaged slab (combinedRaw above) — no
     // text splice here. Stubbed tools[] descriptions cite the "## Tool: <name>"
@@ -2018,87 +1782,19 @@ export async function transformRequest(
         ? m.content
         : [{ type: 'text' as const, text: m.content }];
 
-      // 5a. Compress <system-reminder> text blocks. cache_control on source text
-      //     moves to the LAST produced image (pxpipe never adds its own markers).
-      const processedExisting: ContentBlock[] = [];
-      if (o.compressReminders) {
-        for (const blk of existing) {
-          const isReminderText =
-            blk &&
-            (blk as TextBlock).type === 'text' &&
-            typeof (blk as TextBlock).text === 'string' &&
-            (blk as TextBlock).text.trimStart().startsWith('<system-reminder>');
-          if (!isReminderText) {
-            processedExisting.push(blk);
-            continue;
-          }
-          // Caller fidelity override: pin this block as text, skip imaging.
-          if (callerKeepsSharp(o.keepSharp, { kind: 'reminder', text: (blk as TextBlock).text })) {
-            bumpPassthrough(info, 'kept_sharp');
-            info.keptSharpBlocks = (info.keptSharpBlocks ?? 0) + 1;
-            processedExisting.push(blk);
-            continue;
-          }
-          const textLen = (blk as TextBlock).text.length;
-          if (textLen < o.minReminderChars) {
-            // Below coarse threshold; can't possibly be profitable. Skip.
-            bumpPassthrough(info, 'below_threshold');
-            processedExisting.push(blk);
-            continue;
-          }
-          // Lossless whitespace compaction — same dynamics as the system
-          // slab: every newline costs ≥1 visual row regardless of column
-          // width, so stripped trailing whitespace + collapsed blank-line
-          // runs reduce real renderer cost without changing what the
-          // model reads.
-          const reminderRaw = (blk as TextBlock).text;
-          const reminderText = maybeReflow(compactSlabWhitespace(reminderRaw), o.reflow);
-          if (!isCompressionProfitable(reminderText, denseGeo.cols, undefined, o.charsPerToken, 0, 0, true, denseGeo.maxChars)) {
-            bumpPassthrough(info, 'not_profitable');
-            processedExisting.push(blk);
-            continue;
-          }
-          const { blocks: imgs, pngs: rawPngs, dims: rawDims, droppedChars, droppedCodepoints: dcp, pixels } =
-            await textToImageBlocks(reminderText, o.cols);
-          (info.imagePngs ??= []).push(...rawPngs);
-          (info.imageDims ??= []).push(...rawDims);
-          const srcCacheControl = demoteRelocatedCacheControl((blk as { cache_control?: unknown }).cache_control);
-          for (let i = 0; i < imgs.length; i++) {
-            const img = imgs[i]!;
-            const out =
-              i === imgs.length - 1 && srcCacheControl !== undefined
-                ? { ...img, cache_control: srcCacheControl }
-                : img;
-            processedExisting.push(out as ImageBlock);
-            info.imageBytes += approxBlockBytes(img);
-          }
-          const reminderFactSheet = factSheetText(reminderRaw);
-          if (reminderFactSheet) processedExisting.push({ type: 'text', text: reminderFactSheet });
-          info.imagePixels = (info.imagePixels ?? 0) + pixels;
-          info.reminderImgs = (info.reminderImgs ?? 0) + imgs.length;
-          await recordRecoverable(info, o.emitRecoverable, {
-            kind: 'reminder',
-            text: reminderRaw,
-            imageCount: imgs.length,
-          });
-          info.compressedChars += reminderRaw.length;
-          bumpBucket(info, 'reminder', reminderRaw.length);
-          info.imageCount += imgs.length;
-          info.droppedChars = (info.droppedChars ?? 0) + droppedChars;
-          for (const [cp, n] of dcp) {
-            droppedCodepoints.set(cp, (droppedCodepoints.get(cp) ?? 0) + n);
-          }
-        }
-      } else {
-        processedExisting.push(...existing);
-      }
+      // <system-reminder> blocks stay text, always. They are the wrapper Claude
+      // Code puts around every injected instruction block (CLAUDE.md included),
+      // they churn turn-to-turn as the client re-injects and relocates them, and
+      // imaging one drags its cache_control onto a block that will not recur
+      // byte-identically next turn. Rendering them lost more to cache misses
+      // than it saved in tokens, so the path is gone rather than flag-gated.
 
       const slabFactSheet = factSheetText(combinedRaw);
       m.content = [
         ...imageBlocks,
         ...(slabFactSheet ? [{ type: 'text' as const, text: slabFactSheet }] : []),
         { type: 'text' as const, text: '[End of rendered context.]' },
-        ...processedExisting,
+        ...existing,
       ];
     }
 
@@ -2319,38 +2015,6 @@ export async function transformRequest(
       }
     } else if (histInfo.reason) {
       info.historyReason = histInfo.reason;
-    }
-  }
-
-  // Volatile env/context text lands at the END of the last user message (see
-  // the block above image splice for why). Runs AFTER history collapse so the
-  // env bytes stay in the live tail — never imaged into a frozen chunk — and
-  // AFTER 5b so they are never run through tool_result compression. Note
-  // tool_result blocks legally precede trailing text blocks in a user message
-  // (Claude Code appends its own system-reminders the same way).
-  //
-  // The block is wrapped in <system-reminder> tags so the model (and any
-  // human reading a transcript) attributes it as injected context, NOT user
-  // prose. Without the wrapper the relocated "# Environment" section blends
-  // seamlessly into the user's message — on an empty/short user turn it can
-  // BECOME the entire visible message (observed live, 2026-07). The wrapper
-  // rides in the volatile tail behind the slab anchor, so it costs ~60 chars
-  // per request and cannot perturb the cached prefix. Same-pass safety: 5a
-  // (compressReminders) runs earlier and only scans the first user message,
-  // so this block is never self-imaged; and pxpipe is stateless per request,
-  // so the wrapper never appears in inbound client history (no compounding).
-  if (volatileEnvText) {
-    const wrappedEnvText = `<system-reminder>\nContext relocated by pxpipe from the system prompt (volatile per-turn environment state — not written by the user):\n\n${volatileEnvText}\n</system-reminder>`;
-    const msgs = req.messages ?? [];
-    for (let i = msgs.length - 1; i >= 0; i--) {
-      const m = msgs[i]!;
-      if (m.role !== 'user') continue;
-      const content = Array.isArray(m.content)
-        ? m.content
-        : [{ type: 'text' as const, text: m.content }];
-      msgs[i] = { ...m, content: [...content, { type: 'text' as const, text: wrappedEnvText }] };
-      info.envRelocatedChars = wrappedEnvText.length;
-      break;
     }
   }
 

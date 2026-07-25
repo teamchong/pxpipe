@@ -1633,72 +1633,6 @@ describe('transform', () => {
     expect(cached.length).toBe(0);
   });
 
-  it('compresses long <system-reminder> blocks in the first user message', async () => {
-    // 'a long policy note. ' = 20 chars. 1550× = 31k chars + reminder tags
-    // — past the 14k minReminderChars threshold and the one-image break-even.
-    // 1550 × 20 = 31,000 chars → 310 visual rows → 1 image (capacity 312 rows)
-    // image cost 7665 tokens < text cost 31000/4=7750 → profitable.
-    const reminder = '<system-reminder>\n' + 'a long policy note. '.repeat(1550) + '\n</system-reminder>';
-    const body = new TextEncoder().encode(
-      JSON.stringify({
-        model: 'claude',
-        messages: [
-          {
-            role: 'user',
-            content: [
-              { type: 'text', text: 'real user prompt' },
-              { type: 'text', text: reminder },
-            ],
-          },
-        ],
-        system: 'x'.repeat(150000),
-      }),
-    );
-    const { body: outBytes, info } = await transformRequest(body);
-    expect(info.reminderImgs).toBeGreaterThanOrEqual(1);
-
-    const out = JSON.parse(new TextDecoder().decode(outBytes));
-    const content = out.messages[0].content as any[];
-    // Reminder text must NOT appear as a text block anymore.
-    for (const b of content) {
-      if (b.type === 'text') expect(b.text).not.toContain('<system-reminder>');
-    }
-    // But the user's actual prompt must still be there.
-    const userTexts = content.filter((b: any) => b.type === 'text').map((b: any) => b.text);
-    expect(userTexts.some((t: string) => t.includes('real user prompt'))).toBe(true);
-
-    // Reminder images carry NO cache_control (only the system+tools image
-    // does — Anthropic caps at 4 breakpoints).
-    const reminderImageBlocks = content.filter(
-      (b: any) => b.type === 'image' && !b.cache_control,
-    );
-    expect(reminderImageBlocks.length).toBeGreaterThanOrEqual(info.reminderImgs ?? 0);
-  });
-
-  it('leaves short <system-reminder> blocks alone (below minReminderChars)', async () => {
-    const shortReminder = '<system-reminder>\nshort note\n</system-reminder>';
-    const body = new TextEncoder().encode(
-      JSON.stringify({
-        model: 'claude',
-        messages: [
-          {
-            role: 'user',
-            content: [{ type: 'text', text: shortReminder }],
-          },
-        ],
-        system: 'x'.repeat(150000),
-      }),
-    );
-    const { body: outBytes, info } = await transformRequest(body);
-    expect(info.reminderImgs ?? 0).toBe(0);
-    const out = JSON.parse(new TextDecoder().decode(outBytes));
-    const allText = (out.messages[0].content as any[])
-      .filter((b: any) => b.type === 'text')
-      .map((b: any) => b.text)
-      .join('\n');
-    expect(allText).toContain('<system-reminder>');
-  });
-
   it('compresses large tool_result text content across user messages', async () => {
     // 'output line. ' = 13 chars × 2400 = 31.2k chars — past minToolResultChars
     // (14k) and past the one-image break-even.
@@ -2079,21 +2013,6 @@ describe('transform', () => {
       (b) => b.type === 'tool_result',
     );
     expect(Array.isArray(tr!.content)).toBe(true);
-  });
-
-  it('break-even gate: 25000-char reminder images (above threshold and profitable)', async () => {
-    // With charsPerToken=2 (dense code/log), profitable: textCost=12500 vs imgCost=2*3484=6968.
-    const reminder = '<system-reminder>' + 'x'.repeat(25000) + '</system-reminder>';
-    const req = JSON.stringify({
-      model: 'claude-3-5-sonnet',
-      messages: [
-        { role: 'user', content: [{ type: 'text', text: reminder }] },
-      ],
-      system: 'x'.repeat(150000),
-    });
-    const { info } = await transformRequest(new TextEncoder().encode(req), { charsPerToken: 2 });
-    expect(info.compressed).toBe(true);
-    expect((info.reminderImgs ?? 0)).toBeGreaterThan(0);
   });
 
   it('break-even gate: passthroughReasons omitted when no passthrough happened', async () => {

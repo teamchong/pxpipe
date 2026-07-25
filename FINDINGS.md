@@ -31,45 +31,55 @@ Receipts: [`eval/gist-recall/`](eval/gist-recall/), [`eval/gsm8k/`](eval/gsm8k/)
 (incl. `results_claude-opus-5_novel.json`, all 100 pred/gold pairs),
 [`eval/verbatim-15/`](eval/verbatim-15/).
 
-### What it means
+### What it means in practice
 
-- **Worse at recall than Fable.** Gist gap small (−4/98). Verbatim gap large
-  (2/15 vs 13/15) — Opus 5 mostly fails to resolve glyphs at pxpipe's density.
-  Need verbatim? Read with Fable 5 or Gemini 3.6 Flash.
-- **Good enough for the job.** 100/100 arithmetic through the render, 0/16
-  never-stated (no confabulation), 94/98 gist — fine for summarize / navigate /
-  recall-the-gist, which is what pxpipe is for.
-- **Long sessions before `/compact`.** Fable 5 geometry: ~18.9 c/vt, ~18.9M
-  effective chars on a 1M window, **~4.7×** over text. Geometry, not quality.
+**Opus 5 reads worse than Fable 5.** The row that matters is the last one: asked
+to copy back an exact string of dense characters, Fable 5 gets 13 of 15 and
+Opus 5 gets 2 of 15. At the character level, Opus 5 often cannot tell our glyphs
+apart at the density we render them.
 
-### Recommended setting: effort `medium`
+**But it is good enough for what pxpipe is for.** It scores 100/100 on maths it
+could only do by reading the numbers off the image, it never invented a fact
+that wasn't on the page (0 of 16), and it summarises correctly 94 times out of
+98. Summarising, navigating, and recalling the gist all work.
 
-- These tasks are **perceptual, not reasoning-limited** (text arm = 100%).
-- Higher effort spends tokens without closing the glyph gap, and eats the
-  long-session headroom that is the reason to pick Opus 5.
-- **No effort-level A/B was run.** Treat `medium` as a default, not a finding.
+**If you need an exact transcription, use Fable 5 or Gemini 3.6 Flash.**
 
-### Caveats
+**The upside is much longer sessions before `/compact`.** Opus 5 packs about the
+same amount per image as Fable 5, which works out to roughly **4.7× more text in
+the same context window** than sending it as plain text. That measures how much
+fits, not how well it reads.
 
-- Opus 5 **text baseline not re-measured** on arithmetic — delta inferred.
-- Arms are per-model renders — cross-model rows are not pixel-identical.
-- The `src/core/render.ts` colour work shipping alongside is a **refactor with
-  no demonstrated accuracy benefit** — see below.
+### Suggested effort level: `medium`
 
-### Not demonstrated: "colour helps the LLM read better"
+This is a guess, not a result — **we never A/B tested effort levels.** The
+reasoning: Opus 5's failures are about *seeing* the glyphs, not about thinking
+harder, so raising effort likely burns context without fixing anything.
 
-Recorded so it is not mistaken for a result.
+### Two things we did not prove
 
-| | |
-|---|---|
-| Only scored comparison | `ctl` 5/15 = 33.3% vs `cband` 9/45 = 20.0% |
-| Significance | Fisher **p = 0.31** — colour scored *worse* |
-| Confounds | k=5 vs k=3, different fixtures |
-| Decisive matched re-run (`ctl` vs `bgtint`, k=3, same fixture) | **never executed** |
-| Last substantive check | byte-identity refactor proof (BEFORE vs AFTER identical, all 35) — a **no-behaviour-change** result by construction |
+- Opus 5's maths score was **never re-measured on plain text**, so the
+  image-vs-text gap is inferred rather than measured.
+- Each model reads its own render, so the table columns are not a perfectly
+  controlled comparison.
 
-**Status: undemonstrated.** The render changes merge as a refactor, not as an
-accuracy improvement.
+### The colour theory is untested, not supported
+
+We had a theory that colouring the text would help the model read. We could not
+show that, and this is recorded here so it is not mistaken for a result.
+
+- The one comparison we scored came out **worse** with colour (20% vs 33%), and
+  with samples that small the difference is statistically meaningless — well
+  within what you would expect from luck alone.
+- That comparison was not fair anyway: the two sides used different test pages
+  and different settings, so it could not have settled the question either way.
+- The fair version — same pages, same settings, colour as the only difference —
+  **was never run.**
+- The last check we did run only confirmed the reorganised code produces
+  **byte-for-byte identical images** to the old code (all 35 cases). That proves
+  nothing changed, which by definition cannot show an improvement.
+
+So the `src/core/render.ts` change merges as **tidying, not an improvement**.
 
 ---
 

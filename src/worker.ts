@@ -30,10 +30,8 @@ export interface Env {
   CLOUDFLARE_API_TOKEN?: string;
   COMPRESS?: string;
   COMPRESS_TOOLS?: string;
-  COMPRESS_REMINDERS?: string;
   COMPRESS_TOOL_RESULTS?: string;
   MIN_COMPRESS_CHARS?: string;
-  MIN_REMINDER_CHARS?: string;
   MIN_TOOL_RESULT_CHARS?: string;
   COLS?: string;
   /** When "0" / "false", disable per-request event JSON logs. Default-on.
@@ -99,15 +97,12 @@ export default {
     const transform: TransformOptions = {
       compress: truthy(env.COMPRESS, true),
       compressTools: truthy(env.COMPRESS_TOOLS, true),
-      compressReminders: truthy(env.COMPRESS_REMINDERS, true),
       compressToolResults: truthy(env.COMPRESS_TOOL_RESULTS, true),
       minCompressChars: env.MIN_COMPRESS_CHARS ? Number(env.MIN_COMPRESS_CHARS) : 2000,
-      // 500 chars — CPU/latency floor only, not a correctness guard. The
       // No floors — the content-aware `isCompressionProfitable()` gate
       // decides per-block based on actual pixel cost vs text cost. Host
       // can still set a floor via env if they want observability buckets
       // (e.g. MIN_TOOL_RESULT_CHARS=200 to skip absurdly small dumps).
-      minReminderChars: env.MIN_REMINDER_CHARS ? Number(env.MIN_REMINDER_CHARS) : 0,
       minToolResultChars: env.MIN_TOOL_RESULT_CHARS ? Number(env.MIN_TOOL_RESULT_CHARS) : 0,
       // Omit by default so OpenAI-shaped requests use their exact model profile;
       // COLS remains an explicit operator override for every family.

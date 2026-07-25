@@ -221,43 +221,6 @@ export interface RenderStyle {
    *  white ink on black (pre-invert canvas). Fixed cell pitch. */
   invert?: boolean;
   /**
-   * Tint ink by character class (digit / UPPER / lower / other) for OCR disambiguation
-   * of confusable pairs like 0/O/o. Forces RGB. Composes with aa. Mutually exclusive
-   * intent with colorCycle (if both set, colorByClass wins).
-   */
-  colorByClass?: boolean;
-  /**
-   * Paint a 1px class micro-mark in the cell margin after each glyph blit:
-   * digit → bottom-left, UPPER → top-right, lower/other → none.
-   * Separates 0/O/o without changing cell pitch. Works with gray or RGB output.
-   */
-  classTick?: boolean;
-  /**
-   * Tint the cell *background* by character class, leaving ink at full black.
-   * Unlike colorByClass (which tints ink and therefore spends luminance
-   * contrast to buy hue), this keeps every glyph at maximum contrast and puts
-   * the class signal in the paper, where it costs ~9% contrast instead of ~30%.
-   * Forces RGB. Composes with aa and paperGray.
-   */
-  classBgTint?: boolean;
-  /**
-   * Tint the cell *background* in alternating vertical bands of N columns,
-   * independent of character identity. Where classBgTint cues *what a glyph is*,
-   * this cues *where in the row you are* — it chunks a long run into countable
-   * groups so a reader can hold position without counting cells one by one.
-   *
-   * Motivated by the verbatim-hex failure profile: misses there are not glyph
-   * confusions (substitution pairs track pixel similarity barely above chance,
-   * p~0.05) but place-loss — 54% of wrong answers diverge in multiple characters
-   * and none matches another real string on the page. Ink stays pure black, so
-   * unlike the fg-colour arms this spends no contrast, and unlike the structural
-   * `band` fixtures it does not move a single glyph: cell pitch is untouched.
-   *
-   * Value is the band period in columns (4 suits 12-char needles => 3 groups).
-   * 0/unset = off. Forces RGB. Composes with aa and paperGray.
-   */
-  colBandTint?: number;
-  /**
    * Post-invert paper gray (0–255). Default 255 = pure white. Mid-light values
    * (e.g. 230–240) reduce glare and lift faint grid rules without changing cell pitch.
    * Applied after invert; ink stays near-black via linear remap onto the paper.
@@ -346,85 +309,6 @@ export const ROLE_PALETTE: [number, number, number][] = [
 ];
 const ROLE_SLOT_USER = 1;
 const ROLE_SLOT_ASSISTANT = 2;
-
-/** colorByClass palette, indexed by slot-1: digit / UPPER / lower / other. */
-// Ink is assigned so contrast tracks frequency: the most common class gets the
-// darkest ink. lower a-z dominates prose (~2x any other class), so it takes
-// near-black; punctuation is the sparsest and most context-recoverable, so it
-// takes the weakest ink. All four stay >=77% contrast on white paper.
-export const CLASS_PALETTE: [number, number, number][] = [
-  [20, 40, 160],   // 1: digit 0-9 — blue (0 ≠ O/o), 82.6%
-  [150, 20, 20],   // 2: UPPER A-Z — red (O ≠ 0/o), 81.3%
-  [20, 20, 20],    // 3: lower a-z — near-black (o ≠ 0/O), 92.2%
-  [20, 70, 35],    // 4: other / punctuation — dark green, 77.7%
-];
-/** classBgTint paper palette, indexed by bg slot-1. Black ink on any of these
- *  tints still clears 16:1, so the class cue is additive rather than paid for
- *  out of the ink's contrast budget (which is what sank the fg-colour arms). */
-export const CLASS_BG_PALETTE: [number, number, number][] = [
-  [255, 244, 214], // 1: digit 0-9      — pale amber paper
-  [226, 234, 255], // 2: UPPER A-Z      — pale blue paper
-  [255, 255, 255], // 3: lower a-z      — untinted white
-  [226, 247, 228], // 4: punctuation    — pale green paper
-];
-
-/** Slot ids, 1-based to keep 0 free as "background" in the masks. These index
- *  CLASS_BG_PALETTE (and CLASS_PALETTE) as slot-1, so the two must stay ordered
- *  together — hence the shared constants rather than bare literals. */
-const CLASS_SLOT_DIGIT = 1;
-const CLASS_SLOT_UPPER = 2;
-const CLASS_SLOT_LOWER = 3;
-const CLASS_SLOT_OTHER = 4;
-
-/** Deliberately NOT classSlotForCodepoint: that one is 2-way (digit vs rest) and
- *  is what the already-measured colorByClass/classTick arms were scored against.
- *  Widening it in place would retroactively redefine those arms, so the paper
- *  tint carries its own honest 4-way split. */
-function bgClassSlotForCodepoint(cp: number): number {
-  if (cp >= 0x30 && cp <= 0x39) return CLASS_SLOT_DIGIT; // 0-9
-  if (cp >= 0x41 && cp <= 0x5a) return CLASS_SLOT_UPPER; // A-Z
-  if (cp >= 0x61 && cp <= 0x7a) return CLASS_SLOT_LOWER; // a-z (untinted)
-  return CLASS_SLOT_OTHER;                               // punctuation / everything else
-}
-
-/** Digits carry the collisions that matter at 5x8 (4/A, 0/O, 1/l, 5/S, 8/B) and
- *  they are exactly what must survive verbatim: hashes, versions, counts, ids.
- *  Painting only digits blue resolves every digit/letter pair on its own — the
- *  letter side needs no ink, since "blue vs not-blue" already separates them.
- *  Prose therefore keeps the darkest ink (92.2%) instead of being tinted. */
-function classSlotForCodepoint(cp: number): number {
-  if (cp >= 0x30 && cp <= 0x39) return CLASS_SLOT_DIGIT; // 0-9 → blue
-  return CLASS_SLOT_LOWER; // everything else → near-black, max contrast
-}
-
-/** 1px class micro-marks in cell margins (pre-invert ink = 255). */
-function paintClassTick(
-  fb: Uint8Array,
-  fbW: number,
-  fbH: number,
-  baseX: number,
-  baseY: number,
-  cellW: number,
-  cellH: number,
-  codepoint: number,
-  colorMask: Uint8Array | null,
-  colorSlot: number,
-): void {
-  // classSlotForCodepoint is 2-way by design (see above), so the only mark that
-  // can ever be painted is digit → BL. Everything else is left unmarked.
-  if (classSlotForCodepoint(codepoint) !== CLASS_SLOT_DIGIT) return;
-  const ox = 0;
-  const oy = Math.max(0, cellH - 1);
-  const px = baseX + ox;
-  const py = baseY + oy;
-  if (px < 0 || py < 0 || px >= fbW || py >= fbH) return;
-  const idx = py * fbW + px;
-  // only mark background so we don't erase glyph strokes
-  if (fb[idx]! === 0) {
-    fb[idx] = 255;
-    if (colorMask && colorSlot > 0) colorMask[idx] = colorSlot;
-  }
-}
 
 /**
  * Slot markers for the parallel "slot string" — the structure-through mechanism
@@ -934,35 +818,12 @@ export async function renderChunkToPng(
   const markerMask: Uint8Array | null =
     style.markerRed ? new Uint8Array(width * height) : null;
   // colorMask: stores colorSlot per inked pixel (0 = background) for colorCycle / colorByRole RGB output.
-  const useColorByClass = style.colorByClass === true;
-  const useColorCycle = style.colorCycle === true && !useColorByClass;
-  const useColorByRole = style.colorByRole === true && !useColorByClass;
+  const useColorCycle = style.colorCycle === true;
+  const useColorByRole = style.colorByRole === true;
   const colorMask: Uint8Array | null =
-    (useColorCycle || useColorByRole || useColorByClass) ? new Uint8Array(width * height) : null;
-  // bgMask: stores class slot per *cell background* pixel (0 = untinted) for
-  // classBgTint / colBandTint. Both drive the same composition pass below, which
-  // scales the tint by ink coverage — so ink still lands on pure black either way.
-  const useClassBgTint = style.classBgTint === true;
-  // Column-band tint: period in columns, identity-independent. Mutually exclusive
-  // with classBgTint (they would fight over the same cell background).
-  const colBandPeriod = Math.max(0, Math.floor(style.colBandTint ?? 0));
-  const useColBandTint = colBandPeriod > 0 && !useClassBgTint;
-  // The composition pass below is a colorMask-else-bgMask chain, so a bgMask
-  // built alongside a colorMask could never be read. Don't build it.
-  const bgMask: Uint8Array | null =
-    (useClassBgTint || useColBandTint) && !colorMask ? new Uint8Array(width * height) : null;
-  const useClassTick = style.classTick === true;
+    (useColorCycle || useColorByRole) ? new Uint8Array(width * height) : null;
   // Ink palette is fixed for the whole page; the composition pass indexes it per pixel.
-  const inkPalette = useColorByClass ? CLASS_PALETTE : useColorByRole ? ROLE_PALETTE : GLYPH_PALETTE;
-  // colBandTint keys off column position, not identity: alternate pale-blue and
-  // untinted groups of `colBandPeriod` columns. Precompute per column.
-  const bandSlotByCol: Uint8Array | null = useColBandTint ? new Uint8Array(cols) : null;
-  if (bandSlotByCol) {
-    for (let c = 0; c < cols; c++) {
-      bandSlotByCol[c] =
-        Math.floor(c / colBandPeriod) % 2 === 0 ? CLASS_SLOT_LOWER : CLASS_SLOT_UPPER;
-    }
-  }
+  const inkPalette = useColorByRole ? ROLE_PALETTE : GLYPH_PALETTE;
 
   /** Stamp colorSlot over the inked pixels of one glyph's cell span. Identical
    *  for every blit path — only the horizontal span differs (scaled markers
@@ -998,11 +859,9 @@ export async function renderChunkToPng(
       const codepoint = ch.codePointAt(0)!;
       const baseX = PAD_X + col * cellW;
       const isMarker = codepoint === NL_SENTINEL_CP;
-      const colorSlot = useColorByClass
-        ? classSlotForCodepoint(codepoint)
-        : useColorByRole
-          ? (slotRow ? slotForMarkCp(slotRow[charIdx]?.codePointAt(0)) : 0) // 0 = body (black); only tags carry a role hue
-          : (glyphIndex % GLYPH_PALETTE.length) + 1; // 0 reserved for background in colorMask
+      const colorSlot = useColorByRole
+        ? (slotRow ? slotForMarkCp(slotRow[charIdx]?.codePointAt(0)) : 0) // 0 = body (black); only tags carry a role hue
+        : (glyphIndex % GLYPH_PALETTE.length) + 1; // 0 reserved for background in colorMask
       let advance: number;
       if (isMarker && markerScale > 1) {
         advance = blitGlyphScaled(fb, markerMask, width, height, baseX, baseY, codepoint, markerScale, style.font);
@@ -1013,30 +872,6 @@ export async function renderChunkToPng(
           ? blitGlyphGray(fb, width, baseX, baseY, codepoint, style.font)
           : blitGlyph(fb, width, baseX, baseY, codepoint, style.font, isMarker ? markerMask : null);
         if (colorMask && advance > 0) stampColorMask(baseX, baseY, advance * atlasW, colorSlot);
-      }
-      if (useClassTick && advance > 0) {
-        paintClassTick(fb, width, height, baseX, baseY, cellW, cellH, codepoint, colorMask, colorSlot);
-      }
-      if (bgMask && advance > 0) {
-        // Tint the whole cell rect, ink included: composition scales the tint by
-        // ink coverage, so glyph pixels still land on pure black.
-        const bgSlot = bandSlotByCol
-          ? bandSlotByCol[col]!
-          : bgClassSlotForCodepoint(codepoint);
-        // CLASS_SLOT_LOWER is the untinted (white) entry of CLASS_BG_PALETTE —
-        // no need to spend a fill on it.
-        if (bgSlot !== CLASS_SLOT_LOWER) {
-          const cw = advance * cellW;
-          for (let gy = 0; gy < cellH; gy++) {
-            const py = baseY + gy;
-            if (py >= height) break;
-            for (let gx = 0; gx < cw; gx++) {
-              const px = baseX + gx;
-              if (px >= width) break;
-              bgMask[py * width + px] = bgSlot;
-            }
-          }
-        }
       }
       glyphIndex++;
       charIdx++;
@@ -1078,7 +913,7 @@ export async function renderChunkToPng(
 
   let png: Uint8Array;
   if (colorMask) {
-    // colorCycle / colorByRole / colorByClass: AA-blend ink onto paper in palette color.
+    // colorCycle / colorByRole: AA-blend ink onto paper in palette color.
     const rgb = new Uint8Array(width * height * 3);
     for (let i = 0; i < fb.length; i++) {
       const g = fb[i]!; // post-invert (+ optional paper): 0 = ink, paper = background
@@ -1092,25 +927,6 @@ export async function renderChunkToPng(
         rgb[i * 3]     = Math.round(paper - (cov * (paper - pr!)) / 255);
         rgb[i * 3 + 1] = Math.round(paper - (cov * (paper - pg!)) / 255);
         rgb[i * 3 + 2] = Math.round(paper - (cov * (paper - pb!)) / 255);
-      } else {
-        rgb[i * 3]     = g;
-        rgb[i * 3 + 1] = g;
-        rgb[i * 3 + 2] = g;
-      }
-    }
-    png = await encodeRgbPng(rgb, width, height);
-  } else if (bgMask) {
-    // classBgTint: hue lives in the paper. Ink keeps its full greyscale depth —
-    // g=0 stays (0,0,0) in every cell, so no class pays contrast for its cue.
-    const rgb = new Uint8Array(width * height * 3);
-    for (let i = 0; i < fb.length; i++) {
-      const g = fb[i]!; // post-invert (+ optional paper): 0 = ink, paper = background
-      const slot = bgMask[i]!;
-      if (slot > 0 && paper > 0) {
-        const [tr, tg, tb] = CLASS_BG_PALETTE[(slot - 1) % CLASS_BG_PALETTE.length]!;
-        rgb[i * 3]     = Math.round((tr! * g) / paper);
-        rgb[i * 3 + 1] = Math.round((tg! * g) / paper);
-        rgb[i * 3 + 2] = Math.round((tb! * g) / paper);
       } else {
         rgb[i * 3]     = g;
         rgb[i * 3 + 1] = g;

@@ -102,7 +102,6 @@ export interface TrackEvent {
 
   // Fingerprints:
   system_sha8?: string;
-  claude_md_sha8?: string;
   first_user_sha8?: string;
 
   // From Anthropic/OpenAI Usage:
@@ -225,7 +224,6 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     if (info.staticChars !== undefined) out.static_chars = info.staticChars;
     if (info.dynamicChars !== undefined) out.dynamic_chars = info.dynamicChars;
     if (info.dynamicBlockCount !== undefined) out.dynamic_block_count = info.dynamicBlockCount;
-    if (info.reminderImgs !== undefined) out.reminder_imgs = info.reminderImgs;
     if (info.toolResultImgs !== undefined) out.tool_result_imgs = info.toolResultImgs;
     if (info.toolDocsChars !== undefined) out.tool_docs_chars = info.toolDocsChars;
     if (info.truncatedToolResults !== undefined && info.truncatedToolResults > 0) {
@@ -275,7 +273,6 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     if (info.churningStaticTags && info.churningStaticTags.length > 0)
       out.churning_static_tags = info.churningStaticTags;
     if (info.systemSha8) out.system_sha8 = info.systemSha8;
-    if (info.claudeMdSha8) out.claude_md_sha8 = info.claudeMdSha8;
     if (info.firstUserSha8) out.first_user_sha8 = info.firstUserSha8;
     if (info.baselineTokens !== undefined && info.baselineTokens > 0) {
       out.baseline_tokens = info.baselineTokens;

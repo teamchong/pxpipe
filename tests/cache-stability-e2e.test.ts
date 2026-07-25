@@ -17,11 +17,10 @@
  *
  * Run just this file:  pnpm vitest run tests/cache-stability-e2e.test.ts
  */
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createProxy } from '../src/core/proxy.js';
 import { countCacheControlMarkers } from '../src/core/measurement.js';
 import { HISTORY_SYNTHETIC_INTRO } from '../src/core/history.js';
-import { resetEnvSplitState } from '../src/core/transform.js';
 
 // Pin the model scope so these proxy-contract tests stay independent of the developer shell.
 let ambientPxpipeModels: string | undefined;
@@ -29,11 +28,6 @@ beforeAll(() => {
   ambientPxpipeModels = process.env.PXPIPE_MODELS;
   process.env.PXPIPE_MODELS = 'claude-fable-5,gpt-5.6-sol';
 });
-// The env split learns across sessions keyed by claudeMdSha, and every test
-// here shares the same `# CLAUDE.md` fixture slab — without a reset, an env
-// entry that one test proved stable would promote into the slab in a LATER
-// test's fresh session, changing what relocates to the tail.
-beforeEach(() => resetEnvSplitState());
 afterAll(() => {
   if (ambientPxpipeModels === undefined) delete process.env.PXPIPE_MODELS;
   else process.env.PXPIPE_MODELS = ambientPxpipeModels;
@@ -390,12 +384,11 @@ describe('e2e cache alignment — Anthropic /v1/messages through the real proxy'
     expect(a.length).toBeGreaterThan(0);
     expect(b).toEqual(a);
 
-    // Not dropped: the volatile section re-enters as trailing TEXT on the LAST
-    // user message (per-turn live tail), so the model still sees the current
-    // git state. It must NOT ride in system: system bytes sit BEFORE the slab
-    // anchor in Anthropic's prefix order (tools → system → messages), so any
-    // env change there cold-restarts the entire anchored prefix (48.8% of
-    // telemetry-era cold-create waste).
+    // Not dropped: the section re-enters as plain system TEXT after the anchor,
+    // its original position. pxpipe does not relocate it into the message
+    // stream — doing so surfaced a <system-reminder> block in the conversation
+    // as if the user had written it. Churn on these bytes costs prefix cache
+    // reads; that is accepted rather than rewriting the caller's messages.
     const sysText = (bodyText: string): string => {
       const sys = JSON.parse(bodyText).system;
       return Array.isArray(sys) ? sys.map((s: any) => s?.text ?? '').join('\n') : String(sys ?? '');
@@ -407,67 +400,15 @@ describe('e2e cache alignment — Anthropic /v1/messages through the real proxy'
         ? m.content.map((c: any) => (c?.type === 'text' ? c.text : '')).join('\n')
         : String(m.content ?? '');
     };
-    expect(lastUserText(cap2.main[0]!.body)).toContain('modified: src/pricing.ts');
-    expect(lastUserText(cap1.main[0]!.body)).toContain('Git status:\nclean');
-    // And the section left both the imaged region AND system entirely — nothing
-    // upstream of the anchor may depend on git state. (Byte-equality above is
-    // the load-bearing check; this pins the mechanism.)
-    expect(lastUserText(cap2.main[0]!.body)).toContain('# Environment');
-    expect(sysText(cap2.main[0]!.body)).not.toContain('modified: src/pricing.ts');
-    expect(sysText(cap2.main[0]!.body)).not.toContain('# Environment');
-    // Regression (2026-07): the relocated block must be delimited as injected
-    // context, never blended into user prose — undelimited, it can BECOME the
-    // entire visible message on an empty/short user turn (observed live).
-    expect(lastUserText(cap2.main[0]!.body)).toMatch(
-      /<system-reminder>[\s\S]*relocated by pxpipe[\s\S]*# Environment[\s\S]*<\/system-reminder>/,
-    );
-  });
-
-  it('ENV RELOCATION: model-identity/catalog lines are redacted from the relocated block', async () => {
-    // Regression (2026 LinkedIn report): relocating `# Environment` into the
-    // LAST user message re-surfaced "You are powered by … Fable 5" and "default
-    // to the latest and most capable Claude models" as fresh per-turn guidance,
-    // exactly where the parent model chooses subagent models — subagents that
-    // should run on haiku were spawned on fable, and pxpipe INCREASED cost.
-    // Fix: redactModelIdentityLines on the relocation path (transform.ts). The
-    // rest of the env block (cwd, git, platform) must survive untouched.
-    const env =
-      `\n# Environment\nWorking directory: /repo\nPlatform: darwin\n` +
-      `You are powered by the model named Fable 5. The exact model ID is claude-fable-5.\n` +
-      `The most recent Claude models are the Claude 5 family, Opus 4.8, and Haiku 4.5. ` +
-      `When building AI applications, default to the latest and most capable Claude models.\n` +
-      `Git status:\nclean`;
-    const cap = await driveAnthropic(
-      anthropicBody({ slabChars: 80_000, sysSuffix: env, turns: turns(4, 20) }),
-    );
-    cap.restore();
-
-    const bodyText = cap.main[0]!.body;
-    const sys = JSON.parse(bodyText).system;
-    const sysStr = Array.isArray(sys)
-      ? sys.map((s: any) => s?.text ?? '').join('\n')
-      : String(sys ?? '');
-    const msgs = JSON.parse(bodyText).messages as Array<{ role: string; content: unknown }>;
-    const lastUser = [...msgs].reverse().find((x) => x.role === 'user')!;
-    const lastUserStr = Array.isArray(lastUser.content)
-      ? lastUser.content.map((c: any) => (c?.type === 'text' ? c.text : '')).join('\n')
-      : String(lastUser.content ?? '');
-
-    // Identity/catalog lines: gone from the relocated block — and not moved
-    // back into system either (they'd cache-bust the anchored prefix there).
-    for (const needle of [
-      'You are powered by',
-      'exact model ID is',
-      'most recent Claude models',
-      'default to the latest and most capable',
-    ]) {
-      expect(lastUserStr).not.toContain(needle);
-      expect(sysStr).not.toContain(needle);
-    }
-    // Non-identity env lines still reach the model on the live tail.
-    expect(lastUserStr).toContain('# Environment');
-    expect(lastUserStr).toContain('Working directory: /repo');
-    expect(lastUserStr).toContain('Git status:\nclean');
+    expect(sysText(cap2.main[0]!.body)).toContain('modified: src/pricing.ts');
+    expect(sysText(cap1.main[0]!.body)).toContain('Git status:\nclean');
+    expect(sysText(cap2.main[0]!.body)).toContain('# Environment');
+    // The caller's message stream is never rewritten: no env text, and above
+    // all no synthetic <system-reminder>, is appended to the user's turn.
+    expect(lastUserText(cap2.main[0]!.body)).not.toContain('# Environment');
+    expect(lastUserText(cap2.main[0]!.body)).not.toContain('modified: src/pricing.ts');
+    expect(lastUserText(cap2.main[0]!.body)).not.toContain('<system-reminder>');
+    expect(lastUserText(cap2.main[0]!.body)).not.toContain('relocated by pxpipe');
   });
 
   it('FIRST COLLAPSE (turn-2 rewrite): no frozen chunk yet → anchor stays on the SLAB image', async () => {

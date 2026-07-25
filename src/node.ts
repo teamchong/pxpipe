@@ -1135,7 +1135,6 @@ async function main(): Promise<void> {
       }
       // Terse human-readable console line.
       const extra: string[] = [];
-      if (e.info?.reminderImgs) extra.push(`rem+${e.info.reminderImgs}`);
       if (e.info?.toolResultImgs) extra.push(`tr+${e.info.toolResultImgs}`);
       const extraTag = extra.length > 0 ? ` (${extra.join(' ')})` : '';
       const tag = e.info?.compressed

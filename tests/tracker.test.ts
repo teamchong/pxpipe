@@ -33,7 +33,6 @@ describe('toTrackEvent', () => {
         dynamicChars: 500,
         dynamicBlockCount: 2,
         systemSha8: 'a1b2c3d4',
-        claudeMdSha8: 'cafebabe',
         firstUserSha8: 'deadbeef',
         unknownStaticTags: ['recent_files'],
         env: {
@@ -67,7 +66,6 @@ describe('toTrackEvent', () => {
     expect(out.dynamic_chars).toBe(500);
     expect(out.dynamic_block_count).toBe(2);
     expect(out.system_sha8).toBe('a1b2c3d4');
-    expect(out.claude_md_sha8).toBe('cafebabe');
     expect(out.first_user_sha8).toBe('deadbeef');
     expect(out.unknown_static_tags).toEqual(['recent_files']);
     expect(out.cwd).toBe('/Users/me/code/pp');

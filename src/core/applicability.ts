@@ -78,6 +78,19 @@ export function setAllowedModelBases(list: readonly string[] | null): void {
   runtimeModelBases = list === null ? null : list.map((s) => s.trim()).filter(Boolean);
 }
 
+/** Gateways qualify ids with routing segments:
+ *
+ *    google/gemini-3.6-flash
+ *    workers-ai/@cf/moonshotai/kimi-k3
+ *
+ *  The vendor picks the upstream, not the reader, so scope matching also
+ *  compares the segment after the last slash. Otherwise PXPIPE_MODELS entries
+ *  never match behind a gateway. */
+function unqualifiedModelId(base: string): string | null {
+  const slash = base.lastIndexOf('/');
+  return slash >= 0 ? base.slice(slash + 1) : null;
+}
+
 /** Membership test against the single allowed scope. Matches exact base or `-suffix`
  *  alias; [variant] tags stripped first. */
 function isAllowed(model: string | null | undefined): boolean {
@@ -87,9 +100,11 @@ function isAllowed(model: string | null | undefined): boolean {
   // (e.g. an unmeasured Gemini sibling falling through to the OpenAI fallback).
   // Which ids those are is profile-table knowledge, not a rule maintained here.
   if (isMisresolvedModelId(base)) return false;
+  const unqualified = unqualifiedModelId(base);
   return allowedModelBases().some((b) => {
     const target = b.toLowerCase();
-    return base === target || base.startsWith(`${target}-`) || base === `google/${target}`;
+    const hit = (id: string): boolean => id === target || id.startsWith(`${target}-`);
+    return hit(base) || (unqualified !== null && hit(unqualified));
   });
 }
 

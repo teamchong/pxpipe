@@ -318,6 +318,17 @@ const FAMILY_ID_GUARDS: ReadonlyArray<{ mentions: RegExp; matches: (m: string) =
   { mentions: /grok/, matches: isGrokModel },
 ];
 
+/** True when the operator declared this id in PXPIPE_GPT_PROFILES. The guards
+ *  above catch implicit fallback to another provider's formula; an explicit
+ *  declaration supplies geometry and vision cost, so it clears them. */
+function hasDeclaredProfile(m: string): boolean {
+  const env = envProfiles();
+  if (env.size === 0) return false;
+  const ids = candidateIds(m);
+  for (const k of env.keys()) if (ids.some((id) => id.startsWith(k))) return true;
+  return false;
+}
+
 /**
  * True when an id NAMES a known provider family but does not match that
  * family's profile test — for example `gemini-3.6-pro`, when 3.6 Flash is the
@@ -332,7 +343,14 @@ const FAMILY_ID_GUARDS: ReadonlyArray<{ mentions: RegExp; matches: (m: string) =
  */
 export function isMisresolvedModelId(model: string | null | undefined): boolean {
   const m = (model ?? '').toLowerCase();
-  return FAMILY_ID_GUARDS.some((g) => g.mentions.test(m) && !g.matches(m));
+  if (hasDeclaredProfile(m)) return false;
+  // Must cover every spelling resolveGptProfile() tries, or guard and resolver
+  // disagree: `openrouter/gemini-3.6-flash` resolves to the measured Gemini
+  // profile via its unqualified id, so it must not be refused here.
+  const ids = candidateIds(m);
+  return FAMILY_ID_GUARDS.some(
+    (g) => ids.some((id) => g.mentions.test(id)) && !ids.some((id) => g.matches(id)),
+  );
 }
 
 function resolveBuiltin(m: string): GptModelProfile {
@@ -492,22 +510,38 @@ function envProfiles(): Map<string, GptModelProfile> {
   return envMap;
 }
 
+/** Vendor segments select an upstream, not a geometry, so both spellings of an
+ *  id must resolve to one profile — otherwise `moonshotai/kimi-k3` skips its measured
+ *  entry and lands on DEFAULT_GPT_PROFILE's OpenAI tile math. Mirrors
+ *  unqualifiedModelId() in applicability.ts. */
+function candidateIds(m: string): string[] {
+  const slash = m.lastIndexOf('/');
+  return slash >= 0 ? [m, m.slice(slash + 1)] : [m];
+}
+
 export function resolveGptProfile(model: string | null | undefined): GptModelProfile {
   // Match applicability.ts: bracketed transport variants (for example [1m])
   // do not define a different visual reader profile.
   const m = (model ?? '').toLowerCase().replace(/\[[^\]]*\]/g, '');
-  if (isGeminiModel(m)) return resolveGeminiProfile();
+  const ids = candidateIds(m);
+  if (ids.some(isGeminiModel)) return resolveGeminiProfile();
   const env = envProfiles();
   if (env.size > 0) {
     let best: GptModelProfile | undefined;
     let bestLen = -1;
     for (const [k, p] of env) {
-      if (m.startsWith(k) && k.length > bestLen) {
-        best = p;
-        bestLen = k.length;
+      // Longest matching key wins. Equal-length keys fall to env insertion
+      // order, not candidate order — the outer loop is over keys.
+      for (const id of ids) {
+        if (id.startsWith(k) && k.length > bestLen) {
+          best = p;
+          bestLen = k.length;
+        }
       }
     }
     if (best) return best;
   }
-  return resolveBuiltin(m);
+  const qualified = ids.length > 1 ? resolveBuiltin(ids[0]!) : undefined;
+  if (qualified && qualified !== DEFAULT_GPT_PROFILE) return qualified;
+  return resolveBuiltin(ids[ids.length - 1]!);
 }

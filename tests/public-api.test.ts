@@ -34,7 +34,11 @@ describe('public library API', () => {
     expect(isPxpipeSupportedModel('claude-fable-5-high')).toBe(true);
     expect(isPxpipeSupportedModel('google/gemini-3.6-flash')).toBe(true);
     expect(isPxpipeSupportedModel('gemini-3.6-flash-preview')).toBe(false);
-    expect(isPxpipeSupportedModel('untrusted/google/gemini-3.6-flash')).toBe(false);
+    // Any prefix depth is stripped to the last segment, because real gateway
+    // ids nest more than one level (`workers-ai/@cf/moonshotai/kimi-k3`). The
+    // vendor segments pick an upstream, not a geometry, so they do not gate
+    // scope — an unrecognized prefix in front of a known id still matches.
+    expect(isPxpipeSupportedModel('untrusted/google/gemini-3.6-flash')).toBe(true);
     // Opus 5 IS in the default scope (applicability.ts :: DEFAULT_MODEL_BASES), so it
     // ships compressed with no opt-in. Its dense-hex score is still unmeasured
     // (README "—") — the same axis that excluded Opus 4.8 at 0/15.

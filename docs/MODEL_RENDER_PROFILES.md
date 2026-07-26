@@ -4,6 +4,16 @@ The endpoint is a wire protocol, not a rendering profile. Claude, GPT, and Grok
 can all arrive on `/v1/responses`; pxpipe resolves geometry and vision billing
 from the model id.
 
+A gateway may prefix that wire path with one routing segment and may qualify the
+model id with vendor segments. Both are recognized: `/compat/chat/completions`
+and `/grok/v1/responses` are read as the OpenAI shapes they are (one leading
+path segment is stripped), and the profile lookup tries the full id then its
+bare final segment, so `moonshotai/kimi-k3` and
+`workers-ai/@cf/moonshotai/kimi-k3` both resolve the same as `kimi-k3` — vendor
+segments pick an upstream, not a
+geometry. Prefix recognition does not move routing — a provider-prefixed path
+still forwards to the passthrough upstream.
+
 | model rule | default | cell | columns | max height | evidence |
 |---|:---:|---|---:|---:|---|
 | `claude-*` / `anthropic-*` | yes | Spleen 5×8 | 312 | 728 px | established Claude suites |
@@ -53,3 +63,43 @@ PXPIPE_GPT_PROFILES='{"gpt-5.6-sol":{"stripCols":120}}'
 
 The profitability gate uses the same resolved profile as the renderer, so a
 style or geometry override cannot leave cost prediction on stale dimensions.
+
+## Unmeasured families
+
+An id that names a family pxpipe HAS measured, but does not match any of that
+family's profiles — an unmeasured Gemini or Grok sibling — is refused by
+`isMisresolvedModelId`, and the request passes through as text. Such an id would
+otherwise fall through to `DEFAULT_GPT_PROFILE` and be gated with OpenAI's tile
+math, i.e. priced with the wrong provider's formula.
+
+An id that names no known family at all (anything reached through a gateway's
+OpenAI-compatible route — Kimi K3 on Cloudflare is the example this repo has
+run) is NOT refused. It resolves to
+`DEFAULT_GPT_PROFILE` and is gated with OpenAI's tile math as an approximation.
+`PXPIPE_MODELS` is the only gate: listing such a model is the operator asserting
+it is worth imaging. Two consequences worth stating plainly:
+
+- The savings figure is an approximation, not a measurement. If tile math
+  overstates the model's real image cost, the gate declines transforms that
+  would have paid off; if it understates, you take a small loss.
+- Nothing checks that the model can accept images at all. A text-only model
+  will reject an imaged request outright — a 400 on the first compressed call,
+  not a silent degradation.
+
+To replace the approximation with real numbers, declare the geometry and vision
+cost yourself:
+
+```bash
+PXPIPE_MODELS=claude-fable-5,kimi-k3
+PXPIPE_GPT_PROFILES='{"kimi-k3":{"vision":{"regime":"mpix","tokensPerMegapixel":1000},"stripCols":152,"maxHeightPx":1932}}'
+```
+
+The `tokensPerMegapixel` above is a **placeholder, not a measurement** — read
+the real image-token rule off your provider's billing docs, or measure it by
+sending one known-size image and reading the reported input tokens. A wrong
+number here does not corrupt output; it corrupts the profitability gate and the
+dashboard's savings figure, which is worse, because both will look confident.
+
+Declaring a cost says nothing about whether the model can *read* dense imaged
+text. Verify that separately before trusting a compressed session — see
+[eval/](../eval) for the harnesses used on the shipped profiles.

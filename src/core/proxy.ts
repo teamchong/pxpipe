@@ -221,6 +221,11 @@ function withClientDisconnect(
   });
 }
 
+/** Cap on bodies buffered only to sniff a model name, on paths pxpipe does not
+ *  transform. Chat requests naming a model are far below this; uploads that blow
+ *  past it stream through unbuffered. */
+const MODEL_SNIFF_MAX_BYTES = 1 << 20;
+
 /** Read the actual top-level `model` field. The body is already buffered for
  * transformation, so parsing it is both safer and simpler than a prefix regex
  * (which could mistake `metadata.model` for the routing model). */
@@ -804,14 +809,27 @@ function isProviderPrefixedPath(pathname: string): boolean {
   return PASSTHROUGH_PREFIXES.some((prefix) => pathname.startsWith(prefix));
 }
 
+/** One optional gateway/provider segment, then an optional `/v1`, before the
+ *  wire-shape suffix:
+ *
+ *    /v1/chat/completions
+ *    /openai/v1/chat/completions
+ *    /compat/chat/completions    AI Gateway's OpenAI-compatible route
+ *    /grok/chat/completions
+ *
+ *  Wire shape only: whether the body is OpenAI-shaped enough to parse a model
+ *  out of. Routing stays with isProviderPrefixedPath/isCanonicalOpenAIPath
+ *  above, so a prefixed path still goes to passthroughUpstream. */
+const PROVIDER_SEGMENT = String.raw`(?:\/[a-z0-9][a-z0-9._-]*)?(?:\/v1)?`;
+const OPENAI_CHAT_PATH = new RegExp(`^${PROVIDER_SEGMENT}\\/chat\\/completions$`);
+const OPENAI_RESPONSES_PATH = new RegExp(`^${PROVIDER_SEGMENT}\\/responses$`);
+
 function isOpenAIChatPath(pathname: string): boolean {
-  return pathname === '/v1/chat/completions' || pathname === '/openai/v1/chat/completions';
+  return OPENAI_CHAT_PATH.test(pathname);
 }
 
 function isOpenAIResponsesPath(pathname: string): boolean {
-  return pathname === '/v1/responses'
-    || pathname === '/openai/v1/responses'
-    || pathname === '/openai/responses';
+  return OPENAI_RESPONSES_PATH.test(pathname);
 }
 
 function isCanonicalOpenAIPath(pathname: string, headers: Headers, hasOpenAIKey: boolean): boolean {
@@ -1297,6 +1315,31 @@ export function createProxy(config: ProxyConfig = {}) {
           status: 502,
           headers: { 'content-type': 'application/json' },
         });
+      }
+    } else if (req.method === 'POST') {
+      // The model lives in the body, not the path, so read it here too or the
+      // dashboard row has a blank Model and token columns. Label only: the body
+      // is forwarded byte-for-byte, no transform, no baseline probe, no
+      // accounting change. Never overwrite a model already recovered from the
+      // path — Google routes name it there and carry no body `model`.
+      //
+      // This route also carries uploads and audio, so buffer only what can
+      // plausibly be a JSON request naming a model: declared JSON, declared
+      // length under the cap. Anything else streams and shows a blank Model, as
+      // before. A missing content-length is not evidence of a big body —
+      // chunked clients omit it — so only an explicit over-cap declaration
+      // disqualifies.
+      const declaredType = req.headers.get('content-type') ?? '';
+      const declaredLength = Number(req.headers.get('content-length') ?? NaN);
+      const worthBuffering =
+        declaredType.toLowerCase().includes('json') &&
+        !(Number.isFinite(declaredLength) && declaredLength > MODEL_SNIFF_MAX_BYTES);
+      if (worthBuffering) {
+        const bodyIn = new Uint8Array(await req.arrayBuffer());
+        requestModel ??= readModelField(bodyIn) ?? undefined;
+        bodyOut = bodyIn;
+      } else {
+        bodyOut = req.body; // pass through unchanged, model stays unknown
       }
     } else {
       bodyOut = req.body; // pass through unchanged

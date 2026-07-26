@@ -40,12 +40,6 @@ import { countTokens as o200kCountTokens } from 'gpt-tokenizer/encoding/o200k_ba
  *  illegible — that profile is Anthropic-only. */
 const GPT_HISTORY_COLS = 152;
 
-// GPT vision latency grows with physical image count/bytes, not just billed tokens.
-// Long OpenCode sessions can otherwise turn old history into 80+ images: token-cheap
-// but slow enough that gpt-5.5 times out before first token. When this cap trips,
-// callers leave the old history as text rather than dropping or de-prioritizing it.
-const GPT_HISTORY_MAX_IMAGES = 32;
-
 /** Break-even gate predicate, injected to avoid a circular import with openai.ts.
  *  Receives the full string (not length) so the renderer's row-aware image-count
  *  estimate sees real newlines — history text is newline-heavy. */
@@ -125,7 +119,7 @@ export const GPT_HISTORY_DEFAULTS: GptHistoryOptions = {
   // strip — do NOT re-link to render.ts MAX_HEIGHT_PX (Anthropic's 1568/1.15 MP clamp).
   maxHeightPx: GPT_MAX_HEIGHT_PX,
   style: DEFAULT_GPT_PROFILE.style,
-  maxImages: GPT_HISTORY_MAX_IMAGES,
+  maxImages: DEFAULT_GPT_PROFILE.history.maxImages,
   reflow: true,
 };
 

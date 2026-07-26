@@ -36,6 +36,12 @@ export const BASE_STYLE: GptRenderStyle = {
 };
 
 export const BASE_HISTORY: GptHistoryProfile = {
+  // Not a provider limit — no vendor documents a per-request image count we come
+  // near. This is our own latency budget: vision latency grows with physical image
+  // count/bytes, not just billed tokens, and long OpenCode sessions can turn old
+  // history into 80+ images — token-cheap but slow enough that the model times out
+  // before first token. When the cap trips, callers leave the old history as text
+  // rather than dropping or de-prioritizing it, so tripping it is never lossy.
   maxImages: 32,
   keepTail: 6,
   keepRecentPairs: 6,

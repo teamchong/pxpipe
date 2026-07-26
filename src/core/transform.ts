@@ -154,17 +154,34 @@ const DEFAULTS: Required<TransformOptions> = {
  * block: the endpoint answers an unclassified request with an opaque
  * `429 rate_limit_error: "Error"` even when the account has quota left (#149).
  *
- * Which identity ships depends on the entrypoint, not the product:
- * `cc_entrypoint=cli` (terminal) sends the CLI line, while `sdk-cli` — used by
- * `claude -p` and the VS Code extension — sends the Agent SDK line.
+ * Which identity ships depends on the entrypoint, not the product. Claude Code
+ * 2.1.220 picks one of three:
+ *
+ *   if (vertex) return CLI;
+ *   if (nonInteractive) return appendSystemPrompt ? CLI_WITHIN_SDK : AGENT_SDK;
+ *   return CLI;
+ *
+ * so the terminal sends the CLI line, `claude -p` / the VS Code extension /
+ * Claude Desktop's `stream-json` mode send the Agent SDK line, and adding
+ * `--append-system-prompt` to any of those switches to the CLI-within-SDK line.
  */
 export const CLAUDE_CODE_OAUTH_IDENTITY =
   "You are Claude Code, Anthropic's official CLI for Claude.";
 
+export const CLAUDE_CODE_WITHIN_SDK_OAUTH_IDENTITY =
+  "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.";
+
 export const CLAUDE_AGENT_SDK_OAUTH_IDENTITY =
   "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 
-const OAUTH_IDENTITIES = [CLAUDE_CODE_OAUTH_IDENTITY, CLAUDE_AGENT_SDK_OAUTH_IDENTITY];
+/** Longest first: CLAUDE_CODE_OAUTH_IDENTITY is a prefix of the within-SDK line,
+ *  so a shorter-first `startsWith` scan would match it and emit a truncated
+ *  identity, leaving `, running within the Claude Agent SDK.` to be imaged. */
+const OAUTH_IDENTITIES = [
+  CLAUDE_CODE_OAUTH_IDENTITY,
+  CLAUDE_CODE_WITHIN_SDK_OAUTH_IDENTITY,
+  CLAUDE_AGENT_SDK_OAUTH_IDENTITY,
+].sort((a, b) => b.length - a.length);
 
 // --- per-block break-even check ---
 //

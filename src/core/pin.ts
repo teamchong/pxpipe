@@ -42,7 +42,21 @@ const PIN_TOTAL_MAX_CHARS = 2000;
  * of copying: the rewrite stays a pure function of the message, so the protected
  * prefix remains byte-stable turn to turn, exactly like demoteProtectedHeadText.
  */
-const PIN_CMD_RE = /^[ \t]*@pxpipe[ \t]+(pin|unpin)\b[ \t]*(.*?)[ \t]*$/;
+const PIN_CMD_RE = /^@pxpipe[ \t]+(pin|unpin)\b(.*)$/;
+
+/**
+ * Parse one line as a pin command. Returns null when it isn't one.
+ *
+ * The surrounding whitespace is trimmed in JS rather than in the pattern. The
+ * obvious `^[ \t]*...[ \t]*(.*?)[ \t]*$` is quadratic: on a line of many tabs
+ * the leading, lazy, and trailing groups can all claim the same run, so the
+ * engine retries every split before failing. Prompt text reaches this on every
+ * line of every message, so it stays linear.
+ */
+function matchPinCmd(line: string): { verb: string; rest: string } | null {
+  const m = PIN_CMD_RE.exec(line.trim());
+  return m ? { verb: m[1]!, rest: m[2]!.trim() } : null;
+}
 
 /** Leading `<system-reminder>` run — the harness's CLAUDE.md envelope. */
 const LEADING_REMINDER_RE = /^\s*<system-reminder>[\s\S]*?<\/system-reminder>/;
@@ -106,13 +120,19 @@ export function foldPins(messages: Message[]): Pin[] {
   messages.forEach((m, idx) => {
     if (m.role !== 'user') return;
     for (const { line, source, path } of pinLines(m, idx)) {
-      const cmd = PIN_CMD_RE.exec(line);
+      const cmd = matchPinCmd(line);
       if (!cmd) continue;
-      if (cmd[1] === 'unpin') {
-        applyUnpin(pins, cmd[2]!.trim());
+      if (cmd.verb === 'unpin') {
+        applyUnpin(pins, cmd.rest);
         continue;
       }
-      const text = cmd[2]!.trim().slice(0, PIN_MAX_CHARS);
+      const raw = cmd.rest;
+      // Mark the cut. The source line is stripped from the outbound copy, so a
+      // severed rule reads to the model as a whole one — "do X unless Y" becomes
+      // "do X" — while the user's own transcript still shows the full text.
+      const text = raw.length > PIN_MAX_CHARS
+        ? `${raw.slice(0, PIN_MAX_CHARS)}… [pxpipe: pin truncated]`
+        : raw;
       if (source === 'file') {
         // A file is a document, not a list of instructions. Its blank lines and
         // its repeated lines ARE the format: a fence closes with the same ```
@@ -205,9 +225,19 @@ function* pinLines(
       const source: PinSource = leadingRun ? 'file' : 'session';
       // Per block, not per message: one leading run can inline several files,
       // and each pin has to remember which one to send the user back to.
+      let consumed = 0;
       for (const block of reminderBlocks(text)) {
+        consumed += block.length;
         const path = source === 'file' ? filePathOf(block) : undefined;
         for (const line of block.split('\n')) yield { line, source, path };
+      }
+      // The harness packs the envelope and the user's own typed prompt into the
+      // SAME block. Stopping at the run would strip a pin typed in the first
+      // turn (stripLines is unconditional) without ever folding it.
+      const rest = text.slice(consumed);
+      if (rest.trim()) {
+        leadingRun = false;
+        for (const line of rest.split('\n')) yield { line, source: 'session' };
       }
       continue;
     }
@@ -254,10 +284,14 @@ function isCommandOnlyTurn(m: Message): boolean {
     if ((blk as { type?: string }).type !== 'text') return false; // tool_result/image: real work
     const raw = (blk as TextBlock).text;
     if (typeof raw !== 'string') return false;
+    // The CLAUDE.md envelope rides in the same block as the user's first typed
+    // line. Stripping reminders before the test would classify that turn as
+    // command-only and drop the project's instructions from every later request.
+    if (LEADING_REMINDER_RE.test(raw)) return false;
     const text = raw.replace(ANY_REMINDER_RE, '');
     for (const line of text.split('\n')) {
       if (!line.trim()) continue;
-      if (!PIN_CMD_RE.test(line)) return false;
+      if (!matchPinCmd(line)) return false;
       sawCommand = true;
     }
   }
@@ -299,6 +333,16 @@ export function stripPinCommands(messages: Message[]): Message[] {
       continue;
     }
     const stripped = stripFromMessage(m);
+    if (stripped === null) {
+      // Commands and nothing else, with no confirmation to pair with. Keeping
+      // the original would send `@pxpipe pin ...` to the model as if it were a
+      // request; dropping it alone would break role alternation, so it goes
+      // with the reply that answered it. As the final turn there is no reply
+      // yet and proxy.ts answers locally, so leave it for that path.
+      if (messages[i + 1]?.role === 'assistant') { i++; continue; }
+      out.push(m);
+      continue;
+    }
     out.push(stripped ?? m);
   }
   return out;
@@ -308,11 +352,11 @@ export function stripPinCommands(messages: Message[]): Message[] {
  *  Returns the original when stripping would leave the message with no content —
  *  an empty `content` is rejected by the API, and dropping a lone message would
  *  break role alternation. */
-function stripFromMessage(m: Message): Message | undefined {
+function stripFromMessage(m: Message): Message | null | undefined {
   if (typeof m.content === 'string') {
     const text = stripLines(m.content);
     if (text === m.content) return undefined;
-    return text.trim() ? { ...m, content: text } : undefined;
+    return text.trim() ? { ...m, content: text } : null;
   }
   if (!Array.isArray(m.content)) return undefined;
   let changed = false;
@@ -324,8 +368,18 @@ function stripFromMessage(m: Message): Message | undefined {
         const text = stripLines(tb.text);
         if (text !== tb.text) {
           changed = true;
-          // Preserve cache_control: dropping the block would move the breakpoint.
-          if (!text.trim() && tb.cache_control === undefined) continue;
+          if (!text.trim()) {
+            // `{text: ''}` is rejected by the API, so the block cannot stay. Its
+            // cache_control can't just go with it — dropping a breakpoint moves
+            // the cache boundary — so hand it to the block in front.
+            const prev = blocks[blocks.length - 1] as TextBlock | undefined;
+            if (tb.cache_control !== undefined && prev) {
+              blocks[blocks.length - 1] = { ...prev, cache_control: tb.cache_control };
+            } else if (tb.cache_control !== undefined) {
+              blocks.push(blk); // nothing in front to hold it: leave as sent
+            }
+            continue;
+          }
           blocks.push({ ...tb, text });
           continue;
         }
@@ -333,14 +387,15 @@ function stripFromMessage(m: Message): Message | undefined {
     }
     blocks.push(blk);
   }
-  if (!changed || blocks.length === 0) return undefined;
+  if (!changed) return undefined;
+  if (blocks.length === 0) return null;
   return { ...m, content: blocks };
 }
 
 function stripLines(text: string): string {
   return text
     .split('\n')
-    .filter((line) => !PIN_CMD_RE.test(line))
+    .filter((line) => !matchPinCmd(line))
     .join('\n');
 }
 
@@ -355,7 +410,9 @@ export function pinBlockText(pins: Pin[]): string {
   let budget = PIN_TOTAL_MAX_CHARS;
   const lines: string[] = [];
   for (const p of pins) {
-    if (budget - p.text.length < 0) break;
+    // Skip, don't stop: one long file excerpt early in a big CLAUDE.md would
+    // otherwise swallow every session pin the user typed this turn.
+    if (budget - p.text.length < 0) continue;
     budget -= p.text.length;
     // Session pins are a list the user dictated one line at a time, so a bullet
     // is what they meant. A file excerpt is markdown the user already formatted;
@@ -373,6 +430,20 @@ export function pinBlockText(pins: Pin[]): string {
     ...lines,
     '</system-reminder>',
   ].join('\n');
+}
+
+/**
+ * True when appendPinBlock has somewhere to land.
+ *
+ * Pins are MOVED, not copied, so the strip and the append are one operation: an
+ * assistant prefill as the final message (nothing may follow it) or a final user
+ * turn with content we cannot push onto means the block has no home, and
+ * stripping anyway would delete the user's rules from the request entirely.
+ */
+export function canAppendPinBlock(messages: Message[]): boolean {
+  const last = messages[messages.length - 1];
+  if (!last || last.role !== 'user') return false;
+  return typeof last.content === 'string' || Array.isArray(last.content);
 }
 
 /** Append the pin block to the final user message. Returns chars added. */
@@ -484,8 +555,8 @@ function liveVerb(m: Message | undefined): PinVerb {
     const text = (blk as TextBlock)?.text;
     if (typeof text !== 'string') continue;
     for (const line of text.split('\n')) {
-      const cmd = PIN_CMD_RE.exec(line);
-      if (cmd) verb = cmd[1] as PinVerb;
+      const cmd = matchPinCmd(line);
+      if (cmd) verb = cmd.verb as PinVerb;
     }
   }
   return verb;

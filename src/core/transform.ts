@@ -36,7 +36,7 @@ import {
   renderCellWidth,
   type RenderStyle,
 } from './render.js';
-import { appendPinBlock, foldPins, stripPinCommands, type Pin } from './pin.js';
+import { appendPinBlock, canAppendPinBlock, foldPins, stripPinCommands, type Pin } from './pin.js';
 import { factSheetText } from './factsheet.js';
 import { stripSchemaDescriptions, schemaHasStructure } from './schema-strip.js';
 import { bytesToBase64 } from './png.js';
@@ -568,6 +568,8 @@ export interface TransformInfo {
    *  cost. Both absent when nothing is pinned. Uncached by construction (the
    *  block lands after every breakpoint), so these chars are paid every turn. */
   pinChars?: number;
+  /** Pin folding threw and was skipped. The body still goes out unpinned. */
+  pinError?: string;
   /** OpenAI Responses only: local o200k decomposition of the ORIGINAL request
    *  before pxpipe rewrites it. No provider count_tokens call. Categories are
    *  mutually exclusive text-token estimates; imageParts counts native images. */
@@ -1661,15 +1663,25 @@ export async function transformRequest(
   //    `pinsRewrote` is what the early-exit paths below test: when either the
   //    strip or the tail append changed `req`, the original bytes no longer
   //    describe the request and must not be the ones forwarded.
+  //    Strip and append are one move, so both are skipped unless the tail can
+  //    take the block; otherwise the strip would delete the rules outright.
   let pins: Pin[] = [];
   let pinsRewrote = false;
-  if (Array.isArray(req.messages)) {
-    pins = foldPins(req.messages);
-    const stripped = stripPinCommands(req.messages);
-    pinsRewrote = pins.length > 0
-      || stripped.length !== req.messages.length
-      || stripped.some((m, i) => m !== req.messages![i]);
-    req.messages = stripped;
+  if (Array.isArray(req.messages) && canAppendPinBlock(req.messages)) {
+    try {
+      pins = foldPins(req.messages);
+      const stripped = stripPinCommands(req.messages);
+      pinsRewrote = pins.length > 0
+        || stripped.length !== req.messages.length
+        || stripped.some((m, i) => m !== req.messages![i]);
+      req.messages = stripped;
+    } catch (e) {
+      // A malformed message must not fail the request: pins are an optimization,
+      // the untouched body is still valid.
+      pins = [];
+      pinsRewrote = false;
+      info.pinError = String((e as Error)?.message ?? e);
+    }
   }
 
   // 1. Pull system text out. Split into:

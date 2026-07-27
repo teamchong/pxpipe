@@ -28,6 +28,12 @@ export interface Summary {
    *  from the text path by rendering to PNG. */
   origCharsTotal: number;
   imageBytesTotal: number;
+  /** Sum of pin_chars: text pxpipe moved out of the cacheable prefix and
+   *  re-emitted as the tail footer. Paid at full input price every turn, so it
+   *  is a recurring charge against the one-time imaging win above. */
+  pinCharsTotal: number;
+  /** Requests that carried a pin footer. Zero means pins cost nothing. */
+  pinEvents: number;
   /** Aggregated Anthropic token usage. */
   inputTokensTotal: number;
   outputTokensTotal: number;
@@ -59,6 +65,8 @@ export function newSummary(): Summary {
     passthrough: 0,
     origCharsTotal: 0,
     imageBytesTotal: 0,
+    pinCharsTotal: 0,
+    pinEvents: 0,
     inputTokensTotal: 0,
     outputTokensTotal: 0,
     cacheCreateTokensTotal: 0,
@@ -87,6 +95,13 @@ export function fold(s: Summary, ev: TrackEvent): Summary {
   } else if (ev.compressed === false) {
     s.passthrough++;
     if (ev.reason) s.skipReasons.set(ev.reason, (s.skipReasons.get(ev.reason) ?? 0) + 1);
+  }
+
+  // Outside the compressed branch on purpose: the pin footer is appended on
+  // both the compressed and passthrough paths, so it is charged either way.
+  if (typeof ev.pin_chars === 'number' && ev.pin_chars > 0) {
+    s.pinCharsTotal += ev.pin_chars;
+    s.pinEvents++;
   }
 
   if (typeof ev.duration_ms === 'number') s.durationMs.push(ev.duration_ms);
@@ -181,6 +196,15 @@ export function renderTextReport(s: Summary): string {
   const ratio =
     s.origCharsTotal > 0 ? (s.imageBytesTotal / s.origCharsTotal).toFixed(3) : '—';
   lines.push(`  bytes/char ratio:   ${ratio}`);
+  if (s.pinEvents > 0) {
+    const perTurn = Math.round(s.pinCharsTotal / s.pinEvents);
+    lines.push(
+      `  pin footer:         ${fmtN(s.pinCharsTotal)} chars over ${fmtN(s.pinEvents)} req (~${fmtN(perTurn)}/req)`,
+    );
+    lines.push(
+      '    moved out of the cached prefix, so charged as fresh input every turn',
+    );
+  }
   lines.push('');
 
   lines.push('Anthropic token usage:');
@@ -299,6 +323,8 @@ export function summaryToJson(s: Summary): Record<string, unknown> {
     passthrough: s.passthrough,
     origCharsTotal: s.origCharsTotal,
     imageBytesTotal: s.imageBytesTotal,
+    pinCharsTotal: s.pinCharsTotal,
+    pinEvents: s.pinEvents,
     inputTokensTotal: s.inputTokensTotal,
     outputTokensTotal: s.outputTokensTotal,
     cacheCreateTokensTotal: s.cacheCreateTokensTotal,

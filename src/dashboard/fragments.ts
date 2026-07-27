@@ -787,6 +787,12 @@ export function renderStatsTableFragment(p: FullStatsPayload): string {
     tr('original chars', numFmt(s.origCharsTotal)) +
     tr('image bytes', numFmt(s.imageBytesTotal)) +
     tr('bytes / char', charRatio) +
+    (s.pinEvents
+      ? tr(
+          'pin footer (uncached)',
+          `${numFmt(s.pinCharsTotal ?? 0)} chars / ${numFmt(s.pinEvents)} req`,
+        )
+      : '') +
     tr('latency p50 / p95', `${numFmt(s.durationP50)} / ${numFmt(s.durationP95)} ms`) +
     tr('first-byte p50 / p95', `${numFmt(s.firstByteP50)} / ${numFmt(s.firstByteP95)} ms`) +
     `</tbody></table>`

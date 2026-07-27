@@ -36,6 +36,13 @@ export interface TrackEvent {
   baseline_imaged_tokens?: number;
   /** Provider-specific estimate of pxpipe-added native text. */
   native_injected_tokens?: number;
+  /** Chars re-emitted as the pin footer on the last user message.
+   *  These are MOVED, not copied: the source lines are stripped from the
+   *  cacheable prefix and re-sent as plain text at the tail, so they are paid
+   *  at full input price every turn instead of cache-read price once. Not part
+   *  of orig_chars or compressed_chars, so any savings figure that ignores it
+   *  overstates the win by this much per turn. */
+  pin_chars?: number;
   /** TEXT chars in the outgoing body (all text blocks, incl. non-compressed tool_results).
    *  With image_pixels, a regression over cold-miss events solves chars_per_token (α) and pixels_per_token (β). */
   outgoing_text_chars?: number;
@@ -217,6 +224,9 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     }
     if (info.outgoingTextChars !== undefined && info.outgoingTextChars > 0) {
       out.outgoing_text_chars = info.outgoingTextChars;
+    }
+    if (info.pinChars !== undefined && info.pinChars > 0) {
+      out.pin_chars = info.pinChars;
     }
     if (info.responsesComposition) {
       out.responses_composition = info.responsesComposition;

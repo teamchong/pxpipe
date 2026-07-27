@@ -20,6 +20,7 @@ import {
   chatCompletionsUrl,
   openAIChatToAnthropicResponse,
 } from './messages-chat-bridge.js';
+import { pinCommandResponse } from './pin.js';
 import { parseGoogleModelFromPath, transformGoogleGenerateContent } from './google.js';
 import { isGeminiModel } from './gemini-model-profiles.js';
 import { resolveGptProfile } from './gpt-model-profiles.js';
@@ -1149,6 +1150,22 @@ export function createProxy(config: ProxyConfig = {}) {
         // Fail-closed: unreadable model → no compression, not a risky guess.
         const model = googleModel ?? readModelField(bodyIn);
         requestModel = model ?? undefined;
+        // A turn whose only content is `@pxpipe pin` / `@pxpipe unpin` is
+        // configuration, not a question. Answer it here: forwarding it would bill
+        // a full prefix to have the model paraphrase a list the proxy already
+        // holds, and the reply would be a guess about state it cannot see.
+        if (isMessages) {
+          const pinReply = pinCommandResponse(bodyIn);
+          if (pinReply) {
+            return new Response(pinReply.body, {
+              status: 200,
+              headers: {
+                'content-type': pinReply.contentType,
+                'cache-control': 'no-cache',
+              },
+            });
+          }
+        }
         // /v1/messages is only a wire schema: Claude Code can target a non-
         // Anthropic model (for example GPT-5.6 Sol). Do not apply Claude's
         // renderer or Anthropic count_tokens merely because the route is

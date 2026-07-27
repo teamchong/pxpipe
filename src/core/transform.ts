@@ -36,6 +36,7 @@ import {
   renderCellWidth,
   type RenderStyle,
 } from './render.js';
+import { appendPinBlock, foldPins, stripPinCommands, type Pin } from './pin.js';
 import { factSheetText } from './factsheet.js';
 import { stripSchemaDescriptions, schemaHasStructure } from './schema-strip.js';
 import { bytesToBase64 } from './png.js';
@@ -563,6 +564,10 @@ export interface TransformInfo {
   /** Total TEXT chars in the outgoing body (system + messages, excluding image base64).
    *  Denominator for empirical chars-per-token regression on cold-miss events. */
   outgoingTextChars?: number;
+  /** User-pinned instructions relocated to the request tail, and the chars that
+   *  cost. Both absent when nothing is pinned. Uncached by construction (the
+   *  block lands after every breakpoint), so these chars are paid every turn. */
+  pinChars?: number;
   /** OpenAI Responses only: local o200k decomposition of the ORIGINAL request
    *  before pxpipe rewrites it. No provider count_tokens call. Categories are
    *  mutually exclusive text-token estimates; imageParts counts native images. */
@@ -1491,6 +1496,19 @@ function approxBlockBytes(blk: ImageBlock): number {
 
 
 /**
+ * Emit the user's pins at the tail, immediately before serialization.
+ *
+ * Last, so nothing the transform does afterwards can bury them again, and after
+ * every cache_control breakpoint, so the appended bytes are always in the
+ * re-read suffix and can never invalidate a cached prefix.
+ */
+function applyPins(req: MessagesRequest, info: TransformInfo, pins: Pin[]): void {
+  if (pins.length === 0 || !Array.isArray(req.messages)) return;
+  const chars = appendPinBlock(req.messages, pins);
+  if (chars > 0) info.pinChars = chars;
+}
+
+/**
  * Run history-image compression on `req.messages` and finalize the body.
  * Called from both the main path AND early-exit paths (below_min_chars,
  * not_profitable) — history collapse must run even when the slab skips.
@@ -1501,6 +1519,7 @@ async function runHistoryCollapseAndFinalize(
   o: Required<TransformOptions>,
   opts: TransformOptions,
   droppedCodepoints: Map<number, number>,
+  pins: Pin[],
 ): Promise<{ body: Uint8Array; info: TransformInfo; collapsed: boolean }> {
   let collapsedFlag = false;
   if (Array.isArray(req.messages) && req.messages.length > 0) {
@@ -1568,6 +1587,7 @@ async function runHistoryCollapseAndFinalize(
       info.historyReason = histInfo.reason;
     }
   }
+  applyPins(req, info, pins);
   info.outgoingTextChars = countOutgoingTextChars(req);
   const outBody = new TextEncoder().encode(JSON.stringify(req));
   return { body: outBody, info, collapsed: collapsedFlag };
@@ -1631,6 +1651,25 @@ export async function transformRequest(
   } catch (e) {
     info.reason = `parse_error: ${(e as Error).message}`;
     return { body, info };
+  }
+
+  // 0. User-pinned instructions. Fold the transcript's pin commands, then remove
+  //    them from the outbound copy — the client's own transcript is untouched, so
+  //    the next request still carries every command and re-derives the same state.
+  //    The surviving pins are re-emitted at the very tail (applyPins, below), after
+  //    every cache breakpoint, where the model reads them last.
+  //    `pinsRewrote` is what the early-exit paths below test: when either the
+  //    strip or the tail append changed `req`, the original bytes no longer
+  //    describe the request and must not be the ones forwarded.
+  let pins: Pin[] = [];
+  let pinsRewrote = false;
+  if (Array.isArray(req.messages)) {
+    pins = foldPins(req.messages);
+    const stripped = stripPinCommands(req.messages);
+    pinsRewrote = pins.length > 0
+      || stripped.length !== req.messages.length
+      || stripped.some((m, i) => m !== req.messages![i]);
+    req.messages = stripped;
   }
 
   // 1. Pull system text out. Split into:
@@ -1788,12 +1827,15 @@ export async function transformRequest(
     // If history collapses, we flip `info.compressed = true` and let the
     // library wrapper return reason='applied'; otherwise this still
     // populates `outgoingTextChars` for the regression denominator.
-    const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints);
+    const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints, pins);
     if (finalized.collapsed) {
       info.compressed = true;
       return { body: finalized.body, info };
     }
-    return { body, info };
+    // `body` is the original bytes. If the pin pass edited `req`, those bytes
+    // describe a request we are no longer sending, so forwarding them would put
+    // the raw `@pxpipe pin` line back and drop the tail block.
+    return { body: pinsRewrote ? finalized.body : body, info };
   }
 
   // Break-even check guards even the slab (rare edge: tiny tool docs + tiny slab < 10k chars).
@@ -1857,12 +1899,15 @@ export async function transformRequest(
     info.reason = `not_profitable (slab=${combined.length} chars)`;
     bumpPassthrough(info, 'not_profitable');
     // Slab not profitable but history may still be collapsable — try before returning.
-    const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints);
+    const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints, pins);
     if (finalized.collapsed) {
       info.compressed = true;
       return { body: finalized.body, info };
     }
-    return { body, info };
+    // `body` is the original bytes. If the pin pass edited `req`, those bytes
+    // describe a request we are no longer sending, so forwarding them would put
+    // the raw `@pxpipe pin` line back and drop the tail block.
+    return { body: pinsRewrote ? finalized.body : body, info };
   }
 
   // Instruction header co-renders into the same PNG (+1.04pp L1 OCR vs baseline;
@@ -2242,6 +2287,7 @@ export async function transformRequest(
     }
     info.droppedCodepointsTop = out;
   }
+  applyPins(req, info, pins);
   info.outgoingTextChars = countOutgoingTextChars(req);
   const outBody = new TextEncoder().encode(JSON.stringify(req));
   return { body: outBody, info };

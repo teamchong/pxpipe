@@ -135,6 +135,8 @@ export interface FullStatsSummary {
   eventsWithBaseline: number;
   origCharsTotal: number;
   imageBytesTotal: number;
+  pinCharsTotal?: number;
+  pinEvents?: number;
   durationP50: number;
   durationP95: number;
   firstByteP50: number;

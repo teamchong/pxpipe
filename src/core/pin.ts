@@ -61,10 +61,32 @@ function matchPinCmd(line: string): { verb: string; rest: string } | null {
 /** Leading `<system-reminder>` run — the harness's CLAUDE.md envelope. */
 const LEADING_REMINDER_RE = /^\s*<system-reminder>[\s\S]*?<\/system-reminder>/;
 
-/** Any reminder, anywhere in a block. The harness appends its own notices (e.g.
- *  "task tools haven't been used recently") to a turn the user typed, so a turn
- *  is command-only by what the *user* wrote, not by what the harness added. */
-const ANY_REMINDER_RE = /<system-reminder>[\s\S]*?<\/system-reminder>/g;
+const REMINDER_OPEN = '<system-reminder>';
+const REMINDER_CLOSE = '</system-reminder>';
+
+/**
+ * Drop every reminder, anywhere in a block. The harness appends its own notices
+ * (e.g. "task tools haven't been used recently") to a turn the user typed, so a
+ * turn is command-only by what the *user* wrote, not by what the harness added.
+ *
+ * Scanned rather than matched with `/<system-reminder>[\s\S]*?<\/…>/g`: under a
+ * lazy body every unterminated open rescans to the end of the string, so a
+ * message carrying many of them costs O(n²). An unterminated open ends the
+ * scan; the rest of the block is text the user can see, so it stays.
+ */
+function stripReminders(text: string): string {
+  let out = '';
+  let at = 0;
+  for (;;) {
+    const open = text.indexOf(REMINDER_OPEN, at);
+    if (open < 0) break;
+    const close = text.indexOf(REMINDER_CLOSE, open + REMINDER_OPEN.length);
+    if (close < 0) break;
+    out += text.slice(at, open);
+    at = close + REMINDER_CLOSE.length;
+  }
+  return out + text.slice(at);
+}
 
 /** Opening marker of a synthesized pin confirmation. We generate these, so the
  *  match is on bytes we control, not a heuristic that could eat a real reply. */
@@ -288,7 +310,7 @@ function isCommandOnlyTurn(m: Message): boolean {
     // line. Stripping reminders before the test would classify that turn as
     // command-only and drop the project's instructions from every later request.
     if (LEADING_REMINDER_RE.test(raw)) return false;
-    const text = raw.replace(ANY_REMINDER_RE, '');
+    const text = stripReminders(raw);
     for (const line of text.split('\n')) {
       if (!line.trim()) continue;
       if (!matchPinCmd(line)) return false;

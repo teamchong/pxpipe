@@ -74,10 +74,13 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
    * `type`, and only an interactive shell has sourced the rc file that defines
    * one. Costs a single shell start at launch.
    */
-  const isShellAlias = (name: string, shell: string, env: NodeJS.ProcessEnv): boolean => {
-    if (name.includes('/')) return false;
+  const shellAliasTarget = (name: string, shell: string, env: NodeJS.ProcessEnv): string | null => {
+    if (name.includes('/')) return null;
     const probe = spawnSync(shell, ['-ic', `type -- ${name}`], { encoding: 'utf8', env });
-    return /\bis (an alias|aliased)\b/.test(probe.stdout ?? '');
+    const match = /\bis (?:an alias for|aliased to)\s+(.+)$/m.exec(probe.stdout ?? '');
+    if (!match) return null;
+    // bash wraps the expansion in `backtick quote'; zsh leaves it bare.
+    return match[1]!.trim().replace(/^`/, '').replace(/'$/, '');
   };
 
   /** Minimal `which`: is this bare name an executable on PATH? */
@@ -94,6 +97,10 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
     }
     return false;
   };
+
+  /** Can this word actually be executed: a path that exists, or a name on PATH. */
+  const isRunnable = (word: string, env: NodeJS.ProcessEnv): boolean =>
+    word.includes('/') ? existsSync(word) : whichSync(word, env);
 
   /** POSIX single-quote: safe for anything except a single quote itself. */
   const shellQuote = (arg: string): string => `'${arg.replaceAll("'", `'\\''`)}'`;
@@ -114,13 +121,22 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
   const spawnResolved = (command: string[], env: NodeJS.ProcessEnv) => {
     const direct = { stdio: 'inherit', env } as const;
     const shell = env.SHELL || '/bin/sh';
-    // An alias can shadow a real binary — `cc` is Apple clang on PATH and a
-    // Claude Code alias in the user's zsh — so PATH alone would silently run
+    // An alias can shadow a real binary: `cc` is Apple clang on PATH and a
+    // Claude Code alias in the user's zsh, so PATH alone would silently run
     // the wrong program. Ask the interactive shell what the word means first.
-    if (!isShellAlias(command[0]!, shell, env)) {
-      if (existsSync(command[0]!) || whichSync(command[0]!, env)) {
-        return spawn(command[0]!, command.slice(1), direct);
-      }
+    const alias = shellAliasTarget(command[0]!, shell, env);
+    // But a stale alias must not shadow a working binary either. An alias
+    // pointing at an uninstalled path (`claude` -> /opt/homebrew/bin/claude
+    // after a move to a node-managed install) would otherwise fail the launch
+    // outright, with a real claude sitting on PATH. An env-assignment prefix
+    // (`FOO=1 claude`) is unverifiable, so it is taken at its word.
+    const aliasWord = alias?.split(/\s+/)[0] ?? '';
+    const aliasUsable = alias !== null && (aliasWord.includes('=') || isRunnable(aliasWord, env));
+    if (alias !== null && !aliasUsable) {
+      console.error(`[pxpipe] warp: ignoring stale alias ${command[0]} → ${aliasWord} (not executable)`);
+    }
+    if (!aliasUsable && isRunnable(command[0]!, env)) {
+      return spawn(command[0]!, command.slice(1), direct);
     }
     console.error(`[pxpipe] warp: resolving ${command[0]} via interactive shell fallback`);
     // The command word is deliberately left unquoted: a shell only expands

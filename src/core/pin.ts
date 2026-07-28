@@ -346,7 +346,7 @@ function filePathOf(block: string): string | undefined {
 }
 
 /** True when this message's only typed content is pin commands. */
-function isCommandOnlyTurn(m: Message): boolean {
+function isCommandOnlyTurn(m: Message, live = false): boolean {
   if (m.role !== 'user') return false;
   const blocks: ContentBlock[] = typeof m.content === 'string'
     ? [{ type: 'text', text: m.content }]
@@ -358,9 +358,12 @@ function isCommandOnlyTurn(m: Message): boolean {
     const raw = (blk as TextBlock).text;
     if (typeof raw !== 'string') return false;
     // The CLAUDE.md envelope rides in the same block as the user's first typed
-    // line. Stripping reminders before the test would classify that turn as
-    // command-only and drop the project's instructions from every later request.
-    if (LEADING_REMINDER_RE.test(raw)) return false;
+    // line, so `pin` as the opening line of a Claude Code session arrives behind
+    // it. Answering that turn locally is safe: nothing is forwarded, and the
+    // client resends message 0 intact on the next request. Rewriting it is not —
+    // the outbound path would drop the whole block and take the project's
+    // instructions with it, so only the live test tolerates the envelope.
+    if (!live && LEADING_REMINDER_RE.test(raw)) return false;
     const text = stripReminders(raw);
     for (const line of text.split('\n')) {
       if (!line.trim()) continue;
@@ -661,8 +664,26 @@ export function pinReplyText(pins: Pin[], verb: PinVerb = 'pin'): string {
  * forwarded normally with the command lines merely stripped.
  */
 export function isPinOnlyRequest(messages: Message[] | undefined): boolean {
-  const last = (messages ?? [])[messages!.length - 1];
-  return !!last && isCommandOnlyTurn(last);
+  const live = liveTurn(messages);
+  return !!live && isCommandOnlyTurn(live, true);
+}
+
+/**
+ * The turn the request is actually asking about. Claude Code appends a
+ * system-role message (its agent-type catalogue) *after* the user's turn, so
+ * the literal last element is client metadata, not work — every cc pin command
+ * went upstream unanswered because of it. Only `system` is skipped: a trailing
+ * tool_result or assistant prefill is real work and must stay on the normal
+ * path, which is what keeps a mid-tool-loop turn from being hijacked.
+ */
+function liveTurn(messages: Message[] | undefined): Message | undefined {
+  const list = messages ?? [];
+  for (let i = list.length - 1; i >= 0; i--) {
+    const m = list[i];
+    if (m && (m as { role?: string }).role === 'system') continue;
+    return m;
+  }
+  return undefined;
 }
 
 /**
@@ -704,7 +725,7 @@ export function pinCommandResponse(
   }
   if (!Array.isArray(req.messages) || !isPinOnlyRequest(req.messages)) return undefined;
   return synthesizeReply(
-    pinReplyText(foldPins(req.messages), liveVerb(req.messages[req.messages.length - 1])),
+    pinReplyText(foldPins(req.messages), liveVerb(liveTurn(req.messages))),
     typeof req.model === 'string' ? req.model : 'pxpipe',
     req.stream === true,
   );

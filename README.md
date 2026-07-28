@@ -57,6 +57,16 @@ normally — pxpipe compresses the *request* only, never the model's output.
 Recent turns stay text; the system prompt, tool docs, and older bulk history
 are imaged.
 
+### `pxpipe warp`
+
+```bash
+pxpipe warp -- claude          # also: cursor-agent, codex, or a shell alias
+```
+
+Same thing without `ANTHROPIC_BASE_URL`, so `/remote-control`, claude.ai
+connectors, and first-party gates keep working. Full instructions in the
+dashboard.
+
 ## Offline export (no proxy)
 
 You can render text, files, or diffs to PNG pages without running the proxy or

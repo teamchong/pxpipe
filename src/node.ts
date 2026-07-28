@@ -7,6 +7,7 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createWarpRuntime } from './warp/index.js';
 import { once } from 'node:events';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -201,6 +202,9 @@ function printHelp(): void {
 Usage:
   pxpipe                run the proxy (no flags)
   pxpipe export [...]   render files/diff to PNG pages + cost report (see pxpipe export --help)
+  pxpipe warp -- CMD    run CMD behind the proxy without a custom base URL, so
+                        client-side first-party gates (/remote-control,
+                        claude.ai connectors) keep working
 
 The proxy compresses eligible tools, schemas, reminders, tool_results,
 and history; tracks events to disk; and measures real saved_pct via
@@ -1023,9 +1027,28 @@ async function main(): Promise<void> {
     await runExport(argv.slice(1));
     return; // server never starts
   }
-  // No subcommands — pxpipe is just the proxy. Stats / sessions / cleanup
-  // tools live in the dashboard (see http://127.0.0.1:${port}/).
-  const opts = parseCli(argv);
+  // `warp` runs an agent behind a CONNECT proxy and redirects its inference
+  // traffic into the pxpipe already running. It starts no proxy of its own, so
+  // it exits through its own branch below rather than falling through here.
+  let warpCommand: string[] | undefined;
+  let cliArgv = argv;
+  if (argv[0] === 'warp') {
+    const sep = argv.indexOf('--');
+    warpCommand = sep < 0 ? [] : argv.slice(sep + 1);
+    cliArgv = argv.slice(1, sep < 0 ? argv.length : sep);
+  }
+  // Stats / sessions / cleanup tools live in the dashboard
+  // (see http://127.0.0.1:${port}/).
+  const opts = parseCli(cliArgv);
+
+  // warp only redirects traffic: it decrypts the agent's TLS and re-points the
+  // inference path at the pxpipe you already have running, so that instance
+  // does the transforming, the tracking and the dashboard. Everything below —
+  // tracker, proxy pipeline, listener — belongs to that instance, not to us.
+  if (warpCommand) {
+    createWarpRuntime({ port: opts.port }).launch(warpCommand);
+    return;
+  }
   // A/B harness passthrough switch (see the `transform` callback below).
   const forcePassthrough = /^(1|true|yes|on)$/i.test(process.env.PXPIPE_DISABLE ?? '');
   if (forcePassthrough) {
@@ -1195,7 +1218,7 @@ async function main(): Promise<void> {
   };
   const handle = createProxy(config);
 
-  const server = createServer((req, res) => {
+  const handleRequest = (req: IncomingMessage, res: ServerResponse): void => {
     Promise.resolve()
       .then(async () => {
         // Local dashboard routes — handled BEFORE the proxy so they never hit
@@ -1228,20 +1251,15 @@ async function main(): Promise<void> {
         if (!res.headersSent) res.statusCode = 500;
         if (!res.writableEnded) res.end();
       });
-  });
+  };
+
+  const server = createServer(handleRequest);
 
   // IPv6 literals need bracket notation to form a valid URL (http://[::1]:47821).
   const displayHost = opts.host.includes(':') ? `[${opts.host}]` : opts.host;
   const isLoopbackHost =
     opts.host === '127.0.0.1' || opts.host === 'localhost' || opts.host === '::1';
-  server.listen(opts.port, opts.host, () => {
-    console.log(`[pxpipe] listening on http://${displayHost}:${opts.port}`);
-    if (!isLoopbackHost) {
-      console.warn(
-        `[pxpipe] bound to ${opts.host}; proxy API is reachable off-host, ` +
-          `but dashboard routes remain loopback-only.`,
-      );
-    }
+  const announce = () => {
     const routes = resolveUpstreams(config);
     console.log(`[pxpipe] anthropic upstream → ${routes.anthropic}`);
     console.log(`[pxpipe] openai upstream → ${routes.openai}`);
@@ -1252,7 +1270,6 @@ async function main(): Promise<void> {
       );
     }
     console.log(`[pxpipe] tracking events → ${opts.eventsFile}`);
-    console.log(`[pxpipe] dashboard → http://127.0.0.1:${opts.port}/`);
     if (opts.captureErrorReqBody) {
       console.warn(
         `[pxpipe] PXPIPE_DEBUG_CAPTURE_4XX=1 — persisting full 4xx request and ` +
@@ -1260,6 +1277,18 @@ async function main(): Promise<void> {
           `Debugging only.`,
       );
     }
+  };
+
+  server.listen(opts.port, opts.host, () => {
+    console.log(`[pxpipe] listening on http://${displayHost}:${opts.port}`);
+    if (!isLoopbackHost) {
+      console.warn(
+        `[pxpipe] bound to ${opts.host}; proxy API is reachable off-host, ` +
+          `but dashboard routes remain loopback-only.`,
+      );
+    }
+    announce();
+    console.log(`[pxpipe] dashboard → http://127.0.0.1:${opts.port}/`);
   });
 
   // server.close() only stops accepting new connections and waits for open

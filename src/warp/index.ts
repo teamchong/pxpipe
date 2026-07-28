@@ -122,7 +122,7 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
         return spawn(command[0]!, command.slice(1), direct);
       }
     }
-    console.error(`[pxpipe] warp: resolving ${command[0]} via ${shell} -ic`);
+    console.error(`[pxpipe] warp: resolving ${command[0]} via interactive shell fallback`);
     // The command word is deliberately left unquoted: a shell only expands
     // aliases on unquoted words, so quoting it would defeat the entire point of
     // this fallback. Arguments are still quoted — they are data, never aliases.

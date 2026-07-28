@@ -157,12 +157,21 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
       console.error(`[pxpipe] warp: cannot run ${command[0]}: ${err.message}`);
       process.exit(127);
     });
+    const forwarded = ['SIGINT', 'SIGTERM'] as const;
     child.on('exit', (code, signal) => {
       // Reproduce the child's own exit status so warp is transparent to callers.
-      if (signal) process.kill(process.pid, signal);
-      else process.exit(code ?? 0);
+      // Re-raising means routing the signal back through our own handlers, so
+      // drop them first: Ctrl-C kills the child with SIGINT, and without this
+      // the re-raise just re-enters the forwarder, kills an already-dead child
+      // and leaves warp running forever.
+      if (signal) {
+        for (const s of forwarded) process.removeAllListeners(s);
+        process.kill(process.pid, signal);
+        return;
+      }
+      process.exit(code ?? 0);
     });
-    for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+    for (const signal of forwarded) {
       process.on(signal, () => child.kill(signal));
     }
   };

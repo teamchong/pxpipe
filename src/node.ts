@@ -1218,7 +1218,7 @@ async function main(): Promise<void> {
   };
   const handle = createProxy(config);
 
-  const handleRequest = (req: IncomingMessage, res: ServerResponse): void => {
+  const server = createServer((req, res) => {
     Promise.resolve()
       .then(async () => {
         // Local dashboard routes — handled BEFORE the proxy so they never hit
@@ -1251,9 +1251,7 @@ async function main(): Promise<void> {
         if (!res.headersSent) res.statusCode = 500;
         if (!res.writableEnded) res.end();
       });
-  };
-
-  const server = createServer(handleRequest);
+  });
 
   // IPv6 literals need bracket notation to form a valid URL (http://[::1]:47821).
   const displayHost = opts.host.includes(':') ? `[${opts.host}]` : opts.host;

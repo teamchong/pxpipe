@@ -30,7 +30,6 @@ import {
   bool,
   contextTag,
   integer,
-  ia5String,
   octetString,
   oid,
   pem,
@@ -39,6 +38,8 @@ import {
   utcTime,
   utf8String,
 } from './der.js';
+
+const textEncoder = new TextEncoder();
 
 const OID_ECDSA_SHA256 = '1.2.840.10045.4.3.2';
 const OID_COMMON_NAME = '2.5.4.3';
@@ -91,10 +92,14 @@ function subjectAltNameExtension(host: string): Uint8Array {
         : ipv6Bytes(host);
     return extension(OID_SUBJECT_ALT_NAME, false, seq(contextTag(7, octets, false)));
   }
+  // [2] IMPLICIT IA5String is the IA5String content under a different tag, so
+  // re-encode the content rather than slicing the header off ia5String(): that
+  // header is 3 bytes, not 2, once the host reaches 128 chars, and the leftover
+  // length byte lands inside the name.
   return extension(
     OID_SUBJECT_ALT_NAME,
     false,
-    seq(contextTag(2, ia5String(host).subarray(2), false)),
+    seq(contextTag(2, textEncoder.encode(host), false)),
   );
 }
 

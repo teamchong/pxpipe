@@ -85,6 +85,11 @@ function splitHostPort(value: string, fallbackPort: string): { host: string; por
   return { host: value.slice(0, i), port: value.slice(i + 1) };
 }
 
+/** `host:port`, bracketing IPv6 literals so the result is URL-parseable. */
+function authority(host: string, port: string): string {
+  return host.includes(':') ? `[${host}]:${port}` : `${host}:${port}`;
+}
+
 function forwardHeaders(headers: IncomingHttpHeaders): Record<string, string | string[]> {
   const out: Record<string, string | string[]> = {};
   for (const [key, value] of Object.entries(headers)) {
@@ -120,11 +125,20 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
   const announced = new Set<string>();
 
   /** Re-originate one request, to a route target or to the real host. */
-  const forward = (req: IncomingMessage, res: ServerResponse, host: string, requestUri: string) => {
+  const forward = (
+    req: IncomingMessage,
+    res: ServerResponse,
+    host: string,
+    requestUri: string,
+    // Where the bytes actually go when no route matches. Passed in rather than
+    // rebuilt from `host`: a plain `http://host:8080` request reaching us in
+    // absolute form must not be re-originated as `https://host:443`.
+    origin: string,
+  ) => {
     const path = requestUri.split('?')[0] ?? '/';
     const route = matchRoute(routes, host, path);
 
-    const target = new URL(route ? rewriteUrl(route, requestUri) : `https://${host}${requestUri}`);
+    const target = new URL(route ? rewriteUrl(route, requestUri) : `${origin}${requestUri}`);
     if (route && !announced.has(route.pattern)) {
       announced.add(route.pattern);
       onDivert?.(host, path, target.origin);
@@ -144,22 +158,39 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
       agent: target.protocol === 'https:' ? httpsAgent : httpAgent,
     });
 
+    let upstreamRes: IncomingMessage | undefined;
     outbound.on('response', (upstream) => {
+      upstreamRes = upstream;
       res.writeHead(upstream.statusCode ?? 502, forwardHeaders(upstream.headers));
       // Streamed, never buffered: /v1/messages is SSE and must arrive token by
       // token or the agent appears to hang until the response completes.
       upstream.pipe(res);
     });
     outbound.on('error', (err) => {
+      // Our own teardown below surfaces here as ECONNRESET; the client is
+      // already gone, so writing a 502 into it would throw.
+      if (res.writableEnded || res.destroyed) return;
       if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' });
       res.end(`pxpipe warp: upstream error: ${err.message}`);
+    });
+    // An SSE completion only ends when the model stops. If the agent is killed
+    // mid-stream nothing else cancels the upstream: the response keeps draining
+    // into a dead socket, and the keepAlive agent later hands that same
+    // half-consumed connection to the next request.
+    res.on('close', () => {
+      if (res.writableFinished) return;
+      upstreamRes?.destroy();
+      outbound.destroy();
     });
     req.pipe(outbound);
   };
 
   const handleDecrypted = (req: IncomingMessage, res: ServerResponse): void => {
     const servername = (req.socket as TLSSocket).servername || '';
-    forward(req, res, stripPort(req.headers.host || servername), req.url ?? '/');
+    // A client that CONNECTed to a non-443 port repeats it in Host, which is
+    // the only place the original port survives the hijack into mitmServer.
+    const { host, port } = splitHostPort(req.headers.host || servername, '443');
+    forward(req, res, host, req.url ?? '/', `https://${authority(host, port)}`);
   };
 
   /**
@@ -171,8 +202,8 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
    */
   const handleUpgrade = (req: IncomingMessage, clientSocket: Socket, head: Buffer): void => {
     const servername = (req.socket as TLSSocket).servername || '';
-    const host = stripPort(req.headers.host || servername);
-    const upstream = tlsConnect({ host, port: 443, servername: host }, () => {
+    const { host, port } = splitHostPort(req.headers.host || servername, '443');
+    const upstream = tlsConnect({ host, port: Number(port), servername: host }, () => {
       const lines = [`${req.method} ${req.url} HTTP/${req.httpVersion}`];
       for (const [key, value] of Object.entries(req.headers)) {
         for (const v of Array.isArray(value) ? value : [value]) {
@@ -243,7 +274,14 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
       res.end('pxpipe warp: bad absolute URI');
       return;
     }
-    forward(req, res, target.hostname, target.pathname + target.search);
+    if (target.protocol !== 'http:' && target.protocol !== 'https:') {
+      res.writeHead(400, { 'content-type': 'text/plain' });
+      res.end('pxpipe warp: unsupported scheme');
+      return;
+    }
+    // target.origin, not a rebuilt https:// URL: scheme and non-default port
+    // are part of where this request was actually going.
+    forward(req, res, stripPort(target.host), target.pathname + target.search, target.origin);
   };
 
   return { handleConnect, handleAbsoluteForm };

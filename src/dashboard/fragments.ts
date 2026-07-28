@@ -1226,6 +1226,21 @@ export function renderPage(port: number): string {
 </header>
 
 <details class="models-collapse">
+  <summary class="models-summary">Connect an agent <span class="hint">warp launches any CLI through this proxy · pin keeps instructions last in the request</span></summary>
+  <p>Warp starts the agent with the proxy already wired, no env or config edits:</p>
+  <pre>pxpipe warp -- claude
+pxpipe warp -- codex
+pxpipe warp -- cursor-agent</pre>
+  <p>Aliases work too (<code>pxpipe warp -- pp</code>), and <code>--route pattern=http://host:port</code> adds routes beyond <code>api.anthropic.com</code>. Without warp, point the agent at <code>ANTHROPIC_BASE_URL=http://127.0.0.1:${port}</code> yourself.</p>
+  <p>Pin instructions from inside the session — they get moved to the end of every request, where the model actually reads them:</p>
+  <pre>@pxpipe pin be concise, no walls of text
+@pxpipe unpin 2
+@pxpipe unpin all</pre>
+  <p><code>@pxpipe pin</code> with no text lists what is pinned.</p>
+  <p>A <code>@pxpipe pin …</code> line in your global or project <code>CLAUDE.md</code> (<code>AGENTS.md</code> under Codex / OpenCode) is relocated the same way, on every session, with no typing. Those are file-backed, so <code>unpin</code> and <code>unpin all</code> never touch them — edit the file to remove one.</p>
+</details>
+
+<details class="models-collapse">
   <summary class="models-summary">Image model scope <span class="hint">Fable 5 and Gemini 3.6 Flash by default · expand to experiment with other families</span></summary>
   <div class="models-warning">⚠ Image compression is validated for Fable 5 and Gemini 3.6 Flash — other families can use <strong>more</strong> tokens, not less. Opt in only for deliberate experiments.</div>
   <div id="frag-models" hx-get="/fragments/models" hx-trigger="load, every 2s [!document.activeElement || document.activeElement.id !== 'models-csv']" hx-swap="innerHTML"></div>

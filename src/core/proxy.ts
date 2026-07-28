@@ -20,7 +20,7 @@ import {
   chatCompletionsUrl,
   openAIChatToAnthropicResponse,
 } from './messages-chat-bridge.js';
-import { pinCommandResponse } from './pin.js';
+import { pinCommandResponse, pinCommandResponseOpenAI } from './pin.js';
 import { parseGoogleModelFromPath, transformGoogleGenerateContent } from './google.js';
 import { isGeminiModel } from './gemini-model-profiles.js';
 import { resolveGptProfile } from './gpt-model-profiles.js';
@@ -1154,8 +1154,10 @@ export function createProxy(config: ProxyConfig = {}) {
         // configuration, not a question. Answer it here: forwarding it would bill
         // a full prefix to have the model paraphrase a list the proxy already
         // holds, and the reply would be a guess about state it cannot see.
-        if (isMessages) {
-          const pinReply = pinCommandResponse(bodyIn);
+        if (isMessages || isOpenAIChat || isOpenAIResponses) {
+          const pinReply = isMessages
+            ? pinCommandResponse(bodyIn)
+            : pinCommandResponseOpenAI(bodyIn, isOpenAIResponses ? 'responses' : 'chat');
           if (pinReply) {
             return new Response(pinReply.body, {
               status: 200,

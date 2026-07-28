@@ -772,3 +772,210 @@ export function synthesizeReply(
       ev('message_stop', { type: 'message_stop' }),
   };
 }
+
+/** Which OpenAI wire schema the reply has to imitate. */
+export type OpenAIPinWire = 'chat' | 'responses';
+
+interface OpenAIItem {
+  type?: string;
+  role?: string;
+  content?: unknown;
+}
+
+/** Text parts of one OpenAI message. `input_text`/`output_text` are the
+ *  Responses spellings of Chat Completions' `text`; images and file parts carry
+ *  no pin commands, so they drop out. */
+function openAITextBlocks(content: unknown): ContentBlock[] {
+  if (typeof content === 'string') return [{ type: 'text', text: content }];
+  if (!Array.isArray(content)) return [];
+  const out: ContentBlock[] = [];
+  for (const raw of content) {
+    const part = raw as { type?: string; text?: unknown };
+    if (!part || typeof part.text !== 'string') continue;
+    if (part.type === undefined || part.type === 'text'
+      || part.type === 'input_text' || part.type === 'output_text') {
+      out.push({ type: 'text', text: part.text });
+    }
+  }
+  return out;
+}
+
+/**
+ * Rewrite an OpenAI request into the Messages shape the pin folder understands.
+ * `instructions` and system/developer turns become the system field, which is
+ * where file-sourced pins live on this wire.
+ */
+function normalizeOpenAIRequest(
+  req: { messages?: unknown; input?: unknown; instructions?: unknown },
+): { messages: Message[]; system?: SystemField } | undefined {
+  const items = Array.isArray(req.input) ? req.input
+    : Array.isArray(req.messages) ? req.messages
+    : typeof req.input === 'string' ? [{ role: 'user', content: req.input }]
+    : undefined;
+  if (!items) return undefined;
+  const system: Array<TextBlock | ImageBlock> = [];
+  if (typeof req.instructions === 'string' && req.instructions) {
+    system.push({ type: 'text', text: req.instructions });
+  }
+  const messages: Message[] = [];
+  for (const raw of items) {
+    if (!raw || typeof raw !== 'object') return undefined;
+    const item = raw as OpenAIItem;
+    // reasoning / function_call / function_call_output are not messages. They
+    // still occupy a slot: a tool result in the last position must not let an
+    // older pin command look like the live turn and replay its answer.
+    if (item.type !== undefined && item.type !== 'message') {
+      messages.push({ role: 'assistant', content: [] });
+      continue;
+    }
+    const blocks = openAITextBlocks(item.content);
+    if (item.role === 'system' || item.role === 'developer') {
+      for (const blk of blocks) system.push(blk as TextBlock);
+      continue;
+    }
+    messages.push({ role: item.role === 'user' ? 'user' : 'assistant', content: blocks });
+  }
+  return { messages, system: system.length > 0 ? system : undefined };
+}
+
+/** `pinCommandResponse` for the OpenAI routes. Codex talks Responses and other
+ *  clients talk Chat Completions, so the same command has to be answered in
+ *  whichever schema the caller used. */
+export function pinCommandResponseOpenAI(
+  bodyIn: Uint8Array,
+  wire: OpenAIPinWire,
+): { body: string; contentType: string } | undefined {
+  let req: {
+    messages?: unknown;
+    input?: unknown;
+    instructions?: unknown;
+    model?: string;
+    stream?: boolean;
+  };
+  try {
+    req = JSON.parse(new TextDecoder().decode(bodyIn));
+  } catch {
+    return undefined;
+  }
+  const norm = normalizeOpenAIRequest(req);
+  if (!norm || !isPinOnlyRequest(norm.messages)) return undefined;
+  const text = pinReplyText(
+    foldPins(norm.messages, norm.system),
+    liveVerb(norm.messages[norm.messages.length - 1]),
+  );
+  const model = typeof req.model === 'string' ? req.model : 'pxpipe';
+  return wire === 'responses'
+    ? synthesizeResponsesReply(text, model, req.stream === true)
+    : synthesizeChatReply(text, model, req.stream === true);
+}
+
+/** Local `/v1/chat/completions` reply carrying `text`. Zero usage: nothing was
+ *  billed, and reporting otherwise would corrupt the dashboard's accounting. */
+export function synthesizeChatReply(
+  text: string,
+  model: string,
+  stream: boolean,
+): { body: string; contentType: string } {
+  const id = `chatcmpl_pxpipe_pin_${Date.now().toString(36)}`;
+  const created = Math.floor(Date.now() / 1000);
+  if (!stream) {
+    return {
+      contentType: 'application/json',
+      body: JSON.stringify({
+        id,
+        object: 'chat.completion',
+        created,
+        model,
+        choices: [{
+          index: 0,
+          message: { role: 'assistant', content: text },
+          finish_reason: 'stop',
+          logprobs: null,
+        }],
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      }),
+    };
+  }
+  const chunk = (delta: unknown, finish: string | null) =>
+    `data: ${JSON.stringify({
+      id,
+      object: 'chat.completion.chunk',
+      created,
+      model,
+      choices: [{ index: 0, delta, finish_reason: finish }],
+    })}\n\n`;
+  return {
+    contentType: 'text/event-stream',
+    body: chunk({ role: 'assistant', content: '' }, null)
+      + chunk({ content: text }, null)
+      + chunk({}, 'stop')
+      + 'data: [DONE]\n\n',
+  };
+}
+
+/** Local `/v1/responses` reply carrying `text`, in the event order the Responses
+ *  API emits: clients read the final item from `response.completed`, but Codex
+ *  renders the streamed deltas, so both have to be present. */
+export function synthesizeResponsesReply(
+  text: string,
+  model: string,
+  stream: boolean,
+): { body: string; contentType: string } {
+  const stamp = Date.now().toString(36);
+  const id = `resp_pxpipe_pin_${stamp}`;
+  const itemId = `msg_pxpipe_pin_${stamp}`;
+  const created_at = Math.floor(Date.now() / 1000);
+  const usage = { input_tokens: 0, output_tokens: 0, total_tokens: 0 };
+  const item = {
+    id: itemId,
+    type: 'message',
+    status: 'completed',
+    role: 'assistant',
+    content: [{ type: 'output_text', text, annotations: [] }],
+  };
+  const response = (status: string, output: unknown[]) => ({
+    id,
+    object: 'response',
+    created_at,
+    status,
+    model,
+    output,
+    error: null,
+    incomplete_details: null,
+    usage: status === 'completed' ? usage : null,
+  });
+  if (!stream) {
+    return {
+      contentType: 'application/json',
+      body: JSON.stringify(response('completed', [item])),
+    };
+  }
+  let seq = 0;
+  const ev = (type: string, data: Record<string, unknown>) =>
+    `event: ${type}\ndata: ${JSON.stringify({ type, sequence_number: seq++, ...data })}\n\n`;
+  const part = (t: string) => ({ type: 'output_text', text: t, annotations: [] });
+  return {
+    contentType: 'text/event-stream',
+    body:
+      ev('response.created', { response: response('in_progress', []) })
+      + ev('response.in_progress', { response: response('in_progress', []) })
+      + ev('response.output_item.added', {
+        output_index: 0,
+        item: { id: itemId, type: 'message', status: 'in_progress', role: 'assistant', content: [] },
+      })
+      + ev('response.content_part.added', {
+        item_id: itemId, output_index: 0, content_index: 0, part: part(''),
+      })
+      + ev('response.output_text.delta', {
+        item_id: itemId, output_index: 0, content_index: 0, delta: text,
+      })
+      + ev('response.output_text.done', {
+        item_id: itemId, output_index: 0, content_index: 0, text,
+      })
+      + ev('response.content_part.done', {
+        item_id: itemId, output_index: 0, content_index: 0, part: part(text),
+      })
+      + ev('response.output_item.done', { output_index: 0, item })
+      + ev('response.completed', { response: response('completed', [item]) }),
+  };
+}

@@ -2374,3 +2374,138 @@ describe('colorByRole (structure-through slot string)', () => {
     expect(plain.png[25]).toBe(0); // 0 = grayscale
   });
 });
+
+describe('upperBlue (case parity: uppercase A-Z inked blue)', () => {
+  // Decode our own PNG output (filter=None, single IDAT, zlib) back to pixels.
+  // colorType 2 → RGB triples; colorType 0 → grayscale bytes.
+  const decodePng = async (
+    png: Uint8Array,
+  ): Promise<{ w: number; h: number; colorType: number; px: Uint8Array }> => {
+    const dv = new DataView(png.buffer, png.byteOffset, png.byteLength);
+    const w = dv.getUint32(16);
+    const h = dv.getUint32(20);
+    const colorType = png[25]!;
+    // Collect IDAT payloads.
+    const idat: Uint8Array[] = [];
+    let off = 8;
+    while (off < png.length) {
+      const len = dv.getUint32(off);
+      const type = String.fromCharCode(png[off + 4]!, png[off + 5]!, png[off + 6]!, png[off + 7]!);
+      if (type === 'IDAT') idat.push(png.subarray(off + 8, off + 8 + len));
+      off += 12 + len;
+    }
+    const ds = new DecompressionStream('deflate');
+    const writer = ds.writable.getWriter();
+    for (const part of idat) void writer.write(part.slice());
+    void writer.close();
+    const raw = new Uint8Array(await new Response(ds.readable).arrayBuffer());
+    const bpp = colorType === 2 ? 3 : 1;
+    const stride = w * bpp + 1;
+    const px = new Uint8Array(w * h * bpp);
+    for (let y = 0; y < h; y++) {
+      expect(raw[y * stride]).toBe(0); // filter None — matches our encoder
+      px.set(raw.subarray(y * stride + 1, y * stride + 1 + w * bpp), y * w * bpp);
+    }
+    return { w, h, colorType, px };
+  };
+
+  /** Distinct ink colors (r,g,b) present in a horizontal cell range [x0, x1). */
+  const inkColorsIn = (
+    img: { w: number; h: number; px: Uint8Array },
+    x0: number,
+    x1: number,
+  ): Set<string> => {
+    const out = new Set<string>();
+    for (let y = 0; y < img.h; y++) {
+      for (let x = x0; x < x1; x++) {
+        const i = (y * img.w + x) * 3;
+        const r = img.px[i]!, g = img.px[i + 1]!, b = img.px[i + 2]!;
+        if (r < 250 || g < 250 || b < 250) out.add(`${r},${g},${b}`); // any ink
+      }
+    }
+    return out;
+  };
+
+  const PAD = 4; // PAD_X
+  const cellX = (col: number, cellW: number) => PAD + col * cellW;
+
+  it('uppercase letters are inked blue; lowercase stays black (w/W, c/C separable by color alone)', async () => {
+    const cellW = renderCellWidth({});
+    for (const pair of ['wW', 'cC', 'sS'] as const) {
+      const img = await renderChunkToPng(pair, 10, {});
+      expect(img.png[25]).toBe(2); // truecolor: the page contains an uppercase
+      const decoded = await decodePng(img.png);
+      const lowerInk = inkColorsIn(decoded, cellX(0, cellW), cellX(1, cellW));
+      const upperInk = inkColorsIn(decoded, cellX(1, cellW), cellX(2, cellW));
+      // Lowercase cell: pure black ink only (r=g=b).
+      expect(lowerInk.size).toBeGreaterThan(0);
+      for (const c of lowerInk) {
+        const [r, g, b] = c.split(',').map(Number);
+        expect(r).toBe(g);
+        expect(g).toBe(b);
+      }
+      // Uppercase cell: fixed blue ink [0,70,190] (bit atlas → full coverage, exact palette).
+      expect(upperInk.has('0,70,190')).toBe(true);
+      // The two cells share no ink color — case is decidable by color alone.
+      for (const c of upperInk) expect(lowerInk.has(c)).toBe(false);
+    }
+  });
+
+  it('existing confusable-set semantics keep their ink: l/i/o black (lowercase), I/O blue, digits black', async () => {
+    const cellW = renderCellWidth({});
+    const img = await renderChunkToPng('lioIO01', 20, {});
+    const decoded = await decodePng(img.png);
+    for (let col = 0; col < 3; col++) { // l i o
+      for (const c of inkColorsIn(decoded, cellX(col, cellW), cellX(col + 1, cellW))) {
+        const [r, g, b] = c.split(',').map(Number);
+        expect([r, g, b]).toEqual([r, r, r]); // grayscale ink only
+      }
+    }
+    for (let col = 3; col < 5; col++) { // I O
+      expect(inkColorsIn(decoded, cellX(col, cellW), cellX(col + 1, cellW)).has('0,70,190')).toBe(true);
+    }
+    for (let col = 5; col < 7; col++) { // 0 1
+      for (const c of inkColorsIn(decoded, cellX(col, cellW), cellX(col + 1, cellW))) {
+        const [r, g, b] = c.split(',').map(Number);
+        expect([r, g, b]).toEqual([r, r, r]);
+      }
+    }
+  });
+
+  it('pages without any uppercase stay grayscale and byte-identical to pre-upperBlue output', async () => {
+    const noUpper = await renderChunkToPng('all lowercase 0123 !?', 40, {});
+    expect(noUpper.png[25]).toBe(0); // grayscale — no RGB penalty when the signal is unused
+    const optedOut = await renderChunkToPng('all lowercase 0123 !?', 40, { upperBlue: false });
+    expect(noUpper.png).toEqual(optedOut.png); // no-upper page is bit-for-bit the opted-out page
+  });
+
+  it('upperBlue: false opts out (uppercase page stays grayscale)', async () => {
+    const img = await renderChunkToPng('Wide CASE', 40, { upperBlue: false });
+    expect(img.png[25]).toBe(0);
+  });
+
+  it('composes with colorByRole: role tags keep their hue, uppercase body glyphs go blue', async () => {
+    const body = 'W';
+    const text = `<user>\n${body}\n</user>`;
+    const slot = roleSlotSegment('user', body, SLOT_MARK_USER);
+    const img = await renderChunkToPng(text, 40, { colorByRole: true }, undefined, slot);
+    const decoded = await decodePng(img.png);
+    const all = inkColorsIn(decoded, 0, decoded.w);
+    expect(all.has('150,20,20')).toBe(true); // ROLE_PALETTE user tag red survives
+    expect(all.has('0,70,190')).toBe(true); // body W carries the uppercase blue
+  });
+
+  it('AA path blends toward the uppercase blue (blue channel dominates red on W ink)', async () => {
+    const cellW = renderCellWidth({ aa: true });
+    const img = await renderChunkToPng('wW', 10, { aa: true });
+    const decoded = await decodePng(img.png);
+    const upperInk = inkColorsIn(decoded, cellX(1, cellW), cellX(2, cellW));
+    expect(upperInk.size).toBeGreaterThan(0);
+    let sawBlueDominant = false;
+    for (const c of upperInk) {
+      const [r, , b] = c.split(',').map(Number);
+      if (b! > r! + 40) sawBlueDominant = true;
+    }
+    expect(sawBlueDominant).toBe(true);
+  });
+});

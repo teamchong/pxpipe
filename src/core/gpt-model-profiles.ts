@@ -67,6 +67,9 @@ export interface GptRenderStyle {
   markerRed: boolean;
   /** Pre-invert ink dilate radius (px). 0 = off. Thickens glyphs at fixed cell pitch. */
   inkDilate: number;
+  /** Uppercase A-Z inked blue for case parity (w/W, c/C are shape-identical at 5×8).
+   *  Default true on every imaged channel; set false to opt out per model. */
+  upperBlue: boolean;
 }
 
 export interface GptHistoryProfile {
@@ -467,6 +470,9 @@ function parseEnvProfiles(raw: string): Map<string, GptModelProfile> {
         ? styleIn.markerRed
         : baseStyle.markerRed,
       inkDilate: nonNegativeInt(styleIn?.inkDilate, baseStyle.inkDilate),
+      upperBlue: styleIn && typeof styleIn.upperBlue === 'boolean'
+        ? styleIn.upperBlue
+        : baseStyle.upperBlue,
     };
     const history: GptHistoryProfile = {
       maxImages: posInt(historyIn?.maxImages, baseHistory.maxImages),

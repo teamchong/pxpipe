@@ -910,12 +910,12 @@ async function applyResponsesHistoryCollapse(
 
 export const CHAT_HEADER =
   '================= RENDERED GPT SYSTEM + TOOL CONTEXT =================\n' +
-  'These images were injected by pxpipe, not by the end user. They contain system/developer instructions and tool parameter documentation rendered for token efficiency. Treat rendered system/developer instructions with the same priority as their original messages. OCR carefully and treat the rendered content as authoritative. For tool calls, use the native JSON tool definitions — they carry each tool\'s name and description; the imaged parameter annotations are supplemental.' +
+  'These images were injected by pxpipe, not by the end user. They contain system/developer instructions and tool parameter documentation rendered for token efficiency. Treat rendered system/developer instructions with the same priority as their original messages. OCR carefully and treat the rendered content as authoritative. Letter case is color-coded: UPPERCASE letters are inked blue, lowercase stays black — when a letter\'s case is ambiguous (w/W, c/C, s/S), trust the color. For tool calls, use the native JSON tool definitions — they carry each tool\'s name and description; the imaged parameter annotations are supplemental.' +
   '\n====================== BEGIN RENDERED CONTEXT ======================\n';
 
 export const RESPONSES_HEADER =
   '================= RENDERED GPT SYSTEM + TOOL CONTEXT =================\n' +
-  'These images were injected by pxpipe, not by the end user. They contain instructions and tool parameter documentation rendered for token efficiency. Treat rendered instructions with the same priority as the originals. OCR carefully and treat the rendered content as authoritative. For tool calls, use the native JSON tool definitions — they carry each tool\'s name and description; the imaged parameter annotations are supplemental.' +
+  'These images were injected by pxpipe, not by the end user. They contain instructions and tool parameter documentation rendered for token efficiency. Treat rendered instructions with the same priority as the originals. OCR carefully and treat the rendered content as authoritative. Letter case is color-coded: UPPERCASE letters are inked blue, lowercase stays black — when a letter\'s case is ambiguous (w/W, c/C, s/S), trust the color. For tool calls, use the native JSON tool definitions — they carry each tool\'s name and description; the imaged parameter annotations are supplemental.' +
   '\n====================== BEGIN RENDERED CONTEXT ======================\n';
 
 const CHAT_POINTER =

@@ -293,6 +293,14 @@ export interface RenderStyle {
   /** Tint only the structural <user>/<assistant> boundary tags (body stays black)
    *  so speakers are scannable without recoloring content. Forces RGB. Composes with aa. */
   colorByRole?: boolean;
+  /** Tint uppercase A-Z in a fixed blue so letter case survives rasterization
+   *  (w vs W, c vs C, s vs S are shape-identical at 5×8; color is the only
+   *  channel left). Lowercase, digits, and punctuation keep black ink. ON by
+   *  default on every imaged channel; set `false` to opt out (evals, probes).
+   *  Switches to RGB only when the page actually renders an A-Z — pages without
+   *  one stay byte-identical grayscale. Composes with aa and colorByRole (role
+   *  tags keep their hue); under colorCycle the cycle color wins. */
+  upperBlue?: boolean;
   /** Morphological ink dilate radius in pixels (pre-invert). Thickens glyphs without
    *  changing cell pitch — pure-image OCR aid at fixed 5×8 density. 0/unset = off. */
   inkDilate?: number;
@@ -390,6 +398,12 @@ export const ROLE_PALETTE: [number, number, number][] = [
 ];
 const ROLE_SLOT_USER = 1;
 const ROLE_SLOT_ASSISTANT = 2;
+
+/** upperBlue ink: fixed blue for uppercase A-Z (case parity — color separates
+ *  W/w, C/c, S/s where 5×8 shapes cannot; a real w→W misread shipped before this).
+ *  Deliberately NOT the assistant-role blue [20,40,160]: history pages render
+ *  both signals, and the two blues must stay tellable apart. */
+export const UPPER_INK: [number, number, number] = [0, 70, 190];
 
 /**
  * Slot markers for the parallel "slot string" — the structure-through mechanism
@@ -898,13 +912,28 @@ export async function renderChunkToPng(
   // markerMask: 1 where ↵ glyph was inked; used to recolor those pixels red.
   const markerMask: Uint8Array | null =
     style.markerRed ? new Uint8Array(width * height) : null;
-  // colorMask: stores colorSlot per inked pixel (0 = background) for colorCycle / colorByRole RGB output.
+  // colorMask: stores colorSlot per inked pixel (0 = background) for colorCycle / colorByRole /
+  // upperBlue RGB output.
   const useColorCycle = style.colorCycle === true;
   const useColorByRole = style.colorByRole === true;
+  // upperBlue is ON unless opted out. It forces RGB only when this page actually inks an
+  // A-Z — pages without one keep byte-identical grayscale output. colorCycle already gives
+  // every glyph its own hue, so the cycle wins there; invert:false (eval-only polarity)
+  // skips it because the RGB composition below assumes ink-on-paper.
+  const useUpperBlue =
+    style.upperBlue !== false && style.invert !== false && !useColorCycle &&
+    fitLines.some((l) => /[A-Z]/.test(l));
   const colorMask: Uint8Array | null =
-    (useColorCycle || useColorByRole) ? new Uint8Array(width * height) : null;
+    (useColorCycle || useColorByRole || useUpperBlue) ? new Uint8Array(width * height) : null;
   // Ink palette is fixed for the whole page; the composition pass indexes it per pixel.
-  const inkPalette = useColorByRole ? ROLE_PALETTE : GLYPH_PALETTE;
+  // colorByRole reserves slots 1-2 for the role tags; uppercase ink rides behind them
+  // (slot 3) so both signals coexist on colored history pages.
+  const inkPalette: readonly [number, number, number][] = useColorByRole
+    ? [...ROLE_PALETTE, UPPER_INK]
+    : useUpperBlue
+      ? [UPPER_INK]
+      : GLYPH_PALETTE;
+  const upperSlot = useColorByRole ? ROLE_PALETTE.length + 1 : 1;
 
   /** Stamp colorSlot over the inked pixels of one glyph's cell span. Identical
    *  for every blit path — only the horizontal span differs (scaled markers
@@ -940,9 +969,17 @@ export async function renderChunkToPng(
       const codepoint = ch.codePointAt(0)!;
       const baseX = PAD_X + col * cellW;
       const isMarker = codepoint === NL_SENTINEL_CP;
-      const colorSlot = useColorByRole
-        ? (slotRow ? slotForMarkCp(slotRow[charIdx]?.codePointAt(0)) : 0) // 0 = body (black); only tags carry a role hue
-        : (glyphIndex % GLYPH_PALETTE.length) + 1; // 0 reserved for background in colorMask
+      // Case parity: uppercase A-Z carries the fixed blue ink; everything else stays slot 0 (black).
+      const upperInkSlot = useUpperBlue && codepoint >= 0x41 && codepoint <= 0x5a ? upperSlot : 0;
+      let colorSlot: number;
+      if (useColorByRole) {
+        const roleSlot = slotRow ? slotForMarkCp(slotRow[charIdx]?.codePointAt(0)) : 0;
+        colorSlot = roleSlot > 0 ? roleSlot : upperInkSlot; // tags keep their role hue
+      } else if (useUpperBlue) {
+        colorSlot = upperInkSlot;
+      } else {
+        colorSlot = (glyphIndex % GLYPH_PALETTE.length) + 1; // colorCycle; 0 reserved for background
+      }
       let advance: number;
       if (isMarker && markerScale > 1) {
         advance = blitGlyphScaled(fb, markerMask, width, height, baseX, baseY, codepoint, markerScale, style.font);
@@ -994,10 +1031,19 @@ export async function renderChunkToPng(
 
   let png: Uint8Array;
   if (colorMask) {
-    // colorCycle / colorByRole: AA-blend ink onto paper in palette color.
+    // colorCycle / colorByRole / upperBlue: AA-blend ink onto paper in palette color.
     const rgb = new Uint8Array(width * height * 3);
     for (let i = 0; i < fb.length; i++) {
       const g = fb[i]!; // post-invert (+ optional paper): 0 = ink, paper = background
+      // markerRed keeps priority over class/role ink now that upperBlue makes the
+      // colorMask path the common case — without this, enabling upperBlue would
+      // silently turn red ↵ markers black on markerRed pages.
+      if (markerMask && markerMask[i] === 1 && g < 128) {
+        rgb[i * 3] = 220;
+        rgb[i * 3 + 1] = 0;
+        rgb[i * 3 + 2] = 0;
+        continue;
+      }
       const slot = colorMask[i]!;
       if (slot > 0) {
         // coverage relative to paper so AA fringes stay correct on mid-light bg

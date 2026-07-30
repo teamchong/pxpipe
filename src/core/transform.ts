@@ -1883,6 +1883,8 @@ export async function transformRequest(
     ' For exact identifiers, paths, hashes, version strings, and numbers, use the adjacent' +
     ' exact-value factsheet; if a value was only visible in an image and is not in that factsheet,' +
     ' do not guess it — say it is not safe to quote from the image and re-read the source text.' +
+    ' Letter case is color-coded: UPPERCASE letters are inked blue, lowercase stays black —' +
+    ' when a letter\u2019s case is ambiguous (w/W, c/C, s/S), trust the color.' +
     reflowNoteImg +
     '\n====================== BEGIN RENDERED CONTEXT ======================\n';
   const combinedWithHeader = imageInstructionHeader + combined;

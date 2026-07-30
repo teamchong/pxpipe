@@ -33,6 +33,7 @@ export const BASE_STYLE: GptRenderStyle = {
   markerScale: 1,
   markerRed: false,
   inkDilate: 0,
+  upperBlue: true,
 };
 
 export const BASE_HISTORY: GptHistoryProfile = {

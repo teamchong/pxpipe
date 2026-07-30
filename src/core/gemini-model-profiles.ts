@@ -41,6 +41,7 @@ export const GEMINI_3_6_FLASH_PROFILE: GptModelProfile = {
     markerScale: 1,
     markerRed: false,
     inkDilate: 0,
+    upperBlue: true,
   },
 };
 

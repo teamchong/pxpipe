@@ -11,6 +11,7 @@ import { createWarpRuntime } from './warp/index.js';
 import { once } from 'node:events';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import * as zlib from 'node:zlib';
 import * as os from 'node:os';
 import { isIP } from 'node:net';
 import { spawnSync } from 'node:child_process';
@@ -233,6 +234,14 @@ Environment:
   PXPIPE_CONFIG           JSON config path (default ~/.config/pxpipe/config.json)
                           supports {"models": [...]} or {"models": "off"}
   PXPIPE_LOG              JSONL events path (default ~/.pxpipe/events.jsonl)
+  PXPIPE_LOG_MAX_MB       rotate the events file once it exceeds this size
+                          (default 100)
+  PXPIPE_LOG_KEEP         number of rotated generations to retain on disk,
+                          .1 .. .N (default 1)
+  PXPIPE_LOG_COMPRESS     set to 1 to gzip each rotated generation as
+                          .1.gz, .2.gz, ...
+  PXPIPE_LOG_FSYNC_MS     periodic fsync interval in ms; 0 = fsync only on
+                          shutdown (default 0)
   PXPIPE_DUMP_DIR         debug: write every rendered PNG here (what the model
                           sees); off unless set. Compress arm only.
   PXPIPE_DEBUG_CAPTURE_4XX  debug: set to 1 to persist full 4xx request and
@@ -627,25 +636,73 @@ async function dispatchDashboard(
  * Node-only — uses node:fs. The Worker host uses tracker.JsonLogTracker with
  * console.log instead (Cloudflare ingests that as Workers Logs).
  *
- * Rotation: when the current file exceeds MAX_FILE_BYTES (100 MB by default),
- * it's renamed to `<path>.1` (overwriting any previous .1) and a fresh file
- * is opened. Keeps one generation of history; for longer retention pipe
- * the file off-host yourself.
+ * Rotation: when the current file exceeds the configured max (default 100 MB
+ * via PXPIPE_LOG_MAX_MB), the file is rotated out. By default a single .1
+ * generation is kept (PXPIPE_LOG_KEEP=1); raise it to retain a chain .1, .2,
+ * ... up to N. Set PXPIPE_LOG_COMPRESS=1 to gzip each rotated generation
+ * (.1.gz, .2.gz, ...) so long-term retention costs less.
+ *
+ * Durability: by default fsync runs only on shutdown. Set
+ * PXPIPE_LOG_FSYNC_MS to a positive interval (e.g. 500) to fsync on a
+ * unref'd timer so a hard kill (SIGKILL / Windows TerminateProcess / power
+ * loss) loses at most that many ms of writes. Cost is one fsync per tick.
  *
  * Failures here NEVER propagate — the proxy must keep serving requests even
  * if the disk is full or the path is unwritable.
  */
 class FileTracker implements Tracker {
+  // Defaults preserve the original hardcoded behavior. Override via
+  // FileTracker.configure() from main() with env-driven values. Static so
+  // existing tests that construct FileTracker directly keep working.
+  private static config: {
+    maxBytes: number;
+    keep: number;
+    compress: boolean;
+    fsyncMs: number;
+  } = {
+    maxBytes: 100 * 1024 * 1024,
+    keep: 1,
+    compress: false,
+    fsyncMs: 0,
+  };
+
+  /** Apply env-driven defaults from main(). Safe to call once at startup. */
+  static configure(env: {
+    maxMb?: number;
+    keep?: number;
+    compress?: boolean;
+    fsyncMs?: number;
+  }): void {
+    if (typeof env.maxMb === 'number' && env.maxMb > 0) {
+      FileTracker.config.maxBytes = Math.floor(env.maxMb * 1024 * 1024);
+    }
+    if (typeof env.keep === 'number' && env.keep >= 1) {
+      FileTracker.config.keep = Math.floor(env.keep);
+    }
+    if (typeof env.compress === 'boolean') {
+      FileTracker.config.compress = env.compress;
+    }
+    if (typeof env.fsyncMs === 'number' && env.fsyncMs >= 0) {
+      FileTracker.config.fsyncMs = Math.floor(env.fsyncMs);
+    }
+  }
+
   private fd: number | null = null;
   private bytesWritten = 0;
   private brokenLogged = false;
-  private static readonly MAX_FILE_BYTES = 100 * 1024 * 1024;
+  private flushTimer: NodeJS.Timeout | null = null;
   private readonly writerLock: EventsFileLock;
 
   constructor(private readonly filePath: string) {
     // Fail startup explicitly rather than allow two append fds whose rotations
     // and prune coordination could silently split or lose the log.
     this.writerLock = acquireEventsFileLock(filePath, 'writer');
+    if (FileTracker.config.fsyncMs > 0) {
+      // unref() so the timer never blocks process exit; flush() on a null fd
+      // is a no-op so the tick is safe even after close().
+      this.flushTimer = setInterval(() => this.flush(), FileTracker.config.fsyncMs);
+      this.flushTimer.unref();
+    }
   }
 
   private ensureOpen(): boolean {
@@ -688,12 +745,55 @@ class FileTracker implements Tracker {
       }
       this.fd = null;
     }
-    try {
-      fs.renameSync(this.filePath, this.filePath + '.1');
-    } catch {
-      /* if rename fails (e.g. .1 locked) we'll just keep growing — better
-         than dropping events */
+
+    const { keep, compress } = FileTracker.config;
+    const ext = (n: number) => `.${n}${compress ? '.gz' : ''}`;
+
+    // Cascade: shift .N -> .(N+1) until the cap. The oldest is dropped to
+    // make room. With keep=1 this matches the original single-rename behavior.
+    for (let n = keep; n >= 1; n--) {
+      const oldName = this.filePath + ext(n);
+      if (n === keep) {
+        try {
+          fs.unlinkSync(oldName);
+        } catch {
+          /* may not exist on first rotation */
+        }
+        continue;
+      }
+      const newName = this.filePath + ext(n + 1);
+      try {
+        fs.renameSync(oldName, newName);
+      } catch {
+        /* oldName may not exist; ignore */
+      }
     }
+
+    // Move current -> .1 (or .1.gz). On a compression failure fall back to a
+    // plain rename so we never drop events on disk.
+    const target = this.filePath + ext(1);
+    if (compress) {
+      try {
+        const data = fs.readFileSync(this.filePath);
+        const gz = zlib.gzipSync(data, { level: zlib.constants.Z_BEST_SPEED });
+        fs.writeFileSync(target, gz, { mode: 0o600 });
+        fs.unlinkSync(this.filePath);
+      } catch {
+        try {
+          fs.renameSync(this.filePath, this.filePath + '.1');
+        } catch {
+          /* keep growing */
+        }
+      }
+    } else {
+      try {
+        fs.renameSync(this.filePath, this.filePath + '.1');
+      } catch {
+        /* if rename fails (e.g. .1 locked) we'll just keep growing — better
+           than dropping events */
+      }
+    }
+
     this.bytesWritten = 0;
   }
 
@@ -704,7 +804,7 @@ class FileTracker implements Tracker {
       const buf = Buffer.from(line, 'utf8');
       fs.writeSync(this.fd!, buf);
       this.bytesWritten += buf.length;
-      if (this.bytesWritten > FileTracker.MAX_FILE_BYTES) this.rotate();
+      if (this.bytesWritten > FileTracker.config.maxBytes) this.rotate();
     } catch (err) {
       if (!this.brokenLogged) {
         console.error(
@@ -726,6 +826,10 @@ class FileTracker implements Tracker {
   }
 
   close(): void {
+    if (this.flushTimer != null) {
+      clearInterval(this.flushTimer);
+      this.flushTimer = null;
+    }
     if (this.fd != null) {
       try {
         fs.fsyncSync(this.fd);
@@ -1134,6 +1238,15 @@ async function main(): Promise<void> {
   // rows) showed 5 mode flips ever and losses at 0.8% of wins — all
   // one-time cache-create amortization — so closing the loop would not
   // change decisions. Re-run that reconciliation before wiring one in.
+  // FileTracker knobs read straight from env. Defaults inside the class
+  // match the previous hardcoded behavior (100 MB, keep 1, no compression,
+  // fsync only on shutdown) so this is a no-op when the env vars are unset.
+  FileTracker.configure({
+    maxMb: Number(process.env.PXPIPE_LOG_MAX_MB) || undefined,
+    keep: Number(process.env.PXPIPE_LOG_KEEP) || undefined,
+    compress: process.env.PXPIPE_LOG_COMPRESS === '1',
+    fsyncMs: Number(process.env.PXPIPE_LOG_FSYNC_MS) || undefined,
+  });
   const tracker: Tracker = new FileTracker(opts.eventsFile);
 
   // Sidecar dir for oversized 4xx request-body samples. Lives next to the

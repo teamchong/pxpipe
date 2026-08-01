@@ -587,6 +587,12 @@ function statusCls(status: number): string {
   return 'good';
 }
 
+function imageByteLabel(bytes: number): string {
+  return bytes >= 1024 * 1024
+    ? `${(bytes / (1024 * 1024)).toFixed(1)} MiB`
+    : `${Math.ceil(bytes / 1024)} KiB`;
+}
+
 export function renderRecentFragment(p: RecentPayload): string {
   const rows = (p.recent ?? []).slice().reverse();
   const body =
@@ -620,9 +626,27 @@ export function renderRecentFragment(p: RecentPayload): string {
                 : saved < 0
                   ? `<td class="num neg">${numFmt(saved)}${createNote}</td>`
                   : `<td class="num">0</td>`;
-            const imaged = e.cc_added
-              ? `<span class="badge badge-img">image</span>`
-              : `<span class="badge badge-txt">text</span>`;
+            const imageBudgetUsed = (e.input_image_bytes ?? 0) + (e.image_bytes ?? 0);
+            const wireSize = e.serialized_request_bytes != null
+              ? `; ${imageByteLabel(e.serialized_request_bytes)} serialized request`
+              : '';
+            const imageBudgetDetail = e.image_byte_budget != null
+              ? `${imageByteLabel(imageBudgetUsed)} of ${imageByteLabel(e.image_byte_budget)} image-byte budget${wireSize}`
+              : '';
+            const imageBudgetTitle = e.image_bytes != null && e.image_byte_budget != null
+              ? ` title="${escapeHtml(imageBudgetDetail)}"`
+              : '';
+            const imageBudgetNear = e.image_byte_budget != null && e.image_byte_budget > 0 &&
+              imageBudgetUsed >= e.image_byte_budget * 0.9;
+            const budgetBadge = e.image_budget_degraded
+              ? ` <span class="badge badge-txt" title="${escapeHtml(`The caller images already exceeded the image-byte budget or one or more render groups stayed as text. ${imageBudgetDetail}`.trim())}">budget</span>`
+              : imageBudgetNear
+                ? ` <span class="badge badge-txt" title="This request has consumed at least 90% of its image-byte budget.">near budget</span>`
+                : '';
+            const imaged = (e.cc_added
+              ? `<span class="badge badge-img"${imageBudgetTitle}>image</span>` +
+                budgetBadge
+              : `<span class="badge badge-txt">text</span>` + budgetBadge);
             return (
               `<tr>` +
               `<td class="muted">${i + 1}</td>` +

@@ -72,6 +72,11 @@ export interface RecentRow {
   size_in?: number;
   compressed: boolean;
   cc_added?: number;
+  image_bytes?: number;
+  input_image_bytes?: number;
+  serialized_request_bytes?: number;
+  image_byte_budget?: number;
+  image_budget_degraded?: boolean;
   input_tokens?: number;
   output_tokens?: number;
   cache_create?: number;

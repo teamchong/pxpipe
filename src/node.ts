@@ -245,6 +245,9 @@ Environment:
   PXPIPE_LOG              JSONL events path (default ~/.pxpipe/events.jsonl)
   PXPIPE_DUMP_DIR         debug: write every rendered PNG here (what the model
                           sees); off unless set. Compress arm only.
+  PXPIPE_MAX_IMAGE_BYTES  Anthropic Messages decoded image-byte ceiling
+                          (default 18874368 = 18 MiB). A render group that
+                          would cross it stays as native text.
   PXPIPE_DEBUG_CAPTURE_4XX  debug: set to 1 to persist full 4xx request and
                           upstream error bodies (prompts + any secrets in
                           context) to disk. Off by default.
@@ -1054,6 +1057,18 @@ async function main(): Promise<void> {
   if (forcePassthrough) {
     console.log('[pxpipe] PXPIPE_DISABLE set — passthrough mode (compress=false), still logging usage + baselines');
   }
+  const imageBudgetRaw = process.env.PXPIPE_MAX_IMAGE_BYTES?.trim();
+  let configuredImageByteBudget: number | undefined;
+  if (imageBudgetRaw) {
+    const parsed = Number(imageBudgetRaw);
+    if (Number.isFinite(parsed) && parsed >= 0) {
+      configuredImageByteBudget = Math.floor(parsed);
+    } else {
+      console.warn(
+        `[pxpipe] ignored invalid PXPIPE_MAX_IMAGE_BYTES=${JSON.stringify(imageBudgetRaw)}; using the 18 MiB default`,
+      );
+    }
+  }
   // Debug aid: when PXPIPE_DUMP_DIR is set, persist every rendered PNG this
   // process emits, so you can eyeball exactly what the model received (OCR /
   // legibility audits, demo inspection). Best-effort — never affects requests.
@@ -1132,7 +1147,9 @@ async function main(): Promise<void> {
       // (The dashboard kill switch does the same thing at runtime.)
       if (forcePassthrough || !dashboard.getCompressionEnabled()) return { compress: false };
       // Active path: use DEFAULTS in transform.ts for break-even gating.
-      return {};
+      return configuredImageByteBudget === undefined
+        ? {}
+        : { maxImageBytes: configuredImageByteBudget };
     },
     onRequest: async (e) => {
       // Feed the dashboard BEFORE tracker.emit — toTrackEvent strips
@@ -1176,6 +1193,14 @@ async function main(): Promise<void> {
       console.log(
         `[${new Date().toISOString()}] ${e.method} ${e.path} → ${e.status} (${e.durationMs}ms) ${tag}${usageTag}`,
       );
+      if (e.info?.imageBudgetOutcome === 'degraded') {
+        const used = (e.info.inputImageBytes ?? 0) + e.info.imageBytes;
+        console.warn(e.info.imageBudgetSkippedBlocks
+          ? `  ↳ image-byte budget kept ${e.info.imageBudgetSkippedBlocks} render group(s) as text ` +
+            `(${used}B total images / ${e.info.imageByteBudget}B budget)`
+          : `  ↳ caller images already exceed the image-byte budget ` +
+            `(${used}B total images / ${e.info.imageByteBudget}B budget)`);
+      }
 
       // Upstream error bodies are present only under PXPIPE_DEBUG_CAPTURE_4XX;
       // custom gateways may echo prompt fragments or credentials in them.

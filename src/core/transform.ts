@@ -785,6 +785,10 @@ const DYNAMIC_BLOCK_TAGS = [
   'git_status',
   'directoryStructure',
   'system-reminder',
+  // Remaining context budget. Changes on every single turn, so leaving it in
+  // the static slab would rewrite the cached image each turn and drop the
+  // cache hit rate to zero.
+  'total_tokens',
 ] as const;
 
 // Known-static slab tags — suppresses first-sighting `unknownStaticTags` noise

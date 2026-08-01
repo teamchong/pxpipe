@@ -411,6 +411,48 @@ describe('e2e cache alignment — Anthropic /v1/messages through the real proxy'
     expect(lastUserText(cap2.main[0]!.body)).not.toContain('relocated by pxpipe');
   });
 
+  it('TOKEN BUDGET: a changing <total_tokens> count never re-renders the slab image', async () => {
+    // Same class of bug as ENV SPLIT, different injector: Claude Code emits a
+    // <total_tokens>N tokens left</total_tokens> block whose N changes on EVERY
+    // turn. Left in the static slab it re-rendered the PNG once per turn, so the
+    // prefix cache never survived a single turn. Fixed by listing the tag in
+    // DYNAMIC_BLOCK_TAGS; this test fails if it is ever moved to
+    // KNOWN_STATIC_TAGS to silence the unknown-tag warning.
+    const budget = (n: number) => `\n<total_tokens>${n} tokens left</total_tokens>`;
+    const cap1 = await driveAnthropic(
+      anthropicBody({ slabChars: 80_000, sysSuffix: budget(14_998_937), turns: turns(4, 20) }),
+    );
+    cap1.restore();
+    const cap2 = await driveAnthropic(
+      anthropicBody({ slabChars: 80_000, sysSuffix: budget(12_345_678), turns: turns(4, 20) }),
+    );
+    cap2.restore();
+
+    const a = anthropicImages(cap1.main[0]!.body).map((i) => i.data);
+    const b = anthropicImages(cap2.main[0]!.body).map((i) => i.data);
+    expect(a.length).toBeGreaterThan(0);
+    expect(b).toEqual(a);
+
+    // Stripped from the image, but not dropped: the live count still reaches the
+    // model as plain system text, and never leaks into the user's turn.
+    const sysText = (bodyText: string): string => {
+      const sys = JSON.parse(bodyText).system;
+      return typeof sys === 'string'
+        ? sys
+        : (sys ?? []).map((b: any) => (b?.type === 'text' ? b.text : '')).join('\n');
+    };
+    const lastUserText = (bodyText: string): string => {
+      const msgs = JSON.parse(bodyText).messages as Array<{ role: string; content: unknown }>;
+      const m = [...msgs].reverse().find((x) => x.role === 'user')!;
+      return Array.isArray(m.content)
+        ? m.content.map((c: any) => (c?.type === 'text' ? c.text : '')).join('\n')
+        : String(m.content ?? '');
+    };
+    expect(sysText(cap2.main[0]!.body)).toContain('12345678 tokens left');
+    expect(sysText(cap1.main[0]!.body)).toContain('14998937 tokens left');
+    expect(lastUserText(cap2.main[0]!.body)).not.toContain('tokens left');
+  });
+
   it('FIRST COLLAPSE (turn-2 rewrite): no frozen chunk yet → anchor stays on the SLAB image', async () => {
     // With defaults (keepTail 4, minCollapsePrefix 10, freezeChunk 10) and a slab
     // (protectedPrefix 1), 15 messages give collapse range [1..11) = exactly 10 =

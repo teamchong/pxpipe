@@ -630,13 +630,16 @@ export function renderRecentFragment(p: RecentPayload): string {
             const wireSize = e.serialized_request_bytes != null
               ? `; ${imageByteLabel(e.serialized_request_bytes)} serialized request`
               : '';
+            const imageBudgetDetail = e.image_byte_budget != null
+              ? `${imageByteLabel(imageBudgetUsed)} of ${imageByteLabel(e.image_byte_budget)} image-byte budget${wireSize}`
+              : '';
             const imageBudgetTitle = e.image_bytes != null && e.image_byte_budget != null
-              ? ` title="${escapeHtml(`${imageByteLabel(imageBudgetUsed)} of ${imageByteLabel(e.image_byte_budget)} image-byte budget${wireSize}`)}"`
+              ? ` title="${escapeHtml(imageBudgetDetail)}"`
               : '';
             const imageBudgetNear = e.image_byte_budget != null && e.image_byte_budget > 0 &&
               imageBudgetUsed >= e.image_byte_budget * 0.9;
             const budgetBadge = e.image_budget_degraded
-              ? ` <span class="badge badge-txt" title="The caller images already exceeded the image-byte budget or one or more render groups stayed as text.">budget</span>`
+              ? ` <span class="badge badge-txt" title="${escapeHtml(`The caller images already exceeded the image-byte budget or one or more render groups stayed as text. ${imageBudgetDetail}`.trim())}">budget</span>`
               : imageBudgetNear
                 ? ` <span class="badge badge-txt" title="This request has consumed at least 90% of its image-byte budget.">near budget</span>`
                 : '';

@@ -214,4 +214,27 @@ describe('Anthropic rendered-image byte budget', () => {
     expect(html).toContain('>near budget</span>');
     expect(html).toContain('23.0 MiB serialized request');
   });
+
+  it('shows budget and wire-byte details for a caller-only oversized request', () => {
+    const html = renderRecentFragment({
+      recent: [{
+        ts: Date.now() / 1000,
+        method: 'POST',
+        path: '/v1/messages',
+        status: 200,
+        compressed: false,
+        image_bytes: 0,
+        input_image_bytes: 19 * 1024 * 1024,
+        image_byte_budget: 18 * 1024 * 1024,
+        image_budget_degraded: true,
+        serialized_request_bytes: 26 * 1024 * 1024,
+      }],
+      has_preview: false,
+      preview_meta: '',
+    });
+
+    expect(html).toContain('>budget</span>');
+    expect(html).toContain('19.0 MiB of 18.0 MiB image-byte budget');
+    expect(html).toContain('26.0 MiB serialized request');
+  });
 });

@@ -1194,10 +1194,12 @@ async function main(): Promise<void> {
         `[${new Date().toISOString()}] ${e.method} ${e.path} → ${e.status} (${e.durationMs}ms) ${tag}${usageTag}`,
       );
       if (e.info?.imageBudgetOutcome === 'degraded') {
-        console.warn(
-          `  ↳ image-byte budget kept ${e.info.imageBudgetSkippedBlocks ?? 0} render group(s) as text ` +
-          `(${(e.info.inputImageBytes ?? 0) + e.info.imageBytes}B total images / ${e.info.imageByteBudget}B budget)`,
-        );
+        const used = (e.info.inputImageBytes ?? 0) + e.info.imageBytes;
+        console.warn(e.info.imageBudgetSkippedBlocks
+          ? `  ↳ image-byte budget kept ${e.info.imageBudgetSkippedBlocks} render group(s) as text ` +
+            `(${used}B total images / ${e.info.imageByteBudget}B budget)`
+          : `  ↳ caller images already exceed the image-byte budget ` +
+            `(${used}B total images / ${e.info.imageByteBudget}B budget)`);
       }
 
       // Upstream error bodies are present only under PXPIPE_DEBUG_CAPTURE_4XX;

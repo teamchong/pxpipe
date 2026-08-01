@@ -15,6 +15,11 @@ request-size guards: it protects against the observed reliability cliff around
 If the next static slab, tool result, or history group would cross the remaining
 budget, pxpipe keeps that whole group as native text.
 
+pxpipe never deletes caller-supplied images. If those images alone exceed the
+configured budget, the request is forwarded without adding image groups and is
+reported as `imageBudgetOutcome: "degraded"` with zero skipped groups until an
+otherwise-profitable pxpipe group is considered.
+
 Set `PXPIPE_MAX_IMAGE_BYTES` in the Node or Worker host, or pass
 `maxImageBytes` through `TransformOptions`, to override the default.
 `TransformInfo.imageByteBudget`, `imageBudgetOutcome`,

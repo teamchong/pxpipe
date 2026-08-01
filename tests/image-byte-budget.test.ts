@@ -70,6 +70,29 @@ describe('Anthropic rendered-image byte budget', () => {
     expect(result.info.inputImageBytes).toBe(12);
   });
 
+  it('flags caller images that already exceed the budget without deleting them', async () => {
+    const image = {
+      type: 'image',
+      source: { type: 'base64', media_type: 'image/png', data: 'AQIDBA==' },
+    } as const;
+    const original = bytes({
+      model: 'claude-fable-5',
+      system: 'short',
+      messages: [{ role: 'user', content: [image] }],
+    });
+
+    const result = await transformRequest(original, {
+      collapseHistory: false,
+      maxImageBytes: 3,
+    });
+    expect(result.body).toEqual(original);
+    expect(result.info.inputImageBytes).toBe(4);
+    expect(result.info.imageBytes).toBe(0);
+    expect(result.info.imageByteBudget).toBe(3);
+    expect(result.info.imageBudgetOutcome).toBe('degraded');
+    expect(result.info.imageBudgetSkippedBlocks).toBeUndefined();
+  });
+
   it('keeps an oversized static slab byte-identical as text', async () => {
     const original = bytes({
       model: 'claude-fable-5',
@@ -168,5 +191,27 @@ describe('Anthropic rendered-image byte budget', () => {
 
     expect(html).toContain('>budget</span>');
     expect(html).toContain('stayed as text');
+  });
+
+  it('warns near the budget and exposes serialized wire size in the dashboard', () => {
+    const html = renderRecentFragment({
+      recent: [{
+        ts: Date.now() / 1000,
+        method: 'POST',
+        path: '/v1/messages',
+        status: 200,
+        compressed: true,
+        cc_added: 1,
+        image_bytes: 17 * 1024 * 1024,
+        input_image_bytes: 0,
+        image_byte_budget: 18 * 1024 * 1024,
+        serialized_request_bytes: 23 * 1024 * 1024,
+      }],
+      has_preview: false,
+      preview_meta: '',
+    });
+
+    expect(html).toContain('>near budget</span>');
+    expect(html).toContain('23.0 MiB serialized request');
   });
 });

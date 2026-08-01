@@ -626,12 +626,20 @@ export function renderRecentFragment(p: RecentPayload): string {
                 : saved < 0
                   ? `<td class="num neg">${numFmt(saved)}${createNote}</td>`
                   : `<td class="num">0</td>`;
+            const imageBudgetUsed = (e.input_image_bytes ?? 0) + (e.image_bytes ?? 0);
+            const wireSize = e.serialized_request_bytes != null
+              ? `; ${imageByteLabel(e.serialized_request_bytes)} serialized request`
+              : '';
             const imageBudgetTitle = e.image_bytes != null && e.image_byte_budget != null
-              ? ` title="${escapeHtml(`${imageByteLabel((e.input_image_bytes ?? 0) + e.image_bytes)} of ${imageByteLabel(e.image_byte_budget)} image-byte budget`)}"`
+              ? ` title="${escapeHtml(`${imageByteLabel(imageBudgetUsed)} of ${imageByteLabel(e.image_byte_budget)} image-byte budget${wireSize}`)}"`
               : '';
+            const imageBudgetNear = e.image_byte_budget != null && e.image_byte_budget > 0 &&
+              imageBudgetUsed >= e.image_byte_budget * 0.9;
             const budgetBadge = e.image_budget_degraded
-              ? ` <span class="badge badge-txt" title="One or more render groups stayed as text to keep this request below the image-byte budget.">budget</span>`
-              : '';
+              ? ` <span class="badge badge-txt" title="The caller images already exceeded the image-byte budget or one or more render groups stayed as text.">budget</span>`
+              : imageBudgetNear
+                ? ` <span class="badge badge-txt" title="This request has consumed at least 90% of its image-byte budget.">near budget</span>`
+                : '';
             const imaged = (e.cc_added
               ? `<span class="badge badge-img"${imageBudgetTitle}>image</span>` +
                 budgetBadge

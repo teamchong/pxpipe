@@ -170,10 +170,12 @@ export default {
         console.log(`${e.method} ${e.path} → ${e.status} (${e.durationMs}ms) ${tag} cache_read=${cacheRead}`);
 
         if (e.info?.imageBudgetOutcome === 'degraded') {
-          console.warn(
-            `[pxpipe warn] image-byte budget kept ${e.info.imageBudgetSkippedBlocks ?? 0} render group(s) as text ` +
-            `(${(e.info.inputImageBytes ?? 0) + e.info.imageBytes}B total images / ${e.info.imageByteBudget}B budget)`,
-          );
+          const used = (e.info.inputImageBytes ?? 0) + e.info.imageBytes;
+          console.warn(e.info.imageBudgetSkippedBlocks
+            ? `[pxpipe warn] image-byte budget kept ${e.info.imageBudgetSkippedBlocks} render group(s) as text ` +
+              `(${used}B total images / ${e.info.imageByteBudget}B budget)`
+            : `[pxpipe warn] caller images already exceed the image-byte budget ` +
+              `(${used}B total images / ${e.info.imageByteBudget}B budget)`);
         }
 
         if (e.info?.unknownStaticTags && e.info.unknownStaticTags.length > 0) {

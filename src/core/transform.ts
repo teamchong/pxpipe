@@ -564,8 +564,8 @@ export interface TransformInfo {
   imageBytes: number;
   /** Configured ceiling for total decoded image payload bytes. */
   imageByteBudget?: number;
-  /** Whether one or more otherwise-profitable render groups stayed as text
-   *  because their PNGs would have crossed `imageByteBudget`. */
+  /** Whether the request stayed within budget, or degraded because caller
+   *  images already exceeded it and/or a render group had to stay as text. */
   imageBudgetOutcome?: 'within_budget' | 'degraded';
   /** Render groups kept as native text by the image-byte budget. */
   imageBudgetSkippedBlocks?: number;
@@ -1563,6 +1563,12 @@ function usedImageBudgetBytes(info: TransformInfo): number {
   return (info.inputImageBytes ?? 0) + info.imageBytes;
 }
 
+function normalizedImageByteBudget(maxImageBytes: number): number {
+  return Number.isFinite(maxImageBytes)
+    ? Math.max(0, Math.floor(maxImageBytes))
+    : DEFAULTS.maxImageBytes;
+}
+
 /** Admit one complete render group or keep the whole group as native text.
  *  Groups are atomic so a tool result/history segment is never half-imaged and
  *  half-lost. Caller-supplied images and admitted pxpipe groups share the
@@ -1572,9 +1578,7 @@ function fitsImageBudget(
   maxImageBytes: number,
   candidateBytes: number,
 ): boolean {
-  const limit = Number.isFinite(maxImageBytes)
-    ? Math.max(0, Math.floor(maxImageBytes))
-    : DEFAULTS.maxImageBytes;
+  const limit = normalizedImageByteBudget(maxImageBytes);
   info.imageByteBudget = limit;
   if (candidateBytes <= Math.max(0, limit - usedImageBudgetBytes(info))) {
     info.imageBudgetOutcome ??= 'within_budget';
@@ -1729,6 +1733,7 @@ export async function transformRequest(
     compressedChars: 0,
     imageCount: 0,
     imageBytes: 0,
+    imageByteBudget: normalizedImageByteBudget(o.maxImageBytes),
     staticChars: 0,
     dynamicChars: 0,
     dynamicBlockCount: 0,
@@ -1752,6 +1757,12 @@ export async function transformRequest(
     return { body, info };
   }
   info.inputImageBytes = countInputImageBytes(req);
+  // Caller content is never dropped merely to satisfy a pxpipe optimization
+  // budget. Flag an already-oversized native request and refuse every added
+  // render group, while forwarding the caller's images unchanged.
+  if (info.inputImageBytes > info.imageByteBudget!) {
+    info.imageBudgetOutcome = 'degraded';
+  }
 
   // 0. User-pinned instructions. Fold the transcript's pin commands, then remove
   //    them from the outbound copy — the client's own transcript is untouched, so

@@ -26,8 +26,10 @@ describe('toTrackEvent', () => {
       firstByteMs: 200,
       info: {
         compressed: true,
+        serializedRequestBytes: 8192,
         origChars: 16000,
         imageCount: 1,
+        inputImageBytes: 1024,
         imageBytes: 2103,
         imageByteBudget: 18 * 1024 * 1024,
         imageBudgetOutcome: 'degraded',
@@ -66,11 +68,13 @@ describe('toTrackEvent', () => {
     expect(out.duration_ms).toBe(1234);
     expect(out.first_byte_ms).toBe(200);
     expect(out.compressed).toBe(true);
+    expect(out.serialized_request_bytes).toBe(8192);
     expect(out.orig_chars).toBe(16000);
     expect(out.static_chars).toBe(14000);
     expect(out.dynamic_chars).toBe(500);
     expect(out.dynamic_block_count).toBe(2);
     expect(out.image_byte_budget).toBe(18 * 1024 * 1024);
+    expect(out.input_image_bytes).toBe(1024);
     expect(out.image_budget_outcome).toBe('degraded');
     expect(out.image_budget_skipped_blocks).toBe(2);
     expect(out.image_budget_skipped_bytes).toBe(4096);

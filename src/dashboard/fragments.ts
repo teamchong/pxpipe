@@ -627,7 +627,7 @@ export function renderRecentFragment(p: RecentPayload): string {
                   ? `<td class="num neg">${numFmt(saved)}${createNote}</td>`
                   : `<td class="num">0</td>`;
             const imageBudgetTitle = e.image_bytes != null && e.image_byte_budget != null
-              ? ` title="${escapeHtml(`${imageByteLabel(e.image_bytes)} of ${imageByteLabel(e.image_byte_budget)} image-byte budget`)}"`
+              ? ` title="${escapeHtml(`${imageByteLabel((e.input_image_bytes ?? 0) + e.image_bytes)} of ${imageByteLabel(e.image_byte_budget)} image-byte budget`)}"`
               : '';
             const budgetBadge = e.image_budget_degraded
               ? ` <span class="badge badge-txt" title="One or more render groups stayed as text to keep this request below the image-byte budget.">budget</span>`

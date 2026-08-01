@@ -22,11 +22,13 @@ export interface TrackEvent {
   // From TransformInfo:
   compressed?: boolean;
   reason?: string;
+  serialized_request_bytes?: number;
   orig_chars?: number;
   /** Text-chars replaced by image blocks (slab + reminders + tool_results).
    *  Compare with image_count: textTokens(n/4) vs imageTokens(n×2500). */
   compressed_chars?: number;
   image_count?: number;
+  input_image_bytes?: number;
   image_bytes?: number;
   image_byte_budget?: number;
   image_budget_outcome?: 'within_budget' | 'degraded';
@@ -213,11 +215,17 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
   if (info) {
     if (info.compressed !== undefined) out.compressed = info.compressed;
     if (info.reason) out.reason = info.reason;
+    if (info.serializedRequestBytes !== undefined) {
+      out.serialized_request_bytes = info.serializedRequestBytes;
+    }
     if (info.origChars !== undefined) out.orig_chars = info.origChars;
     if (info.compressedChars !== undefined && info.compressedChars > 0) {
       out.compressed_chars = info.compressedChars;
     }
     if (info.imageCount !== undefined) out.image_count = info.imageCount;
+    if (info.inputImageBytes !== undefined && info.inputImageBytes > 0) {
+      out.input_image_bytes = info.inputImageBytes;
+    }
     if (info.imageBytes !== undefined) out.image_bytes = info.imageBytes;
     if (info.imageByteBudget !== undefined) out.image_byte_budget = info.imageByteBudget;
     if (info.imageBudgetOutcome !== undefined) out.image_budget_outcome = info.imageBudgetOutcome;

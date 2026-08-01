@@ -35,7 +35,7 @@ export interface Env {
   MIN_COMPRESS_CHARS?: string;
   MIN_TOOL_RESULT_CHARS?: string;
   COLS?: string;
-  /** Anthropic Messages PNG-byte ceiling. Defaults to 18 MiB. */
+  /** Anthropic Messages decoded image-byte ceiling. Defaults to 18 MiB. */
   PXPIPE_MAX_IMAGE_BYTES?: string;
   /** Comma-separated model bases eligible for compression. */
   PXPIPE_MODELS?: string;
@@ -68,6 +68,13 @@ async function secretsMatch(a: string, b: string): Promise<boolean> {
 
 const truthy = (v: string | undefined, fallback: boolean): boolean =>
   v == null ? fallback : v === '1' || v.toLowerCase() === 'true';
+
+const nonNegativeInteger = (v: string | undefined): number | undefined => {
+  const trimmed = v?.trim();
+  if (!trimmed) return undefined;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : undefined;
+};
 
 export default {
   async fetch(req: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
@@ -107,6 +114,7 @@ export default {
       req.headers.delete('x-pxpipe-secret');
     }
 
+    const configuredImageByteBudget = nonNegativeInteger(env.PXPIPE_MAX_IMAGE_BYTES);
     const transform: TransformOptions = {
       compress: truthy(env.COMPRESS, true),
       compressTools: truthy(env.COMPRESS_TOOLS, true),
@@ -120,8 +128,8 @@ export default {
       // Omit by default so OpenAI-shaped requests use their exact model profile;
       // COLS remains an explicit operator override for every family.
       ...(env.COLS ? { cols: Number(env.COLS) } : {}),
-      ...(env.PXPIPE_MAX_IMAGE_BYTES
-        ? { maxImageBytes: Number(env.PXPIPE_MAX_IMAGE_BYTES) }
+      ...(configuredImageByteBudget !== undefined
+        ? { maxImageBytes: configuredImageByteBudget }
         : {}),
     };
     const trackingOn = truthy(env.PXPIPE_TRACK, true);
@@ -164,7 +172,7 @@ export default {
         if (e.info?.imageBudgetOutcome === 'degraded') {
           console.warn(
             `[pxpipe warn] image-byte budget kept ${e.info.imageBudgetSkippedBlocks ?? 0} render group(s) as text ` +
-            `(${e.info.imageBytes}B emitted / ${e.info.imageByteBudget}B budget)`,
+            `(${(e.info.inputImageBytes ?? 0) + e.info.imageBytes}B total images / ${e.info.imageByteBudget}B budget)`,
           );
         }
 

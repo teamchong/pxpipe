@@ -245,7 +245,7 @@ Environment:
   PXPIPE_LOG              JSONL events path (default ~/.pxpipe/events.jsonl)
   PXPIPE_DUMP_DIR         debug: write every rendered PNG here (what the model
                           sees); off unless set. Compress arm only.
-  PXPIPE_MAX_IMAGE_BYTES  Anthropic Messages PNG-byte ceiling per request
+  PXPIPE_MAX_IMAGE_BYTES  Anthropic Messages decoded image-byte ceiling
                           (default 18874368 = 18 MiB). A render group that
                           would cross it stays as native text.
   PXPIPE_DEBUG_CAPTURE_4XX  debug: set to 1 to persist full 4xx request and
@@ -1196,7 +1196,7 @@ async function main(): Promise<void> {
       if (e.info?.imageBudgetOutcome === 'degraded') {
         console.warn(
           `  ↳ image-byte budget kept ${e.info.imageBudgetSkippedBlocks ?? 0} render group(s) as text ` +
-          `(${e.info.imageBytes}B emitted / ${e.info.imageByteBudget}B budget)`,
+          `(${(e.info.inputImageBytes ?? 0) + e.info.imageBytes}B total images / ${e.info.imageByteBudget}B budget)`,
         );
       }
 

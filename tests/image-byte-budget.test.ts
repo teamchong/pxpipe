@@ -18,6 +18,58 @@ function denseLines(prefix: string, count: number): string {
 }
 
 describe('Anthropic rendered-image byte budget', () => {
+  it('counts caller images and admits a slab only at the exact combined boundary', async () => {
+    const nativeImage = {
+      type: 'image',
+      source: { type: 'base64', media_type: 'image/png', data: 'AQIDBA==' },
+    } as const;
+    const original = bytes({
+      model: 'claude-fable-5',
+      system: [nativeImage, { type: 'text', text: denseLines('instruction', 2500) }],
+      messages: [{ role: 'user', content: 'continue' }],
+    });
+    const options = { collapseHistory: false } as const;
+    const measured = await transformRequest(original, options);
+
+    expect(measured.info.inputImageBytes).toBe(4);
+    expect(measured.info.imageBytes).toBeGreaterThan(0);
+    const exactLimit = 4 + measured.info.imageBytes;
+
+    const exact = await transformRequest(original, { ...options, maxImageBytes: exactLimit });
+    expect(exact.info.compressed).toBe(true);
+    expect(exact.info.inputImageBytes).toBe(4);
+    expect(exact.info.imageBytes).toBe(measured.info.imageBytes);
+    expect(exact.info.imageBudgetOutcome).toBe('within_budget');
+
+    const oneByteShort = await transformRequest(original, {
+      ...options,
+      maxImageBytes: exactLimit - 1,
+    });
+    expect(oneByteShort.body).toEqual(original);
+    expect(oneByteShort.info.compressed).toBe(false);
+    expect(oneByteShort.info.inputImageBytes).toBe(4);
+    expect(oneByteShort.info.imageBytes).toBe(0);
+    expect(oneByteShort.info.imageBudgetOutcome).toBe('degraded');
+  });
+
+  it('counts caller images in messages and nested tool results', async () => {
+    const image = {
+      type: 'image',
+      source: { type: 'base64', media_type: 'image/png', data: 'AQIDBA==' },
+    } as const;
+    const original = bytes({
+      model: 'claude-fable-5',
+      system: [image, { type: 'text', text: 'short' }],
+      messages: [{
+        role: 'user',
+        content: [image, { type: 'tool_result', tool_use_id: 'tool-1', content: [image] }],
+      }],
+    });
+
+    const result = await transformRequest(original, { collapseHistory: false });
+    expect(result.info.inputImageBytes).toBe(12);
+  });
+
   it('keeps an oversized static slab byte-identical as text', async () => {
     const original = bytes({
       model: 'claude-fable-5',

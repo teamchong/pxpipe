@@ -132,8 +132,9 @@ without running the proxy.
   and allows 64 images, while Grok allows 24 images. Opt-in long-session
   coverage can be changed (defensive cap 100) with
   `PXPIPE_GPT_HISTORY_MAX_IMAGES=48` after validating the provider's request cap.
-- **Image-byte safety:** Anthropic Messages rendering is capped at 18 MiB of
-  PNG payload per request, below the observed ~20 MiB reliability cliff. If a
+- **Image-byte safety:** Anthropic Messages requests are capped at 18 MiB of
+  decoded image payload, including caller-supplied base64 images, below the
+  observed ~20 MiB reliability cliff. If a
   slab, tool result, or history render would cross the remaining budget, that
   complete group stays as native text so the request—and `/compact`—can still
   proceed. Override the byte ceiling with `PXPIPE_MAX_IMAGE_BYTES`.

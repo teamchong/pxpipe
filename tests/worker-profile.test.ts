@@ -91,4 +91,44 @@ describe('Cloudflare Worker model profiles', () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  it('matches Node image-budget parsing for invalid, fractional, and zero values', async () => {
+    const originalFetch = globalThis.fetch;
+    const body = JSON.stringify({
+      model: 'claude-fable-5', max_tokens: 16,
+      system: 'instruction '.repeat(2000), messages: [{ role: 'user', content: 'continue' }],
+    });
+    try {
+      for (const [configured, shouldImage] of [
+        ['-1', true],
+        ['not-a-number', true],
+        ['0.9', false],
+        ['0', false],
+      ] as const) {
+        let forwarded = '';
+        globalThis.fetch = (async (input: Request | string | URL, init?: RequestInit) => {
+          const request = input instanceof Request ? input : new Request(String(input), init);
+          forwarded = await request.text();
+          return new Response(JSON.stringify({
+            id: 'msg_test', type: 'message', role: 'assistant', content: [],
+            model: 'claude-fable-5', stop_reason: 'end_turn', usage: { input_tokens: 1, output_tokens: 1 },
+          }), { headers: { 'content-type': 'application/json' } });
+        }) as typeof fetch;
+        await worker.fetch(
+          new Request('https://pxpipe.test/v1/messages', {
+            method: 'POST', headers: { 'content-type': 'application/json' }, body,
+          }),
+          {
+            ANTHROPIC_UPSTREAM: 'https://anthropic.test',
+            MIN_COMPRESS_CHARS: '1',
+            PXPIPE_MAX_IMAGE_BYTES: configured,
+          },
+          {} as ExecutionContext,
+        );
+        expect(forwarded.includes('image/png'), configured).toBe(shouldImage);
+      }
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });

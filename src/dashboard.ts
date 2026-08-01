@@ -126,6 +126,7 @@ export interface RecentRow {
   compressed: boolean;
   cc_added?: number;
   image_bytes?: number;
+  input_image_bytes?: number;
   image_byte_budget?: number;
   image_budget_degraded?: boolean;
   input_tokens?: number;
@@ -1005,6 +1006,7 @@ export class DashboardState {
       compressed,
       cc_added: compressed ? 1 : undefined,
       image_bytes: info?.imageBytes,
+      input_image_bytes: info?.inputImageBytes,
       image_byte_budget: info?.imageByteBudget,
       image_budget_degraded: info?.imageBudgetOutcome === 'degraded' || undefined,
       input_tokens: haveUsage ? inp : undefined,
@@ -1229,6 +1231,7 @@ export class DashboardState {
         compressed,
         cc_added: compressed ? 1 : undefined,
         image_bytes: t.image_bytes,
+        input_image_bytes: t.input_image_bytes,
         image_byte_budget: t.image_byte_budget,
         image_budget_degraded: t.image_budget_outcome === 'degraded' || undefined,
         input_tokens: t.input_tokens,

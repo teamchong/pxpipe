@@ -103,6 +103,9 @@ export interface ProxyEvent {
   /** Ground-truth char counts from the response stream, independent of usage.output_tokens.
    *  Absent when the body couldn't be scanned (5xx, unknown content-type). See OutputMeasurement. */
   measurement?: OutputMeasurement;
+  /** Upstream response media/encoding metadata for scanner diagnostics. */
+  responseContentType?: string;
+  responseContentEncoding?: string;
 }
 
 /** Max chars of 4xx error body captured on ProxyEvent — enough for Anthropic's full error JSON. */
@@ -227,6 +230,45 @@ function withClientDisconnect(
  *  past it stream through unbuffered. */
 const MODEL_SNIFF_MAX_BYTES = 1 << 20;
 
+/** Hard safety ceiling for request shapes pxpipe must buffer before transforming.
+ * This is deliberately separate from provider/model request limits: it bounds the
+ * proxy's own heap exposure, including when a chunked request has no Content-Length.
+ * The largest successful provider request seen in local telemetry is 11.2 MiB, so
+ * 16 MiB preserves measured traffic while preventing an unbounded allocation. */
+const TRANSFORM_BODY_MAX_BYTES = 16 * 1024 * 1024;
+
+async function readTransformBody(req: Request): Promise<Uint8Array | null> {
+  const reader = req.body?.getReader();
+  if (!reader) return new Uint8Array();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let tooLarge = false;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (tooLarge) continue; // drain without retaining bytes
+      total += value.byteLength;
+      if (total > TRANSFORM_BODY_MAX_BYTES) {
+        tooLarge = true;
+        chunks.length = 0;
+        continue;
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  if (tooLarge) return null;
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
+}
+
 /** Read the actual top-level `model` field. The body is already buffered for
  * transformation, so parsing it is both safer and simpler than a prefix regex
  * (which could mistake `metadata.model` for the routing model). */
@@ -237,6 +279,53 @@ function readModelField(body: Uint8Array): string | null {
   } catch {
     return null;
   }
+}
+
+/** Responses defaults to non-streaming when `stream` is absent. */
+function readStreamField(body: Uint8Array): boolean {
+  try {
+    const parsed = JSON.parse(new TextDecoder().decode(body)) as { stream?: unknown };
+    return parsed.stream === true;
+  } catch {
+    return false;
+  }
+}
+
+/** Read only a bounded clone of a request while leaving its original body
+ * untouched for streaming passthrough. */
+async function readBoundedClone(req: Request): Promise<Uint8Array | null> {
+  const reader = req.clone().body?.getReader();
+  if (!reader) return new Uint8Array();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (total <= MODEL_SNIFF_MAX_BYTES) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > MODEL_SNIFF_MAX_BYTES) return null;
+      chunks.push(value);
+    }
+    const body = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      body.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return body;
+  } catch {
+    return null;
+  } finally {
+    void reader.cancel().catch(() => undefined);
+  }
+}
+
+/** Read only a bounded clone of a bypassed JSON request. Bypass must keep the
+ * original body byte-for-byte, but Responses telemetry still needs to know
+ * whether a headerless Codex reply is SSE or JSON. */
+async function readStreamFieldFromClone(req: Request): Promise<boolean> {
+  const body = await readBoundedClone(req);
+  return body !== null && readStreamField(body);
 }
 
 // Claude Code only admits gateway-discovered ids beginning with "claude" or
@@ -316,22 +405,63 @@ function processSseEvent(
     return;
   }
   const obj = j as Record<string, unknown>;
+  // The Responses wire format identifies events in the JSON `type` field.
+  // Some providers also emit an SSE `event:` line, but ChatGPT's
+  // /backend-api/codex/responses commonly does not. Prefer the official JSON
+  // discriminator when present and use the SSE name as a compatibility fallback.
+  const eventType = typeof obj.type === 'string' ? obj.type : event;
 
   // OpenAI chunks have no `event:` line; usage only present when stream_options.include_usage is set.
   const openAIUsage = normalizeUsage((obj as { usage?: unknown }).usage);
   if (openAIUsage) state.usage = openAIUsage;
   // OpenAI Responses API streams usage nested under `response` on the terminal
-  // `response.completed` (or `.incomplete`) event — not at the top level.
-  if (event === 'response.completed' || event === 'response.incomplete') {
+  // terminal Responses event — not at the top level.
+  if (
+    eventType === 'response.completed'
+    || eventType === 'response.incomplete'
+    || eventType === 'response.failed'
+  ) {
     const resp = obj.response as
-      | { usage?: unknown; incomplete_details?: { reason?: unknown } }
+      | {
+          usage?: unknown;
+          incomplete_details?: { reason?: unknown };
+          error?: { code?: unknown; message?: unknown };
+        }
       | undefined;
     const respUsage = normalizeUsage(resp?.usage);
     if (respUsage) state.usage = respUsage;
-    // Responses API has no stop_reason; normalize the terminal status/reason instead.
+    // Responses API has no stop_reason; normalize terminal status/reason.
+    // Preserve a refusal observed in an earlier delta rather than overwriting it.
     const reason = resp?.incomplete_details?.reason;
+    const failureCode = resp?.error?.code;
     state.stopReason = typeof reason === 'string' ? reason
-      : event === 'response.incomplete' ? 'incomplete' : 'stop';
+      : eventType === 'response.incomplete' ? 'incomplete'
+      : eventType === 'response.failed'
+        ? (typeof failureCode === 'string' ? failureCode : 'failed')
+        : state.stopReason ?? 'stop';
+  }
+  // Responses streaming deltas are not Chat Completions `choices[]` chunks.
+  // Count their visible/reasoning/tool payloads directly from the JSON event.
+  if (eventType === 'response.refusal.delta' || eventType === 'response.refusal.done') {
+    // `.done` repeats the completed refusal text; only deltas are additive.
+    if (eventType === 'response.refusal.delta' && typeof obj.delta === 'string') {
+      m.textChars += obj.delta.length;
+    }
+    state.stopReason = 'refusal';
+  } else if (eventType === 'response.output_text.delta' && typeof obj.delta === 'string') {
+    m.textChars += obj.delta.length;
+  } else if (
+    (eventType === 'response.reasoning_text.delta'
+      || eventType === 'response.reasoning_summary_text.delta')
+    && typeof obj.delta === 'string'
+  ) {
+    m.thinkingChars += obj.delta.length;
+  } else if (
+    (eventType === 'response.function_call_arguments.delta'
+      || eventType === 'response.custom_tool_call_input.delta')
+    && typeof obj.delta === 'string'
+  ) {
+    m.toolUseChars += obj.delta.length;
   }
   // Google AI Studio streaming chunks: usageMetadata object.
   if (obj.usageMetadata && typeof obj.usageMetadata === 'object') {
@@ -350,14 +480,14 @@ function processSseEvent(
     }
   }
 
-  if (event === 'message_start') {
+  if (eventType === 'message_start') {
     const msg = obj.message as { usage?: Usage } | undefined;
     const usage = normalizeUsage(msg?.usage);
     if (usage) state.usage = usage;
-  } else if (event === 'content_block_start') {
+  } else if (eventType === 'content_block_start') {
     const cb = obj.content_block as { type?: string } | undefined;
     if (cb?.type === 'redacted_thinking') m.redactedBlockCount += 1;
-  } else if (event === 'content_block_delta') {
+  } else if (eventType === 'content_block_delta') {
     const d = obj.delta as
       | { type?: string; text?: string; thinking?: string; partial_json?: string }
       | undefined;
@@ -368,7 +498,7 @@ function processSseEvent(
     } else if (d?.type === 'input_json_delta' && typeof d.partial_json === 'string') {
       m.toolUseChars += d.partial_json.length;
     }
-  } else if (event === 'message_delta') {
+  } else if (eventType === 'message_delta') {
     // Anthropic ships the final stop_reason here ("end_turn", "refusal", …).
     const d = obj.delta as { stop_reason?: unknown } | undefined;
     if (typeof d?.stop_reason === 'string') state.stopReason = d.stop_reason;
@@ -457,6 +587,18 @@ function normalizeUsage(raw: unknown): Usage | undefined {
     (u.prompt_tokens_details as Record<string, unknown> | undefined);
   if (details && typeof details.cached_tokens === 'number') {
     out.cached_tokens = details.cached_tokens;
+  }
+  // Some OpenAI-compatible providers additionally expose prompt-cache writes.
+  // Like cached_tokens, this is a diagnostic subset of input_tokens: consumers
+  // must not add it to the input total a second time.
+  if (details && typeof details.cache_write_tokens === 'number') {
+    out.cache_write_tokens = details.cache_write_tokens;
+  }
+  const outputDetails =
+    (u.output_tokens_details as Record<string, unknown> | undefined) ??
+    (u.completion_tokens_details as Record<string, unknown> | undefined);
+  if (outputDetails && typeof outputDetails.reasoning_tokens === 'number') {
+    out.reasoning_output_tokens = outputDetails.reasoning_tokens;
   }
 
   return Object.keys(out).length > 0 ? out : undefined;
@@ -600,7 +742,11 @@ function readStopReasonFromJson(j: unknown): string | undefined {
  * Streams are scanned to EOF (final output_tokens is in message_delta; redacted_thinking
  * blocks can appear anywhere). 4xx bodies are capped at ERROR_BODY_MAX. 5xx is skipped.
  */
-function teeForUsage(res: Response): {
+function teeForUsage(
+  res: Response,
+  assumeResponsesSse = false,
+  assumeResponsesJson = false,
+): {
   response: Response;
   usagePromise: Promise<Usage | undefined>;
   errorBodyPromise: Promise<string | undefined>;
@@ -677,7 +823,10 @@ function teeForUsage(res: Response): {
     let buf = '';
 
     try {
-      if (ct.includes('text/event-stream')) {
+      // ChatGPT's /backend-api/codex/responses currently omits Content-Type.
+      // The request's top-level `stream` field selects SSE vs JSON for that
+      // route; explicit unknown media types still fail closed.
+      if (ct.includes('text/event-stream') || (ct === '' && assumeResponsesSse)) {
         // Walk every SSE event to EOF — message_delta (final output_tokens) is last.
         const m: OutputMeasurement = {
           textChars: 0,
@@ -693,12 +842,22 @@ function teeForUsage(res: Response): {
           const { done, value } = await reader.read();
           if (done) break;
           buf += decoder.decode(value, { stream: true });
-          // SSE events are terminated by a blank line; support LF and CRLF.
+          // SSE events are terminated by a blank line; support LF, CRLF, and CR.
           let boundary: RegExpExecArray | null;
           while ((boundary = /\r\n\r\n|\n\n|\r\r/.exec(buf)) !== null) {
             const block = buf.slice(0, boundary.index);
             buf = buf.slice(boundary.index + boundary[0].length);
             processSseEvent(block, m, state);
+          }
+          // A malformed/headerless non-SSE response must not make the audit
+          // branch buffer without bound. Ordinary Responses events are far
+          // smaller; fail closed and drain if no delimiter arrives within 4 MiB.
+          if (buf.length > 4 * 1024 * 1024) {
+            while (true) {
+              const { done: drained } = await reader.read();
+              if (drained) break;
+            }
+            return { usage: undefined, measurement: undefined, stopReason: undefined };
           }
         }
         buf += decoder.decode();
@@ -706,7 +865,7 @@ function teeForUsage(res: Response): {
         return { usage: state.usage, measurement: m, stopReason: state.stopReason };
       }
 
-      if (ct.includes('application/json')) {
+      if (ct.includes('application/json') || (ct === '' && assumeResponsesJson)) {
         // Buffer fully, capped at 4 MiB.
         const MAX = 4 * 1024 * 1024;
         while (buf.length < MAX) {
@@ -830,7 +989,18 @@ function isOpenAIChatPath(pathname: string): boolean {
 }
 
 function isOpenAIResponsesPath(pathname: string): boolean {
-  return OPENAI_RESPONSES_PATH.test(pathname);
+  return OPENAI_RESPONSES_PATH.test(pathname)
+    || pathname === '/backend-api/codex/responses';
+}
+
+/** ChatGPT endpoints used by Codex when `requires_openai_auth = true` is set
+ * on a custom provider. They must go to OPENAI_UPSTREAM, never the Anthropic
+ * default. Only `responses` is transformed; the models catalogue is forwarded
+ * byte-for-byte so Codex can refresh its model list without noisy 404s. */
+function isChatGPTCodexPath(pathname: string): boolean {
+  return pathname === '/backend-api/codex/responses'
+    || pathname === '/backend-api/codex/models'
+    || pathname.startsWith('/backend-api/codex/models/');
 }
 
 function isCanonicalOpenAIPath(pathname: string, headers: Headers, hasOpenAIKey: boolean): boolean {
@@ -846,6 +1016,7 @@ function isCanonicalOpenAIPath(pathname: string, headers: Headers, hasOpenAIKey:
   return pathname === '/v1/chat/completions'
     || pathname === '/v1/responses'
     || pathname.startsWith('/v1/responses/')
+    || isChatGPTCodexPath(pathname)
     || (isModelsPath && looksOpenAIAuth);
 }
 
@@ -900,14 +1071,27 @@ async function countGoogleTokensUpstream(
   }
 }
 
-/** Resolve upstream URLs from config. Pure — unit-testable. */
+/**
+ * Resolve upstream URLs from config. Pure — unit-testable.
+ *
+ * Every env-derived input is trimmed of leading/trailing whitespace before
+ * URL construction, and trailing slashes are stripped so `base + path` joins
+ * cleanly. The trim is defensive: a stray space in OPENAI_UPSTREAM /
+ * ANTHROPIC_UPSTREAM / PXPIPE_GATEWAY_BASE_URL (commonly introduced by
+ * cmd.exe `set VAR=...`, a copy-paste with a trailing space, or a shell
+ * quoting bug in a launcher script) would otherwise build URLs like
+ * "https://api.openai.com /v1/..." — fetch() then throws
+ * "Failed to parse URL" with no actionable log line, and the operator is
+ * left guessing. Trimming at the URL boundary keeps the failure mode loud
+ * (the proxy still returns a real 401/502 from upstream) instead of silent.
+ */
 export function resolveUpstreams(config: ProxyConfig): {
   anthropic: string;
   openai: string;
   stripOpenAIV1: boolean;
 } {
   if (config.provider === 'cloudflare-ai-gateway') {
-    const base = (config.gatewayBaseUrl ?? '').replace(/\/+$/, '');
+    const base = (config.gatewayBaseUrl ?? '').trim().replace(/\/+$/, '');
     if (!base) {
       throw new Error(
         "provider 'cloudflare-ai-gateway' requires gatewayBaseUrl (PXPIPE_GATEWAY_BASE_URL)",
@@ -916,8 +1100,8 @@ export function resolveUpstreams(config: ProxyConfig): {
     return { anthropic: `${base}/anthropic`, openai: `${base}/openai`, stripOpenAIV1: true };
   }
   return {
-    anthropic: (config.upstream ?? DEFAULT_UPSTREAM).replace(/\/+$/, ''),
-    openai: (config.openAIUpstream ?? DEFAULT_OPENAI_UPSTREAM).replace(/\/+$/, ''),
+    anthropic: (config.upstream ?? DEFAULT_UPSTREAM).trim().replace(/\/+$/, ''),
+    openai: (config.openAIUpstream ?? DEFAULT_OPENAI_UPSTREAM).trim().replace(/\/+$/, ''),
     stripOpenAIV1: false,
   };
 }
@@ -969,8 +1153,11 @@ export function createProxy(config: ProxyConfig = {}) {
   const routes = resolveUpstreams(config);
   const upstream = routes.anthropic;
   const openAIUpstream = routes.openai;
+  // Same trim policy as resolveUpstreams: keep provider-prefixed passthroughs
+  // (e.g. /openai/*, /google-ai-studio/*) safe from env whitespace — see the
+  // JSDoc on resolveUpstreams for the full rationale.
   const passthroughUpstream = config.provider === 'cloudflare-ai-gateway'
-    ? (config.gatewayBaseUrl ?? '').replace(/\/+$/, '')
+    ? (config.gatewayBaseUrl ?? '').trim().replace(/\/+$/, '')
     : upstream;
   const gatewayHeaders = config.gatewayHeaders ?? {};
   const applyGatewayHeaders = (h: Headers): Headers => {
@@ -1006,6 +1193,8 @@ export function createProxy(config: ProxyConfig = {}) {
     // reqBodyBytes: kept for lazy gzip on 4xx. reqBodySha8: computed eagerly for correlation.
     let reqBodyBytes: Uint8Array | undefined;
     let reqBodySha8: string | undefined;
+let responseContentType: string | undefined;
+    let responseContentEncoding: string | undefined;
     let reqBodySha256: string | undefined;
 
     const fire = (
@@ -1082,7 +1271,7 @@ export function createProxy(config: ProxyConfig = {}) {
           // GPT image/baseline telemetry and renders As text / Saved as dashes.
           accountingProvider: isGoogleRoute
             ? 'google'
-            : isOpenAIChat || isOpenAIResponses || bridgedGptMessages || bridgedChatMessages
+            : isOpenAIChatWire || isOpenAIResponsesWire || bridgedGptMessages || bridgedChatMessages
               ? 'openai'
               : 'anthropic',
           status,
@@ -1096,6 +1285,8 @@ export function createProxy(config: ProxyConfig = {}) {
           reqBodyGz,
           measurement,
           stopReason,
+          responseContentType,
+          responseContentEncoding,
         });
       };
       void finalize();
@@ -1110,9 +1301,15 @@ export function createProxy(config: ProxyConfig = {}) {
     const bypassHeader = req.headers.get('x-pxpipe-bypass');
     const bypass = bypassHeader !== null && !/^(?:0|false|off|no)$/i.test(bypassHeader.trim());
     const providerPrefixed = isProviderPrefixedPath(url.pathname);
-    const isMessages = !bypass && req.method === 'POST' && isAnthropicMessagesPath(url.pathname);
-    const isOpenAIChat = !bypass && req.method === 'POST' && isOpenAIChatPath(url.pathname);
-    const isOpenAIResponses = !bypass && req.method === 'POST' && isOpenAIResponsesPath(url.pathname);
+    // Wire-shape detection stays independent from transform eligibility. A
+    // bypassed Codex request is still an OpenAI Responses request for routing,
+    // accounting, and response scanning; only its body transformation is off.
+    const isMessagesWire = req.method === 'POST' && isAnthropicMessagesPath(url.pathname);
+    const isOpenAIChatWire = req.method === 'POST' && isOpenAIChatPath(url.pathname);
+    const isOpenAIResponsesWire = req.method === 'POST' && isOpenAIResponsesPath(url.pathname);
+    const isMessages = !bypass && isMessagesWire;
+    const isOpenAIChat = !bypass && isOpenAIChatWire;
+    const isOpenAIResponses = !bypass && isOpenAIResponsesWire;
     const googleModel = req.method === 'POST'
       ? parseGoogleModelFromPath(url.pathname)
       : null;
@@ -1141,14 +1338,32 @@ export function createProxy(config: ProxyConfig = {}) {
     let baselinePromise: Promise<number | null> | undefined;
     let baselineCacheablePromise: Promise<number | null> | undefined;
     let baselineStatusApplies = false;
+    let responsesStreaming = false;
+
+    if (bypass && isOpenAIResponsesWire
+      && (req.headers.get('content-type') ?? '').toLowerCase().includes('json')) {
+      responsesStreaming = await readStreamFieldFromClone(req);
+    }
 
     if (isMessages || isOpenAIChat || isOpenAIResponses || isGoogle) {
-      const bodyIn = new Uint8Array(await req.arrayBuffer());
+      const bodyIn = await readTransformBody(req);
+      if (bodyIn === null) {
+        const message = `pxpipe request body exceeds safety limit (${TRANSFORM_BODY_MAX_BYTES} bytes)`;
+        fire(413, undefined, message);
+        const error = isMessages
+          ? { type: 'error', error: { type: 'request_too_large', message } }
+          : { error: { type: 'request_too_large', message } };
+        return new Response(JSON.stringify(error), {
+          status: 413,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
       try {
         const transformOpts =
           typeof config.transform === 'function' ? config.transform() : config.transform;
         // Fail-closed: unreadable model → no compression, not a risky guess.
-        const model = googleModel ?? readModelField(bodyIn);
+const model = googleModel ?? readModelField(bodyIn);
+        if (isOpenAIResponses) responsesStreaming = readStreamField(bodyIn);
         requestModel = model ?? undefined;
         // A turn whose only content is `@pxpipe pin` / `@pxpipe unpin` is
         // configuration, not a question. Answer it here: forwarding it would bill
@@ -1354,12 +1569,12 @@ export function createProxy(config: ProxyConfig = {}) {
         declaredType.toLowerCase().includes('json') &&
         !(Number.isFinite(declaredLength) && declaredLength > MODEL_SNIFF_MAX_BYTES);
       if (worthBuffering) {
-        const bodyIn = new Uint8Array(await req.arrayBuffer());
-        requestModel ??= readModelField(bodyIn) ?? undefined;
-        bodyOut = bodyIn;
-      } else {
-        bodyOut = req.body; // pass through unchanged, model stays unknown
+        const sniffed = await readBoundedClone(req);
+        if (sniffed !== null) requestModel ??= readModelField(sniffed) ?? undefined;
       }
+      // Label-only inspection must never consume/buffer the actual request. A
+      // large or chunked JSON body remains byte-for-byte streaming passthrough.
+      bodyOut = req.body;
     } else {
       bodyOut = req.body; // pass through unchanged
     }
@@ -1379,7 +1594,17 @@ export function createProxy(config: ProxyConfig = {}) {
       const bridgeKey = bridgedChatMessages
         ? config.cloudflareApiKey
         : config.openAIApiKey;
-      if (bridgeKey) outHeaders.set('authorization', `Bearer ${bridgeKey}`);
+      // Codex talks to chatgpt.com with the client's ChatGPT OAuth bearer.
+      // OPENAI_API_KEY is for canonical /v1 OpenAI endpoints only; replacing
+      // Codex's bearer here makes an otherwise valid signed-in session 401.
+      const isCodexPath = isChatGPTCodexPath(url.pathname);
+      const inboundBearerIsAnthropic = /^Bearer\s+sk-ant-/i.test(outHeaders.get('authorization') ?? '');
+      if (isCodexPath && inboundBearerIsAnthropic) outHeaders.delete('authorization');
+      if (bridgeKey && (
+        !isCodexPath || inboundBearerIsAnthropic || !outHeaders.has('authorization')
+      )) {
+        outHeaders.set('authorization', `Bearer ${bridgeKey}`);
+      }
     } else if (config.apiKey && (!providerPrefixed || url.pathname.startsWith('/anthropic/'))) {
       outHeaders.set('x-api-key', config.apiKey);
     }
@@ -1521,16 +1746,22 @@ export function createProxy(config: ProxyConfig = {}) {
     }
 
     const firstByteMs = Date.now() - t0;
+    responseContentType = upstreamRes.headers.get('content-type') ?? undefined;
+    responseContentEncoding = upstreamRes.headers.get('content-encoding') ?? undefined;
 
     // Tee: client gets one side; scanner reads the other for usage/measurement/error body.
-    let teed: Response;
+let teed: Response;
     let usagePromise: Promise<Usage | undefined>;
     let errorBodyPromise: Promise<string | undefined>;
     let measurementPromise: Promise<OutputMeasurement | undefined>;
     let stopReasonPromise: Promise<string | undefined>;
     try {
       ({ response: teed, usagePromise, errorBodyPromise, measurementPromise, stopReasonPromise } =
-        teeForUsage(upstreamRes));
+        teeForUsage(
+          upstreamRes,
+          isOpenAIResponsesWire && responsesStreaming,
+          isOpenAIResponsesWire && !responsesStreaming,
+        ));
     } catch (e) {
       releaseInFlight();
       throw e;

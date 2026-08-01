@@ -1005,7 +1005,9 @@ async function runExport(argv: string[]): Promise<void> {
 
   // Write artifacts
   for (const artifact of result.artifacts) {
-    fs.writeFileSync(path.join(outDir, artifact.filename), artifact.data);
+    // The bundle contains source and prompt-derived content. mkdtemp creates
+    // its directory owner-only; keep each artifact owner-only as well.
+    fs.writeFileSync(path.join(outDir, artifact.filename), artifact.data, { mode: 0o600 });
   }
 
   // Print report

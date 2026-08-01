@@ -92,6 +92,10 @@ export interface TransformOptions {
   /** Hard upper bound on images per tool_result; source text truncated with a paging
    *  marker above this to stay under Anthropic's 100-image/request cap. Default 10. */
   maxImagesPerToolResult?: number;
+  /** Maximum total PNG payload bytes pxpipe may add to one request. When the
+   *  next render group would cross the budget, that group stays native text.
+   *  Default 18 MiB, below the observed ~20 MiB reliability cliff (#157). */
+  maxImageBytes?: number;
   /** Chars-per-token assumption for `isCompressionProfitable()`. Default 4. */
   charsPerToken?: number;
   /** Multi-turn amortization horizon for the history-collapse gate. N≥2 evaluates as
@@ -138,6 +142,7 @@ const DEFAULTS: Required<TransformOptions> = {
   // 312 cols × 5 px + 8 px pad = 1568 px (Anthropic no-resize edge).
   cols: ANTHROPIC_SLAB_COLS,
   maxImagesPerToolResult: 10,
+  maxImageBytes: 18 * 1024 * 1024,
   charsPerToken: 4,
   historyAmortizationHorizon: 1,
   priorWarmTokens: 0,
@@ -479,7 +484,7 @@ export function isCompressionProfitableAmortized(
 /** Increment a passthrough-reason counter on `info`. Lazily allocates `passthroughReasons`. */
 function bumpPassthrough(
   info: TransformInfo,
-  reason: 'below_threshold' | 'not_profitable' | 'kept_sharp',
+  reason: 'below_threshold' | 'not_profitable' | 'kept_sharp' | 'image_budget',
 ): void {
   if (!info.passthroughReasons) info.passthroughReasons = {};
   info.passthroughReasons[reason] = (info.passthroughReasons[reason] ?? 0) + 1;
@@ -552,6 +557,15 @@ export interface TransformInfo {
   compressedChars: number;
   imageCount: number;
   imageBytes: number;
+  /** Configured ceiling for pxpipe-generated PNG payload bytes. */
+  imageByteBudget?: number;
+  /** Whether one or more otherwise-profitable render groups stayed as text
+   *  because their PNGs would have crossed `imageByteBudget`. */
+  imageBudgetOutcome?: 'within_budget' | 'degraded';
+  /** Render groups kept as native text by the image-byte budget. */
+  imageBudgetSkippedBlocks?: number;
+  /** PNG bytes those skipped groups would have added. */
+  imageBudgetSkippedBytes?: number;
   /** Σ width×height across all rendered images. Pairs with upstream token count for
    *  empirical px/token regression: `tokens ≈ α·outgoingTextChars + β·imagePixels`. */
   imagePixels?: number;
@@ -637,7 +651,12 @@ export interface TransformInfo {
   /** Top dropped codepoints by frequency (`U+HHHH` → count), at most 20 entries. */
   droppedCodepointsTop?: Record<string, number>;
   /** Why blocks passed through without compression. Only present when count > 0. */
-  passthroughReasons?: { below_threshold?: number; not_profitable?: number; kept_sharp?: number };
+  passthroughReasons?: {
+    below_threshold?: number;
+    not_profitable?: number;
+    kept_sharp?: number;
+    image_budget?: number;
+  };
   /** Slab gate diagnostics — imageTokens, textTokens, burn terms, and verdict.
    *  Lets hosts measure flap-prevention efficacy and tune amortization horizon. */
   gateEval?: {
@@ -687,6 +706,7 @@ export interface TransformInfo {
     | 'below_min_chars'
     | 'below_min_tokens'
     | 'not_profitable'
+    | 'image_budget'
     | 'too_many_images'
     | 'render_empty'
     | 'collapsed';
@@ -1497,6 +1517,29 @@ function approxBlockBytes(blk: ImageBlock): number {
   return Math.floor((b64.length * 3) / 4) - pad;
 }
 
+/** Admit one complete render group or keep the whole group as native text.
+ *  Groups are atomic so a tool result/history segment is never half-imaged and
+ *  half-lost. `info.imageBytes` contains only groups already admitted. */
+function fitsImageBudget(
+  info: TransformInfo,
+  maxImageBytes: number,
+  candidateBytes: number,
+): boolean {
+  const limit = Number.isFinite(maxImageBytes)
+    ? Math.max(0, Math.floor(maxImageBytes))
+    : DEFAULTS.maxImageBytes;
+  info.imageByteBudget = limit;
+  if (candidateBytes <= Math.max(0, limit - info.imageBytes)) {
+    info.imageBudgetOutcome ??= 'within_budget';
+    return true;
+  }
+  info.imageBudgetOutcome = 'degraded';
+  info.imageBudgetSkippedBlocks = (info.imageBudgetSkippedBlocks ?? 0) + 1;
+  info.imageBudgetSkippedBytes = (info.imageBudgetSkippedBytes ?? 0) + candidateBytes;
+  bumpPassthrough(info, 'image_budget');
+  return false;
+}
+
 // --- main transform --------------------------------------------------------
 
 
@@ -1567,27 +1610,31 @@ async function runHistoryCollapseAndFinalize(
       },
     );
     if (histInfo.collapsedTurns > 0) {
-      req.messages = newMessages;
-      info.collapsedTurns = histInfo.collapsedTurns;
-      info.collapsedChars = histInfo.collapsedChars;
-      info.collapsedImages = histInfo.collapsedImages;
-      info.imageCount += histInfo.collapsedImages;
-      info.imageBytes += histInfo.collapsedImageBytes;
-      info.imagePixels = (info.imagePixels ?? 0) + histInfo.collapsedImagePixels;
-      // Register the rendered (colored) history PNGs into the dashboard image ring
-      // so they are visible, not merely counted. Every other image path feeds this.
-      // imagePngs + imageDims must be pushed in lockstep (ring reads them parallel).
-      (info.imagePngs ??= []).push(...histInfo.collapsedPngs);
-      (info.imageDims ??= []).push(...histInfo.collapsedImageDims);
-      info.droppedChars = (info.droppedChars ?? 0) + histInfo.droppedChars;
-      for (const [cp, n] of histInfo.droppedCodepoints) {
-        droppedCodepoints.set(cp, (droppedCodepoints.get(cp) ?? 0) + n);
+      if (!fitsImageBudget(info, o.maxImageBytes, histInfo.collapsedImageBytes)) {
+        info.historyReason = 'image_budget';
+      } else {
+        req.messages = newMessages;
+        info.collapsedTurns = histInfo.collapsedTurns;
+        info.collapsedChars = histInfo.collapsedChars;
+        info.collapsedImages = histInfo.collapsedImages;
+        info.imageCount += histInfo.collapsedImages;
+        info.imageBytes += histInfo.collapsedImageBytes;
+        info.imagePixels = (info.imagePixels ?? 0) + histInfo.collapsedImagePixels;
+        // Register the rendered (colored) history PNGs into the dashboard image ring
+        // so they are visible, not merely counted. Every other image path feeds this.
+        // imagePngs + imageDims must be pushed in lockstep (ring reads them parallel).
+        (info.imagePngs ??= []).push(...histInfo.collapsedPngs);
+        (info.imageDims ??= []).push(...histInfo.collapsedImageDims);
+        info.droppedChars = (info.droppedChars ?? 0) + histInfo.droppedChars;
+        for (const [cp, n] of histInfo.droppedCodepoints) {
+          droppedCodepoints.set(cp, (droppedCodepoints.get(cp) ?? 0) + n);
+        }
+        info.historyReason = 'collapsed';
+        info.historyTextChars = histInfo.collapsedChars;
+        info.historyImageSha = await historyImageSha8(newMessages);
+        bumpBucket(info, 'history', histInfo.collapsedChars);
+        collapsedFlag = true;
       }
-      info.historyReason = 'collapsed';
-      info.historyTextChars = histInfo.collapsedChars;
-      info.historyImageSha = await historyImageSha8(newMessages);
-      bumpBucket(info, 'history', histInfo.collapsedChars);
-      collapsedFlag = true;
     } else if (histInfo.reason) {
       info.historyReason = histInfo.reason;
     }
@@ -1944,6 +1991,16 @@ export async function transformRequest(
     denseGeo.style,
     denseGeo.maxHeightPx,
   );
+  const slabImageBytes = images.reduce((sum, image) => sum + image.png.length, 0);
+  if (!fitsImageBudget(info, o.maxImageBytes, slabImageBytes)) {
+    info.reason = `image_budget (slab=${slabImageBytes}B > remaining=${Math.max(0, o.maxImageBytes - info.imageBytes)}B)`;
+    const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints, pins);
+    if (finalized.collapsed) {
+      info.compressed = true;
+      return { body: finalized.body, info };
+    }
+    return { body: pinsRewrote ? finalized.body : body, info };
+  }
   const imageBlocks: ImageBlock[] = [];
   for (let i = 0; i < images.length; i++) {
     const img = images[i]!;
@@ -2071,10 +2128,6 @@ export async function transformRequest(
                   denseGeo.maxChars,
                   linesPerImage,
                 );
-                if (paged.truncated) {
-                  info.truncatedToolResults = (info.truncatedToolResults ?? 0) + 1;
-                  info.omittedChars = (info.omittedChars ?? 0) + paged.omittedChars;
-                }
                 const { blocks: imgs, pngs: rawPngs, dims: rawDims, droppedChars, droppedCodepoints: dcp, pixels } =
                   await textToImageBlocks(
                     paged.text,
@@ -2083,6 +2136,15 @@ export async function transformRequest(
                     denseGeo.style,
                     denseGeo.maxHeightPx,
                   );
+                const candidateBytes = rawPngs.reduce((sum, png) => sum + png.length, 0);
+                if (!fitsImageBudget(info, o.maxImageBytes, candidateBytes)) {
+                  rewritten.push(blk);
+                  continue;
+                }
+                if (paged.truncated) {
+                  info.truncatedToolResults = (info.truncatedToolResults ?? 0) + 1;
+                  info.omittedChars = (info.omittedChars ?? 0) + paged.omittedChars;
+                }
                 (info.imagePngs ??= []).push(...rawPngs);
                 (info.imageDims ??= []).push(...rawDims);
                 for (const img of imgs) info.imageBytes += approxBlockBytes(img);
@@ -2153,10 +2215,6 @@ export async function transformRequest(
                   denseGeo.maxChars,
                   linesPerImage,
                 );
-                if (paged.truncated) {
-                  info.truncatedToolResults = (info.truncatedToolResults ?? 0) + 1;
-                  info.omittedChars = (info.omittedChars ?? 0) + paged.omittedChars;
-                }
                 const { blocks: imgs, pngs: rawPngs, dims: rawDims, droppedChars, droppedCodepoints: dcp, pixels } =
                   await textToImageBlocks(
                     paged.text,
@@ -2165,6 +2223,15 @@ export async function transformRequest(
                     denseGeo.style,
                     denseGeo.maxHeightPx,
                   );
+                const candidateBytes = rawPngs.reduce((sum, png) => sum + png.length, 0);
+                if (!fitsImageBudget(info, o.maxImageBytes, candidateBytes)) {
+                  newInner.push(ib as TextBlock | ImageBlock);
+                  continue;
+                }
+                if (paged.truncated) {
+                  info.truncatedToolResults = (info.truncatedToolResults ?? 0) + 1;
+                  info.omittedChars = (info.omittedChars ?? 0) + paged.omittedChars;
+                }
                 (info.imagePngs ??= []).push(...rawPngs);
                 (info.imageDims ??= []).push(...rawDims);
                 const srcCacheControl = demoteRelocatedCacheControl((ib as { cache_control?: unknown }).cache_control);
@@ -2246,38 +2313,42 @@ export async function transformRequest(
       },
     );
     if (histInfo.collapsedTurns > 0) {
-      req.messages = newMessages;
-      info.collapsedTurns = histInfo.collapsedTurns;
-      info.collapsedChars = histInfo.collapsedChars;
-      info.collapsedImages = histInfo.collapsedImages;
-      info.imageCount += histInfo.collapsedImages;
-      info.imageBytes += histInfo.collapsedImageBytes;
-      info.imagePixels = (info.imagePixels ?? 0) + histInfo.collapsedImagePixels;
-      // Register the rendered (colored) history PNGs into the dashboard image ring
-      // so they are visible, not merely counted. Every other image path feeds this.
-      // imagePngs + imageDims must be pushed in lockstep (ring reads them parallel).
-      (info.imagePngs ??= []).push(...histInfo.collapsedPngs);
-      (info.imageDims ??= []).push(...histInfo.collapsedImageDims);
-      info.droppedChars = (info.droppedChars ?? 0) + histInfo.droppedChars;
-      for (const [cp, n] of histInfo.droppedCodepoints) {
-        droppedCodepoints.set(cp, (droppedCodepoints.get(cp) ?? 0) + n);
-      }
-      info.historyReason = 'collapsed';
-      info.historyTextChars = histInfo.collapsedChars;
-      info.historyImageSha = await historyImageSha8(newMessages);
-      bumpBucket(info, 'history', histInfo.collapsedChars);
-      // Move the single cache anchor onto the history image so slab + history
-      // cache as one stable prefix (created once, then read), instead of the
-      // history image re-creating whenever the caller's downstream marker moves.
-      //
-      // ONLY when collapseHistory pinned a byte-frozen carry-over chunk. On the
-      // session's FIRST collapse the range fits in one freeze window, no carry-over
-      // exists (ordinal undefined), and relocating would land the anchor on the
-      // newest still-growing history image — a volatile breakpoint that forced a
-      // one-time full-prefix rewrite (~53k tokens/session). Leave the anchor on
-      // the byte-stable slab image until a frozen chunk exists to pin to.
-      if (histInfo.carryOverImageOrdinal !== undefined) {
-        relocateAnchorToHistoryImage(req.messages, histInfo.carryOverImageOrdinal);
+      if (!fitsImageBudget(info, o.maxImageBytes, histInfo.collapsedImageBytes)) {
+        info.historyReason = 'image_budget';
+      } else {
+        req.messages = newMessages;
+        info.collapsedTurns = histInfo.collapsedTurns;
+        info.collapsedChars = histInfo.collapsedChars;
+        info.collapsedImages = histInfo.collapsedImages;
+        info.imageCount += histInfo.collapsedImages;
+        info.imageBytes += histInfo.collapsedImageBytes;
+        info.imagePixels = (info.imagePixels ?? 0) + histInfo.collapsedImagePixels;
+        // Register the rendered (colored) history PNGs into the dashboard image ring
+        // so they are visible, not merely counted. Every other image path feeds this.
+        // imagePngs + imageDims must be pushed in lockstep (ring reads them parallel).
+        (info.imagePngs ??= []).push(...histInfo.collapsedPngs);
+        (info.imageDims ??= []).push(...histInfo.collapsedImageDims);
+        info.droppedChars = (info.droppedChars ?? 0) + histInfo.droppedChars;
+        for (const [cp, n] of histInfo.droppedCodepoints) {
+          droppedCodepoints.set(cp, (droppedCodepoints.get(cp) ?? 0) + n);
+        }
+        info.historyReason = 'collapsed';
+        info.historyTextChars = histInfo.collapsedChars;
+        info.historyImageSha = await historyImageSha8(newMessages);
+        bumpBucket(info, 'history', histInfo.collapsedChars);
+        // Move the single cache anchor onto the history image so slab + history
+        // cache as one stable prefix (created once, then read), instead of the
+        // history image re-creating whenever the caller's downstream marker moves.
+        //
+        // ONLY when collapseHistory pinned a byte-frozen carry-over chunk. On the
+        // session's FIRST collapse the range fits in one freeze window, no carry-over
+        // exists (ordinal undefined), and relocating would land the anchor on the
+        // newest still-growing history image — a volatile breakpoint that forced a
+        // one-time full-prefix rewrite (~53k tokens/session). Leave the anchor on
+        // the byte-stable slab image until a frozen chunk exists to pin to.
+        if (histInfo.carryOverImageOrdinal !== undefined) {
+          relocateAnchorToHistoryImage(req.messages, histInfo.carryOverImageOrdinal);
+        }
       }
     } else if (histInfo.reason) {
       info.historyReason = histInfo.reason;

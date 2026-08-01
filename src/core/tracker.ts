@@ -28,6 +28,10 @@ export interface TrackEvent {
   compressed_chars?: number;
   image_count?: number;
   image_bytes?: number;
+  image_byte_budget?: number;
+  image_budget_outcome?: 'within_budget' | 'degraded';
+  image_budget_skipped_blocks?: number;
+  image_budget_skipped_bytes?: number;
   /** Total pixel area across all rendered images; pairs with cache_create_tokens for px/token regression. */
   image_pixels?: number;
   /** Provider-estimated vision tokens billed for rendered images. */
@@ -74,7 +78,12 @@ export interface TrackEvent {
   /** Top-20 dropped codepoints (U+HHHH keys) by frequency. Only present when dropped_chars > 0. */
   dropped_codepoints_top?: Record<string, number>;
   /** Blocks that weren't image-compressed this request; only emitted when at least one counter > 0. */
-  passthrough_reasons?: { below_threshold?: number; not_profitable?: number };
+  passthrough_reasons?: {
+    below_threshold?: number;
+    not_profitable?: number;
+    kept_sharp?: number;
+    image_budget?: number;
+  };
   /** Unrecognized tag names in the static slab — canary for Claude Code releases adding new dynamic tags. */
   unknown_static_tags?: string[];
   /** Slab tags whose content changed within a session — proven per-turn dynamics busting the image cache. */
@@ -210,6 +219,14 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     }
     if (info.imageCount !== undefined) out.image_count = info.imageCount;
     if (info.imageBytes !== undefined) out.image_bytes = info.imageBytes;
+    if (info.imageByteBudget !== undefined) out.image_byte_budget = info.imageByteBudget;
+    if (info.imageBudgetOutcome !== undefined) out.image_budget_outcome = info.imageBudgetOutcome;
+    if (info.imageBudgetSkippedBlocks !== undefined) {
+      out.image_budget_skipped_blocks = info.imageBudgetSkippedBlocks;
+    }
+    if (info.imageBudgetSkippedBytes !== undefined) {
+      out.image_budget_skipped_bytes = info.imageBudgetSkippedBytes;
+    }
     if (info.imagePixels !== undefined && info.imagePixels > 0) {
       out.image_pixels = info.imagePixels;
     }
@@ -262,7 +279,12 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     }
     if (info.passthroughReasons) {
       const pr = info.passthroughReasons;
-      if ((pr.below_threshold ?? 0) > 0 || (pr.not_profitable ?? 0) > 0) {
+      if (
+        (pr.below_threshold ?? 0) > 0 ||
+        (pr.not_profitable ?? 0) > 0 ||
+        (pr.kept_sharp ?? 0) > 0 ||
+        (pr.image_budget ?? 0) > 0
+      ) {
         out.passthrough_reasons = pr;
       }
     }

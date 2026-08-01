@@ -587,6 +587,12 @@ function statusCls(status: number): string {
   return 'good';
 }
 
+function imageByteLabel(bytes: number): string {
+  return bytes >= 1024 * 1024
+    ? `${(bytes / (1024 * 1024)).toFixed(1)} MiB`
+    : `${Math.ceil(bytes / 1024)} KiB`;
+}
+
 export function renderRecentFragment(p: RecentPayload): string {
   const rows = (p.recent ?? []).slice().reverse();
   const body =
@@ -620,9 +626,16 @@ export function renderRecentFragment(p: RecentPayload): string {
                 : saved < 0
                   ? `<td class="num neg">${numFmt(saved)}${createNote}</td>`
                   : `<td class="num">0</td>`;
-            const imaged = e.cc_added
-              ? `<span class="badge badge-img">image</span>`
-              : `<span class="badge badge-txt">text</span>`;
+            const imageBudgetTitle = e.image_bytes != null && e.image_byte_budget != null
+              ? ` title="${escapeHtml(`${imageByteLabel(e.image_bytes)} of ${imageByteLabel(e.image_byte_budget)} image-byte budget`)}"`
+              : '';
+            const budgetBadge = e.image_budget_degraded
+              ? ` <span class="badge badge-txt" title="One or more render groups stayed as text to keep this request below the image-byte budget.">budget</span>`
+              : '';
+            const imaged = (e.cc_added
+              ? `<span class="badge badge-img"${imageBudgetTitle}>image</span>` +
+                budgetBadge
+              : `<span class="badge badge-txt">text</span>` + budgetBadge);
             return (
               `<tr>` +
               `<td class="muted">${i + 1}</td>` +

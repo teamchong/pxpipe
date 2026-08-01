@@ -132,6 +132,11 @@ without running the proxy.
   and allows 64 images, while Grok allows 24 images. Opt-in long-session
   coverage can be changed (defensive cap 100) with
   `PXPIPE_GPT_HISTORY_MAX_IMAGES=48` after validating the provider's request cap.
+- **Image-byte safety:** Anthropic Messages rendering is capped at 18 MiB of
+  PNG payload per request, below the observed ~20 MiB reliability cliff. If a
+  slab, tool result, or history render would cross the remaining budget, that
+  complete group stays as native text so the request—and `/compact`—can still
+  proceed. Override the byte ceiling with `PXPIPE_MAX_IMAGE_BYTES`.
 - **Per-model rendering:** opt-in `gpt-5.6-sol` and Grok use native 14px
   JetBrains Mono glyphs in a 9×16 cell, 84 columns, and a 764px full-width
   strip; Claude keeps its 312-column, 1568×728 5×8 Spleen profile. These

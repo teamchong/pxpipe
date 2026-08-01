@@ -5,6 +5,20 @@ shaped the way it is, and which invariants future contributors must not break.
 The canonical source is `src/core/transform.ts`; everything here points back at
 it.
 
+## Image-byte budget
+
+Anthropic Messages requests have an 18 MiB default budget for PNG payloads
+created by pxpipe. The budget is independent of token profitability and provider
+request-size guards: it protects against the observed reliability cliff around
+20 MiB without claiming a documented hard API limit. Render groups are atomic.
+If the next static slab, tool result, or history group would cross the remaining
+budget, pxpipe keeps that whole group as native text.
+
+Set `PXPIPE_MAX_IMAGE_BYTES` in the Node or Worker host, or pass
+`maxImageBytes` through `TransformOptions`, to override the default.
+`TransformInfo.imageByteBudget`, `imageBudgetOutcome`,
+`imageBudgetSkippedBlocks`, and `imageBudgetSkippedBytes` report the decision.
+
 ## 1. Why this proxy exists
 
 Claude Code sends a large, mostly-static prefix on every single turn: the

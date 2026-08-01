@@ -125,6 +125,9 @@ export interface RecentRow {
   size_in?: number;
   compressed: boolean;
   cc_added?: number;
+  image_bytes?: number;
+  image_byte_budget?: number;
+  image_budget_degraded?: boolean;
   input_tokens?: number;
   /** From /v1/messages `usage.output_tokens`. Identical with/without
    *  compression — shown so the operator can see why an output-heavy
@@ -1001,6 +1004,9 @@ export class DashboardState {
       status: ev.status,
       compressed,
       cc_added: compressed ? 1 : undefined,
+      image_bytes: info?.imageBytes,
+      image_byte_budget: info?.imageByteBudget,
+      image_budget_degraded: info?.imageBudgetOutcome === 'degraded' || undefined,
       input_tokens: haveUsage ? inp : undefined,
       output_tokens: haveUsage ? out : undefined,
       cache_create: haveUsage ? cc : undefined,
@@ -1222,6 +1228,9 @@ export class DashboardState {
         status: t.status,
         compressed,
         cc_added: compressed ? 1 : undefined,
+        image_bytes: t.image_bytes,
+        image_byte_budget: t.image_byte_budget,
+        image_budget_degraded: t.image_budget_outcome === 'degraded' || undefined,
         input_tokens: t.input_tokens,
         output_tokens: t.output_tokens,
         cache_create: t.cache_create_tokens,

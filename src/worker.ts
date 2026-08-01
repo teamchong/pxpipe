@@ -35,6 +35,8 @@ export interface Env {
   MIN_COMPRESS_CHARS?: string;
   MIN_TOOL_RESULT_CHARS?: string;
   COLS?: string;
+  /** Anthropic Messages PNG-byte ceiling. Defaults to 18 MiB. */
+  PXPIPE_MAX_IMAGE_BYTES?: string;
   /** Comma-separated model bases eligible for compression. */
   PXPIPE_MODELS?: string;
   /** When "0" / "false", disable per-request event JSON logs. Default-on.
@@ -118,6 +120,9 @@ export default {
       // Omit by default so OpenAI-shaped requests use their exact model profile;
       // COLS remains an explicit operator override for every family.
       ...(env.COLS ? { cols: Number(env.COLS) } : {}),
+      ...(env.PXPIPE_MAX_IMAGE_BYTES
+        ? { maxImageBytes: Number(env.PXPIPE_MAX_IMAGE_BYTES) }
+        : {}),
     };
     const trackingOn = truthy(env.PXPIPE_TRACK, true);
     // Workers Logs ingests stdout as separate log lines. Emit one JSON line
@@ -155,6 +160,13 @@ export default {
             : '';
         const cacheRead = e.usage?.cache_read_input_tokens ?? 0;
         console.log(`${e.method} ${e.path} → ${e.status} (${e.durationMs}ms) ${tag} cache_read=${cacheRead}`);
+
+        if (e.info?.imageBudgetOutcome === 'degraded') {
+          console.warn(
+            `[pxpipe warn] image-byte budget kept ${e.info.imageBudgetSkippedBlocks ?? 0} render group(s) as text ` +
+            `(${e.info.imageBytes}B emitted / ${e.info.imageByteBudget}B budget)`,
+          );
+        }
 
         if (e.info?.unknownStaticTags && e.info.unknownStaticTags.length > 0) {
           console.warn(

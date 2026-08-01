@@ -29,6 +29,11 @@ describe('toTrackEvent', () => {
         origChars: 16000,
         imageCount: 1,
         imageBytes: 2103,
+        imageByteBudget: 18 * 1024 * 1024,
+        imageBudgetOutcome: 'degraded',
+        imageBudgetSkippedBlocks: 2,
+        imageBudgetSkippedBytes: 4096,
+        passthroughReasons: { image_budget: 2 },
         staticChars: 14000,
         dynamicChars: 500,
         dynamicBlockCount: 2,
@@ -65,6 +70,11 @@ describe('toTrackEvent', () => {
     expect(out.static_chars).toBe(14000);
     expect(out.dynamic_chars).toBe(500);
     expect(out.dynamic_block_count).toBe(2);
+    expect(out.image_byte_budget).toBe(18 * 1024 * 1024);
+    expect(out.image_budget_outcome).toBe('degraded');
+    expect(out.image_budget_skipped_blocks).toBe(2);
+    expect(out.image_budget_skipped_bytes).toBe(4096);
+    expect(out.passthrough_reasons?.image_budget).toBe(2);
     expect(out.system_sha8).toBe('a1b2c3d4');
     expect(out.first_user_sha8).toBe('deadbeef');
     expect(out.unknown_static_tags).toEqual(['recent_files']);

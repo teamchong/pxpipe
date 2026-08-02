@@ -1699,6 +1699,103 @@ describe('transform', () => {
     expect(info.unknownStaticTags).toBeUndefined();
   });
 
+  // -------------------------------------------------------------------------
+  // churningStaticTags — the second canary. `unknownStaticTags` catches a tag
+  // nobody has classified yet; this one catches a tag we classified WRONGLY:
+  // anything sitting in the static slab whose content actually changes per turn
+  // re-renders the slab PNG every turn and silently destroys the image cache.
+  //
+  // The observation map is keyed by firstUserSha8 and lives at module scope, so
+  // it survives across tests in this file. Every test below therefore uses its
+  // own first user message — reusing one would inherit a foreign baseline and
+  // report phantom churn.
+  // -------------------------------------------------------------------------
+  const churnBody = (tagBlock: string, firstUser: string) =>
+    new TextEncoder().encode(
+      JSON.stringify({
+        model: 'claude',
+        messages: [{ role: 'user', content: firstUser }],
+        system:
+          'claude.md\n'.repeat(400) + tagBlock + '\n<env>\nWorking directory: /tmp\n</env>',
+      }),
+    );
+
+  it('stays silent on a tag it has never seen before (no baseline to compare)', async () => {
+    const { info } = await transformRequest(
+      churnBody('<types>\nstring\n</types>', 'churn-first-sighting'),
+    );
+    expect(info.churningStaticTags).toBeUndefined();
+  });
+
+  it('flags a static-slab tag whose content changes within one session', async () => {
+    const first = await transformRequest(churnBody('<types>\nstring\n</types>', 'churn-same-session'));
+    expect(first.info.churningStaticTags).toBeUndefined();
+    // Same session (identical first user message), different <types> content:
+    // proven per-turn dynamics, whatever KNOWN_STATIC_TAGS claims.
+    const second = await transformRequest(churnBody('<types>\nnumber\n</types>', 'churn-same-session'));
+    expect(second.info.churningStaticTags).toEqual(['types']);
+  });
+
+  it('re-arms rather than latches: a tag that settles stops being reported', async () => {
+    await transformRequest(churnBody('<types>\nstring\n</types>', 'churn-settles'));
+    const changed = await transformRequest(churnBody('<types>\nnumber\n</types>', 'churn-settles'));
+    expect(changed.info.churningStaticTags).toEqual(['types']);
+    // Third turn repeats turn two verbatim. The tag is stable again, so the
+    // canary must fall silent — it reports an edge, not a permanent verdict.
+    const settled = await transformRequest(churnBody('<types>\nnumber\n</types>', 'churn-settles'));
+    expect(settled.info.churningStaticTags).toBeUndefined();
+  });
+
+  it('keeps reporting a tag that changes on every single turn', async () => {
+    // The case the canary exists for: a tag that never settles. Each turn must
+    // be compared against the turn before it, so every one of them is a hit.
+    // A tracker that drops its baseline after reporting would flag only every
+    // second turn and silently halve the detection rate.
+    await transformRequest(churnBody('<types>\nstring\n</types>', 'churn-every-turn'));
+    const second = await transformRequest(churnBody('<types>\nnumber\n</types>', 'churn-every-turn'));
+    expect(second.info.churningStaticTags).toEqual(['types']);
+    const third = await transformRequest(churnBody('<types>\nboolean\n</types>', 'churn-every-turn'));
+    expect(third.info.churningStaticTags).toEqual(['types']);
+  });
+
+  it('scopes observations per session (a different first user message is a different session)', async () => {
+    await transformRequest(churnBody('<types>\nstring\n</types>', 'churn-session-a'));
+    // Same tag, different content, but a different session: the two sessions
+    // must not contaminate each other, or every fresh conversation would open
+    // with a burst of phantom churn warnings.
+    const other = await transformRequest(churnBody('<types>\nnumber\n</types>', 'churn-session-b'));
+    expect(other.info.churningStaticTags).toBeUndefined();
+  });
+
+  it('bounds its observation table, forgetting the oldest tags', async () => {
+    // pxpipe is a long-lived daemon: the per-tag hash table must not grow
+    // without limit. Losing the oldest baselines is the accepted price, and it
+    // is the only externally visible proof that the bound is actually live.
+    await transformRequest(churnBody('<types>\nstring\n</types>', 'churn-evict'));
+    // One request carrying more distinct tags than the table holds (4096),
+    // pushing the <types> baseline off the far end.
+    const flood = Array.from(
+      { length: 4100 },
+      (_, i) => `<t${i}>\nx\n</t${i}>`,
+    ).join('\n');
+    await transformRequest(churnBody(flood, 'churn-evict'));
+    // <types> changed, but its baseline was evicted, so there is nothing to
+    // compare against and the canary stays silent rather than guessing.
+    const after = await transformRequest(churnBody('<types>\nnumber\n</types>', 'churn-evict'));
+    expect(after.info.churningStaticTags).toBeUndefined();
+  });
+
+  it('treats reordered same-named blocks as churn (the slab bytes really do move)', async () => {
+    const a = '<example>\nalpha\n</example>\n<example>\nbeta\n</example>';
+    const b = '<example>\nbeta\n</example>\n<example>\nalpha\n</example>';
+    await transformRequest(churnBody(a, 'churn-reorder'));
+    // Same set of blocks, same total content, different order. The slab text —
+    // and therefore the rendered PNG — is not byte-identical, so the cache does
+    // bust and reporting churn is correct, not a false positive.
+    const reordered = await transformRequest(churnBody(b, 'churn-reorder'));
+    expect(reordered.info.churningStaticTags).toEqual(['example']);
+  });
+
   it('passes through when the system prompt is only dynamic blocks', async () => {
     const sys = '<env>\nWorking directory: /tmp\n</env>';
     const body = new TextEncoder().encode(

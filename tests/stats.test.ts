@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { newSummary, fold, renderTextReport } from '../src/stats.js';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { newSummary, fold, renderTextReport, runStats } from '../src/stats.js';
 import type { TrackEvent } from '../src/core/tracker.js';
 
 function ev(partial: Partial<TrackEvent>): TrackEvent {
@@ -132,5 +135,72 @@ describe('stats aggregator', () => {
     expect(out).toContain('stable');
     // 50% cache hit rate by event.
     expect(out).toMatch(/cache hit rate \(by events\):\s+50.0%/);
+  });
+
+  it('measures savings only on probe-OK rows and shows the headline', () => {
+    const s = newSummary();
+    // Probe OK: 1000 baseline vs 300 actual (200 input + 100 cache create).
+    fold(
+      s,
+      ev({
+        baseline_tokens: 1000,
+        baseline_probe_status: 'ok',
+        input_tokens: 200,
+        cache_create_tokens: 100,
+        cache_read_tokens: 0,
+      }),
+    );
+    // Failed probe: must NOT pollute the ratio even with a huge baseline.
+    fold(
+      s,
+      ev({
+        baseline_tokens: 9999,
+        baseline_probe_status: 'failed',
+        input_tokens: 10,
+      }),
+    );
+    // No baseline at all: excluded from both totals.
+    fold(s, ev({ input_tokens: 500 }));
+
+    expect(s.baselineMeasuredEvents).toBe(1);
+    expect(s.baselineTokensTotal).toBe(1000);
+    expect(s.measuredActualTokensTotal).toBe(300);
+
+    const out = renderTextReport(s);
+    expect(out).toContain('measured savings');
+    // saved = 1000 − 300 = 700 → 70.0% of baseline.
+    expect(out).toMatch(/saved:\s+700\s+\(\s*70.0%\)/);
+  });
+
+  it('runStats reads a log offline and reports savings; errors when absent', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pxpipe-stats-'));
+    const file = path.join(dir, 'events.jsonl');
+    try {
+      const rows = [
+        { ts: 't', method: 'POST', path: '/v1/messages', status: 200, baseline_tokens: 1000, baseline_probe_status: 'ok', input_tokens: 200, cache_create_tokens: 100 },
+        'not json',
+      ];
+      fs.writeFileSync(file, rows.map((r) => (typeof r === 'string' ? r : JSON.stringify(r))).join('\n') + '\n');
+
+      const ok = await runStats([], file);
+      expect(ok.code).toBe(0);
+      expect(ok.out).toContain('measured savings');
+      expect(ok.out).toMatch(/saved:\s+700\s+\(\s*70.0%\)/);
+      expect(ok.err).toContain('1 unparseable');
+
+      const asJson = await runStats(['--json'], file);
+      expect(JSON.parse(asJson.out).savedTokensTotal).toBe(700);
+
+      const missing = await runStats([], path.join(dir, 'nope.jsonl'));
+      expect(missing.code).toBe(1);
+
+      // --help short-circuits before any file read (usage, exit 0).
+      const help = await runStats(['--help'], path.join(dir, 'nope.jsonl'));
+      expect(help.code).toBe(0);
+      expect(help.out).toContain('Usage:');
+      expect(help.out).toContain('Exit codes:');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

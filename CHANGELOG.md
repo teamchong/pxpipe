@@ -6,6 +6,13 @@ behavioral changes, patch = fixes).
 
 ## Unreleased
 
+### Added
+- `pxpipe stats [--json] [--file <p>]` — offline summary of the events log with
+  no proxy server running (restores after-the-fact analysis the dashboard only
+  offers while live). Adds a measured-savings headline (`count_tokens` baseline
+  vs real usage over probe-OK rows only); the same fields are exposed on
+  `/api/stats.json`.
+
 ### Changed
 - Opt-in `gpt-5.6-sol` now uses native 14px JetBrains Mono at 84 columns. Its paid
   pilot preserved gist and guard checks, read 7/8 exact values, and produced no

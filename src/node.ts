@@ -36,6 +36,7 @@ import {
   dashboardPath,
   type DashboardRoute,
 } from './dashboard.js';
+import { runStats } from './stats.js';
 
 /** Runtime config. The core transform tuning comes from DEFAULTS in
  *  transform.ts; startup knobs cover deployment plus emergency GPT scope
@@ -63,6 +64,7 @@ interface RuntimeConfig {
 }
 
 const DEFAULT_CONFIG_FILE = path.join(os.homedir(), '.config', 'pxpipe', 'config.json');
+const DEFAULT_EVENTS_FILE = path.join(os.homedir(), '.pxpipe', 'events.jsonl');
 
 function normalizeModelsConfig(value: unknown): string | undefined {
   if (Array.isArray(value)) {
@@ -180,9 +182,7 @@ function parseCli(argv: string[]): RuntimeConfig {
     provider: parseProvider(process.env.PXPIPE_PROVIDER),
     gatewayBaseUrl: process.env.PXPIPE_GATEWAY_BASE_URL,
     gatewayHeaders: parseGatewayHeaders(process.env.PXPIPE_GATEWAY_HEADERS),
-    eventsFile:
-      process.env.PXPIPE_LOG ??
-      path.join(os.homedir(), '.pxpipe', 'events.jsonl'),
+    eventsFile: process.env.PXPIPE_LOG ?? DEFAULT_EVENTS_FILE,
     // Off by default: either side of a 4xx may hold prompts or secrets.
     // Opt in for debugging only. (issue #69)
     captureErrorReqBody: process.env.PXPIPE_DEBUG_CAPTURE_4XX === '1',
@@ -205,13 +205,17 @@ Usage:
   pxpipe warp -- CMD    run CMD behind the proxy without a custom base URL, so
                         client-side first-party gates (/remote-control,
                         claude.ai connectors) keep working
+  pxpipe stats [--json] [--file <p>]
+                        summarize the events log offline (no server needed),
+                        incl. measured savings; defaults to $PXPIPE_LOG
 
 The proxy compresses eligible tools, schemas, reminders, tool_results,
 and history; tracks events to disk; and measures real saved_pct via
 /v1/messages/count_tokens. Dashboard controls can disable compression live.
 
-Stats, sessions, and cleanup tools live in the dashboard at
+Live sessions and cleanup tools live in the dashboard at
   http://127.0.0.1:<port>/  (default port 47821)
+For after-the-fact analysis without the server running, use pxpipe stats.
 
 Flags:
   -h, --help              show this help
@@ -1026,6 +1030,15 @@ async function main(): Promise<void> {
   if (argv[0] === 'export') {
     await runExport(argv.slice(1));
     return; // server never starts
+  }
+  if (argv[0] === 'stats') {
+    // Offline log analysis — reads the events JSONL without a running proxy.
+    // The live dashboard covers the same data while pxpipe is up.
+    const defaultFile = process.env.PXPIPE_LOG ?? DEFAULT_EVENTS_FILE;
+    const { code, out, err } = await runStats(argv.slice(1), defaultFile);
+    if (out) process.stdout.write(out + '\n');
+    if (err) process.stderr.write(err + '\n');
+    process.exit(code); // server never starts
   }
   // `warp` runs an agent behind a CONNECT proxy and redirects its inference
   // traffic into the pxpipe already running. It starts no proxy of its own, so

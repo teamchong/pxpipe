@@ -39,6 +39,16 @@ export interface Summary {
   outputTokensTotal: number;
   cacheCreateTokensTotal: number;
   cacheReadTokensTotal: number;
+  /** Measured savings, raw-token basis. Σ baseline_tokens over rows whose
+   *  count_tokens probe is OK — the original body priced as text. */
+  baselineTokensTotal: number;
+  /** Real input-side usage (input + cache create + cache read) over the SAME
+   *  probe-OK rows, so numerator and denominator are paired per request. The
+   *  honest server-sourced compression is 1 − measuredActual / baseline. */
+  measuredActualTokensTotal: number;
+  /** Count of probe-OK rows contributing to the two totals above — the honest
+   *  denominator for the measured-savings headline. */
+  baselineMeasuredEvents: number;
   /** Number of events whose cache_read_tokens > 0 — i.e. the prompt cache
    *  actually hit. */
   cacheHitEvents: number;
@@ -71,6 +81,9 @@ export function newSummary(): Summary {
     outputTokensTotal: 0,
     cacheCreateTokensTotal: 0,
     cacheReadTokensTotal: 0,
+    baselineTokensTotal: 0,
+    measuredActualTokensTotal: 0,
+    baselineMeasuredEvents: 0,
     cacheHitEvents: 0,
     eventsWithUsage: 0,
     durationMs: [],
@@ -119,6 +132,26 @@ export function fold(s: Summary, ev: TrackEvent): Summary {
     s.cacheCreateTokensTotal += ev.cache_create_tokens ?? 0;
     s.cacheReadTokensTotal += ev.cache_read_tokens ?? 0;
     if ((ev.cache_read_tokens ?? 0) > 0) s.cacheHitEvents++;
+  }
+
+  // Measured savings: pair count_tokens(original body) against real usage on
+  // the SAME row, gated on an OK probe. Same rule as the dashboard's per-row
+  // `probeOk` — an explicit 'ok' status, or a positive baseline on legacy rows
+  // that predate the status field. Rows without a trustworthy baseline are
+  // excluded from BOTH totals so the ratio never mixes measured with estimated.
+  const baseline = ev.baseline_tokens;
+  const probeOk =
+    ev.baseline_probe_status === 'ok' ||
+    (ev.baseline_probe_status === undefined &&
+      typeof baseline === 'number' &&
+      baseline > 0);
+  if (typeof baseline === 'number' && baseline > 0 && probeOk) {
+    s.baselineTokensTotal += baseline;
+    s.measuredActualTokensTotal +=
+      (ev.input_tokens ?? 0) +
+      (ev.cache_create_tokens ?? 0) +
+      (ev.cache_read_tokens ?? 0);
+    s.baselineMeasuredEvents++;
   }
 
   if (ev.cwd) {
@@ -220,6 +253,25 @@ export function renderTextReport(s: Summary): string {
   lines.push(
     `  cache hit rate (by events):  ${fmtPct(s.cacheHitEvents, s.eventsWithUsage)}`,
   );
+  lines.push('');
+
+  lines.push('measured savings — raw tokens (count_tokens baseline vs real usage):');
+  const savedTokens = s.baselineTokensTotal - s.measuredActualTokensTotal;
+  lines.push(`  measured requests:  ${fmtN(s.baselineMeasuredEvents).padStart(12)}`);
+  lines.push(`  baseline tokens:    ${fmtN(s.baselineTokensTotal).padStart(12)}`);
+  lines.push(`  actual tokens:      ${fmtN(s.measuredActualTokensTotal).padStart(12)}`);
+  lines.push(
+    `  saved:              ${fmtN(savedTokens).padStart(12)}  (${fmtPct(savedTokens, s.baselineTokensTotal)})`,
+  );
+  // Raw-token basis: cache reads counted at face value, NOT cost-weighted, so
+  // this % is deliberately a different quantity from the dashboard's
+  // cost-weighted saved_pct. Naming it out here prevents "the CLI disagrees
+  // with the dashboard" confusion when the two numbers differ.
+  lines.push('  (raw-token basis: cache reads at face value, not cost-weighted —');
+  lines.push('   differs from the dashboard\'s cost-weighted saved %)');
+  if (s.baselineMeasuredEvents === 0) {
+    lines.push('  (no probe-measured requests yet — savings unknown, not zero)');
+  }
   lines.push('');
 
   if (s.skipReasons.size > 0) {
@@ -329,6 +381,10 @@ export function summaryToJson(s: Summary): Record<string, unknown> {
     outputTokensTotal: s.outputTokensTotal,
     cacheCreateTokensTotal: s.cacheCreateTokensTotal,
     cacheReadTokensTotal: s.cacheReadTokensTotal,
+    baselineTokensTotal: s.baselineTokensTotal,
+    measuredActualTokensTotal: s.measuredActualTokensTotal,
+    baselineMeasuredEvents: s.baselineMeasuredEvents,
+    savedTokensTotal: s.baselineTokensTotal - s.measuredActualTokensTotal,
     cacheHitEvents: s.cacheHitEvents,
     eventsWithUsage: s.eventsWithUsage,
     durationP50: percentile(sortedDur, 50),
@@ -340,4 +396,81 @@ export function summaryToJson(s: Summary): Record<string, unknown> {
     systemShaHist: topN(s.systemShaHist),
     unknownTags: topN(s.unknownTags),
   };
+}
+
+// ---- offline CLI (`pxpipe stats`) -----------------------------------------
+
+const FLAG_JSON = '--json';
+const FLAG_FILE = '--file';
+const FLAGS_HELP = new Set(['-h', '--help']);
+/** Exit codes: file missing vs empty are distinct so scripts can branch. */
+const EXIT_OK = 0;
+const EXIT_NO_FILE = 1;
+const EXIT_NO_EVENTS = 2;
+
+const STATS_HELP = `pxpipe stats — offline summary of the events JSONL (no proxy server)
+
+Usage:
+  pxpipe stats                 report from $PXPIPE_LOG (default ~/.pxpipe/events.jsonl)
+  pxpipe stats --json          same aggregate as machine-readable JSON
+  pxpipe stats --file <path>   read a specific events log
+
+Exit codes:
+  0  report printed
+  1  events file not found
+  2  file present but no valid events`;
+
+interface StatsCliResult {
+  code: number;
+  out: string;
+  err: string;
+}
+
+function parseStatsArgs(
+  argv: string[],
+  defaultFile: string,
+): { file: string; json: boolean } {
+  let file = defaultFile;
+  let json = false;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === FLAG_JSON) json = true;
+    else if (a === FLAG_FILE) file = argv[++i] ?? file;
+  }
+  return { file, json };
+}
+
+/**
+ * `pxpipe stats [--json] [--file <p>]` — summarize an events JSONL log offline,
+ * with NO proxy server running. The live dashboard covers the same data while
+ * the proxy is up; this restores after-the-fact analysis of ~/.pxpipe/events.jsonl
+ * and adds a measured-savings headline the dashboard keeps behind its HTTP API.
+ *
+ * Returns a result rather than writing streams so it stays unit-testable; the
+ * node entrypoint does the stdout/stderr plumbing.
+ */
+export async function runStats(
+  argv: string[],
+  defaultFile: string,
+): Promise<StatsCliResult> {
+  if (argv.some((a) => FLAGS_HELP.has(a))) {
+    return { code: EXIT_OK, out: STATS_HELP, err: '' };
+  }
+  const { file, json } = parseStatsArgs(argv, defaultFile);
+  const agg = await aggregateEventsFile(file);
+  if (agg === undefined) {
+    return {
+      code: EXIT_NO_FILE,
+      out: '',
+      err: `events file not found: ${file}\n(run pxpipe and send a request first, or set PXPIPE_LOG)`,
+    };
+  }
+  if (agg.parsed === 0) {
+    return { code: EXIT_NO_EVENTS, out: '', err: `no valid events in ${file}` };
+  }
+  const dropNote = agg.dropped > 0 ? `(${agg.dropped} unparseable line(s) skipped)` : '';
+  const out = json
+    ? JSON.stringify(summaryToJson(agg.summary), null, 2)
+    : renderTextReport(agg.summary);
+  return { code: EXIT_OK, out, err: dropNote };
 }

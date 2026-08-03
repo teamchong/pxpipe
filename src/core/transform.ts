@@ -1255,6 +1255,19 @@ function relocateAnchorToHistoryImage(messages: Message[] | undefined, anchorOrd
   delete slabAnchor.cache_control;
 }
 
+/** The one block the endpoint does not hash into its cache key: an uncached
+ *  system block whose entire text is the billing header line. Deliberately
+ *  narrow — a block that merely *starts* with the header but carries body text
+ *  after it is real prefix content (that shape is what liftBillingBlock splits
+ *  apart), and must keep counting. */
+function isEndpointIgnoredBillingBlock(block: unknown): boolean {
+  const b = block as { type?: string; text?: string; cache_control?: unknown } | null;
+  if (!b || b.type !== 'text' || typeof b.text !== 'string') return false;
+  if (b.cache_control) return false; // a cached block is hashed, wherever it sits
+  const { kept, body } = stripBillingLine(b.text);
+  return kept !== null && body === '';
+}
+
 /**
  * Read-only digest of the cacheable prefix pxpipe actually sends: tools +
  * system + message blocks up to and including the imaged history image (or, on
@@ -1266,8 +1279,18 @@ function relocateAnchorToHistoryImage(messages: Message[] | undefined, anchorOrd
  * breakpoint, or marker drift); a STABLE digest on a turn that still re-created
  * the prefix points upstream (eviction). Never mutates the request, so it cannot
  * perturb the cache behavior it measures.
+ *
+ * One block is deliberately excluded: the leading billing header (#149). The
+ * endpoint lifts it out of its cache key — that is the whole reason the fix
+ * reproduces the client's layout instead of burying it — so hashing it here
+ * made the digest churn every turn (per-request `cch` nonce) while the real
+ * cached prefix stood still: 74k–92k cache_read against a sha8 that never
+ * repeated. A detector that reports a bust on every turn reports nothing.
  */
-async function cachePrefixDigest(
+/* Exported for tests only: the positional guard above cannot be reached through
+ * transformRequest, since liftBillingBlock always re-leads the block on the way
+ * out. Nothing else in src/ imports this. */
+export async function cachePrefixDigest(
   req: { tools?: unknown; system?: unknown; messages?: unknown },
 ): Promise<
   | {
@@ -1309,7 +1332,16 @@ async function cachePrefixDigest(
   const sysParts: string[] = [];
   const sys = req.system;
   if (typeof sys === 'string') sysParts.push(sys);
-  else if (Array.isArray(sys)) for (const b of sys) sysParts.push(JSON.stringify(b));
+  else if (Array.isArray(sys)) {
+    for (let i = 0; i < sys.length; i++) {
+      // Positional on purpose: the endpoint only ignores a *leading* billing
+      // block. One that ever moves elsewhere does bust the cache for real, and
+      // must still churn the digest — that is the regression this detector is
+      // for. Skipping it unconditionally would blind the detector to it.
+      if (i === 0 && isEndpointIgnoredBillingBlock(sys[i])) continue;
+      sysParts.push(JSON.stringify(sys[i]));
+    }
+  }
   const headParts: string[] = [];
   for (let i = 0; i <= boundary; i++) {
     const content = msgs[i]?.content;

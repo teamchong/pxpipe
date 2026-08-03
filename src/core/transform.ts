@@ -942,6 +942,11 @@ const KNOWN_STATIC_TAGS = [
   'toolUseInstructions',
 ] as const;
 
+/** Reserved churn-observation key for the slab text outside any tag-shaped block.
+ *  Starts with '#', which the tag scanner's name classifier (`[a-zA-Z]` start)
+ *  can never produce, so it cannot be shadowed by a real tag. */
+export const UNTAGGED_SLAB_KEY = '#untagged';
+
 /** Tag-name and whitespace classifiers matching /[a-zA-Z]/,
  *  /[a-zA-Z0-9_-]/ and /\s/. */
 function isTagNameStart(c: number): boolean {
@@ -1016,6 +1021,11 @@ function splitStaticDynamic(text: string): {
   // untrusted text, since both a lazy `[\s\S]*?` body and an `(?:\s[^>]*)?>`
   // attribute run rescan the tail once per candidate tag.
   const noCloser = new Set<string>();
+  // Slab text outside every *registered* tag-shaped block, tracked for the
+  // churn canary below. Failed candidates (no closer, oversized tag names) are
+  // deliberately left inside the residue: no per-tag key observes them.
+  let residue = '';
+  let residueCursor = 0;
   let i = 0;
   while (i < staticBuf.length) {
     const lt = staticBuf.indexOf('<', i);
@@ -1057,9 +1067,23 @@ function splitStaticDynamic(text: string): {
         tag,
         (staticTagContents.get(tag) ?? '') + staticBuf.slice(contentStart, end),
       );
+      residue += staticBuf.slice(residueCursor, lt);
+      residueCursor = end + closer.length;
     }
     i = end + closer.length;
   }
+  residue += staticBuf.slice(residueCursor);
+  // Everything in the slab that is NOT inside a tag-shaped block. Observed under
+  // a reserved key so the churn canary covers it too: tag sniffing only ever saw
+  // tagged content, so a per-turn change in plain prose — a counter, a path, a
+  // date the client folds into its instructions — re-rendered the slab PNG and
+  // voided the image cache with nothing to show for it. Measured on 2026-08-02:
+  // a two-character move in the untagged remainder invalidated 101,848 cached
+  // tokens while every tag hash stayed put. The key cannot collide with a real
+  // tag; the sniffer only matches /[a-zA-Z][a-zA-Z0-9_-]*/, which cannot start
+  // with '#'. Registered unconditionally, so the canary also runs for slabs that
+  // carry no tags at all — the case that hid this in the first place.
+  staticTagContents.set(UNTAGGED_SLAB_KEY, residue);
 
   return {
     // Collapse the run of blank lines left behind by removed blocks.

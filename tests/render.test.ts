@@ -22,6 +22,7 @@ import {
   estimateImageCount,
   compactSlabWhitespace,
   SLAB_CHARS_PER_TOKEN,
+  UNTAGGED_SLAB_KEY,
 } from '../src/core/transform.js';
 import { stripSchemaDescriptions } from '../src/core/schema-strip.js';
 import {
@@ -1780,9 +1781,54 @@ describe('transform', () => {
     ).join('\n');
     await transformRequest(churnBody(flood, 'churn-evict'));
     // <types> changed, but its baseline was evicted, so there is nothing to
-    // compare against and the canary stays silent rather than guessing.
+    // compare against and the canary must not name it. It may legitimately name
+    // #untagged here: removing 4100 '\n'-joined blocks leaves 4099 newlines in
+    // the residue that the single-tag turns do not have, so the untagged text
+    // really did move. Assert the claim we mean, not the absence of all output.
     const after = await transformRequest(churnBody('<types>\nnumber\n</types>', 'churn-evict'));
-    expect(after.info.churningStaticTags).toBeUndefined();
+    expect(after.info.churningStaticTags ?? []).not.toContain('types');
+  });
+
+  // The gap the tag sniffer had by construction: it only ever hashed content
+  // INSIDE tag-shaped blocks. Plain prose in the slab could move every turn and
+  // no canary would say so. Measured 2026-08-02: a two-character change in the
+  // untagged remainder voided 101,848 cached tokens with every tag hash stable.
+  const proseBody = (prose: string, firstUser: string) =>
+    new TextEncoder().encode(
+      JSON.stringify({
+        model: 'claude',
+        messages: [{ role: 'user', content: firstUser }],
+        system:
+          prose + 'claude.md\n'.repeat(400) + '<env>\nWorking directory: /tmp\n</env>',
+      }),
+    );
+
+  it('reports untagged slab prose that changes between turns', async () => {
+    await transformRequest(proseBody('Files open: 3\n', 'churn-untagged'));
+    const changed = await transformRequest(proseBody('Files open: 4\n', 'churn-untagged'));
+    expect(changed.info.churningStaticTags).toContain(UNTAGGED_SLAB_KEY);
+  });
+
+  it('watches the untagged text even when the slab carries no tags at all', async () => {
+    // This is the shape that hid the defect: with no tags, staticTagContents was
+    // empty and the canary never ran, so a per-turn slab was completely silent.
+    const bare = (prose: string) =>
+      new TextEncoder().encode(
+        JSON.stringify({
+          model: 'claude',
+          messages: [{ role: 'user', content: 'churn-no-tags' }],
+          system: prose + 'claude.md\n'.repeat(400),
+        }),
+      );
+    await transformRequest(bare('counter 1\n'));
+    const changed = await transformRequest(bare('counter 2\n'));
+    expect(changed.info.churningStaticTags).toEqual([UNTAGGED_SLAB_KEY]);
+  });
+
+  it('stays silent while the untagged text holds still', async () => {
+    await transformRequest(proseBody('stable prose\n', 'churn-untagged-stable'));
+    const same = await transformRequest(proseBody('stable prose\n', 'churn-untagged-stable'));
+    expect(same.info.churningStaticTags).toBeUndefined();
   });
 
   it('treats reordered same-named blocks as churn (the slab bytes really do move)', async () => {

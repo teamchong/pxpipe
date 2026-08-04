@@ -67,6 +67,14 @@ Same thing without `ANTHROPIC_BASE_URL`, so `/remote-control`, claude.ai
 connectors, and first-party gates keep working. Full instructions in the
 dashboard.
 
+`api.anthropic.com/v1/messages` is routed by default. Agents that reach their
+provider over some other base URL need a rule for it, and a rule that names a
+port matches only that port:
+
+```bash
+pxpipe warp --route '127.0.0.1:8082/v1/*=http://127.0.0.1:47821' -- codex
+```
+
 ## Offline export (no proxy)
 
 You can render text, files, or diffs to PNG pages without running the proxy or

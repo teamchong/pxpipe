@@ -27,6 +27,12 @@ import { parseRoute, routeDestination, type Route } from './route.js';
 export interface WarpRuntimeOptions {
   /** Port the pxpipe proxy is already serving on: where matches are sent. */
   port: number;
+  /**
+   * Extra PATTERN=TARGET rules, in priority order ahead of the default
+   * Anthropic rule. Agents that reach their provider over a base URL rather
+   * than api.anthropic.com (codex, opencode) need one rule each.
+   */
+  routes?: readonly string[];
 }
 
 export interface WarpRuntime {
@@ -45,7 +51,12 @@ function defaultRoutes(port: number): Route[] {
 
 export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
   const { port } = options;
-  const routes = defaultRoutes(port);
+  // Explicit rules first: an operator route for a specific host:port must win
+  // over anything built in.
+  const routes = [
+    ...(options.routes ?? []).map((spec) => parseRoute(spec)),
+    ...defaultRoutes(port),
+  ];
   const ca = CertificateAuthority.loadOrCreate(join(homedir(), '.pxpipe'));
 
   const handlers = createWarpHandlers({

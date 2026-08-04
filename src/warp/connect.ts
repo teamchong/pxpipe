@@ -68,12 +68,6 @@ function isLoopbackAddress(address: string | undefined): boolean {
   );
 }
 
-function stripPort(value: string): string {
-  if (value.startsWith('[')) return value.slice(1, value.indexOf(']'));
-  const i = value.lastIndexOf(':');
-  return i > 0 ? value.slice(0, i) : value;
-}
-
 function splitHostPort(value: string, fallbackPort: string): { host: string; port: string } {
   if (value.startsWith('[')) {
     const end = value.indexOf(']');
@@ -128,7 +122,8 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
   const forward = (
     req: IncomingMessage,
     res: ServerResponse,
-    host: string,
+    /** "host" or "host:port": routes may select on the port. */
+    hostPort: string,
     requestUri: string,
     // Where the bytes actually go when no route matches. Passed in rather than
     // rebuilt from `host`: a plain `http://host:8080` request reaching us in
@@ -136,12 +131,12 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
     origin: string,
   ) => {
     const path = requestUri.split('?')[0] ?? '/';
-    const route = matchRoute(routes, host, path);
+    const route = matchRoute(routes, hostPort, path);
 
     const target = new URL(route ? rewriteUrl(route, requestUri) : `${origin}${requestUri}`);
     if (route && !announced.has(route.pattern)) {
       announced.add(route.pattern);
-      onDivert?.(host, path, target.origin);
+      onDivert?.(hostPort, path, target.origin);
     }
 
     const send = target.protocol === 'https:' ? httpsRequest : httpRequest;
@@ -190,7 +185,7 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
     // A client that CONNECTed to a non-443 port repeats it in Host, which is
     // the only place the original port survives the hijack into mitmServer.
     const { host, port } = splitHostPort(req.headers.host || servername, '443');
-    forward(req, res, host, req.url ?? '/', `https://${authority(host, port)}`);
+    forward(req, res, authority(host, port), req.url ?? '/', `https://${authority(host, port)}`);
   };
 
   /**
@@ -242,7 +237,7 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
     }
     const { host, port } = splitHostPort(req.url ?? '', '443');
 
-    if (!hostCouldMatch(routes, host)) {
+    if (!hostCouldMatch(routes, authority(host, port))) {
       const upstream = netConnect({ host, port: Number(port) }, () => {
         clientSocket.write('HTTP/1.1 200 Connection established\r\n\r\n');
         if (head?.length) upstream.write(head);
@@ -281,7 +276,7 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
     }
     // target.origin, not a rebuilt https:// URL: scheme and non-default port
     // are part of where this request was actually going.
-    forward(req, res, stripPort(target.host), target.pathname + target.search, target.origin);
+    forward(req, res, target.host, target.pathname + target.search, target.origin);
   };
 
   return { handleConnect, handleAbsoluteForm };

@@ -35,6 +35,8 @@ export {
 } from './transform.js';
 export { transformOpenAIChatCompletions, transformOpenAIResponses, resolveVisionCost, openAIVisionTokens } from './openai.js';
 export { createProxy, type ProxyConfig, type ProxyEvent } from './proxy.js';
+export { wordlistEncode, wordlistDecode, WordlistDecodeError, type WordlistDecodeFailure } from './wordlist.js';
+export { BIP39_WORDS } from './bip39-words.js';
 export {
   computeActualInputEff,
   computeBaselineInputEff,

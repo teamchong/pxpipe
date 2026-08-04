@@ -178,6 +178,9 @@ export interface ResponsesPairCollapsePlan extends GptCollapsePlan {
   segments: ResponsesPairCollapseSegment[];
   selectedIndices: number[];
   pairState: ResponsesPairState;
+  /** Item `type` values that ended a collapse run, with counts. Each barrier
+   *  forces a page break, so this names what is under-filling images. */
+  barrierTypes?: Map<string, number>;
 }
 
 export interface GptCollapsePlan {
@@ -582,9 +585,18 @@ function responseMessageText(item: unknown): ResponsesMessageText | null {
     for (const part of o.content) {
       const p = part as Record<string, unknown> | null;
       const type = p && typeof p.type === 'string' ? p.type : '';
-      if (!p || !['input_text', 'output_text', 'text'].includes(type) || typeof p.text !== 'string') {
-        return null;
+      if (!p) return null;
+      // A refusal is plain model-authored prose that happens to ride in its own
+      // part type. Rejecting it made the whole message non-imageable, and since
+      // a non-imageable message is a hard barrier, ONE refusal split the run and
+      // cost a page break. Same for any future part that carries a string
+      // `text`: the content is losslessly renderable, so gate on the payload
+      // being text rather than on an allow-list of part names.
+      if (type === 'refusal' && typeof p.refusal === 'string') {
+        parts.push(p.refusal);
+        continue;
       }
+      if (typeof p.text !== 'string') return null;
       parts.push(p.text);
     }
     body = parts.join('\n\n');
@@ -593,6 +605,33 @@ function responseMessageText(item: unknown): ResponsesMessageText | null {
   }
   if (!body.trim()) return null;
   return { role: o.role, text: body };
+}
+
+/** True for a `message` item that carries no renderable text at all: empty
+ *  content array, or parts whose text is present but blank. Such an item is
+ *  inert — imaging it would produce nothing and skipping it changes no
+ *  ordering — so it must not end a collapse run. Anything with non-text parts
+ *  (images, unknown shapes) is NOT contentless and stays a barrier. */
+function isContentlessMessage(item: unknown): boolean {
+  const o = item as Record<string, unknown> | null;
+  if (!o || (o.role !== 'user' && o.role !== 'assistant')) return false;
+  const itemType = typeof o.type === 'string' ? o.type : '';
+  if (itemType && itemType !== 'message') return false;
+  if (typeof o.content === 'string') return !o.content.trim();
+  if (!Array.isArray(o.content)) return false;
+  for (const part of o.content) {
+    const p = part as Record<string, unknown> | null;
+    const type = p && typeof p.type === 'string' ? p.type : '';
+    if (!p) return false;
+    if (type === 'refusal' && typeof p.refusal === 'string') {
+      if (p.refusal.trim()) return false;
+      continue;
+    }
+    // A non-text part means real payload we cannot render — not contentless.
+    if (typeof p.text !== 'string') return false;
+    if (p.text.trim()) return false;
+  }
+  return true;
 }
 
 function responseMessageTranscript(item: unknown, index: number): string | null {
@@ -795,6 +834,16 @@ async function planResponsesMixedCollapse(
 
   const runs: ResponsesMixedUnit[][] = [];
   let current: ResponsesMixedUnit[] = [];
+  // Every flush ends a run, and every run renders at least one image. Naming
+  // the item type that caused it is the only way to tell an unavoidable
+  // barrier (protected tail, item_reference) from an incidental one that is
+  // silently costing a page break per occurrence.
+  const barrierTypes = new Map<string, number>();
+  const noteBarrier = (index: number): void => {
+    if (current.length === 0) return; // nothing to split — not a real break
+    const t = responseItemType(items[index]) || 'untyped';
+    barrierTypes.set(t, (barrierTypes.get(t) ?? 0) + 1);
+  };
   const flush = (): void => {
     if (current.length > 0) runs.push(current);
     current = [];
@@ -825,6 +874,17 @@ async function planResponsesMixedCollapse(
       });
       continue;
     }
+    // A contentless message (empty content array, whitespace-only text) carries
+    // nothing to image and nothing to reorder, but treating it as a barrier
+    // still split the run and cost a page break. Leave it native in place and
+    // keep the run open: `selectedIndices` never includes it, so the splice in
+    // openai.ts re-emits it at its original position and protocol order is
+    // unchanged. Only applies when the item is genuinely a message with no
+    // renderable payload — anything unrecognized remains a hard barrier.
+    if (!protectedMessages.has(i) && !referenced && isContentlessMessage(items[i])) {
+      continue;
+    }
+    noteBarrier(i);
     flush();
   }
   flush();
@@ -889,6 +949,7 @@ async function planResponsesMixedCollapse(
       ...base,
       reason: hitImageCap ? 'too_many_images' : 'not_profitable',
       collapsedChars: allText.length,
+      barrierTypes,
     };
   }
   const selectedIndices = segments.flatMap((segment) => segment.selectedIndices).sort((a, b) => a - b);
@@ -911,6 +972,7 @@ async function planResponsesMixedCollapse(
   }
   return {
     ...base,
+    barrierTypes,
     segments,
     images,
     imageSources,

@@ -867,6 +867,14 @@ async function applyResponsesHistoryCollapse(
   rc.collapsedFunctionPairs = ps.collapsedPairs;
   rc.collapsedFunctionCalls = ps.collapsedFunctionCallTokens;
   rc.collapsedFunctionOutputs = ps.collapsedFunctionOutputTokens;
+  // Descending count so the dominant page-breaker is first. Bounded to 8 so a
+  // pathological body cannot bloat the event row.
+  if (plan.barrierTypes && plan.barrierTypes.size > 0) {
+    rc.barrierTypes = [...plan.barrierTypes.entries()]
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .slice(0, 8)
+      .map(([type, count]) => `${type}:${count}`);
+  }
 
   foldGptHistory(info, req.model, plan);
   if (plan.segments.length === 0) return false;

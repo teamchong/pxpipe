@@ -31,14 +31,18 @@ cd "$(dirname "$0")/.."
 
 # --- Parse our own flags out of "$@". --no-build only — pxpipe takes none. ----
 DO_BUILD=1
+DETACH=0
 for arg in "$@"; do
   case "$arg" in
     --no-build)
       DO_BUILD=0
       ;;
+    --detach)
+      DETACH=1
+      ;;
     *)
       echo "[restart] unknown argument: $arg" >&2
-      echo "[restart] this script only accepts --no-build (pxpipe takes no flags)" >&2
+      echo "[restart] this script only accepts --no-build/--detach (pxpipe takes no flags)" >&2
       exit 2
       ;;
   esac
@@ -85,13 +89,13 @@ if [ -n "$PIDS_RAW" ]; then
 
   # Poll up to 5s for graceful exit.
   for _ in $(seq 1 50); do
-    STILL=$(pgrep -f 'node.*bin/[c]li\.js' 2>/dev/null || true)
+    STILL=$(list_serving_pids || true)
     [ -z "$STILL" ] && break
     sleep 0.1
   done
 
   # --- 3. Escalate to SIGKILL only if still alive ---
-  STILL=$(pgrep -f 'node.*bin/[c]li\.js' 2>/dev/null || true)
+  STILL=$(list_serving_pids || true)
   if [ -n "$STILL" ]; then
     echo "[restart] WARNING: PID(s) still alive after 5s, escalating to SIGKILL: $STILL"
     for pid in $STILL; do
@@ -131,5 +135,31 @@ if command -v lsof >/dev/null 2>&1; then
 fi
 
 # --- 6. Start fresh in the foreground. exec so Ctrl-C goes straight to Node.
+if [ "$DETACH" -eq 1 ]; then
+  # Survive the calling shell: non-interactive callers (CI, agent tool calls,
+  # `ssh host cmd`) get SIGHUP'd on exit, which would take the proxy with them.
+  LOG="${TMPDIR:-/tmp}/pxpipe-proxy.log"
+  echo "[restart] starting detached proxy on :$TARGET_PORT (log: $LOG)"
+  nohup node bin/cli.js >>"$LOG" 2>&1 &
+  NEW_PID=$!
+  disown "$NEW_PID" 2>/dev/null || true
+  # Confirm it actually bound the port instead of dying on startup.
+  for _ in $(seq 1 100); do
+    if ! kill -0 "$NEW_PID" 2>/dev/null; then
+      echo "[restart] ERROR: proxy exited during startup. Last log lines:" >&2
+      tail -20 "$LOG" >&2
+      exit 1
+    fi
+    if lsof -nP -iTCP:"$TARGET_PORT" -sTCP:LISTEN -t 2>/dev/null | grep -qx "$NEW_PID"; then
+      echo "[restart] proxy PID $NEW_PID listening on :$TARGET_PORT"
+      exit 0
+    fi
+    sleep 0.1
+  done
+  echo "[restart] ERROR: PID $NEW_PID never bound :$TARGET_PORT within 10s" >&2
+  tail -20 "$LOG" >&2
+  exit 1
+fi
+
 echo "[restart] starting fresh proxy on :$TARGET_PORT (Ctrl-C to stop)"
 exec node bin/cli.js

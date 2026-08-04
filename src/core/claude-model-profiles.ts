@@ -27,7 +27,49 @@ export const CLAUDE_PROFILE: GptModelProfile = {
   maxHeightPx: ANTHROPIC_MAX_HEIGHT_PX,
   visionTier: 'high-res',
   factSheetFormat: 'full',
-  history: BASE_HISTORY,
+  // BASE_HISTORY.maxImages is a page count, and a page is not a fixed amount of
+  // text: at GPT geometry (84 cols x 1954 px) a page holds ~660 chars, at
+  // Anthropic geometry (312 cols x 728 px) it holds ~2750. The shared 32 was
+  // tuned as a latency budget against the former, so on Claude it stopped being
+  // a latency budget and became a coverage limit: live Opus traffic pinned at
+  // 32 images on 70% of requests with collapsed text flatlined at ~97k chars
+  // while untouched history kept growing past 250k.
+  //
+  // Re-derived against the same latency signal on Claude pages (first-byte p50
+  // / p95, n=11k): 32 -> 5.2s/10.9s, 64 -> 8.3s/15.3s, 96 -> 11.4s/18.5s,
+  // 128 -> 12.5s/27.0s. Upstream 502s stay ~0.2% through 96 images and jump to
+  // 2.2-3.9% at 112+. 96 is the last point that is both cheap and clean.
+  //
+  // The same page-count-vs-geometry mismatch applies to the per-image framing.
+  // BASE_HISTORY pairs `framing: 'full'` with `factSheetScope: 'per-segment'`,
+  // which costs a 221-token intro + 25-token outro + a ~158-token fact sheet on
+  // EVERY segment. At GPT's 32-page ceiling that is a rounding error; at 96
+  // Claude pages it measured 425 tokens/image, 25.2k tokens/request, eating 57%
+  // of the gross saving the higher cap unlocked. Compact framing (36 + 8) with a
+  // single combined sheet carries the same attribution wording the transcript
+  // needs and projects 2.8k tokens/request on the same traffic.
+  //
+  // responsesMode: BASE_HISTORY's 'pairs' planner only groups tool rounds that
+  // are INDEX-CONTIGUOUS. Codex emits an assistant message between rounds, so
+  // every round lands in its own run and every run renders its own image. Live
+  // Claude-on-Responses traffic averaged 2,921 chars/image (10% of the 28,080
+  // a page holds) at 2.4 turns/image, against 10,456 (37%) for gpt-5.6-sol on
+  // the same endpoint — the only difference being that GPT already runs
+  // 'mixed'. Replaying a 60-round transcript through both planners isolates it
+  // to the interleaving, not the volume:
+  //   pairs, no interleave  ->  1 segment,   6 images, 27,653 chars/image
+  //   pairs, interleaved    -> 54 segments, 54 images,  3,073 chars/image
+  //   mixed, interleaved    ->  2 segments,  8 images, 21,109 chars/image
+  // 'mixed' treats safe textual messages as groupable instead of as barriers;
+  // every non-message item stays a hard barrier, so protocol order and open
+  // call/output state are preserved exactly as in 'pairs'.
+  history: {
+    ...BASE_HISTORY,
+    maxImages: 96,
+    framing: 'compact',
+    factSheetScope: 'combined',
+    responsesMode: 'mixed',
+  },
   style: { ...BASE_STYLE },
   // No maxSerializedRequestBytes: no Anthropic request-size limit has ever been
   // sourced. The 768 KiB entry that used to sit here was a guess, and live

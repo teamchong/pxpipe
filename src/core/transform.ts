@@ -600,6 +600,11 @@ export interface TransformInfo {
     collapsedFunctionPairs?: number;
     collapsedFunctionCalls?: number;
     collapsedFunctionOutputs?: number;
+    /** Item `type` values that acted as a hard barrier in the Responses
+     *  planner, with occurrence counts (`local_shell_call:12`). Every barrier
+     *  forces a page break, so a frequent type here is directly responsible
+     *  for under-filled images. Diagnostic only — never affects routing. */
+    barrierTypes?: string[];
   };
   /** Length of the static (cacheable) slab rendered into the image. */
   staticChars: number;

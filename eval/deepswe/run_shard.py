@@ -149,14 +149,17 @@ def write_token_file():
     """Publish the current host token where the proxy can re-read it.
 
     Atomic: the proxy stats this file on every request, so a partial write would
-    be served as a bearer. Written 0600 because it is a live credential.
+    be served as a bearer. Created 0600 because it is a live credential.
     """
     tok = oauth_token(min_valid_s=1800)
     if tok is None:
         return False
     tmp = TOKEN_FILE.with_suffix(".tmp")
-    tmp.write_text(tok)
-    tmp.chmod(0o600)
+    # 0600 at creation: chmod after writing leaves the token briefly readable
+    # by any user on the host.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(tok)
     os.replace(tmp, TOKEN_FILE)
     return True
 

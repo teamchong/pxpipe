@@ -816,6 +816,38 @@ const KNOWN_STATIC_TAGS = [
   'toolUseInstructions',
 ] as const;
 
+/** Tag-name and whitespace classifiers matching /[a-zA-Z]/,
+ *  /[a-zA-Z0-9_-]/ and /\s/. */
+function isTagNameStart(c: number): boolean {
+  return (c >= 97 && c <= 122) || (c >= 65 && c <= 90); // a-z A-Z
+}
+
+function isTagNameChar(c: number): boolean {
+  return (
+    (c >= 97 && c <= 122) || // a-z
+    (c >= 65 && c <= 90) || // A-Z
+    (c >= 48 && c <= 57) || // 0-9
+    c === 95 || // _
+    c === 45 // -
+  );
+}
+
+function isTagSpace(c: number): boolean {
+  if (c === 32 || (c >= 9 && c <= 13)) return true; // space, \t \n \v \f \r
+  if (c < 0xa0) return false;
+  return (
+    c === 0xa0 ||
+    c === 0x1680 ||
+    (c >= 0x2000 && c <= 0x200a) ||
+    c === 0x2028 ||
+    c === 0x2029 ||
+    c === 0x202f ||
+    c === 0x205f ||
+    c === 0x3000 ||
+    c === 0xfeff
+  );
+}
+
 function splitStaticDynamic(text: string): {
   staticText: string;
   dynamicText: string;
@@ -852,16 +884,55 @@ function splitStaticDynamic(text: string): {
   // surfacing the tag name lets us detect it within hours of a release.
   const known = new Set<string>(DYNAMIC_BLOCK_TAGS);
   const knownStatic = new Set<string>(KNOWN_STATIC_TAGS);
-  const sniffer = /<([a-zA-Z][a-zA-Z0-9_-]*)(?:\s[^>]*)?>([\s\S]*?)<\/\1>/g;
   const unknown = new Set<string>();
   const staticTagContents = new Map<string, string>();
-  let s: RegExpExecArray | null;
-  while ((s = sniffer.exec(staticBuf)) !== null) {
-    const tag = s[1]!;
-    if (tag.length > 64) continue;
-    if (!known.has(tag) && !knownStatic.has(tag)) unknown.add(tag);
-    // Fold repeated tags (e.g. several <example>s) into one fingerprint.
-    staticTagContents.set(tag, (staticTagContents.get(tag) ?? '') + s[2]!);
+  // Scanned by index: matching this with a regex costs quadratic time on
+  // untrusted text, since both a lazy `[\s\S]*?` body and an `(?:\s[^>]*)?>`
+  // attribute run rescan the tail once per candidate tag.
+  const noCloser = new Set<string>();
+  let i = 0;
+  while (i < staticBuf.length) {
+    const lt = staticBuf.indexOf('<', i);
+    if (lt < 0) break;
+    let j = lt + 1;
+    if (!isTagNameStart(staticBuf.charCodeAt(j))) {
+      i = lt + 1;
+      continue;
+    }
+    j += 1;
+    while (j < staticBuf.length && isTagNameChar(staticBuf.charCodeAt(j))) j += 1;
+    // Either `<tag>` or `<tag ...>`; anything else is not an opening tag.
+    let gt: number;
+    if (staticBuf[j] === '>') {
+      gt = j;
+    } else if (j < staticBuf.length && isTagSpace(staticBuf.charCodeAt(j))) {
+      gt = staticBuf.indexOf('>', j);
+      // No `>` left, so no later opening can complete either.
+      if (gt < 0) break;
+    } else {
+      i = lt + 1;
+      continue;
+    }
+    const tag = staticBuf.slice(lt + 1, j);
+    const contentStart = gt + 1;
+    const closer = `</${tag}>`;
+    // A closer missing after one opening is missing for every later opening of
+    // the same tag, so record it and skip the repeated failed scan.
+    const end = noCloser.has(tag) ? -1 : staticBuf.indexOf(closer, contentStart);
+    if (end < 0) {
+      noCloser.add(tag);
+      i = lt + 1;
+      continue;
+    }
+    if (tag.length <= 64) {
+      if (!known.has(tag) && !knownStatic.has(tag)) unknown.add(tag);
+      // Fold repeated tags (e.g. several <example>s) into one fingerprint.
+      staticTagContents.set(
+        tag,
+        (staticTagContents.get(tag) ?? '') + staticBuf.slice(contentStart, end),
+      );
+    }
+    i = end + closer.length;
   }
 
   return {
@@ -1114,14 +1185,29 @@ export function firstMessageHasSystemReminder(messages: Message[] | undefined): 
   return false;
 }
 
+/** Body of the first `<tag>…</tag>` pair, or undefined when unpaired.
+ *  Scanned by index: a lazy `[\s\S]*?` span rescans the tail for every
+ *  candidate opening, so many openings and no closer costs quadratic time.
+ *  Tag names are ASCII literals, so lowercasing suffices for a
+ *  case-insensitive match. */
+function firstTagBody(text: string, tag: string): string | undefined {
+  const open = `<${tag}>`;
+  const close = `</${tag}>`;
+  const haystack = text.toLowerCase();
+  const start = haystack.indexOf(open);
+  if (start < 0) return undefined;
+  const end = haystack.indexOf(close, start + open.length);
+  if (end < 0) return undefined;
+  return text.slice(start + open.length, end);
+}
+
 /** Parse structured fields from the dynamic slab for telemetry. Read-only. */
 export function extractEnvFields(dynamicText: string): EnvFields {
   const out: EnvFields = {};
   if (!dynamicText) return out;
 
-  const envMatch = /<env>([\s\S]*?)<\/env>/i.exec(dynamicText);
-  if (envMatch) {
-    const body = envMatch[1]!;
+  const body = firstTagBody(dynamicText, 'env');
+  if (body !== undefined) {
     const cwd = /(?:^|\n)\s*Working directory:\s*(.+?)\s*(?:\n|$)/i.exec(body);
     if (cwd) out.cwd = cwd[1]!.trim();
     const gitRepo = /(?:^|\n)\s*Is directory a git repo:\s*(Yes|No)\b/i.exec(body);

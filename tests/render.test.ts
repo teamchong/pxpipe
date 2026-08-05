@@ -1314,6 +1314,72 @@ describe('transform', () => {
     expect(textBlocks.some((b: any) => b.text.includes('x-anthropic-billing-header'))).toBe(true);
   });
 
+  // The billing header is per-turn on CLI >= 2.1.222, so the slab must render
+  // the SAME bytes whether the header is present or not, and wherever it sits.
+  // Asserting on slab bytes (not just "the line came back as text") is what
+  // catches an off-by-one newline: a stray leading \n or two spliced lines both
+  // re-render the PNG every turn and void the cached prefix.
+  describe('billing header never reaches the slab', () => {
+    const slabOf = async (system: string): Promise<string> => {
+      const bytes = new TextEncoder().encode(
+        JSON.stringify({
+          model: 'claude-3-5-sonnet',
+          messages: [{ role: 'user', content: 'hi' }],
+          system,
+        }),
+      );
+      const { body, info } = await transformRequest(bytes);
+      expect(info.compressed).toBe(true);
+      const out = JSON.parse(new TextDecoder().decode(body));
+      // A pure-static system string lands the slab on messages[0], not on
+      // `system`, so collect every image in the body rather than guessing.
+      const data: string[] = [];
+      const walk = (node: any): void => {
+        if (Array.isArray(node)) return void node.forEach(walk);
+        if (!node || typeof node !== 'object') return;
+        if (node.type === 'image' && node.source?.data) data.push(node.source.data);
+        Object.values(node).forEach(walk);
+      };
+      walk(out);
+      expect(data.length).toBeGreaterThan(0);
+      return data.join('');
+    };
+    const HDR = 'x-anthropic-billing-header: cc_version=2.1.222; cc_prev_req=req_011Cdk3';
+    const HEAD = 'real prompt text. '.repeat(1250);
+    const TAIL = 'more ground truth. '.repeat(1250);
+    const CLEAN = `${HEAD}\n${TAIL}`;
+
+    it('renders identical slab bytes when the header leads the system text', async () => {
+      expect(await slabOf(`${HDR}\n${CLEAN}`)).toBe(await slabOf(CLEAN));
+    });
+
+    it('renders identical slab bytes when the header sits mid-text', async () => {
+      // Claude Code sends this as its own system block, so after the blocks are
+      // joined the header is typically NOT line 1 — the case #177 missed.
+      expect(await slabOf(`${HEAD}\n${HDR}\n${TAIL}`)).toBe(await slabOf(CLEAN));
+    });
+
+    it('renders identical slab bytes when the header ends the system text', async () => {
+      expect(await slabOf(`${CLEAN}\n${HDR}`)).toBe(await slabOf(CLEAN));
+    });
+
+    it('relocates the header to the system tail from every position', async () => {
+      for (const system of [`${HDR}\n${CLEAN}`, `${HEAD}\n${HDR}\n${TAIL}`, `${CLEAN}\n${HDR}`]) {
+        const bytes = new TextEncoder().encode(
+          JSON.stringify({
+            model: 'claude-3-5-sonnet',
+            messages: [{ role: 'user', content: 'hi' }],
+            system,
+          }),
+        );
+        const { body } = await transformRequest(bytes);
+        const out = JSON.parse(new TextDecoder().decode(body));
+        const texts = out.system.filter((b: any) => b.type === 'text').map((b: any) => b.text);
+        expect(texts.some((t: string) => t.includes(HDR))).toBe(true);
+      }
+    });
+  });
+
   it('keeps <env> as text outside the image so cache_control stays stable', async () => {
     // Dense slab (long single line) so the row-aware break-even gate
     // greenlights compression. Same total chars as the old short-line

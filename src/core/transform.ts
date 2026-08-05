@@ -1235,14 +1235,29 @@ export function extractEnvFields(dynamicText: string): EnvFields {
 }
 
 /** Strip the per-turn `x-anthropic-billing-header:` line (changes every turn;
- *  must not be baked into the image). Returned as `kept` for the system tail. */
+ *  must not be baked into the image). Returned as `kept` for the system tail.
+ *
+ *  Claude Code sends this as its own system block, so after extractSystemText
+ *  joins the blocks the line is never line 1 and a first-line-only test never
+ *  fires: on 86/86 captured bodies the header reached splitStaticDynamic, which
+ *  has no XML wrapper to key on, classified it static, and baked it into the
+ *  slab PNG. On 2.1.220 the value was session-stable (11/11 captures share
+ *  `cch=07295`) so the PNG stayed byte-identical and nothing showed. 2.1.222
+ *  added `cc_prev_req=<previous request id>`, making the line per-turn by
+ *  construction — re-rendering the slab and voiding the whole cached prefix on
+ *  every request. Match the line wherever it appears. */
 function stripBillingLine(text: string): { kept: string | null; body: string } {
-  const nl = text.indexOf('\n');
-  const first = nl === -1 ? text : text.slice(0, nl);
-  if (first.startsWith('x-anthropic-billing-header:')) {
-    return { kept: first, body: nl === -1 ? '' : text.slice(nl + 1) };
-  }
-  return { kept: null, body: text };
+  const m = /(^|\n)(x-anthropic-billing-header:[^\n]*)(\n?)/.exec(text);
+  if (!m) return { kept: null, body: text };
+  const lead = m[1]!; // '' when the line starts the text, else the preceding \n
+  const trail = m[3]!; // '\n' unless the line ends the text
+  // Excise the line plus EXACTLY ONE adjacent newline, so the surviving text is
+  // byte-identical to the same text without the header: the trailing newline
+  // when there is one (keeps the preceding break), otherwise the leading one.
+  // Taking both would splice the neighbouring lines together and re-render the
+  // slab — the very churn this function exists to prevent.
+  const cutStart = m.index + (trail ? lead.length : 0);
+  return { kept: m[2]!, body: text.slice(0, cutStart) + text.slice(m.index + m[0].length) };
 }
 
 /** Extract the `# Environment` markdown section Claude Code injects into its
@@ -2079,10 +2094,9 @@ export async function transformRequest(
     if (preservedIdentity) {
       sysTail.push({ type: 'text', text: preservedIdentity });
     }
-    // Session-stable, so it sits ahead of the churny blocks below.
-
-    // billingLine is session-stable (warm reads through the anchored prefix
-    // confirm it; a per-turn value here would zero every cache read).
+    // billingLine carries `cc_prev_req` on CLI >= 2.1.222, so it changes every
+    // turn. It sits with the other churny blocks below, after the anchor and
+    // outside the slab, where per-turn drift costs nothing.
     if (billingLine) sysTail.push({ type: 'text', text: billingLine });
     if (dynamicText) sysTail.push({ type: 'text', text: dynamicText });
     if (envMarkdown) sysTail.push({ type: 'text', text: envMarkdown });

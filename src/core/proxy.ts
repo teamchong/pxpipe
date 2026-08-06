@@ -37,6 +37,11 @@ export interface ProxyConfig {
   upstream?: string;
   /** Override or supply an API key. If unset, we forward whatever the client sent. */
   apiKey?: string;
+  /** Override the Anthropic `authorization` bearer. Pass a function to re-resolve
+   *  per request: subscription tokens expire, and a client that froze its bearer
+   *  at startup (a container env var) cannot renew one mid-run. Resolving here
+   *  keeps rotation on the host, with a single writer. */
+  authToken?: string | (() => string | undefined);
   /** OpenAI API base for GPT chat completions, no trailing slash. */
   openAIUpstream?: string;
   /** Override or supply an OpenAI API key. If unset, we forward Authorization. */
@@ -833,6 +838,10 @@ function isOpenAIResponsesPath(pathname: string): boolean {
   return OPENAI_RESPONSES_PATH.test(pathname);
 }
 
+function resolveAuthToken(config: ProxyConfig): string | undefined {
+  return typeof config.authToken === 'function' ? config.authToken() : config.authToken;
+}
+
 function isCanonicalOpenAIPath(pathname: string, headers: Headers, hasOpenAIKey: boolean): boolean {
   const isModelsPath = pathname === '/v1/models' || pathname.startsWith('/v1/models/');
   // `/v1/models` exists on BOTH APIs, so it is routed by auth style — but an
@@ -1304,6 +1313,10 @@ export function createProxy(config: ProxyConfig = {}) {
             const ctHeaders = applyGatewayHeaders(filterHeaders(req.headers, STRIP_REQ_HEADERS));
             ctHeaders.set('content-type', 'application/json');
             if (config.apiKey) ctHeaders.set('x-api-key', config.apiKey);
+            // The probe carries the client's frozen bearer otherwise, so it 401s
+            // exactly when the main forward starts succeeding on the fresh one.
+            const ctAuth = resolveAuthToken(config);
+            if (ctAuth) ctHeaders.set('authorization', `Bearer ${ctAuth}`);
             // Mirror the actual outbound request base+path: count_tokens lives at
             // `<messages-path>/count_tokens`, so provider-prefixed routes like
             // `/anthropic/messages` probe `/anthropic/messages/count_tokens`.
@@ -1380,8 +1393,10 @@ export function createProxy(config: ProxyConfig = {}) {
         ? config.cloudflareApiKey
         : config.openAIApiKey;
       if (bridgeKey) outHeaders.set('authorization', `Bearer ${bridgeKey}`);
-    } else if (config.apiKey && (!providerPrefixed || url.pathname.startsWith('/anthropic/'))) {
-      outHeaders.set('x-api-key', config.apiKey);
+    } else if (!providerPrefixed || url.pathname.startsWith('/anthropic/')) {
+      if (config.apiKey) outHeaders.set('x-api-key', config.apiKey);
+      const bearer = resolveAuthToken(config);
+      if (bearer) outHeaders.set('authorization', `Bearer ${bearer}`);
     }
 
     applyGatewayHeaders(outHeaders);

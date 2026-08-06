@@ -27,6 +27,12 @@ import { parseRoute, routeDestination, type Route } from './route.js';
 export interface WarpRuntimeOptions {
   /** Port the pxpipe proxy is already serving on: where matches are sent. */
   port: number;
+  /**
+   * Extra PATTERN=TARGET rules, in priority order ahead of the default
+   * Anthropic rule. Agents that reach their provider over a base URL rather
+   * than api.anthropic.com (codex, opencode) need one rule each.
+   */
+  routes?: readonly string[];
 }
 
 export interface WarpRuntime {
@@ -45,7 +51,12 @@ function defaultRoutes(port: number): Route[] {
 
 export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
   const { port } = options;
-  const routes = defaultRoutes(port);
+  // Explicit rules first: an operator route for a specific host:port must win
+  // over anything built in.
+  const routes = [
+    ...(options.routes ?? []).map((spec) => parseRoute(spec)),
+    ...defaultRoutes(port),
+  ];
   const ca = CertificateAuthority.loadOrCreate(join(homedir(), '.pxpipe'));
 
   const handlers = createWarpHandlers({
@@ -180,7 +191,36 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
     process.on('exit', () => {
       if (childLive) child.kill('SIGTERM');
     });
-    const die = (err: unknown): never => {
+    // A connection dying is not a warp failure. The upstream resets, the proxy
+    // gets restarted, a keep-alive socket goes away between requests — all of
+    // that arrives here as an errno on a socket nobody was listening to at that
+    // instant. Exiting on it would take the agent down with us (see the exit
+    // handler above) and lose a whole run to one dropped TCP connection. Log
+    // and keep serving; the request that owned the socket fails on its own and
+    // the agent retries. Anything without an errno is a real bug in our code,
+    // and staying up for that would leave the agent talking to a proxy in an
+    // unknown state, so those still exit.
+    const NET_ERRNO = new Set([
+      'ECONNRESET',
+      'ECONNREFUSED',
+      'ECONNABORTED',
+      'EPIPE',
+      'ETIMEDOUT',
+      'EHOSTUNREACH',
+      'ENETUNREACH',
+      'ENETDOWN',
+      'ENOTCONN',
+      'EAI_AGAIN',
+      'ERR_STREAM_DESTROYED',
+      'ERR_STREAM_WRITE_AFTER_END',
+      'ERR_SOCKET_CONNECTION_TIMEOUT',
+    ]);
+    const die = (err: unknown): void => {
+      const code = (err as NodeJS.ErrnoException | undefined)?.code;
+      if (typeof code === 'string' && NET_ERRNO.has(code)) {
+        console.error(`[pxpipe] warp: connection error ${code} (continuing)`);
+        return;
+      }
       console.error(`[pxpipe] warp: ${err instanceof Error ? err.stack : String(err)}`);
       process.exit(1);
     };

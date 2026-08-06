@@ -1,6 +1,6 @@
 import json,re,os,subprocess,sys
 from concurrent.futures import ThreadPoolExecutor
-D=os.path.dirname(os.path.abspath("/Users/steven_chong/Downloads/repos/pxpipe/eval/gsm8k/x"))
+D=os.path.dirname(os.path.abspath("eval/gsm8k/x"))
 IMGS=os.path.join(D,"novel_imgs_claude-opus-5")
 gold=[json.loads(l) for l in open("/tmp/novel.jsonl")]
 N=min(len(gold),len(os.listdir(IMGS)))

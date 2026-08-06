@@ -34,9 +34,11 @@ let runtimeModelBases: readonly string[] | null = null;
  *  - GPT 5.6 Sol — 98/100 production arithmetic, but 79/93 completed gist,
  *    4/15 completed guard confabulations, and 0/15 dense hex.
  *  - Grok 4.5 — native 14px: 100/100 arithmetic, 97/98 gist, 17/18 state; hex 0/15.
- *  Both profiles remain available for explicit opt-in.
+ *  - Opus 5 — 2/15 exact recall on imaged context (DeepSWE v1.1 eval);
+ *    task pass rate holds but dense recall does not.
+ *  All remain available for explicit opt-in.
  *  Silently imaging weak or unvalidated readers is the wrong default. */
-const DEFAULT_MODEL_BASES = ['claude-fable-5', 'claude-opus-5', 'gemini-3.6-flash'];
+const DEFAULT_MODEL_BASES = ['claude-fable-5', 'gemini-3.6-flash'];
 
 function falsey(v: string): boolean {
   return /^(0|false|no|off|none)$/i.test(v.trim());
@@ -44,7 +46,7 @@ function falsey(v: string): boolean {
 
 /** PXPIPE_MODELS env / built-in default, ignoring the runtime override. One CSV
  *  controls every family (Claude + GPT). Resolution (read per-call so scope flips LIVE):
- *  - unset or empty        → built-in default (Fable 5 only)
+ *  - unset or empty        → built-in default (Fable 5 + Gemini 3.6 Flash)
  *  - `off`/`0`/`false`/... → compress nothing
  *  - CSV of model bases    → exactly those families (e.g. `claude-fable-5,gpt-5.6-sol`) */
 function envOrDefaultBases(): string[] {

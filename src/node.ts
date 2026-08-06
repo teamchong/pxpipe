@@ -202,9 +202,14 @@ function printHelp(): void {
 Usage:
   pxpipe                run the proxy (no flags)
   pxpipe export [...]   render files/diff to PNG pages + cost report (see pxpipe export --help)
-  pxpipe warp -- CMD    run CMD behind the proxy without a custom base URL, so
+  pxpipe warp [--route PATTERN=TARGET]... -- CMD
+                        run CMD behind the proxy without a custom base URL, so
                         client-side first-party gates (/remote-control,
-                        claude.ai connectors) keep working
+                        claude.ai connectors) keep working.
+                        api.anthropic.com/v1/messages is routed by default;
+                        --route adds rules for agents that talk to another
+                        base URL, e.g.
+                          --route '127.0.0.1:8082/v1/*=http://127.0.0.1:47821'
 
 The proxy compresses eligible tools, schemas, reminders, tool_results,
 and history; tracks events to disk; and measures real saved_pct via
@@ -1033,11 +1038,34 @@ async function main(): Promise<void> {
   // traffic into the pxpipe already running. It starts no proxy of its own, so
   // it exits through its own branch below rather than falling through here.
   let warpCommand: string[] | undefined;
+  const warpRoutes: string[] = [];
   let cliArgv = argv;
   if (argv[0] === 'warp') {
     const sep = argv.indexOf('--');
     warpCommand = sep < 0 ? [] : argv.slice(sep + 1);
-    cliArgv = argv.slice(1, sep < 0 ? argv.length : sep);
+    // warp's own flags live before the `--`; parseCli accepts none of them, so
+    // they are consumed here rather than passed through.
+    const warpArgv = argv.slice(1, sep < 0 ? argv.length : sep);
+    const rest: string[] = [];
+    for (let i = 0; i < warpArgv.length; i += 1) {
+      const a = warpArgv[i]!;
+      if (a === '--route') {
+        const spec = warpArgv[i + 1];
+        if (spec === undefined) {
+          console.error('[pxpipe] warp: --route needs PATTERN=TARGET');
+          process.exit(2);
+        }
+        warpRoutes.push(spec);
+        i += 1;
+        continue;
+      }
+      if (a.startsWith('--route=')) {
+        warpRoutes.push(a.slice('--route='.length));
+        continue;
+      }
+      rest.push(a);
+    }
+    cliArgv = rest;
   }
   // Stats / sessions / cleanup tools live in the dashboard
   // (see http://127.0.0.1:${port}/).
@@ -1048,13 +1076,39 @@ async function main(): Promise<void> {
   // does the transforming, the tracking and the dashboard. Everything below —
   // tracker, proxy pipeline, listener — belongs to that instance, not to us.
   if (warpCommand) {
-    createWarpRuntime({ port: opts.port }).launch(warpCommand);
+    createWarpRuntime({ port: opts.port, routes: warpRoutes }).launch(warpCommand);
     return;
   }
   // A/B harness passthrough switch (see the `transform` callback below).
   const forcePassthrough = /^(1|true|yes|on)$/i.test(process.env.PXPIPE_DISABLE ?? '');
   if (forcePassthrough) {
     console.log('[pxpipe] PXPIPE_DISABLE set — passthrough mode (compress=false), still logging usage + baselines');
+  }
+  // Subscription bearers expire. A client that froze its bearer at startup — a
+  // container handed CLAUDE_CODE_OAUTH_TOKEN as an env var — cannot renew one,
+  // so its max session length is the token's remaining life. When this is set we
+  // resolve the bearer per request from the file instead, which keeps rotation
+  // on the host with a single writer: N parallel containers refreshing their own
+  // copies would rotate each other's credential out from under them.
+  // Cached on mtime, so it costs a stat per request rather than a read.
+  const authTokenFile = process.env.ANTHROPIC_OAUTH_TOKEN_FILE?.trim() || undefined;
+  let authTokenCache: { mtimeMs: number; token: string } | undefined;
+  const anthropicAuthToken = authTokenFile
+    ? (): string | undefined => {
+        try {
+          const { mtimeMs } = fs.statSync(authTokenFile);
+          if (authTokenCache?.mtimeMs !== mtimeMs) {
+            authTokenCache = { mtimeMs, token: fs.readFileSync(authTokenFile, 'utf8').trim() };
+          }
+          return authTokenCache.token || undefined;
+        } catch {
+          // Mid-rotation the writer may have unlinked it; last good beats none.
+          return authTokenCache?.token;
+        }
+      }
+    : undefined;
+  if (authTokenFile) {
+    console.log(`[pxpipe] ANTHROPIC_OAUTH_TOKEN_FILE set — bearer resolved per request from ${authTokenFile}`);
   }
   // Debug aid: when PXPIPE_DUMP_DIR is set, persist every rendered PNG this
   // process emits, so you can eyeball exactly what the model received (OCR /
@@ -1110,6 +1164,7 @@ async function main(): Promise<void> {
   await dashboard.replay(opts.eventsFile).catch(() => {});
 
   const config: ProxyConfig = {
+    authToken: anthropicAuthToken,
     provider: opts.provider,
     gatewayBaseUrl: opts.gatewayBaseUrl,
     gatewayHeaders: opts.gatewayHeaders,

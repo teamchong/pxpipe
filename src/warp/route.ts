@@ -22,6 +22,13 @@ export interface Route {
    * all — a CONNECT carries no path.
    */
   readonly hostRe: RegExp;
+  /**
+   * Whether the pattern named a port. Loopback targets make the port the only
+   * thing distinguishing two hosts (127.0.0.1:8082 vs 127.0.0.1:47821), so a
+   * pattern that names one must be matched against "host:port" and a pattern
+   * that does not must keep matching any port.
+   */
+  readonly hasPort: boolean;
   readonly target: URL;
   /**
    * Target path prefix, normalized to "" or "/foo" (no trailing slash). Kept
@@ -88,15 +95,29 @@ export function parseRoute(spec: string): Route {
 
   const hostGlob = pattern.split('/')[0]!;
   const hostRe = new RegExp(`^${hostGlob.toLowerCase().split('*').map(quoteMeta).join('.*')}$`);
+  const hasPort = /:\d/.test(hostGlob);
 
-  return { pattern, re, hostRe, target, prefix };
+  return { pattern, re, hostRe, hasPort, target, prefix };
 }
 
-/** First match wins, so earlier rules shadow later ones. */
-export function matchRoute(routes: readonly Route[], host: string, path: string): Route | null {
-  const subject = host.toLowerCase() + path;
+/** Drop a trailing ":port", leaving IPv6 literals in brackets intact. */
+function stripPort(hostPort: string): string {
+  if (hostPort.startsWith('[')) return hostPort.slice(0, hostPort.indexOf(']') + 1);
+  const i = hostPort.lastIndexOf(':');
+  return i > 0 ? hostPort.slice(0, i) : hostPort;
+}
+
+/**
+ * First match wins, so earlier rules shadow later ones.
+ *
+ * `hostPort` carries the port so a pattern may select on it; patterns that name
+ * no port are matched against the bare host and so still match any port.
+ */
+export function matchRoute(routes: readonly Route[], hostPort: string, path: string): Route | null {
+  const lower = hostPort.toLowerCase();
+  const bare = stripPort(lower);
   for (const route of routes) {
-    if (route.re.test(subject)) return route;
+    if (route.re.test((route.hasPort ? lower : bare) + path)) return route;
   }
   return null;
 }
@@ -106,9 +127,10 @@ export function matchRoute(routes: readonly Route[], host: string, path: string)
  * time, before a path exists, so this is deliberately permissive: guessing
  * "yes" costs a needless MITM, guessing "no" silently breaks the route.
  */
-export function hostCouldMatch(routes: readonly Route[], host: string): boolean {
-  const lower = host.toLowerCase();
-  return routes.some((route) => route.hostRe.test(lower));
+export function hostCouldMatch(routes: readonly Route[], hostPort: string): boolean {
+  const lower = hostPort.toLowerCase();
+  const bare = stripPort(lower);
+  return routes.some((route) => route.hostRe.test(route.hasPort ? lower : bare));
 }
 
 /**

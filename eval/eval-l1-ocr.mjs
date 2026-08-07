@@ -258,15 +258,30 @@ if (MAX_BLOCKS > 0) blocks = blocks.slice(0, MAX_BLOCKS);
 console.log(`[L1] Loaded ${blocks.length} text blocks from corpus`);
 console.log(`[L1] Variants: ${VARIANTS.map(v => v.name).join(', ')}`);
 
+// Fail loudly if the shared name list (used by run-eval.mjs to price the run)
+// has drifted from the variants actually defined here.
+{
+  const { L1_VARIANT_NAMES } = await import('./lib/variant-names.mjs');
+  const declared = VARIANTS_FILTER ? null : VARIANTS.map(v => v.name).join(',');
+  if (declared !== null && declared !== L1_VARIANT_NAMES.join(',')) {
+    console.error(
+      `[L1] variant list drift: eval/lib/variant-names.mjs is out of sync.
+` +
+      `     here:  ${declared}
+` +
+      `     there: ${L1_VARIANT_NAMES.join(',')}`,
+    );
+    process.exit(1);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Cost estimate gate
 // ---------------------------------------------------------------------------
-// printCostEstimate models the legacy 2-call (baseline + reflow) shape. Actual
-// spend scales by the variant count, so adjust the headline figure.
+// printCostEstimate scales by the variant count it is handed.
 
 const corpus = { l1Blocks: blocks, l2Sessions: [] };
-const baseUsd = printCostEstimate(corpus, MODEL);
-const totalUsd = baseUsd * (VARIANTS.length / 2);
+const totalUsd = printCostEstimate(corpus, MODEL, VARIANTS.length);
 console.log(`[L1] ${VARIANTS.length} variants/block → estimated ~$${totalUsd.toFixed(4)} USD\n`);
 
 if (!DRY_RUN && !CONFIRMED) {

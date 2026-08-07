@@ -135,7 +135,12 @@ if (ESTIMATE_ONLY) {
   const l1Blocks   = existsSync(blocksPath)   ? JSON.parse(readFileSync(blocksPath,   'utf8')) : [];
   const l2Sessions = existsSync(sessionsPath) ? JSON.parse(readFileSync(sessionsPath, 'utf8')) : [];
 
-  printCostEstimate({ l1Blocks, l2Sessions }, args.model);
+  // L1 makes one call per variant per block, not the 2 this used to assume — with
+  // the full sweep that understated the bill 5.5×. This orchestrator has no
+  // --variants filter of its own, so it always prices the full sweep; run
+  // eval-l1-ocr.mjs directly (it takes --variants) for a narrowed estimate.
+  const { L1_VARIANT_NAMES } = await import('./lib/variant-names.mjs');
+  printCostEstimate({ l1Blocks, l2Sessions }, args.model, L1_VARIANT_NAMES.length);
   process.exit(0);
 }
 
@@ -211,18 +216,33 @@ const combinedLines = [
   ``,
   `## Overview`,
   ``,
-  l1Results ? [
-    `### L1: OCR Fidelity`,
-    ``,
-    `| | Baseline | Reflow | Δ |`,
-    `|--|---------|--------|---|`,
-    `| Mean char accuracy | ${(l1Results.baselineAgg.meanAccuracy * 100).toFixed(2)}% | ${(l1Results.reflowAgg.meanAccuracy * 100).toFixed(2)}% | ${((l1Results.reflowAgg.meanAccuracy - l1Results.baselineAgg.meanAccuracy) * 100).toFixed(2)}pp |`,
-    `| Macro accuracy | ${(l1Results.baselineAgg.macroAccuracy * 100).toFixed(2)}% | ${(l1Results.reflowAgg.macroAccuracy * 100).toFixed(2)}% | ${((l1Results.reflowAgg.macroAccuracy - l1Results.baselineAgg.macroAccuracy) * 100).toFixed(2)}pp |`,
-    `| Image savings | — | ${l1Results.imageSavingsPct.toFixed(1)}% | |`,
-    ``,
-    `Full L1 report: [l1-report.md](l1-report.md)`,
-    ``,
-  ].join('\n') : '*(L1 not run)*',
+  // L1 grew from a fixed baseline/reflow pair into an N-variant sweep, so the
+  // summary is now built from `perVariant` (keyed by variant name) instead of the
+  // long-gone `baselineAgg`/`reflowAgg` fields. Deltas are stated against
+  // `baseline` when present, which keeps the old two-column reading intact.
+  l1Results ? (() => {
+    const perVariant = l1Results.perVariant ?? {};
+    const names = Object.keys(perVariant);
+    if (names.length === 0) return '### L1: OCR Fidelity\n\n*(no variant results)*\n';
+    const base = perVariant.baseline?.agg;
+    const pct = (v) => `${(v * 100).toFixed(2)}%`;
+    const delta = (v, b) =>
+      b === undefined ? '—' : `${((v - b) * 100 >= 0 ? '+' : '')}${((v - b) * 100).toFixed(2)}pp`;
+    return [
+      `### L1: OCR Fidelity`,
+      ``,
+      `| Variant | Mean char accuracy | Δ vs baseline | Macro accuracy | Images |`,
+      `|---------|-------------------:|--------------:|---------------:|-------:|`,
+      ...names.map((n) => {
+        const a = perVariant[n].agg;
+        return `| ${n} | ${pct(a.meanAccuracy)} | ${delta(a.meanAccuracy, base?.meanAccuracy)} `
+          + `| ${pct(a.macroAccuracy)} | ${perVariant[n].imageCount ?? '—'} |`;
+      }),
+      ``,
+      `Full L1 report: [l1-report.md](l1-report.md)`,
+      ``,
+    ].join('\n');
+  })() : '*(L1 not run)*',
 
   ``,
 

@@ -33,12 +33,34 @@
 import { spawn } from 'node:child_process';
 import { writeFileSync, unlinkSync, existsSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 
 // Real claude binary — NOT the shell alias, which injects the proxy base URL.
-const CLAUDE_BIN = join(homedir(), '.claude', 'local', 'claude');
+// The historical hardcoded path only exists for installs that used the bundled
+// local installer; npm/global installs land elsewhere (e.g. ~/.local/bin/claude),
+// which made the harness unrunnable with a confusing "exited 1" instead of a
+// missing-binary error. Resolution order: explicit env → legacy path → PATH.
+function resolveClaudeBin() {
+  if (process.env.CCI_CLAUDE_BIN) return process.env.CCI_CLAUDE_BIN;
+
+  const legacy = join(homedir(), '.claude', 'local', 'claude');
+  if (existsSync(legacy)) return legacy;
+
+  const exts = process.platform === 'win32' ? ['.cmd', '.exe', '.ps1', ''] : [''];
+  for (const dir of (process.env.PATH ?? '').split(delimiter)) {
+    if (!dir) continue;
+    for (const ext of exts) {
+      const candidate = join(dir, `claude${ext}`);
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+  throw new Error(
+    'claude binary not found. Set CCI_CLAUDE_BIN to its full path ' +
+    `(looked in ${legacy} and on PATH).`,
+  );
+}
 
 // Interactive shim: drives the real TUI (Max auth) instead of headless `claude -p`.
 const CCI_PY = join(dirname(fileURLToPath(import.meta.url)), 'cci.py');
@@ -132,7 +154,9 @@ async function callClaudeCli(body, model) {
   // Child env: strip the proxy override so the CLI hits the real API directly
   // with the subscription OAuth token. Tall buffer so long transcriptions are
   // not truncated by the visible screen height.
-  const env = { ...process.env, CCI_ROWS: process.env.CCI_ROWS || '1500' };
+  // cci.py reads CCI_CLAUDE_BIN; without this it falls back to the legacy path
+  // and fails on any install that did not use the bundled local installer.
+  const env = { ...process.env, CCI_ROWS: process.env.CCI_ROWS || '1500', CCI_CLAUDE_BIN: resolveClaudeBin() };
   delete env.ANTHROPIC_BASE_URL;
 
   const args = [
@@ -142,10 +166,31 @@ async function callClaudeCli(body, model) {
   ];
   if (imageCount > 0) args.push('--allowedTools', 'Read');
 
+  // Transport choice. cci.py drives the interactive TUI through a pty, which
+  // pexpect only provides on POSIX — on Windows `pexpect.spawn` does not exist at
+  // all, so the shim can never run there. Headless `claude -p` authenticates
+  // against the same subscription and accepts the same --model/--allowedTools, so
+  // it is used automatically on win32 (and can be forced anywhere with
+  // CCI_HEADLESS=1). The trade-off is that -p reports usage per call while the
+  // TUI panels do not, so the headless path actually yields BETTER accounting.
+  const headless = process.env.CCI_HEADLESS === '1' || process.platform === 'win32';
+
+  const bin = resolveClaudeBin();
+  const cmd = headless ? bin : PYTHON;
+  const cmdArgs = headless
+    ? ['-p', '--model', model, '--output-format', 'json',
+       ...(imageCount > 0 ? ['--allowedTools', 'Read'] : [])]
+    : args;
+
   let stdout = '', stderr = '';
   try {
     await new Promise((resolveP, rejectP) => {
-      const child = spawn(PYTHON, args, { env });
+      // shell:true on Windows: the resolved binary is claude.cmd, which CreateProcess
+      // refuses to execute directly since the CVE-2024-27980 fix.
+      const child = spawn(cmd, cmdArgs, {
+        env,
+        shell: headless && process.platform === 'win32',
+      });
       child.stdout.on('data', d => { stdout += d; });
       child.stderr.on('data', d => { stderr += d; });
       child.on('error', rejectP);
@@ -182,8 +227,11 @@ async function callClaudeCli(body, model) {
     // /context estimate; total_cost_usd is the /cost server total. output_tokens
     // is not separately reported by the interactive panels.
     usage: {
-      input_tokens:  parsed.context_tokens ?? 0,
-      output_tokens: 0,
+      // Headless -p returns a real server usage block; the interactive shim has
+      // only the /context estimate, hence the fallback chain rather than a plain read.
+      input_tokens:  parsed.usage?.input_tokens ?? parsed.context_tokens ?? 0,
+      output_tokens: parsed.usage?.output_tokens ?? 0,
+      cache_read_input_tokens: parsed.usage?.cache_read_input_tokens ?? 0,
     },
     total_cost_usd: parsed.total_cost_usd ?? null,
   };

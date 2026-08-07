@@ -16,7 +16,7 @@
 import { createRequire } from 'node:module';
 import { existsSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..', '..');
@@ -34,10 +34,13 @@ if (!existsSync(RENDER_PATH)) {
   );
 }
 
-const renderModule  = await import(RENDER_PATH);
-const pngModule     = await import(PNG_PATH);
-const profileModule = await import(PROFILE_PATH);
-const visionModule  = await import(VISION_PATH);
+// Dynamic import() takes a URL, not a filesystem path. On POSIX a bare absolute
+// path happens to work; on Windows `E:\...` is parsed as the scheme `e:` and
+// rejected outright, so the eval harness could not run there at all.
+const renderModule  = await import(pathToFileURL(RENDER_PATH).href);
+const pngModule     = await import(pathToFileURL(PNG_PATH).href);
+const profileModule = await import(pathToFileURL(PROFILE_PATH).href);
+const visionModule  = await import(pathToFileURL(VISION_PATH).href);
 
 export const {
   renderTextToPngs,

@@ -14,6 +14,16 @@
 // These are approximate public rates; update if pricing changes.
 // ---------------------------------------------------------------------------
 export const MODELS = {
+  'claude-opus-5': {
+    inputPerMtok:  5.00,
+    outputPerMtok: 25.00,
+    imageTileTokens: 4761,
+  },
+  'claude-fable-5': {
+    inputPerMtok: 10.00,
+    outputPerMtok: 50.00,
+    imageTileTokens: 4761,
+  },
   'claude-sonnet-4-5': {
     inputPerMtok:  3.00,
     outputPerMtok: 15.00,
@@ -25,6 +35,24 @@ export const MODELS = {
     imageTileTokens: 4761,
   },
 };
+
+/** Cache multipliers against the model's base input rate. Reads are ~0.1×; writes
+ *  are 1.25× at the default 5-minute TTL and 2× at 1 hour. Exposed so callers can
+ *  price a cached prefix without hardcoding the ratios. */
+export const CACHE_MULTIPLIERS = { read: 0.1, write5m: 1.25, write1h: 2.0 };
+
+/** Per-Mtok rates for a model including the derived cache rates. */
+export function modelRates(model) {
+  const m = MODELS[model];
+  if (!m) return null;
+  return {
+    input: m.inputPerMtok,
+    output: m.outputPerMtok,
+    cacheRead: m.inputPerMtok * CACHE_MULTIPLIERS.read,
+    cacheWrite5m: m.inputPerMtok * CACHE_MULTIPLIERS.write5m,
+    cacheWrite1h: m.inputPerMtok * CACHE_MULTIPLIERS.write1h,
+  };
+}
 
 /** Characters per token for Claude Code transcripts (empirical, N=354). */
 const CHARS_PER_TOKEN = 1.17;
@@ -171,15 +199,31 @@ export function estimateL2SessionCost(
  * @param {string} model
  * @returns {number} total USD
  */
-export function printCostEstimate(corpus, model = DEFAULT_MODEL) {
+export function printCostEstimate(corpus, model = DEFAULT_MODEL, l1VariantCount = 2) {
   const { l1Blocks, l2Sessions } = corpus;
   let totalUsd = 0;
+  // L1 runs one call per VARIANT per block, not the fixed baseline+reflow pair this
+  // estimator was written against — with the current 11 variants that understated
+  // the bill 5.5×. Callers pass the real count; the per-block cost below still
+  // prices that pair, so scale it by variants/2.
+  const variants = Math.max(1, l1VariantCount | 0);
+  const variantScale = variants / 2;
 
   console.log('\n╔══════════════════════════════════════════════════╗');
   console.log('║          COST ESTIMATE (before real run)         ║');
   console.log('╚══════════════════════════════════════════════════╝');
   console.log(`  Model: ${model}`);
-  console.log(`  Pricing: $${MODELS[model]?.inputPerMtok ?? '?'}/Mtok input, $${MODELS[model]?.outputPerMtok ?? '?'}/Mtok output`);
+  const rates = modelRates(model);
+  if (rates) {
+    console.log(`  Pricing: $${rates.input}/Mtok input, $${rates.output}/Mtok output`);
+    console.log(`           $${rates.cacheRead.toFixed(2)}/Mtok cache read, ` +
+                `$${rates.cacheWrite5m.toFixed(2)} (5m) / $${rates.cacheWrite1h.toFixed(2)} (1h) cache write`);
+  } else {
+    // Previously this printed "$?/Mtok" and then silently priced the run at
+    // DEFAULT_MODEL's rates — a confidently wrong number. Say so instead.
+    console.log(`  Pricing: UNKNOWN for ${model} — no entry in MODELS.`);
+    console.log(`           Totals below use ${DEFAULT_MODEL} rates and are NOT this model's cost.`);
+  }
 
   // L1
   let l1Total = { inputTokens: 0, outputTokens: 0, usd: 0, calls: 0 };
@@ -194,9 +238,14 @@ export function printCostEstimate(corpus, model = DEFAULT_MODEL) {
     l1Total.usd          += base.usd          + refl.usd;
     l1Total.calls        += 2;
   }
+  // Scale the baseline+reflow pair up to the real variant count.
+  l1Total.inputTokens  = Math.round(l1Total.inputTokens  * variantScale);
+  l1Total.outputTokens = Math.round(l1Total.outputTokens * variantScale);
+  l1Total.usd         *= variantScale;
+  l1Total.calls        = l1Blocks.length * variants;
   totalUsd += l1Total.usd;
 
-  console.log(`\n  ── L1 OCR Fidelity (${l1Blocks.length} blocks × 2 calls) ──`);
+  console.log(`\n  ── L1 OCR Fidelity (${l1Blocks.length} blocks x ${variants} variants) ──`);
   console.log(`     API calls:     ${l1Total.calls}`);
   console.log(`     Input tokens:  ${l1Total.inputTokens.toLocaleString()}`);
   console.log(`     Output tokens: ${l1Total.outputTokens.toLocaleString()}`);

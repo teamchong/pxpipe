@@ -201,8 +201,15 @@ describe('wireImages — what the provider actually counts', () => {
 
     const actual = wireImages(dec(out).messages);
     expect(info.wireImages).toBe(actual);
-    // The whole point: we rendered materially more than we shipped.
-    expect(info.imageCount!).toBeGreaterThan(actual);
+    // This assertion used to read `imageCount > actual` — "we rendered materially
+    // more than we shipped" — and on this shape it measured 95 rendered against 27
+    // shipped. That gap was not a design property. It was tool_result imaging
+    // running before the history collapse: 68 of those renders were thrown away
+    // with the messages that absorbed them, and the tool output inside them
+    // reached the wire in no form at all. With the stages ordered so the collapse
+    // sees original text, the same fixture measures 92 rendered and 92 shipped.
+    // A gap reappearing here now means renders are being discarded again.
+    expect(info.imageCount!).toBe(actual - (info.nativeImages ?? 0));
     expect(actual).toBeLessThanOrEqual(ANTHROPIC_MAX_IMAGES);
   });
 

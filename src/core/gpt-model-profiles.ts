@@ -113,6 +113,23 @@ export interface GptModelProfile {
   history: GptHistoryProfile;
   /** Complete model-specific font, cell spacing, color, and marker style. */
   style: GptRenderStyle;
+  /** Optional override of `stripCols` for COLLAPSED HISTORY only, leaving the
+   *  slab and tool-result pages on `stripCols`. Undefined = use `stripCols`,
+   *  i.e. behaviour is unchanged unless a profile opts in.
+   *
+   *  Exists because reading accuracy and rendering cost are not the same axis.
+   *  Geometry is identical across a provider's models because the *billing* is,
+   *  but verbatim recall is not: on one 26-value battery at this profile's
+   *  312-col dense geometry, Fable 5 read 25/26 exactly while Opus 5 read 3/26
+   *  with 10 silent substitutions. A deployment that must re-read exact values
+   *  out of imaged history needs a lower density there — and only there, since
+   *  the static slab holds no such values. */
+  historyStripCols?: number;
+  /** Optional override of `style` for collapsed history only. Same rationale as
+   *  `historyStripCols`; set both together, since a larger font at unchanged
+   *  columns overshoots the provider's no-resize width and is silently
+   *  downscaled, which removes the legibility it was meant to buy. */
+  historyStyle?: GptRenderStyle;
   /** Maximum serialized provider request produced by pxpipe. Undefined leaves
    *  legacy behavior unchanged. Checked in the transform (which falls back to
    *  the original body when imaging would overshoot) and enforced again on the
@@ -477,6 +494,17 @@ function parseEnvProfiles(raw: string): Map<string, GptModelProfile> {
       framing: historyFraming(historyIn?.framing, baseHistory.framing),
       factSheetScope: factSheetScope(historyIn?.factSheetScope, baseHistory.factSheetScope),
     };
+    // History geometry: only materialised when the override actually asks for
+    // it, so a profile that says nothing about history keeps `undefined` and
+    // transform.ts falls through to the dense geometry unchanged.
+    const historyStyleIn = (p as { historyStyle?: GptRenderStyle }).historyStyle;
+    const historyStyle: GptRenderStyle | undefined = historyStyleIn === undefined
+      ? base.historyStyle
+      : { ...style, font: renderFont(historyStyleIn.font, style.font) };
+    const historyStripCols = p.historyStripCols === undefined
+      ? base.historyStripCols
+      : posInt(p.historyStripCols, base.historyStripCols ?? base.stripCols);
+
     out.set(key, {
       vision: isValidVision(p.vision) ? p.vision : base.vision,
       cacheReadRate: rate(p.cacheReadRate, base.cacheReadRate),
@@ -490,6 +518,8 @@ function parseEnvProfiles(raw: string): Map<string, GptModelProfile> {
       factSheetFormat: factSheetFormat(p.factSheetFormat, base.factSheetFormat),
       history,
       style,
+      historyStripCols,
+      historyStyle,
       maxSerializedRequestBytes: p.maxSerializedRequestBytes === undefined
         ? base.maxSerializedRequestBytes
         : posInt(p.maxSerializedRequestBytes, base.maxSerializedRequestBytes ?? 0) || undefined,

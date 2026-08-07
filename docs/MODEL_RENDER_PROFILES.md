@@ -64,6 +64,38 @@ PXPIPE_GPT_PROFILES='{"gpt-5.6-sol":{"stripCols":120}}'
 The profitability gate uses the same resolved profile as the renderer, so a
 style or geometry override cannot leave cost prediction on stale dimensions.
 
+### Per-content-class geometry
+
+`historyStripCols` and `historyStyle` override `stripCols` and `style` for
+**collapsed history only**. The static slab and tool-result pages keep the dense
+geometry. Both are undefined in every shipped profile, so leaving them out
+changes nothing.
+
+```bash
+PXPIPE_GPT_PROFILES='{"claude-opus-5":{"historyStripCols":172,"historyStyle":{"font":"jetbrains-mono-14"}}}'
+```
+
+They exist because reading accuracy and rendering cost are not the same axis.
+Geometry is shared across a provider's models because the *billing* is, but
+verbatim recall is not. Measured on one 26-value battery — commit SHAs, 32-char
+md5 hashes, three-decimal ratios, currency to the cent, timestamped filenames —
+rendered at the shipped 312-column dense geometry:
+
+| reader | exact | silently wrong |
+|---|---|---|
+| Fable 5 | 25/26 | 1/26 (capitalisation) |
+| Opus 5 | 3/26 | **10/26** |
+| Opus 5 at `jetbrains-mono-14`, 172 cols | **100/100** | **0/100** |
+
+So `NOT-OCR.md`'s "unreliable at any size" holds at production density and not
+below it. The trade is real and the caller should make it: on 400 000 characters
+of live transcript, dense rendering is 5.28× cheaper than text and legible
+rendering 1.47×.
+
+**Set both fields together.** A larger font at unchanged columns overshoots the
+provider's no-resize width, gets downscaled server-side, and loses exactly the
+legibility it was meant to buy.
+
 ## Unmeasured families
 
 An id that names a family pxpipe HAS measured, but does not match any of that

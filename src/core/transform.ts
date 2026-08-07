@@ -308,6 +308,26 @@ function imageTokensCost(
   return imageTokensForRows(rows, effectiveCols, imageCountCap, maxCharsPerImage, geometry);
 }
 
+/** Gate geometry for collapsed history.
+ *
+ *  Identical to {@link denseGateGeometry} unless the model profile sets
+ *  `historyStripCols` / `historyStyle`, which let a deployment render history
+ *  at a lower density than the slab without touching either default. Both are
+ *  undefined in every shipped profile, so this returns the dense geometry
+ *  unchanged out of the box. */
+function historyGateGeometry(o?: Required<TransformOptions>): GateGeometry {
+  const dense = denseGateGeometry(o);
+  const profile = o?.model ? resolveGptProfile(o.model) : undefined;
+  if (profile?.historyStripCols === undefined && profile?.historyStyle === undefined) return dense;
+  return {
+    ...dense,
+    // An explicit `o.cols` is a caller override and still wins, as it does for
+    // the dense path.
+    cols: o?.cols ?? profile.historyStripCols ?? dense.cols,
+    style: profile.historyStyle ?? dense.style,
+  };
+}
+
 /** Gate geometry for dense tool-result, reminder, and history pages. */
 function denseGateGeometry(o?: Required<TransformOptions>): GateGeometry {
   const profile = o?.model ? resolveGptProfile(o.model) : undefined;
@@ -1845,7 +1865,7 @@ async function runHistoryCollapseAndFinalize(
     // symmetric burn would have kept the slab gate in. Production data
     // 2026-05-23 showed three-turn sessions paying cache_create every
     // turn because the history gate ignored priorWarmImageTokens.
-    const historyGeometry = denseGateGeometry(o);
+    const historyGeometry = historyGateGeometry(o);
     const historyProfitable = (text: string, cols: number): boolean => {
       // Gate with the same model profile used by the history renderer.
       return isCompressionProfitableAmortized(
@@ -2622,7 +2642,7 @@ export async function transformRequest(
       ? o.charsPerToken
       : HISTORY_CHARS_PER_TOKEN;
     const horizon = Math.max(1, Math.floor(o.historyAmortizationHorizon));
-    const historyGeometry = denseGateGeometry(o);
+    const historyGeometry = historyGateGeometry(o);
     const historyProfitable = (text: string, cols: number): boolean => {
       // Gate with the same model profile used by the history renderer.
       return isCompressionProfitableAmortized(

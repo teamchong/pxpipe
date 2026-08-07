@@ -1079,12 +1079,144 @@ export async function renderTextToPngsReflow(
 }
 
 /** Split text into N PNGs each ≤ MAX_HEIGHT_PX tall, respecting per-image char budget. */
+// --- rendered-page cache ---------------------------------------------------
+
+/**
+ * Rendering is a pure function of (text, cols, maxCharsPerImage, style, maxHeightPx,
+ * slotText): the atlases are decoded once at module init and never mutated, and no
+ * module-level state feeds the output. So identical inputs can safely return the
+ * identical pages instead of being re-rasterized.
+ *
+ * This is worth a cache because the proxy deliberately re-renders the same bytes every
+ * turn: history chunks are frozen so they stay byte-identical for the upstream prompt
+ * cache (see the cache-stability note in history.ts), which means a long session pays
+ * full render cost for pages that provably did not change. Measured on a real session,
+ * ~134 images cost ~10s of single-threaded CPU per request while the payload hash held
+ * constant across consecutive turns.
+ *
+ * Bounded by total retained bytes (PNG payloads + the key strings, which embed the
+ * source text and would otherwise be the larger half). Eviction is LRU via Map's
+ * insertion order: re-inserting on hit moves an entry to the newest position.
+ */
+const RENDER_CACHE_MAX_BYTES = (() => {
+  // Edge-safe: `process` is undefined off-Node.
+  const raw = typeof process !== 'undefined' ? process.env?.PXPIPE_RENDER_CACHE_BYTES : undefined;
+  const parsed = raw !== undefined && raw.trim() !== '' ? Number(raw) : NaN;
+  // 0 disables the cache outright; negative/garbage falls back to the default.
+  if (Number.isFinite(parsed) && parsed >= 0) return Math.floor(parsed);
+  // 64 MiB holds several turns of a heavy session while staying well inside a
+  // Workers isolate's memory ceiling.
+  return 64 * 1024 * 1024;
+})();
+
+interface RenderCacheEntry {
+  readonly images: readonly RenderedImage[];
+  readonly bytes: number;
+}
+
+const renderCache = new Map<string, RenderCacheEntry>();
+let renderCacheBytes = 0;
+let renderCacheHits = 0;
+let renderCacheMisses = 0;
+
+/** Observability for the dashboard/tests. Bytes counts retained PNG + key bytes. */
+export function renderCacheStats(): {
+  entries: number;
+  bytes: number;
+  hits: number;
+  misses: number;
+} {
+  return { entries: renderCache.size, bytes: renderCacheBytes, hits: renderCacheHits, misses: renderCacheMisses };
+}
+
+/** Drop every entry. Tests use this to isolate hit/miss accounting. */
+export function clearRenderCache(): void {
+  renderCache.clear();
+  renderCacheBytes = 0;
+  renderCacheHits = 0;
+  renderCacheMisses = 0;
+}
+
+/** Stable serialization of RenderStyle. Every field is a primitive (see the interface),
+ *  so String() is unambiguous; sorting keys removes any dependence on literal order.
+ *  Undefined values are skipped so `{}` and `{aa: undefined}` share one entry. */
+function styleCacheKey(style: RenderStyle): string {
+  const src = style as Record<string, unknown>;
+  let out = '';
+  for (const k of Object.keys(src).sort()) {
+    const v = src[k];
+    if (v !== undefined) out += `${k}=${String(v)};`;
+  }
+  return out;
+}
+
+/** Copy the array and each entry's mutable `droppedCodepoints` map so a caller cannot
+ *  mutate cached state. The PNG bytes are shared deliberately — copying multi-MB
+ *  payloads on every hit would defeat the point; callers only base64-encode them. */
+function cloneForCaller(images: readonly RenderedImage[]): RenderedImage[] {
+  return images.map((img) => ({ ...img, droppedCodepoints: new Map(img.droppedCodepoints) }));
+}
+
 export async function renderTextToPngsWithCharLimit(
   text: string,
   cols: number = DEFAULT_COLS,
   maxCharsPerImage: number = READABLE_CHARS_PER_IMAGE,
   style: RenderStyle = {},
   maxHeightPx: number = MAX_HEIGHT_PX,
+  slotText?: string,
+): Promise<RenderedImage[]> {
+  if (RENDER_CACHE_MAX_BYTES === 0) {
+    return renderTextToPngsUncached(text, cols, maxCharsPerImage, style, maxHeightPx, slotText);
+  }
+  // The key embeds the source text verbatim rather than a digest, so it is
+  // collision-free by construction — a digest collision here would serve the WRONG
+  // image, a silent correctness bug far worse than a cache miss.
+  //
+  // `slotText` is length-prefixed because it and `text` are both free-form: plain
+  // concatenation would give ("a b", "c") and ("a", "b c") one key. -1 marks absent,
+  // which must stay distinct from empty — renderTextToPngsUncached branches on
+  // `slotText !== undefined`. The numeric and style segments contain no `|` (style
+  // values are booleans, numbers, and dashed string unions), so the fixed-arity
+  // prefix can never be confused with content.
+  const slotLen = slotText === undefined ? -1 : slotText.length;
+  const key =
+    `${cols}|${maxCharsPerImage}|${maxHeightPx}|${styleCacheKey(style)}|${slotLen}|${slotText ?? ''}${text}`;
+  const hit = renderCache.get(key);
+  if (hit !== undefined) {
+    renderCacheHits++;
+    renderCache.delete(key); // re-insert to refresh LRU position
+    renderCache.set(key, hit);
+    return cloneForCaller(hit.images);
+  }
+  renderCacheMisses++;
+
+  const images = await renderTextToPngsUncached(text, cols, maxCharsPerImage, style, maxHeightPx, slotText);
+
+  // Key strings are UTF-16 in memory; 2 bytes/unit is the honest estimate.
+  let bytes = key.length * 2;
+  for (const img of images) bytes += img.png.byteLength;
+  // A single render larger than the whole budget is not cacheable — storing it would
+  // evict everything and then itself. Serve it and move on.
+  if (bytes <= RENDER_CACHE_MAX_BYTES) {
+    renderCache.set(key, { images, bytes });
+    renderCacheBytes += bytes;
+    // Evict oldest-first until back within budget. Map iteration is insertion order.
+    for (const [k, v] of renderCache) {
+      if (renderCacheBytes <= RENDER_CACHE_MAX_BYTES) break;
+      if (k === key) continue; // never evict the entry just stored
+      renderCache.delete(k);
+      renderCacheBytes -= v.bytes;
+    }
+  }
+  return cloneForCaller(images);
+}
+
+async function renderTextToPngsUncached(
+  text: string,
+  cols: number,
+  maxCharsPerImage: number,
+  style: RenderStyle,
+  maxHeightPx: number,
   slotText?: string,
 ): Promise<RenderedImage[]> {
   const markerScale = Math.max(1, Math.floor(style.markerScale ?? 1));

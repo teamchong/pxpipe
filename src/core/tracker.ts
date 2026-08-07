@@ -18,6 +18,8 @@ export interface TrackEvent {
   status: number;
   duration_ms: number;
   first_byte_ms?: number;
+  /** Local render+encode ms. `duration_ms - transform_ms` isolates upstream. */
+  transform_ms?: number;
 
   // From TransformInfo:
   compressed?: boolean;
@@ -223,6 +225,7 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
   if (ev.model) out.model = ev.model;
   if (ev.accountingProvider) out.accounting_provider = ev.accountingProvider;
   if (ev.firstByteMs !== undefined) out.first_byte_ms = ev.firstByteMs;
+  if (ev.transformMs !== undefined) out.transform_ms = ev.transformMs;
   if (ev.error) out.error = ev.error;
   if (ev.errorBody) out.error_body = ev.errorBody;
   if (ev.reqBodySha8) out.req_body_sha8 = ev.reqBodySha8;

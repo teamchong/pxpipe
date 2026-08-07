@@ -9,6 +9,13 @@ Claude models use Anthropic by default. Two optional routes can run together:
 - `OPENAI_MODELS` routes exact model IDs to OpenAI Responses.
 - `CLOUDFLARE_MODELS` routes exact model IDs to Cloudflare's OpenAI-compatible endpoint.
 
+Any OpenAI-compatible provider, including [Novita](https://novita.ai/), can be
+routed the same way `OPENAI_MODELS` already routes to OpenAI itself — set
+`OPENAI_UPSTREAM` to that provider's base URL and list its model IDs. This is
+untested end to end (see the caveat above); it follows the same
+`OPENAI_UPSTREAM` + `OPENAI_MODELS` mechanism already documented below, not a
+new code path.
+
 If a model appears in both lists, precedence is:
 
 ```text
@@ -38,6 +45,25 @@ The Cloudflare variables derive this OpenAI-compatible endpoint:
 ```text
 https://api.cloudflare.com/client/v4/accounts/<account-id>/ai/v1
 ```
+
+### Novita (OpenAI-compatible)
+
+Novita exposes an OpenAI-compatible endpoint, so it goes through the same
+`OPENAI_UPSTREAM` / `OPENAI_MODELS` route as OpenAI itself — no separate flag:
+
+```bash
+OPENAI_UPSTREAM=https://api.novita.ai/openai \
+OPENAI_API_KEY=your-novita-key \
+OPENAI_MODELS=deepseek/deepseek-v3.2 \
+npx pxpipe-proxy
+```
+
+Swap `OPENAI_MODELS` for any [Novita model ID](https://novita.ai/models). This
+was verified against Novita's `/openai/v1/responses` and
+`/openai/v1/chat/completions` endpoints (both reject with an auth error rather
+than 404, confirming the routes exist); the actual model reply was not
+exercised end to end, so treat the routing as reachable but unverified, same
+disclaimer as everything past Kimi K3 above.
 
 ## Connect Claude Code
 

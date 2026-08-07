@@ -43,6 +43,10 @@ behavioral changes, patch = fixes).
 
 ## 0.11.0 — 2026-07-25
 
+### Added
+- Documented routing to Novita's OpenAI-compatible endpoint via the existing
+  `OPENAI_UPSTREAM` / `OPENAI_MODELS` mechanism (no new code path).
+
 ### Changed
 - Opt-in `gpt-5.6-sol` now uses native 14px JetBrains Mono at 84 columns. Its paid
   pilot preserved gist and guard checks, read 7/8 exact values, and produced no

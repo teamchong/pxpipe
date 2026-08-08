@@ -841,6 +841,11 @@ const DYNAMIC_BLOCK_TAGS = [
   'git_status',
   'directoryStructure',
   'system-reminder',
+  // A running per-turn counter. Left in the static slab it re-keys the slab image
+  // on every single turn, which is the worst possible cache shape: the prefix is
+  // paid for as a create and never read. It was showing up in
+  // `unknownStaticTags`, which is exactly the canary that list exists to be.
+  'total_tokens',
 ] as const;
 
 // Known-static slab tags — suppresses first-sighting `unknownStaticTags` noise

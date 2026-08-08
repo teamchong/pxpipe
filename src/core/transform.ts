@@ -100,6 +100,13 @@ export interface TransformOptions {
   /** Hard upper bound on images per tool_result; source text truncated with a paging
    *  marker above this to stay under Anthropic's 100-image/request cap. Default 10. */
   maxImagesPerToolResult?: number;
+  /** Ceiling on total decoded image bytes in one request, caller images
+   *  included. The provider's hard limit is a count, not a size, so the image
+   *  cap alone lets a long session assemble a request that is legal by count and
+   *  fails by weight: production traffic degrades sharply past roughly 20 MiB
+   *  with 500s, 502s, empty 200s and stalls (#157). Groups are admitted whole,
+   *  and a group that does not fit keeps its source text. */
+  maxImageBytes?: number;
   /** Chars-per-token assumption for `isCompressionProfitable()`. Default 4. */
   charsPerToken?: number;
   /** Multi-turn amortization horizon for the history-collapse gate. N≥2 evaluates as
@@ -146,6 +153,9 @@ const DEFAULTS: Required<TransformOptions> = {
   // 312 cols × 5 px + 8 px pad = 1568 px (Anthropic no-resize edge).
   cols: ANTHROPIC_SLAB_COLS,
   maxImagesPerToolResult: 10,
+  // Deliberately under the ~20 MiB cliff observed in production rather than at
+  // it: the measured threshold is empirical and varies by route and provider.
+  maxImageBytes: 18 * 1024 * 1024,
   charsPerToken: 4,
   historyAmortizationHorizon: 1,
   priorWarmTokens: 0,
@@ -655,6 +665,17 @@ export interface TransformInfo {
   nativeImages?: number;
   /** Imaging steps skipped because the cap was exhausted (telemetry for tuning). */
   imageBudgetSkips?: number;
+  /** Decoded bytes of the CLIENT's own image blocks, counted once before any
+   *  rewrite. They occupy the same weight budget ours do, and they are never
+   *  removed to make room: a caller's screenshot outranks our compression. */
+  nativeImageBytes?: number;
+  /** Imaging groups skipped because the byte budget, not the count cap, was
+   *  exhausted. Distinct from {@link imageBudgetSkips} because the two have
+   *  different fixes: one wants fewer pages, the other wants smaller ones. */
+  imageByteSkips?: number;
+  /** Set when the request landed within 10% of the byte budget. Nothing was
+   *  dropped, but the next turn of the same session probably will be. */
+  imageBytesNearLimit?: boolean;
   /** Image blocks actually present in the outgoing body — ours AND the client's.
    *  This is the only number the provider counts. It is <= imageCount + nativeImages
    *  because the history collapse can absorb messages that already carried images. */
@@ -743,6 +764,10 @@ export interface TransformInfo {
     | 'below_min_tokens'
     | 'not_profitable'
     | 'too_many_images'
+    /** Rendered, then not applied: the collapse group did not fit the decoded
+     *  image-byte budget, so the original text stands. Distinct from
+     *  `too_many_images`, which is the provider's count cap. */
+    | 'image_bytes'
     | 'render_empty'
     | 'over_budget'
     | 'collapsed';
@@ -1775,6 +1800,44 @@ export function imageHeadroom(info: TransformInfo): number {
   );
 }
 
+/** Bytes still available for image content, caller images already deducted.
+ *
+ *  Separate from {@link imageHeadroom} because the two limits fail differently.
+ *  The count cap is the provider's documented limit and rejects with a clear
+ *  error. The byte budget is empirical: past roughly 20 MiB production requests
+ *  start failing as 500s, 502s, empty 200s and stalls, which read as flakiness
+ *  rather than as "too big". */
+export function imageByteHeadroom(info: TransformInfo, limit: number): number {
+  return Math.max(0, limit - info.imageBytes - (info.nativeImageBytes ?? 0));
+}
+
+/** True when this request finished close enough to the budget that the next turn
+ *  of the same session is likely to hit it. */
+function nearByteLimit(info: TransformInfo, limit: number): boolean {
+  return limit > 0 && info.imageBytes + (info.nativeImageBytes ?? 0) >= limit * 0.9;
+}
+
+/** Decoded bytes of the caller's own images, at both nesting levels. Runs BEFORE
+ *  any rewrite, for the same reason {@link countNativeImages} does. */
+export function countNativeImageBytes(messages: readonly Message[] | undefined): number {
+  let bytes = 0;
+  const add = (blk: unknown): void => {
+    const b = blk as ImageBlock | null;
+    if (b?.type === 'image' && typeof b.source?.data === 'string') bytes += approxBlockBytes(b);
+  };
+  for (const m of messages ?? []) {
+    if (!Array.isArray(m.content)) continue;
+    for (const blk of m.content) {
+      add(blk);
+      const tr = blk as ToolResultBlock | null;
+      if (tr?.type === 'tool_result' && Array.isArray(tr.content)) {
+        for (const inner of tr.content) add(inner);
+      }
+    }
+  }
+  return bytes;
+}
+
 /** Count image blocks already present in the caller's messages. Runs BEFORE any
  *  rewrite, so it sees the client's images only — ours do not exist yet. */
 export function countNativeImages(messages: readonly Message[] | undefined): number {
@@ -1882,7 +1945,20 @@ async function runHistoryCollapseAndFinalize(
     if (histInfo.freezeStep !== undefined) info.historyFreezeStep = histInfo.freezeStep;
     if (histInfo.budgetTrimmed) info.historyBudgetTrimmed = true;
     if (tuning.packFill) info.historyPackFill = true;
-    if (histInfo.collapsedTurns > 0) {
+    // Atomic admission by weight. The collapse is one semantic group: applying
+    // it means every collapsed message becomes pages, so a group that does not
+    // fit the byte budget is not applied at all and the original text stands.
+    // Rendering it first and discarding it costs CPU, which is the cheap half of
+    // the trade: the alternative is estimating PNG size from character counts and
+    // being wrong on the request that mattered.
+    if (
+      histInfo.collapsedTurns > 0 &&
+      histInfo.collapsedImageBytes > imageByteHeadroom(info, o.maxImageBytes)
+    ) {
+      bumpPassthrough(info, 'image_budget');
+      info.imageByteSkips = (info.imageByteSkips ?? 0) + 1;
+      info.historyReason = 'image_bytes';
+    } else if (histInfo.collapsedTurns > 0) {
       req.messages = newMessages;
       info.collapsedTurns = histInfo.collapsedTurns;
       info.collapsedChars = histInfo.collapsedChars;
@@ -1917,6 +1993,7 @@ async function runHistoryCollapseAndFinalize(
   // only ever sees this number, so telemetry and any future headroom math must
   // read it and not the render counter.
   info.wireImages = countNativeImages(req.messages);
+  if (nearByteLimit(info, o.maxImageBytes)) info.imageBytesNearLimit = true;
   const outBody = new TextEncoder().encode(JSON.stringify(req));
   return { body: outBody, info, collapsed: collapsedFlag };
 }
@@ -1985,6 +2062,7 @@ export async function transformRequest(
   // same wire cap we are about to spend from. Counted once, here, because every
   // later path (slab, tool_results, history) rewrites content in place.
   info.nativeImages = countNativeImages(req.messages);
+  info.nativeImageBytes = countNativeImageBytes(req.messages);
 
   // 0. User-pinned instructions. Fold the transcript's pin commands, then remove
   //    them from the outbound copy — the client's own transcript is untouched, so
@@ -2289,10 +2367,16 @@ export async function transformRequest(
   // (measured: 94 client images + 400k slab -> 109 on the wire -> 400). All or
   // nothing, because the slab is part of the cache prefix — imaging half of it
   // would re-key that prefix on every turn whose client-image count moved.
-  if (images.length > imageHeadroom(info)) {
-    info.reason = `image_budget (slab needs ${images.length}, headroom ${imageHeadroom(info)})`;
+  const slabBytes = images.reduce((sum, img) => sum + img.png.length, 0);
+  const slabOverCount = images.length > imageHeadroom(info);
+  const slabOverBytes = slabBytes > imageByteHeadroom(info, o.maxImageBytes);
+  if (slabOverCount || slabOverBytes) {
+    info.reason = slabOverCount
+      ? `image_budget (slab needs ${images.length}, headroom ${imageHeadroom(info)})`
+      : `image_bytes (slab needs ${slabBytes}, headroom ${imageByteHeadroom(info, o.maxImageBytes)})`;
     bumpPassthrough(info, 'image_budget');
-    info.imageBudgetSkips = (info.imageBudgetSkips ?? 0) + 1;
+    if (slabOverBytes && !slabOverCount) info.imageByteSkips = (info.imageByteSkips ?? 0) + 1;
+    else info.imageBudgetSkips = (info.imageBudgetSkips ?? 0) + 1;
     const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints, pins);
     if (finalized.collapsed) {
       info.compressed = true;
@@ -2456,9 +2540,20 @@ export async function transformRequest(
                 // o.cols; when they differ the real page count can exceed the plan.
                 // Verify against the actual render and drop OUR images rather than
                 // ship a request the provider rejects outright.
+                // Atomic admission: this tool_result is one semantic group. It
+                // is imaged whole or kept as text whole, by count and by weight
+                // alike. A half-imaged result would ship pages without the text
+                // they replaced.
+                const groupBytes = imgs.reduce((sum, img) => sum + approxBlockBytes(img), 0);
                 if (imgs.length > imageHeadroom(info)) {
                   bumpPassthrough(info, 'image_budget');
                   info.imageBudgetSkips = (info.imageBudgetSkips ?? 0) + 1;
+                  rewritten.push(blk);
+                  continue;
+                }
+                if (groupBytes > imageByteHeadroom(info, o.maxImageBytes)) {
+                  bumpPassthrough(info, 'image_budget');
+                  info.imageByteSkips = (info.imageByteSkips ?? 0) + 1;
                   rewritten.push(blk);
                   continue;
                 }
@@ -2556,9 +2651,16 @@ export async function transformRequest(
                 // o.cols; when they differ the real page count can exceed the plan.
                 // Verify against the actual render and drop OUR images rather than
                 // ship a request the provider rejects outright.
+                const partBytes = imgs.reduce((sum, img) => sum + approxBlockBytes(img), 0);
                 if (imgs.length > imageHeadroom(info)) {
                   bumpPassthrough(info, 'image_budget');
                   info.imageBudgetSkips = (info.imageBudgetSkips ?? 0) + 1;
+                  newInner.push(ib as TextBlock | ImageBlock);
+                  continue;
+                }
+                if (partBytes > imageByteHeadroom(info, o.maxImageBytes)) {
+                  bumpPassthrough(info, 'image_budget');
+                  info.imageByteSkips = (info.imageByteSkips ?? 0) + 1;
                   newInner.push(ib as TextBlock | ImageBlock);
                   continue;
                 }
@@ -2651,7 +2753,20 @@ export async function transformRequest(
     if (histInfo.freezeStep !== undefined) info.historyFreezeStep = histInfo.freezeStep;
     if (histInfo.budgetTrimmed) info.historyBudgetTrimmed = true;
     if (tuning.packFill) info.historyPackFill = true;
-    if (histInfo.collapsedTurns > 0) {
+    // Atomic admission by weight. The collapse is one semantic group: applying
+    // it means every collapsed message becomes pages, so a group that does not
+    // fit the byte budget is not applied at all and the original text stands.
+    // Rendering it first and discarding it costs CPU, which is the cheap half of
+    // the trade: the alternative is estimating PNG size from character counts and
+    // being wrong on the request that mattered.
+    if (
+      histInfo.collapsedTurns > 0 &&
+      histInfo.collapsedImageBytes > imageByteHeadroom(info, o.maxImageBytes)
+    ) {
+      bumpPassthrough(info, 'image_budget');
+      info.imageByteSkips = (info.imageByteSkips ?? 0) + 1;
+      info.historyReason = 'image_bytes';
+    } else if (histInfo.collapsedTurns > 0) {
       req.messages = newMessages;
       info.collapsedTurns = histInfo.collapsedTurns;
       info.collapsedChars = histInfo.collapsedChars;
@@ -2724,6 +2839,7 @@ export async function transformRequest(
   info.outgoingTextChars = countOutgoingTextChars(req);
   // Ground truth for the main path too — see the note at the other call site.
   info.wireImages = countNativeImages(req.messages);
+  if (nearByteLimit(info, o.maxImageBytes)) info.imageBytesNearLimit = true;
   const outBody = new TextEncoder().encode(JSON.stringify(req));
   return { body: outBody, info };
 }

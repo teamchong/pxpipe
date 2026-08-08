@@ -37,6 +37,11 @@ export interface Env {
   COLS?: string;
   /** Comma-separated model bases eligible for compression. */
   PXPIPE_MODELS?: string;
+  /** Ceiling on a buffered inbound request body, in bytes. A Worker is publicly
+   *  reachable by default, so this is the setting that keeps one caller from
+   *  choosing the isolate's memory ceiling. Unset uses the core 16 MiB default;
+   *  a non-numeric or non-positive value is ignored rather than obeyed. */
+  PXPIPE_MAX_REQUEST_BYTES?: string;
   /** When "0" / "false", disable per-request event JSON logs. Default-on.
    *  Cloudflare ingests console.log as Workers Logs; pipe via Logpush to
    *  R2/S3 for the same JSONL shape Node writes to disk. */
@@ -66,6 +71,15 @@ async function secretsMatch(a: string, b: string): Promise<boolean> {
 
 const truthy = (v: string | undefined, fallback: boolean): boolean =>
   v == null ? fallback : v === '1' || v.toLowerCase() === 'true';
+
+/** Parse a positive whole number, or undefined for anything else. Used for limits
+ *  where a broken value must not read as "unlimited". */
+const positiveInt = (v: string | undefined): number | undefined => {
+  const raw = v?.trim();
+  if (raw === undefined || raw === '') return undefined;
+  const n = Number(raw);
+  return Number.isSafeInteger(n) && n > 0 ? n : undefined;
+};
 
 export default {
   async fetch(req: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
@@ -142,6 +156,11 @@ export default {
       cloudflareApiKey: cfToken,
       openAIModels: parseModels(env.OPENAI_MODELS),
       cloudflareModels: parseModels(env.CLOUDFLARE_MODELS),
+      // A Worker cannot exit on bad config the way the Node host does, so an
+      // unparseable value is dropped here and the core default applies.
+      ...(positiveInt(env.PXPIPE_MAX_REQUEST_BYTES) !== undefined
+        ? { maxRequestBytes: positiveInt(env.PXPIPE_MAX_REQUEST_BYTES) }
+        : {}),
       transform,
       onRequest: (e) => {
         // Terse human-readable line (separate from the JSON event below;

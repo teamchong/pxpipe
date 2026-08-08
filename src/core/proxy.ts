@@ -73,6 +73,18 @@ export interface ProxyConfig {
    *  fails open. Prevents one stalled request from permanently 409-ing its retries.
    *  0 disables dedupe entirely. */
   duplicateHoldMs?: number;
+  /** Hard ceiling, in bytes, on an inbound request body pxpipe will hold in
+   *  memory. Transformable routes have to read the whole body, so without a
+   *  ceiling one client decides how much the proxy allocates: a Worker or a Node
+   *  instance bound to anything other than loopback is then one long request away
+   *  from memory exhaustion. Over-limit bodies get a provider-shaped 413 before
+   *  any upstream call. Routes pxpipe only labels are never rejected by this -
+   *  they carry uploads and audio - but their model sniff is bounded too.
+   *
+   *  Defaults to {@link DEFAULT_MAX_REQUEST_BYTES}. A non-integer, zero or
+   *  negative value is ignored in favour of that default: an unusable limit must
+   *  not silently become no limit. */
+  maxRequestBytes?: number;
 }
 
 export interface ProxyEvent {
@@ -232,6 +244,150 @@ function withClientDisconnect(
  *  transform. Chat requests naming a model are far below this; uploads that blow
  *  past it stream through unbuffered. */
 const MODEL_SNIFF_MAX_BYTES = 1 << 20;
+
+/** Default ceiling on a buffered inbound body: 16 MiB.
+ *
+ *  Chosen against what the transform actually has to hold, not against what a
+ *  provider accepts. Real Claude Code requests measured on production traffic sit
+ *  far below this even with a 400k system slab and a long tool-heavy history, so
+ *  the limit is not reachable by ordinary use. Hosts that genuinely need more can
+ *  raise it explicitly; nothing raises it implicitly. */
+export const DEFAULT_MAX_REQUEST_BYTES = 16 << 20;
+
+/** Validate a host-supplied ceiling. Garbage falls back to the default rather
+ *  than disabling the check, because "0" or NaN meaning "unlimited" is exactly
+ *  the failure mode this option exists to remove. */
+function resolveMaxRequestBytes(configured: number | undefined): number {
+  if (configured === undefined) return DEFAULT_MAX_REQUEST_BYTES;
+  if (!Number.isSafeInteger(configured) || configured <= 0) return DEFAULT_MAX_REQUEST_BYTES;
+  return configured;
+}
+
+function concatChunks(chunks: readonly Uint8Array[], total: number): Uint8Array<ArrayBuffer> {
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, at);
+    at += chunk.byteLength;
+  }
+  return out;
+}
+
+type BoundedBody =
+  | { ok: true; bytes: Uint8Array<ArrayBuffer> }
+  | { ok: false; observedBytes: number; declaredBytes?: number };
+
+/**
+ * Read a whole request body, refusing anything over `limit`.
+ *
+ * The declared `content-length` is used only as a shortcut to reject without
+ * reading a byte. It is never the authority: chunked senders omit it, and a
+ * wrong value costs the sender nothing. The streaming loop is what enforces the
+ * cap, so a body that lies about its size is bounded by the same number as one
+ * that declares nothing.
+ *
+ * Peak memory is the limit plus at most one chunk: the loop stops pulling the
+ * moment the running total crosses the line and cancels the stream instead of
+ * draining a body it has already refused.
+ */
+async function readBodyBounded(req: Request, limit: number): Promise<BoundedBody> {
+  const declaredRaw = req.headers.get('content-length');
+  const declared = declaredRaw === null ? NaN : Number(declaredRaw);
+  const declaredBytes = Number.isFinite(declared) && declared >= 0 ? declared : undefined;
+  if (declaredBytes !== undefined && declaredBytes > limit) {
+    return { ok: false, observedBytes: 0, declaredBytes };
+  }
+
+  const body = req.body;
+  if (!body) return { ok: true, bytes: new Uint8Array(0) };
+
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value || value.byteLength === 0) continue;
+      total += value.byteLength;
+      if (total > limit) {
+        await reader.cancel().catch(() => {});
+        return { ok: false, observedBytes: total, ...(declaredBytes !== undefined ? { declaredBytes } : {}) };
+      }
+      chunks.push(value);
+    }
+  } catch (err) {
+    // A client that hangs up mid-body lands here. Release the socket and let the
+    // host's error path answer, which is what an unbounded read did too.
+    await reader.cancel().catch(() => {});
+    throw err;
+  }
+  return { ok: true, bytes: concatChunks(chunks, total) };
+}
+
+/**
+ * Read at most `maxPrefix` bytes for inspection while keeping the body
+ * forwardable byte-for-byte.
+ *
+ * Used on routes pxpipe does not transform, where the only thing wanted from the
+ * body is the model name for a dashboard label. Rejecting those requests is not
+ * an option - the same route carries uploads and audio - so instead of buffering
+ * everything, the consumed prefix is replayed ahead of the untouched remainder.
+ * Memory stays at one prefix regardless of how large the upload is.
+ */
+async function sniffPrefixRestoringBody(
+  req: Request,
+  maxPrefix: number,
+): Promise<{ prefix: Uint8Array<ArrayBuffer>; body: BodyInit | null }> {
+  const body = req.body;
+  if (!body) return { prefix: new Uint8Array(0), body: null };
+
+  const reader = body.getReader();
+  const prefixChunks: Uint8Array[] = [];
+  let total = 0;
+  let exhausted = false;
+  try {
+    while (total < maxPrefix) {
+      const { done, value } = await reader.read();
+      if (done) {
+        exhausted = true;
+        break;
+      }
+      if (!value || value.byteLength === 0) continue;
+      prefixChunks.push(value);
+      total += value.byteLength;
+    }
+  } catch (err) {
+    await reader.cancel().catch(() => {});
+    throw err;
+  }
+
+  const prefix = concatChunks(prefixChunks, total);
+  // The whole body fit inside the prefix, so those bytes ARE the body.
+  if (exhausted) return { prefix, body: prefix };
+
+  const restored = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of prefixChunks) controller.enqueue(chunk);
+    },
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          controller.close();
+          return;
+        }
+        if (value && value.byteLength > 0) controller.enqueue(value);
+      } catch (err) {
+        controller.error(err);
+      }
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    },
+  });
+  return { prefix, body: restored };
+}
 
 /** Read the actual top-level `model` field. The body is already buffered for
  * transformation, so parsing it is both safer and simpler than a prefix regex
@@ -964,6 +1120,7 @@ export function createProxy(config: ProxyConfig = {}) {
   const headersTimeoutMs = config.upstreamHeadersTimeoutMs ?? DEFAULT_UPSTREAM_HEADERS_TIMEOUT_MS;
   const idleTimeoutMs = config.upstreamIdleTimeoutMs ?? DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS;
   const duplicateHoldMs = config.duplicateHoldMs ?? DEFAULT_DUPLICATE_HOLD_MS;
+  const maxRequestBytes = resolveMaxRequestBytes(config.maxRequestBytes);
   // Explicit precedence: Cloudflare > OpenAI > normal family routing.
   for (const model of config.openAIModels ?? []) {
     const id = model.trim();
@@ -1153,7 +1310,26 @@ export function createProxy(config: ProxyConfig = {}) {
     let baselineStatusApplies = false;
 
     if (isMessages || isOpenAIChat || isOpenAIResponses || isGoogle) {
-      const bodyIn = new Uint8Array(await req.arrayBuffer());
+      // Transformable routes have to hold the whole body, so this is the one
+      // place a client could otherwise choose how much the proxy allocates.
+      // Refuse past the ceiling before any allocation the caller controls, and
+      // before any upstream call: a 413 the provider would have sent anyway is
+      // cheaper for everyone than an out-of-memory host.
+      const bounded = await readBodyBounded(req, maxRequestBytes);
+      if (!bounded.ok) {
+        const message =
+          `request body exceeds the ${maxRequestBytes}-byte pxpipe limit ` +
+          `(${bounded.declaredBytes !== undefined ? `declared ${bounded.declaredBytes}, ` : ''}` +
+          `read ${bounded.observedBytes})`;
+        const error = isMessages
+          ? { type: 'error', error: { type: 'request_too_large', message } }
+          : { error: { type: 'request_too_large', message } };
+        return new Response(JSON.stringify(error), {
+          status: 413,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      const bodyIn = bounded.bytes;
       try {
         const transformOpts =
           typeof config.transform === 'function' ? config.transform() : config.transform;
@@ -1362,15 +1538,21 @@ export function createProxy(config: ProxyConfig = {}) {
       // before. A missing content-length is not evidence of a big body —
       // chunked clients omit it — so only an explicit over-cap declaration
       // disqualifies.
+      // A declared length over the sniff cap still disqualifies early, but it is
+      // no longer the only bound: an undeclared or under-declared body used to
+      // reach `arrayBuffer()` and buffer without limit. Now the read itself stops
+      // at the cap and the untouched remainder streams on, so the model label is
+      // best-effort and the memory cost is fixed either way.
       const declaredType = req.headers.get('content-type') ?? '';
       const declaredLength = Number(req.headers.get('content-length') ?? NaN);
-      const worthBuffering =
+      const worthSniffing =
         declaredType.toLowerCase().includes('json') &&
         !(Number.isFinite(declaredLength) && declaredLength > MODEL_SNIFF_MAX_BYTES);
-      if (worthBuffering) {
-        const bodyIn = new Uint8Array(await req.arrayBuffer());
-        requestModel ??= readModelField(bodyIn) ?? undefined;
-        bodyOut = bodyIn;
+      if (worthSniffing) {
+        const sniffCap = Math.min(MODEL_SNIFF_MAX_BYTES, maxRequestBytes);
+        const { prefix, body: restoredBody } = await sniffPrefixRestoringBody(req, sniffCap);
+        requestModel ??= readModelField(prefix) ?? undefined;
+        bodyOut = restoredBody;
       } else {
         bodyOut = req.body; // pass through unchanged, model stays unknown
       }

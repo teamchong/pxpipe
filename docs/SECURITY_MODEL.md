@@ -51,6 +51,7 @@ software supply-chain boundary.
 | Prompt or secret leaks through telemetry | Full 4xx body capture is opt-in; normal events retain hashes/metadata; local artifacts are owner-only | Do not add raw content to logs; document any new persistence |
 | Dashboard exposes captured context | Dashboard routes require loopback source and host; cross-site mutations are rejected | Treat every dashboard route as sensitive and preserve both checks |
 | Oversized dashboard request exhausts memory | Dashboard request bodies are bounded | Keep bounds before parsing and add negative tests for new endpoints |
+| Oversized proxy request exhausts memory | Transformable routes refuse past `maxRequestBytes` (`PXPIPE_MAX_REQUEST_BYTES`, 16 MiB default) before allocating, using the streamed size rather than the declared one; label-only routes bound their model sniff and stream the remainder untouched | Never read an inbound body to completion before the limit is proven; add exact-boundary, missing-length and under-declared-length tests for new routes |
 | Malicious dependency or compromised release | Frozen lockfile, three-day release-age gate, restricted lifecycle scripts, OIDC trusted publishing, provenance | Keep least-privilege workflow permissions and review lockfile/lifecycle changes |
 | Vulnerable dependency remains installed | Dependabot, CodeQL/GitHub security scanning, a high-severity CI audit gate, targeted overrides | Run `pnpm audit` and remove overrides when direct dependencies adopt fixed ranges |
 

@@ -60,6 +60,10 @@ interface RuntimeConfig {
   /** Persist 4xx request and upstream error bodies for debugging. Off unless
    *  PXPIPE_DEBUG_CAPTURE_4XX=1. */
   captureErrorReqBody: boolean;
+  /** Ceiling on a buffered inbound request body. Unset leaves the core default
+   *  (16 MiB). Raise it only if a real client needs more; the default binding is
+   *  loopback, but HOST can expose this process to a network. */
+  maxRequestBytes?: number;
 }
 
 const DEFAULT_CONFIG_FILE = path.join(os.homedir(), '.config', 'pxpipe', 'config.json');
@@ -186,7 +190,24 @@ function parseCli(argv: string[]): RuntimeConfig {
     // Off by default: either side of a 4xx may hold prompts or secrets.
     // Opt in for debugging only. (issue #69)
     captureErrorReqBody: process.env.PXPIPE_DEBUG_CAPTURE_4XX === '1',
+    maxRequestBytes: parseMaxRequestBytes(process.env.PXPIPE_MAX_REQUEST_BYTES),
   };
+}
+
+/** A bad limit exits instead of being ignored. The core also refuses to treat a
+ *  broken value as "no limit", but a host that was asked for 8MB and silently ran
+ *  at 16 would be a worse answer than a startup error. */
+function parseMaxRequestBytes(value: string | undefined): number | undefined {
+  const raw = value?.trim();
+  if (raw === undefined || raw === '') return undefined;
+  const bytes = Number(raw);
+  if (!Number.isSafeInteger(bytes) || bytes <= 0) {
+    console.error(
+      `[pxpipe] PXPIPE_MAX_REQUEST_BYTES must be a positive whole number of bytes, got: ${value}`,
+    );
+    process.exit(2);
+  }
+  return bytes;
 }
 
 function parseProvider(v: string | undefined): 'cloudflare-ai-gateway' | undefined {
@@ -1176,6 +1197,7 @@ async function main(): Promise<void> {
     openAIModels: opts.openAIModels,
     cloudflareModels: opts.cloudflareModels,
     captureErrorReqBody: opts.captureErrorReqBody,
+    maxRequestBytes: opts.maxRequestBytes,
     // Per-request transform options:
     //   1. Runtime kill switch — when the dashboard "passthrough" toggle
     //      is off, force compress=false so /v1/messages forwards

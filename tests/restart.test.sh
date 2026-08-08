@@ -179,10 +179,40 @@ test_rejects_unknown_args() {
   return 0
 }
 
+# ---- Test 8: a proxy from ANOTHER checkout is left alone ---------------
+# `pgrep -f 'node.*bin/cli.js'` matches a pxpipe proxy served from any clone on
+# the machine. Restarting here must not stop one that is not serving our port:
+# that was a live cross-checkout kill, with no warning and no way to tell it had
+# happened. Ownership is the port, so a candidate that holds no port is not ours.
+test_foreign_checkout_is_untouched() {
+  local sandbox="$1" logf="$2"
+  echo "4242" > "$sandbox/pids"      # a pxpipe proxy exists ...
+  : > "$sandbox/lsof_pid"            # ... but nothing is listening on our port
+  local out="$sandbox/out.txt"
+  ( cd "$REPO" && "$SCRIPT" --no-build >"$out" 2>&1 || true )
+  grep -q "no pxpipe proxy of this checkout" "$out" || return 1
+  grep -q "found running pxpipe proxy" "$out" && return 1
+  return 0
+}
+
+# ---- Test 9: the proxy holding OUR port is still found -----------------
+# The narrowing must not turn into "never restart anything".
+test_owned_proxy_is_found() {
+  local sandbox="$1" logf="$2"
+  echo "4242" > "$sandbox/pids"
+  echo "4242" > "$sandbox/lsof_pid"  # same PID is listening on our port
+  local out="$sandbox/out.txt"
+  ( cd "$REPO" && "$SCRIPT" --no-build >"$out" 2>&1 || true )
+  grep -q "found running pxpipe proxy PID(s): 4242" "$out" || return 1
+  return 0
+}
+
 run_test "no proxy running"        test_no_running
 run_test "build failure aborts"    test_build_failure
 run_test "port-in-use aborts"      test_port_in_use
 run_test "rejects unknown args"    test_rejects_unknown_args
+run_test "foreign checkout untouched" test_foreign_checkout_is_untouched
+run_test "owned proxy is found"    test_owned_proxy_is_found
 
 echo ""
 echo "$PASS passed, $FAIL failed"

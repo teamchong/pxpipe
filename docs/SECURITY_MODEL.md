@@ -47,7 +47,7 @@ software supply-chain boundary.
 | Threat | Existing control | Contributor requirement |
 | --- | --- | --- |
 | Public deployment spends a configured API key | Worker requires `PXPIPE_WORKER_SECRET` and fails closed | Preserve the fail-closed check and constant-work comparison tests |
-| Provider credential is routed to the wrong upstream | Provider-specific routing and header tests | Add regression tests for every new route or provider |
+| Provider credential is routed to the wrong upstream | An explicit inbound-credential x route policy (`resolveOpenAIRouteAuth`): Anthropic-shaped credentials never reach an OpenAI upstream, subscription OAuth is preserved rather than substituted, and a host key replaces only ordinary keys. Classification is by header shape; no local token store is read | Extend the policy table, not the call site, for every new route or provider, and keep the full matrix under test |
 | Prompt or secret leaks through telemetry | Full 4xx body capture is opt-in; normal events retain hashes/metadata; local artifacts are owner-only | Do not add raw content to logs; document any new persistence |
 | Dashboard exposes captured context | Dashboard routes require loopback source and host; cross-site mutations are rejected | Treat every dashboard route as sensitive and preserve both checks |
 | Oversized dashboard request exhausts memory | Dashboard request bodies are bounded | Keep bounds before parsing and add negative tests for new endpoints |

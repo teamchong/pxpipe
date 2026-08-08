@@ -843,6 +843,89 @@ function resolveAuthToken(config: ProxyConfig): string | undefined {
   return typeof config.authToken === 'function' ? config.authToken() : config.authToken;
 }
 
+/** What the client presented, by shape only.
+ *
+ *  Classification never inspects a credential's contents beyond its prefix and
+ *  segment structure, and never reads a local token store: pxpipe does not know
+ *  or want to know which account a token belongs to. Shape is enough to decide
+ *  routing, and it is the only thing safe to decide it on. */
+export type InboundCredential =
+  | 'none'
+  /** `x-api-key`, which only Anthropic uses. */
+  | 'anthropic-key'
+  /** `Bearer sk-ant-…`: an Anthropic key or subscription token. */
+  | 'anthropic-bearer'
+  /** `Bearer <jwt>`: how Codex and ChatGPT subscription auth arrive. */
+  | 'oauth-jwt'
+  /** `Bearer sk-…` that is not Anthropic: an OpenAI-style API key. */
+  | 'api-key-bearer'
+  /** A bearer of unrecognised shape. Gateways and self-hosted upstreams use these. */
+  | 'opaque-bearer';
+
+const ANTHROPIC_BEARER_RE = /^Bearer\s+sk-ant-/i;
+const API_KEY_BEARER_RE = /^Bearer\s+sk-/i;
+/** Three base64url segments whose first decodes to a JSON header (`eyJ…`). */
+const JWT_BEARER_RE = /^Bearer\s+eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$/;
+
+export function classifyInboundCredential(headers: Headers): InboundCredential {
+  const authorization = headers.get('authorization') ?? '';
+  if (ANTHROPIC_BEARER_RE.test(authorization)) return 'anthropic-bearer';
+  if (JWT_BEARER_RE.test(authorization)) return 'oauth-jwt';
+  if (API_KEY_BEARER_RE.test(authorization)) return 'api-key-bearer';
+  if (authorization.trim() !== '') return 'opaque-bearer';
+  if ((headers.get('x-api-key') ?? '').trim() !== '') return 'anthropic-key';
+  return 'none';
+}
+
+/** The decision for the outgoing `authorization` header. */
+export type OutboundAuth =
+  /** Forward what the client sent, unchanged. */
+  | { action: 'keep-inbound'; reason: string }
+  /** Install the host's configured key in its place. */
+  | { action: 'replace'; reason: string }
+  /** Send no authorization at all. */
+  | { action: 'drop'; reason: string };
+
+/**
+ * Credential policy for a direct OpenAI-family route: `/v1/responses`,
+ * `/v1/chat/completions`, `/v1/models` and the provider-prefixed equivalents,
+ * where the client speaks to the OpenAI upstream itself rather than through a
+ * Messages bridge.
+ *
+ * Three rules, in priority order:
+ *
+ *  1. An Anthropic-shaped credential never reaches an OpenAI upstream. That is a
+ *     cross-provider credential disclosure, and a guaranteed 401 on top. The
+ *     route classifier already refuses this for the ambiguous `/v1/models` path;
+ *     this applies the same rule to every OpenAI route.
+ *  2. Subscription OAuth is preserved even when the host has an API key
+ *     configured. A Codex user proxying through pxpipe means to spend their own
+ *     subscription; silently substituting the host key bills the wrong account
+ *     and usually fails, and the user has no way to see why.
+ *  3. Otherwise a configured key replaces whatever arrived, and is used as the
+ *     fallback when nothing arrived. This is the documented "host supplies the
+ *     credential" mode.
+ */
+export function resolveOpenAIRouteAuth(
+  inbound: InboundCredential,
+  hasConfiguredKey: boolean,
+): OutboundAuth {
+  if (inbound === 'anthropic-bearer' || inbound === 'anthropic-key') {
+    return hasConfiguredKey
+      ? { action: 'replace', reason: 'anthropic-credential-never-crosses-providers' }
+      : { action: 'drop', reason: 'anthropic-credential-never-crosses-providers' };
+  }
+  if (inbound === 'oauth-jwt') {
+    return { action: 'keep-inbound', reason: 'subscription-oauth-belongs-to-the-caller' };
+  }
+  if (hasConfiguredKey) {
+    return { action: 'replace', reason: 'host-configured-key' };
+  }
+  return inbound === 'none'
+    ? { action: 'drop', reason: 'no-credential-available' }
+    : { action: 'keep-inbound', reason: 'caller-credential-forwarded' };
+}
+
 function isCanonicalOpenAIPath(pathname: string, headers: Headers, hasOpenAIKey: boolean): boolean {
   const isModelsPath = pathname === '/v1/models' || pathname.startsWith('/v1/models/');
   // `/v1/models` exists on BOTH APIs, so it is routed by auth style — but an
@@ -1380,10 +1463,8 @@ export function createProxy(config: ProxyConfig = {}) {
 
     const outHeaders = filterHeaders(req.headers, STRIP_REQ_HEADERS);
     if (isOpenAIPath || bridgedGptMessages || bridgedChatMessages) {
+      // `x-api-key` is Anthropic-only and never belongs on an OpenAI upstream.
       outHeaders.delete('x-api-key');
-      // Never forward a Messages client's bearer credential across providers.
-      // A configured upstream key is installed below; otherwise auth stays absent.
-      if (bridgedGptMessages || bridgedChatMessages) outHeaders.delete('authorization');
       const anthropicHeaders: string[] = [];
       outHeaders.forEach((_value, name) => {
         if (name.toLowerCase().startsWith('anthropic-')) anthropicHeaders.push(name);
@@ -1393,7 +1474,24 @@ export function createProxy(config: ProxyConfig = {}) {
       const bridgeKey = bridgedChatMessages
         ? config.cloudflareApiKey
         : config.openAIApiKey;
-      if (bridgeKey) outHeaders.set('authorization', `Bearer ${bridgeKey}`);
+      if (bridgedGptMessages || bridgedChatMessages) {
+        // A bridged request came in as Anthropic Messages, so whatever credential
+        // it carries is an Anthropic one by construction. Drop it unconditionally
+        // and use only what the host configured for the bridge target.
+        outHeaders.delete('authorization');
+        if (bridgeKey) outHeaders.set('authorization', `Bearer ${bridgeKey}`);
+      } else {
+        // A direct OpenAI-family route. The client's own credential may be the
+        // right one to forward, so decide by shape instead of by whether a host
+        // key happens to be set. See resolveOpenAIRouteAuth for the three rules.
+        const decision = resolveOpenAIRouteAuth(
+          classifyInboundCredential(req.headers),
+          bridgeKey !== undefined && bridgeKey !== '',
+        );
+        if (decision.action === 'drop') outHeaders.delete('authorization');
+        else if (decision.action === 'replace') outHeaders.set('authorization', `Bearer ${bridgeKey}`);
+        // 'keep-inbound' leaves the header filterHeaders already copied.
+      }
     } else if (!providerPrefixed || url.pathname.startsWith('/anthropic/')) {
       if (config.apiKey) outHeaders.set('x-api-key', config.apiKey);
       const bearer = resolveAuthToken(config);

@@ -38,7 +38,13 @@ let runtimeModelBases: readonly string[] | null = null;
  *    task pass rate holds but dense recall does not.
  *  All remain available for explicit opt-in.
  *  Silently imaging weak or unvalidated readers is the wrong default. */
-const DEFAULT_MODEL_BASES = ['claude-fable-5', 'gemini-3.6-flash'];
+/** Model bases imaged with no configuration at all.
+ *
+ *  Exported so documentation can be checked against it instead of restating it.
+ *  The README and this list disagreed once already: Opus 5 was dropped here after
+ *  a measured recall regression and stayed in the README's stated default, so a
+ *  reader following the docs believed a model was being imaged that was not. */
+export const DEFAULT_MODEL_BASES = ['claude-fable-5', 'gemini-3.6-flash'];
 
 function falsey(v: string): boolean {
   return /^(0|false|no|off|none)$/i.test(v.trim());

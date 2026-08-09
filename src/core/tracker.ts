@@ -93,6 +93,10 @@ export interface TrackEvent {
    *  was therefore allowed to repack for density. Pair with cache_read_tokens:
    *  a repack that lands on a live cache would show as a cache_create spike. */
   history_pack_fill?: boolean;
+  /** Set when the model's legible history render overflowed the image-byte
+   *  budget and the collapse was re-rendered at the dense geometry to fit,
+   *  rather than abandoned to a raw-text forward (#216). */
+  history_degraded_dense?: boolean;
   /** Codepoints not in the glyph atlas. A spike means users type glyphs we don't ship — widen ATLAS_PROFILE. */
   dropped_chars?: number;
   /** Top-20 dropped codepoints (U+HHHH keys) by frequency. Only present when dropped_chars > 0. */
@@ -305,6 +309,7 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     if (info.historyFreezeStep !== undefined) out.history_freeze_step = info.historyFreezeStep;
     if (info.historyBudgetTrimmed) out.history_budget_trimmed = true;
     if (info.historyPackFill) out.history_pack_fill = true;
+    if (info.historyDegradedDense) out.history_degraded_dense = true;
     if (info.droppedChars !== undefined && info.droppedChars > 0) {
       out.dropped_chars = info.droppedChars;
     }

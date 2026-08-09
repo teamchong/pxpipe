@@ -39,6 +39,12 @@ behavioral changes, patch = fixes).
   models (#159).
 - `build.mjs` resolves `tsc` via `typescript/package.json` instead of the
   removed `./bin/tsc` export, fixing builds on newer TypeScript.
+- When the legible history geometry (#170) overflowed the image-byte budget on a
+  long session, the collapse was abandoned and the raw history forwarded as
+  text — a request larger than the render it refused, which the upstream 400s.
+  The collapse now degrades to the dense geometry to fit instead of bailing;
+  only a history too big for dense too keeps its text. New `history_degraded_dense`
+  event marks the fallback (#216).
 
 ## 0.12.1 — 2026-08-08
 

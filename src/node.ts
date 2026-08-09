@@ -276,9 +276,11 @@ Environment:
   PXPIPE_DUMP_DIR         debug: write every rendered PNG here (what the model
                           sees); off unless set. Compress arm only.
   PXPIPE_RENDER_CACHE_BYTES  max bytes of rendered pages to keep in memory
-                          (default 64 MiB). Frozen history chunks are
-                          byte-identical across turns, so re-rendering them is
-                          wasted CPU; 0 disables the cache.
+                          (default 64 MiB here; 8 MiB on Workers, where the
+                          isolate has ~128 MiB for everything). Frozen history
+                          chunks are byte-identical across turns, so
+                          re-rendering them is wasted CPU; 0 disables the cache.
+                          Live counters at /proxy-stats under render_cache.
   PXPIPE_DEBUG_CAPTURE_4XX  debug: set to 1 to persist full 4xx request and
                           upstream error bodies (prompts + any secrets in
                           context) to disk. Off by default.

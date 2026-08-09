@@ -44,6 +44,7 @@ import {
   computeOpenAIBaselineRawTokens,
   openAIOutputRate,
 } from './core/openai-savings.js';
+import { renderCacheMaxBytes, renderCacheStats } from './core/render.js';
 import {
   aggregateSessions,
   claudeCodeMap,
@@ -1442,6 +1443,16 @@ export class DashboardState {
       events_with_measurement: totals.eventsWithMeasurement,
       uptime_sec: uptimeSec,
       compression_enabled: this.compressionEnabled,
+      // Rendered-page cache — a live process gauge, not a fold over the event
+      // ring, so it is the one number here that survives no traffic at all.
+      // `max_bytes` ships alongside `bytes` because utilisation is the actionable
+      // reading: a hit rate near zero means something different when the budget is
+      // full (working set too big) than when `oversized` is climbing (a single
+      // render exceeds the whole budget and is never stored).
+      render_cache: {
+        ...renderCacheStats(),
+        max_bytes: renderCacheMaxBytes(),
+      },
     };
     return new Response(JSON.stringify(payload, null, 2), {
       headers: { 'content-type': 'application/json' },

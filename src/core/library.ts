@@ -1,4 +1,4 @@
-import { isPxpipeSupportedModel } from './applicability.js';
+import { isPxpipeSupportedModelForScope } from './applicability.js';
 import { countCacheControlMarkers } from './measurement.js';
 import {
   renderTextToPngsWithCharLimit,
@@ -18,8 +18,13 @@ import {
   type RecoverableBlock,
 } from './transform.js';
 import { resolveGptProfile } from './gpt-model-profiles.js';
+import {
+  mergeCompressionProfileOptions,
+  resolveCompressionProfile,
+  type CompressionProfileName,
+} from './safety-policy.js';
 
-export type { KeepSharpBlock, RecoverableBlock };
+export type { KeepSharpBlock, RecoverableBlock, CompressionProfileName };
 
 export type BytesLike = Uint8Array | ArrayBuffer | ArrayBufferView;
 
@@ -30,6 +35,8 @@ export interface PxpipeOptions
   > {
   /** Test/debug-only bypass. Product hosts should prefer their dashboard setting. */
   readonly compress?: boolean;
+  /** Semantic compression policy. Unset preserves the existing upstream policy. */
+  readonly profile?: CompressionProfileName;
 }
 
 export interface PxpipeTransformInput {
@@ -98,26 +105,33 @@ function classifyReason(info: TransformInfo): PxpipeReason {
 }
 
 /**
- * Library wrapper for the Anthropic Messages transformer: model gate, machine-readable
- * reasons, and cache_control ownership flag (prevents hosts stacking a second injector).
+ * Library wrapper for the Anthropic Messages transformer: profile-local model gate,
+ * machine-readable reasons and cache-control ownership metadata.
  */
 export async function transformAnthropicMessages(
   input: PxpipeTransformInput,
 ): Promise<PxpipeTransformResult> {
   const original = toUint8Array(input.body);
-  if (!isPxpipeSupportedModel(input.model)) {
-    return {
-      body: original,
-      applied: false,
-      reason: 'unsupported_model',
-      detail: input.model ?? undefined,
-      info: emptyInfo('unsupported_model'),
-      cache: { ownsCacheControl: false, markerCount: countCacheControlMarkers(original) },
-    };
-  }
 
   try {
-    const { body, info } = await transformRequest(original, { ...input.options, model: input.model ?? undefined });
+    const { profile: requestedProfile, ...overrides } = input.options ?? {};
+    const profile = resolveCompressionProfile(requestedProfile);
+    if (!isPxpipeSupportedModelForScope(input.model, profile.name)) {
+      return {
+        body: original,
+        applied: false,
+        reason: 'unsupported_model',
+        detail: input.model ?? undefined,
+        info: emptyInfo('unsupported_model'),
+        cache: { ownsCacheControl: false, markerCount: countCacheControlMarkers(original) },
+      };
+    }
+
+    const options = mergeCompressionProfileOptions(profile, overrides);
+    const { body, info } = await transformRequest(original, {
+      ...options,
+      model: input.model ?? undefined,
+    });
     const reason = classifyReason(info);
     const markerCount = countCacheControlMarkers(body);
     return {
@@ -155,9 +169,7 @@ export interface RenderTextToImagesOptions {
   /** Shrink the canvas to the widest actual line (default true). `false` keeps the
    *  full `cols` width — the proxy's eval-backed full-canvas behavior. */
   readonly shrink?: boolean;
-  /** Reflow the text before rendering (minify + join hard newlines with the ↵ sentinel so
-   *  short lines pack into full-width rows). This is the proxy's dense history format and is
-   *  what `pxpipe export` uses. Default false (raw one-line-per-row). */
+  /** Reflow the text before rendering. Default false. */
   readonly reflow?: boolean;
   /** Max source chars per page. Default DENSE_CONTENT_CHARS_PER_IMAGE. */
   readonly maxCharsPerImage?: number;
@@ -181,13 +193,7 @@ export interface RenderTextToImagesResult {
   readonly pixels: number;
 }
 
-/**
- * Render arbitrary text to dense PNG pages — the public, documented entry for the
- * renderer the proxy uses internally. Sizes a narrow canvas to the content (`shrink`).
- * Returns raw PNG bytes + pixel dimensions, ready to write to disk or wrap in
- * image blocks. This is the surface SDK consumers should use instead of reaching into
- * the internal leaf renderers in `render.ts`.
- */
+/** Render arbitrary text to PNG pages using the same internal renderer as the proxy. */
 export async function renderTextToImages(
   text: string,
   opts: RenderTextToImagesOptions = {},
@@ -197,19 +203,7 @@ export async function renderTextToImages(
   const style = opts.style ?? profile?.style ?? DENSE_RENDER_STYLE;
   const maxHeightPx = opts.maxHeightPx ?? profile?.maxHeightPx ?? MAX_HEIGHT_PX;
   const maxChars = opts.maxCharsPerImage ?? DENSE_CONTENT_CHARS_PER_IMAGE;
-
-  // Reflow (the proxy's dense default; opt-in here): minify trailing whitespace + collapse
-  // blank-line runs, then join hard newlines with the ↵ sentinel so short lines PACK into
-  // full-width rows instead of one-line-per-row with a ragged right margin. Indentation is
-  // preserved (minifyForRender only touches trailing ws), so code stays readable and the ↵
-  // marks every real newline so the text is fully reconstructable. This is exactly what the
-  // proxy's history path does before rendering — without it, a 384-col canvas holding ~25-col
-  // code lines wastes ~75% of every row, which is why raw exports looked sparse. reflow()
-  // bails (→ raw text) only if the source already contains ↵, which is vanishingly rare.
   const source = opts.reflow ? reflow(text) ?? text : text;
-
-  // Measure the content width. Reflowed source is one joined full-width line, so this is
-  // byte-identical to the proxy's history render.
   const cols = opts.shrink === false ? maxCols : measureContentCols(source, maxCols);
   const imgs = await renderTextToPngsWithCharLimit(source, cols, maxChars, style, maxHeightPx);
 

@@ -3,10 +3,12 @@ export {
   getConfiguredModelBases,
   isPxpipeSupportedGptModel,
   isPxpipeSupportedModel,
+  isPxpipeSupportedModelForScope,
   setAllowedModelBases,
   shouldTransformAnthropicMessages,
   type PxpipeApplicabilityInput,
   type PxpipeApplicabilityReason,
+  type PxpipeSafetyScope,
 } from './applicability.js';
 export {
   buildCountTokensBodies,
@@ -18,6 +20,7 @@ export {
 export {
   transformAnthropicMessages,
   renderTextToImages,
+  type CompressionProfileName,
   type PxpipeOptions,
   type PxpipeReason,
   type PxpipeTransformInput,
@@ -26,6 +29,12 @@ export {
   type RenderedTextImage,
   type RenderTextToImagesResult,
 } from './library.js';
+export {
+  resolveCompressionProfile,
+  mergeCompressionProfileOptions,
+  shouldKeepToolResultSharp,
+  type CompressionProfile,
+} from './safety-policy.js';
 export {
   transformRequest,
   type TransformInfo as PxpipeTransformInfo,

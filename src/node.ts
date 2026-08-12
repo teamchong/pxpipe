@@ -15,6 +15,7 @@ import * as os from 'node:os';
 import { isIP } from 'node:net';
 import { spawnSync } from 'node:child_process';
 import { createProxy, parseGatewayHeaders, resolveUpstreams, type ProxyConfig } from './core/proxy.js';
+import { mergeCompressionProfileOptions, resolveCompressionProfile } from './core/safety-policy.js';
 import {
   chatCompletionsUrl,
 } from './core/messages-chat-bridge.js';
@@ -1164,20 +1165,10 @@ async function main(): Promise<void> {
       imageDumpDir = undefined;
     }
   }
-  // Transform options pass through empty — the proxy uses the DEFAULTS
-  // baked into transform.ts. There are no behavior toggles: system slab,
-  // reminders, tool_results, and history compression all run
-  // unconditionally; the per-block break-even gate decides per-call
-  // whether to actually image each piece. The function-form `transform`
-  // below is ONLY a kill switch (PXPIPE_DISABLE / dashboard toggle →
-  // compress:false); on the active path it returns {}, so the gate always
-  // runs on static DEFAULTS — charsPerToken=4, priorWarm*=0 — which leaves
-  // the warm-baseline and anti-flapping burn terms inert. That is
-  // deliberate, NOT an oversight: there is no live-α feedback loop from
-  // the dashboard. Telemetry (2026-06, 897 sessions / 21,347 measured
-  // rows) showed 5 mode flips ever and losses at 0.8% of wins — all
-  // one-time cache-create amortization — so closing the loop would not
-  // change decisions. Re-run that reconciliation before wiring one in.
+  // The default profile preserves the existing transform behavior. An explicit
+  // PXPIPE_PROFILE can instead constrain the transform to archival history or
+  // disable it entirely; the per-block profitability gates still make the final
+  // image/text decision within the selected policy.
   const tracker: Tracker = new FileTracker(opts.eventsFile);
 
   // Sidecar dir for oversized 4xx request-body samples. Lives next to the
@@ -1200,6 +1191,11 @@ async function main(): Promise<void> {
   // Seed the "recent requests" table from the JSONL log so a process restart
   // doesn't reset what you can see in the UI. Best-effort; ignored on error.
   await dashboard.replay(opts.eventsFile).catch(() => {});
+
+  const compressionProfile = resolveCompressionProfile(process.env.PXPIPE_PROFILE);
+  if (compressionProfile.name !== 'aggressive') {
+    console.log(`[pxpipe] compression profile: ${compressionProfile.name}`);
+  }
 
   const config: ProxyConfig = {
     authToken: anthropicAuthToken,
@@ -1227,8 +1223,8 @@ async function main(): Promise<void> {
       // still logging real usage + count_tokens baselines to its own PXPIPE_LOG.
       // (The dashboard kill switch does the same thing at runtime.)
       if (forcePassthrough || !dashboard.getCompressionEnabled()) return { compress: false };
-      // Active path: use DEFAULTS in transform.ts for break-even gating.
-      return {};
+      // Explicit profiles constrain what may leave native coding state.
+      return mergeCompressionProfileOptions(compressionProfile);
     },
     onRequest: async (e) => {
       // Feed the dashboard BEFORE tracker.emit — toTrackEvent strips

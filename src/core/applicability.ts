@@ -9,6 +9,8 @@ export type PxpipeApplicabilityReason =
   | 'unsupported_path'
   | 'empty_body';
 
+export type PxpipeSafetyScope = 'coding-safe' | 'balanced' | 'aggressive' | 'passthrough';
+
 export interface PxpipeApplicabilityInput {
   readonly model?: string | null;
   readonly method?: string | null;
@@ -26,37 +28,17 @@ function baseModelId(model: string): string {
 /** Dashboard runtime override; null = fall back to PXPIPE_MODELS env / built-in default. In-memory only. */
 let runtimeModelBases: readonly string[] | null = null;
 
-/** Built-in default scope when PXPIPE_MODELS is unset: Fable 5 and Gemini 3.6 Flash.
- *  Everything else is opt-in via dashboard chips or PXPIPE_MODELS:
- *  - Opus 4.7/4.8 — worse at reading imaged content (FINDINGS.md 2026-06-16:
- *    Opus 4.8 ~2pp arithmetic, 6/15 dense-hex vs Fable 100/100).
- *  - GPT 5.5 — degrades on imaged history/context.
- *  - GPT 5.6 Sol — 98/100 production arithmetic, but 79/93 completed gist,
- *    4/15 completed guard confabulations, and 0/15 dense hex.
- *  - Grok 4.5 — native 14px: 100/100 arithmetic, 97/98 gist, 17/18 state; hex 0/15.
- *  - Opus 5 — 2/15 exact recall on imaged context (DeepSWE v1.1 eval);
- *    task pass rate holds but dense recall does not.
- *  All remain available for explicit opt-in.
- *  Silently imaging weak or unvalidated readers is the wrong default. */
 /** Model bases imaged with no configuration at all.
  *
- *  Exported so documentation can be checked against it instead of restating it.
- *  The README and this list disagreed once already: Opus 5 was dropped here after
- *  a measured recall regression and stayed in the README's stated default, so a
- *  reader following the docs believed a model was being imaged that was not. */
+ * Exported so documentation can be checked against it instead of restating it. */
 export const DEFAULT_MODEL_BASES = ['claude-fable-5', 'gemini-3.6-flash'];
 
 function falsey(v: string): boolean {
   return /^(0|false|no|off|none)$/i.test(v.trim());
 }
 
-/** PXPIPE_MODELS env / built-in default, ignoring the runtime override. One CSV
- *  controls every family (Claude + GPT). Resolution (read per-call so scope flips LIVE):
- *  - unset or empty        → built-in default (Fable 5 + Gemini 3.6 Flash)
- *  - `off`/`0`/`false`/... → compress nothing
- *  - CSV of model bases    → exactly those families (e.g. `claude-fable-5,gpt-5.6-sol`) */
+/** PXPIPE_MODELS env / built-in default, ignoring the runtime override. */
 function envOrDefaultBases(): string[] {
-  // Edge-safe: `process` is undefined off-Node; `typeof` avoids a ReferenceError.
   const raw = typeof process !== 'undefined' ? process.env?.PXPIPE_MODELS : undefined;
   if (raw === undefined) return [...DEFAULT_MODEL_BASES];
   const trimmed = raw.trim();
@@ -65,9 +47,58 @@ function envOrDefaultBases(): string[] {
   return trimmed.split(',').map((s) => s.trim()).filter(Boolean);
 }
 
-function allowedModelBases(): string[] {
+function configuredModelBases(): string[] {
   if (runtimeModelBases !== null) return [...runtimeModelBases];
   return envOrDefaultBases();
+}
+
+function parseSafetyScope(raw: string | undefined): PxpipeSafetyScope {
+  const value = (raw ?? '').trim().toLowerCase();
+  // Backward-compatible: an unset profile keeps upstream's existing policy.
+  if (!value || value === 'aggressive' || value === 'legacy') return 'aggressive';
+  if (value === 'safe' || value === 'coding' || value === 'coding-safe') return 'coding-safe';
+  if (value === 'balanced') return 'balanced';
+  if (value === 'off' || value === 'disabled' || value === 'passthrough') return 'passthrough';
+  // Startup validation reports the bad profile; the applicability gate itself
+  // fails closed rather than broadening model eligibility.
+  return 'passthrough';
+}
+
+function activeSafetyScope(): PxpipeSafetyScope {
+  const raw = typeof process !== 'undefined' ? process.env?.PXPIPE_PROFILE : undefined;
+  return parseSafetyScope(raw);
+}
+
+/** Gateways qualify ids with routing segments such as `google/gemini-3.6-flash`. */
+function unqualifiedModelId(base: string): string | null {
+  const slash = base.lastIndexOf('/');
+  return slash >= 0 ? base.slice(slash + 1) : null;
+}
+
+function modelBaseMatches(id: string, candidate: string): boolean {
+  const target = candidate.toLowerCase();
+  return id === target || id.startsWith(`${target}-`);
+}
+
+function safetyAllowsConfiguredBase(candidate: string, scope: PxpipeSafetyScope): boolean {
+  if (scope === 'passthrough') return false;
+  if (scope === 'aggressive') return true;
+  const base = baseModelId(candidate).toLowerCase();
+  const unqualified = unqualifiedModelId(base);
+  // Safe profiles do not promote an explicitly configured experimental model.
+  // They are limited to the same evidence-backed bases upstream enables by default.
+  return DEFAULT_MODEL_BASES.some((safe) =>
+    modelBaseMatches(base, safe)
+      || (unqualified !== null && modelBaseMatches(unqualified, safe)),
+  );
+}
+
+function allowedModelBasesForScope(scope: PxpipeSafetyScope): string[] {
+  return configuredModelBases().filter((candidate) => safetyAllowsConfiguredBase(candidate, scope));
+}
+
+function allowedModelBases(): string[] {
+  return allowedModelBasesForScope(activeSafetyScope());
 }
 
 /** Current effective allowed-model scope (Claude + GPT). */
@@ -75,8 +106,7 @@ export function getAllowedModelBases(): string[] {
   return allowedModelBases();
 }
 
-/** PXPIPE_MODELS env / default scope, independent of runtime override.
- *  Dashboard unions this into its chip set so env-enabled models are always shown as toggles. */
+/** PXPIPE_MODELS env / default scope, independent of runtime override. */
 export function getConfiguredModelBases(): string[] {
   return envOrDefaultBases();
 }
@@ -86,52 +116,40 @@ export function setAllowedModelBases(list: readonly string[] | null): void {
   runtimeModelBases = list === null ? null : list.map((s) => s.trim()).filter(Boolean);
 }
 
-/** Gateways qualify ids with routing segments:
- *
- *    google/gemini-3.6-flash
- *    workers-ai/@cf/moonshotai/kimi-k3
- *
- *  The vendor picks the upstream, not the reader, so scope matching also
- *  compares the segment after the last slash. Otherwise PXPIPE_MODELS entries
- *  never match behind a gateway. */
-function unqualifiedModelId(base: string): string | null {
-  const slash = base.lastIndexOf('/');
-  return slash >= 0 ? base.slice(slash + 1) : null;
-}
-
-/** Membership test against the single allowed scope. Matches exact base or `-suffix`
- *  alias; [variant] tags stripped first. */
-function isAllowed(model: string | null | undefined): boolean {
+function isAllowedForScope(
+  model: string | null | undefined,
+  scope: PxpipeSafetyScope,
+): boolean {
   if (typeof model !== 'string') return false;
   const base = baseModelId(model).toLowerCase();
-  // Never compress an id that would be priced with another provider's formula
-  // (e.g. an unmeasured Gemini sibling falling through to the OpenAI fallback).
-  // Which ids those are is profile-table knowledge, not a rule maintained here.
   if (isMisresolvedModelId(base)) return false;
   const unqualified = unqualifiedModelId(base);
-  return allowedModelBases().some((b) => {
-    const target = b.toLowerCase();
-    const hit = (id: string): boolean => id === target || id.startsWith(`${target}-`);
-    return hit(base) || (unqualified !== null && hit(unqualified));
+  return allowedModelBasesForScope(scope).some((candidate) => {
+    const target = candidate.toLowerCase();
+    return modelBaseMatches(base, target)
+      || (unqualified !== null && modelBaseMatches(unqualified, target));
   });
 }
 
-/** True when pxpipe may transform this Anthropic model. */
+/** Pure model gate for a caller-selected semantic profile. */
+export function isPxpipeSupportedModelForScope(
+  model: string | null | undefined,
+  scope: PxpipeSafetyScope,
+): boolean {
+  return isAllowedForScope(model, scope);
+}
+
+/** True when pxpipe may transform this Anthropic model under the active profile. */
 export function isPxpipeSupportedModel(model: string | null | undefined): boolean {
-  return isAllowed(model);
+  return isAllowedForScope(model, activeSafetyScope());
 }
 
-/** True when pxpipe may transform this GPT model. Shares the single PXPIPE_MODELS scope. */
+/** True when pxpipe may transform this GPT model under the active profile. */
 export function isPxpipeSupportedGptModel(model: string | null | undefined): boolean {
-  return isAllowed(model);
+  return isAllowedForScope(model, activeSafetyScope());
 }
 
-/** Canonical set of Anthropic Messages routes pxpipe transforms. Shared with
- *  createProxy (src/core/proxy.ts) so the public applicability helper and the
- *  proxy router can never disagree on which paths are eligible — they did: the
- *  proxy accepts /anthropic/messages, but the helper's old `endsWith` check
- *  rejected it (and would have wrongly accepted /foo/v1/messages). Exact matches
- *  only, so /v1/messages/count_tokens stays unsupported. */
+/** Canonical set of Anthropic Messages routes pxpipe transforms. */
 export function isAnthropicMessagesPath(pathname: string): boolean {
   return pathname === '/v1/messages'
     || pathname === '/anthropic/v1/messages'

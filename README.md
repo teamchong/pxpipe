@@ -57,6 +57,26 @@ normally — pxpipe compresses the *request* only, never the model's output.
 Recent turns stay text; the system prompt, tool docs, and older bulk history
 are imaged.
 
+### Compression profiles (optional)
+
+The Node host supports `PXPIPE_PROFILE` when a workload needs a stricter
+semantic boundary than the existing transform policy:
+
+- `coding-safe` keeps system authority, tool definitions, and live tool results
+  native, and only considers sufficiently old closed history for imaging.
+- `balanced` keeps the same live-state boundary with a shorter protected
+  history tail.
+- `aggressive` is the existing transform policy and remains the default when
+  `PXPIPE_PROFILE` is unset.
+- `passthrough` disables context transforms while leaving routing active.
+
+```bash
+PXPIPE_PROFILE=coding-safe npx pxpipe-proxy
+```
+
+Safe profiles do not promote experimental readers: their transform allowlist
+remains limited to pxpipe's evidence-backed default model set.
+
 ### `pxpipe warp`
 
 ```bash
@@ -101,8 +121,10 @@ without running the proxy.
   **13/15** on Fable 5 and **0/15** on Sol — misses are *silent
   confabulations*, not errors. Byte-exact values (IDs, hashes, secrets)
   must stay text; recent turns do. The factsheet selectively preserves up to
-  96 recognized precision-critical tokens, not every identifier. A dedicated
-  verbatim-risk guard is not built yet.
+  96 recognized precision-critical tokens, not every identifier.
+  `PXPIPE_PROFILE=coding-safe` keeps authority, tool definitions, and live tool
+  results native; old closed history may still be imaged, so byte-exact values
+  in historical image content are not guaranteed.
 - **Escape hatch:** subagents on non-allowlisted models pass through as
   text — route byte-exact work there
   (`CLAUDE_CODE_SUBAGENT_MODEL=claude-sonnet-4-6`, or `model: sonnet` in

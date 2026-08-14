@@ -902,6 +902,11 @@ const DYNAMIC_BLOCK_TAGS = [
   // paid for as a create and never read. It was showing up in
   // `unknownStaticTags`, which is exactly the canary that list exists to be.
   'total_tokens',
+  // Claude Code automode state — permissions/rules evolve per turn as grants
+  // land mid-session, so they must not bake into the cached image. Nested
+  // <severity>/<category> tags ride inside these blocks.
+  'cc_automode_session_rules',
+  'cc_automode_permissions',
 ] as const;
 
 // Known-static slab tags — suppresses first-sighting `unknownStaticTags` noise

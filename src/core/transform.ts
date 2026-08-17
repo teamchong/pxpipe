@@ -902,6 +902,15 @@ const DYNAMIC_BLOCK_TAGS = [
   // paid for as a create and never read. It was showing up in
   // `unknownStaticTags`, which is exactly the canary that list exists to be.
   'total_tokens',
+  // Newer Claude Code identity/automode block (#234). Left in the static slab
+  // it gets imaged along with the rest of the prefix, and the provider's
+  // subscription-quota recognition on that block breaks -> spurious 429s on
+  // every compressed request. Route it to the dynamic tail instead, same as
+  // total_tokens above.
+  'cc_automode_session_rules',
+  'cc_automode_permissions',
+  'severity',
+  'category',
 ] as const;
 
 // Known-static slab tags — suppresses first-sighting `unknownStaticTags` noise

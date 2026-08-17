@@ -51,7 +51,7 @@ import {
   ANTHROPIC_MAX_IMAGES,
   ANTHROPIC_HISTORY_IMAGE_BUDGET,
 } from './history.js';
-import { noteHistoryRequest, recordFreezeStep } from './session-state.js';
+import { isRateLimitCircuitOpen, noteHistoryRequest, recordFreezeStep } from './session-state.js';
 import type { GptHistoryOptions } from './openai-history.js';
 import { CACHE_CREATE_RATE, CACHE_READ_RATE } from './baseline.js';
 import { visionTokens, type VisionPricing } from './vision-cost.js';
@@ -2199,6 +2199,18 @@ export async function transformRequest(
   const firstUser = firstUserText(req);
   const firstUserSha = firstUser ? await sha8(firstUser) : undefined;
   if (firstUserSha) info.firstUserSha8 = firstUserSha;
+
+  // Circuit breaker: this session has hit the provider's rate limit on
+  // several requests in a row. Imaging never gets it further — a 429 means
+  // the provider never populated a fresh prefix cache, so a retry re-sends
+  // the same doomed imaged bytes and fails the same way (#234: same
+  // image_count/image_bytes on every attempt). Fall back to plain text so
+  // this request has a chance to complete, which is also what lets the
+  // session's own prefix cache come back.
+  if (isRateLimitCircuitOpen(firstUserSha)) {
+    info.reason = 'compress=false (rate_limit_circuit_open)';
+    return { body, info };
+  }
 
   // Canary: slab tags whose content churns within a session bust the image
   // cache every turn — report them regardless of the hardcoded lists.

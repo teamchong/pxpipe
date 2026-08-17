@@ -3,7 +3,7 @@
  * Adapted by src/node.ts and src/worker.ts; uses only Request/Response/URL/fetch.
  */
 
-import { markCacheDead, noteCacheOutcome, responseLeftNoCache } from './session-state.js';
+import { markCacheDead, noteCacheOutcome, noteRateLimitOutcome, responseLeftNoCache } from './session-state.js';
 import { transformRequest, type TransformOptions, type TransformInfo } from './transform.js';
 import { isClaudeModel, transformOpenAIChatCompletions, transformOpenAIResponses } from './openai.js';
 import { isAnthropicMessagesPath, isPxpipeSupportedGptModel, isPxpipeSupportedModel } from './applicability.js';
@@ -2054,6 +2054,10 @@ let teed: Response;
         usage?.cache_read_input_tokens,
         usage?.cache_creation_input_tokens,
       );
+      // Track consecutive 429s per session so a session stuck behind a rate
+      // limit stops re-imaging the same doomed bytes — see
+      // isRateLimitCircuitOpen.
+      noteRateLimitOutcome(info?.firstUserSha8, upstreamRes.status);
       fire(
         upstreamRes.status,
         info,

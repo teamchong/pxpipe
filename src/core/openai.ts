@@ -43,6 +43,7 @@ import {
 } from './openai-history.js';
 import { HISTORY_SYNTHETIC_INTRO, HISTORY_SYNTHETIC_OUTRO } from './history.js';
 import { factSheetText } from './factsheet.js';
+import { getCodexCacheHint, type CodexCacheHint } from './codex-cache-state.js';
 import { countTokens as o200kCountTokens } from 'gpt-tokenizer/encoding/o200k_base';
 
 // Per-model GPT rendering + vision-cost profiles (portrait-strip width, image-token
@@ -209,6 +210,8 @@ interface OpenAIResolvedOptions {
   charsPerToken: number;
   reflow: boolean;
   collapseHistory: boolean;
+  codexOptimization: boolean;
+  codexSessionKey?: string;
   gptHistory?: Partial<GptHistoryOptions>;
 }
 
@@ -220,6 +223,7 @@ const DEFAULTS: OpenAIResolvedOptions = {
   charsPerToken: 4, // conservative OpenAI default; override after telemetry
   reflow: true,
   collapseHistory: true,
+  codexOptimization: false,
 };
 
 function resolveOptions(opts: TransformOptions): OpenAIResolvedOptions {
@@ -231,6 +235,8 @@ function resolveOptions(opts: TransformOptions): OpenAIResolvedOptions {
     charsPerToken: opts.charsPerToken ?? DEFAULTS.charsPerToken,
     reflow: opts.reflow ?? DEFAULTS.reflow,
     collapseHistory: opts.collapseHistory ?? DEFAULTS.collapseHistory,
+    codexOptimization: opts.codexOptimization ?? DEFAULTS.codexOptimization,
+    codexSessionKey: opts.codexSessionKey?.trim() || undefined,
     gptHistory: opts.gptHistory,
   };
 }
@@ -265,6 +271,9 @@ function gptHistoryOpts(
     maxHeightPx: o.gptHistory?.maxHeightPx ?? profile.maxHeightPx,
     style: o.gptHistory?.style ?? profile.style,
     maxImages: o.gptHistory?.maxImages ?? configuredHistoryMaxImages(model),
+    responsesSectionTokens: o.gptHistory?.responsesSectionTokens
+      ?? (o.codexOptimization ? profile.history.responsesSectionTokens : undefined)
+      ?? 0,
   };
 }
 
@@ -560,6 +569,11 @@ function measureResponsesComposition(
       c.functionCalls += gptTextTokens(JSON.stringify(o));
     } else if (type === 'function_call_output') {
       c.functionOutputs += gptTextTokens(typeof o.output === 'string' ? o.output : JSON.stringify(o.output ?? ''));
+    } else if (type === 'custom_tool_call') {
+      c.customToolCalls = (c.customToolCalls ?? 0) + gptTextTokens(JSON.stringify(o));
+    } else if (type === 'custom_tool_call_output') {
+      c.customToolOutputs = (c.customToolOutputs ?? 0)
+        + gptTextTokens(typeof o.output === 'string' ? o.output : JSON.stringify(o.output ?? ''));
     } else if (type === 'reasoning') {
       // Includes encrypted_content when present; this is often a large Codex-native bucket.
       c.reasoningEncrypted += gptTextTokens(JSON.stringify(o));
@@ -573,8 +587,8 @@ function measureResponsesComposition(
     }
   }
   c.totalLocal = c.instructions + c.systemDeveloper + c.userAssistant +
-    c.functionCalls + c.functionOutputs + c.reasoningEncrypted +
-    c.compactionOpaque + c.toolsJson + c.other;
+    c.functionCalls + c.functionOutputs + (c.customToolCalls ?? 0) + (c.customToolOutputs ?? 0) +
+    c.reasoningEncrypted + c.compactionOpaque + c.toolsJson + c.other;
   return c;
 }
 
@@ -840,6 +854,121 @@ async function applyChatHistoryCollapse(
   return true;
 }
 
+
+function commonHistorySegmentPrefix(
+  previous: readonly string[],
+  current: readonly string[],
+): number {
+  const n = Math.min(previous.length, current.length);
+  let i = 0;
+  while (i < n && previous[i] === current[i]) i += 1;
+  return i;
+}
+
+function responsesHistorySegmentContent(
+  plan: Awaited<ReturnType<typeof planResponsesPairCollapse>>,
+  profile: GptModelProfile,
+  segmentIndex: number,
+): ResponsesContentPart[] {
+  const compact = profile.history.framing === 'compact';
+  const intro = compact ? COMPACT_HISTORY_TRANSCRIPT_INTRO : HISTORY_TRANSCRIPT_INTRO;
+  const outro = compact ? COMPACT_HISTORY_TRANSCRIPT_OUTRO : HISTORY_TRANSCRIPT_OUTRO;
+  const segment = plan.segments[segmentIndex]!;
+  const combinedSheet = profile.history.factSheetScope === 'combined'
+    ? factSheetText(plan.text, profile.factSheetFormat)
+    : '';
+  const sheet = profile.history.factSheetScope === 'combined'
+    ? (segmentIndex === plan.segments.length - 1 ? combinedSheet : '')
+    : factSheetText(segment.text, profile.factSheetFormat);
+  const content: ResponsesContentPart[] = [
+    { type: 'input_text', text: intro },
+    ...segment.images.map(responsesImagePart),
+  ];
+  if (sheet) content.push({ type: 'input_text', text: sheet });
+  content.push({ type: 'input_text', text: outro });
+  return content;
+}
+
+function responsesHistoryFramingTokens(
+  plan: Awaited<ReturnType<typeof planResponsesPairCollapse>>,
+  profile: GptModelProfile,
+): number {
+  let total = 0;
+  for (let i = 0; i < plan.segments.length; i++) {
+    const content = responsesHistorySegmentContent(plan, profile, i);
+    for (const part of content) {
+      if ((part as { type?: unknown }).type !== 'input_text') continue;
+      const value = (part as { text?: unknown }).text;
+      if (typeof value === 'string') total += gptTextTokens(value);
+    }
+  }
+  return total;
+}
+
+async function responsesHistorySegmentShas(
+  plan: Awaited<ReturnType<typeof planResponsesPairCollapse>>,
+  profile: GptModelProfile,
+): Promise<string[]> {
+  return Promise.all(plan.segments.map(async (_segment, index) => {
+    const content = responsesHistorySegmentContent(plan, profile, index);
+    return sha8(JSON.stringify({ role: 'user', content }));
+  }));
+}
+
+function codexHistoryMateriality(
+  plan: Awaited<ReturnType<typeof planResponsesPairCollapse>>,
+  req: ResponsesRequest,
+  profile: GptModelProfile,
+): { baseline: number; image: number; native: number; rawSaving: number; ratio: number; perImage: number } {
+  const baseline = Math.max(0, plan.baselineTokens ?? gptTextTokens(plan.text));
+  const image = gptImageTokens(req.model, plan.images);
+  const native = responsesHistoryFramingTokens(plan, profile);
+  const rawSaving = baseline - image - native;
+  return {
+    baseline,
+    image,
+    native,
+    rawSaving,
+    ratio: baseline > 0 ? rawSaving / baseline : 0,
+    perImage: plan.images.length > 0 ? rawSaving / plan.images.length : 0,
+  };
+}
+
+function cacheAllowsCodexHistory(
+  hint: CodexCacheHint | undefined,
+  currentSegmentShas: readonly string[],
+  profile: GptModelProfile,
+): { allow: boolean; decision: NonNullable<ResponsesComposition['historyCacheDecision']>; stablePrefix: number } {
+  const warmShare = profile.history.warmCacheShareBlock;
+  if (warmShare === undefined) {
+    return { allow: true, decision: 'not_codex', stablePrefix: 0 };
+  }
+  if (!hint) {
+    return { allow: false, decision: 'no_prior_usage', stablePrefix: 0 };
+  }
+  const stablePrefix = commonHistorySegmentPrefix(hint.historySegmentShas, currentSegmentShas);
+  if (
+    profile.history.contextPressureTokens !== undefined
+    && hint.inputTokens >= profile.history.contextPressureTokens
+  ) {
+    return { allow: true, decision: 'context_pressure_override', stablePrefix };
+  }
+  if (hint.cacheShare < warmShare) {
+    return { allow: true, decision: 'cold_or_low_cache', stablePrefix };
+  }
+  if (!hint.compressed) {
+    return { allow: false, decision: 'warm_native_blocked', stablePrefix };
+  }
+  if (
+    hint.historySegmentShas.length > 0
+    && currentSegmentShas.length >= hint.historySegmentShas.length
+    && stablePrefix === hint.historySegmentShas.length
+  ) {
+    return { allow: true, decision: 'warm_append_only', stablePrefix };
+  }
+  return { allow: false, decision: 'warm_mutation_blocked', stablePrefix };
+}
+
 async function applyResponsesHistoryCollapse(
   req: ResponsesRequest,
   inputItems: Array<ResponsesInputItem | Record<string, unknown>>,
@@ -847,8 +976,8 @@ async function applyResponsesHistoryCollapse(
   o: OpenAIResolvedOptions,
   profile: GptModelProfile,
 ): Promise<boolean> {
-  const profitable = (text: string, cols: number, baselineTextTokens?: number) =>
-    evalOpenAIGate(req.model, text, cols, o.charsPerToken, baselineTextTokens).profitable;
+  const profitable = (historyText: string, cols: number, baselineTextTokens?: number) =>
+    evalOpenAIGate(req.model, historyText, cols, o.charsPerToken, baselineTextTokens).profitable;
   const plan = await planResponsesPairCollapse(
     inputItems,
     profitable,
@@ -856,19 +985,31 @@ async function applyResponsesHistoryCollapse(
   );
   const ps = plan.pairState;
   const rc = info.responsesComposition!;
-  rc.completedFunctionPairs = ps.completedPairs;
-  rc.recentNativeFunctionPairs = ps.recentCompletedPairs;
-  rc.oldFunctionPairs = ps.oldCompletedPairs;
-  rc.openFunctionCalls = ps.openCalls;
-  rc.orphanFunctionOutputs = ps.orphanOutputs;
-  rc.malformedFunctionItems = ps.malformedItems;
+
+  rc.completedFunctionPairs = ps.completedFunctionPairs;
+  rc.recentNativeFunctionPairs = ps.recentFunctionPairs;
+  rc.oldFunctionPairs = ps.oldFunctionPairs;
+  rc.openFunctionCalls = ps.openFunctionCalls;
+  rc.orphanFunctionOutputs = ps.orphanFunctionOutputs;
+  rc.malformedFunctionItems = ps.malformedFunctionItems;
   rc.imageableFunctionCalls = ps.imageableFunctionCallTokens;
   rc.imageableFunctionOutputs = ps.imageableFunctionOutputTokens;
-  rc.collapsedFunctionPairs = ps.collapsedPairs;
+  rc.collapsedFunctionPairs = ps.collapsedFunctionPairs;
   rc.collapsedFunctionCalls = ps.collapsedFunctionCallTokens;
   rc.collapsedFunctionOutputs = ps.collapsedFunctionOutputTokens;
-  // Descending count so the dominant page-breaker is first. Bounded to 8 so a
-  // pathological body cannot bloat the event row.
+
+  rc.completedCustomToolPairs = ps.completedCustomToolPairs;
+  rc.recentNativeCustomToolPairs = ps.recentCustomToolPairs;
+  rc.oldCustomToolPairs = ps.oldCustomToolPairs;
+  rc.openCustomToolCalls = ps.openCustomToolCalls;
+  rc.orphanCustomToolOutputs = ps.orphanCustomToolOutputs;
+  rc.malformedCustomToolItems = ps.malformedCustomToolItems;
+  rc.imageableCustomToolCalls = ps.imageableCustomToolCallTokens;
+  rc.imageableCustomToolOutputs = ps.imageableCustomToolOutputTokens;
+  rc.collapsedCustomToolPairs = ps.collapsedCustomToolPairs;
+  rc.collapsedCustomToolCalls = ps.collapsedCustomToolCallTokens;
+  rc.collapsedCustomToolOutputs = ps.collapsedCustomToolOutputTokens;
+
   if (plan.barrierTypes && plan.barrierTypes.size > 0) {
     rc.barrierTypes = [...plan.barrierTypes.entries()]
       .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
@@ -876,29 +1017,57 @@ async function applyResponsesHistoryCollapse(
       .map(([type, count]) => `${type}:${count}`);
   }
 
+  if (plan.segments.length === 0 || plan.images.length === 0) {
+    if (plan.reason) info.historyReason = plan.reason;
+    if (plan.collapsedChars > 0) info.historyTextChars = plan.collapsedChars;
+    return false;
+  }
+
+  if (o.codexOptimization) {
+    const materiality = codexHistoryMateriality(plan, req, profile);
+    rc.historyCandidateRawSaving = materiality.rawSaving;
+    rc.historyCandidateRawSavingPct = materiality.ratio * 100;
+    rc.historyCandidateSavingPerImage = materiality.perImage;
+    const minTokens = profile.history.minNetSavingsTokens ?? 0;
+    const minRatio = profile.history.minNetSavingsRatio ?? 0;
+    const minPerImage = profile.history.minNetSavingsPerImage ?? 0;
+    if (
+      materiality.rawSaving < minTokens
+      || materiality.ratio < minRatio
+      || materiality.perImage < minPerImage
+    ) {
+      info.historyReason = 'not_material';
+      info.historyTextChars = plan.collapsedChars;
+      return false;
+    }
+
+    const segmentShas = await responsesHistorySegmentShas(plan, profile);
+    const hint = getCodexCacheHint(o.codexSessionKey);
+    if (hint) rc.priorCacheSharePct = hint.cacheShare * 100;
+    const cache = cacheAllowsCodexHistory(hint, segmentShas, profile);
+    rc.historyStablePrefixSegments = cache.stablePrefix;
+    rc.historyCacheDecision = cache.decision;
+    if (!cache.allow) {
+      info.historyReason = 'cache_preservation';
+      info.historyTextChars = plan.collapsedChars;
+      return false;
+    }
+    info.historySegmentShas = segmentShas;
+  }
+
   foldGptHistory(info, req.model, plan);
-  if (plan.segments.length === 0) return false;
 
   const replacements = new Map<number, ResponsesInputItem>();
-  const compactFraming = profile.history.framing === 'compact';
-  const intro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_INTRO : HISTORY_TRANSCRIPT_INTRO;
-  const outro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_OUTRO : HISTORY_TRANSCRIPT_OUTRO;
-  const combinedSheet = profile.history.factSheetScope === 'combined'
-    ? factSheetText(plan.text, profile.factSheetFormat)
-    : '';
   for (let segmentIndex = 0; segmentIndex < plan.segments.length; segmentIndex++) {
     const segment = plan.segments[segmentIndex]!;
-    const content: ResponsesContentPart[] = [
-      { type: 'input_text', text: intro },
-      ...segment.images.map(responsesImagePart),
-    ];
-    const sheet = profile.history.factSheetScope === 'combined'
-      ? (segmentIndex === plan.segments.length - 1 ? combinedSheet : '')
-      : factSheetText(segment.text, profile.factSheetFormat);
-    if (sheet) content.push({ type: 'input_text', text: sheet });
-    content.push({ type: 'input_text', text: outro });
-    info.nativeInjectedTokens = (info.nativeInjectedTokens ?? 0)
-      + gptTextTokens(intro + sheet + outro);
+    const content = responsesHistorySegmentContent(plan, profile, segmentIndex);
+    for (const part of content) {
+      if ((part as { type?: unknown }).type !== 'input_text') continue;
+      const value = (part as { text?: unknown }).text;
+      if (typeof value === 'string') {
+        info.nativeInjectedTokens = (info.nativeInjectedTokens ?? 0) + gptTextTokens(value);
+      }
+    }
     replacements.set(segment.insertAt, { role: 'user', content });
   }
 
@@ -910,9 +1079,7 @@ async function applyResponsesHistoryCollapse(
     if (!removed.has(i)) rewritten.push(inputItems[i]!);
   }
   req.input = rewritten;
-  info.historyImageSha = await sha8(
-    plan.images.map((image) => bytesToBase64(image.png)).join(''),
-  );
+  info.historyImageSha = await sha8(plan.images.map((image) => bytesToBase64(image.png)).join(''));
   return true;
 }
 
@@ -1158,6 +1325,10 @@ export async function transformOpenAIResponses(
   info.responsesComposition = measureResponsesComposition(
     req, inputWasString, originalInputString, inputItems,
   );
+  // Stable trajectory key is needed even when this request only reaches the
+  // history-collapse path and never images static authority/tool context.
+  const firstUser = firstResponsesUserText(inputWasString, originalInputString, inputItems);
+  if (firstUser) info.firstUserSha8 = await sha8(firstUser);
 
   // Collect static context: instructions + system/developer items + flat tools.
   const authorityDocs: string[] = [];
@@ -1220,9 +1391,6 @@ export async function transformOpenAIResponses(
   if (!combinedRaw) {
     return finishHistoryOnly('no_static_context');
   }
-
-  const firstUser = firstResponsesUserText(inputWasString, originalInputString, inputItems);
-  if (firstUser) info.firstUserSha8 = await sha8(firstUser);
 
   const combined = compactSlabWhitespace(combinedRaw).trimEnd();
   const minCompressTokens = profile.minCompressTokens;

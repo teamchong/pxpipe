@@ -91,6 +91,9 @@ export interface GptHistoryOptions {
    *  each section renders to roughly one ≤6000px image, well under gpt-5.x's
    *  10,000-patch `detail:original` budget. Turn size, not turn count, drives this. */
   sectionTokens: number;
+  /** Responses mixed-mode immutable section target. 0 preserves the historical
+   *  per-run planner; Codex/Sol opts into larger append-only sections. */
+  responsesSectionTokens: number;
   /** Max rendered image height in px (per-model; from the GPT profile). Threaded
    *  into renderTextToPngs so history pages split at the same height the gate prices. */
   maxHeightPx: number;
@@ -115,6 +118,7 @@ export const GPT_HISTORY_DEFAULTS: GptHistoryOptions = {
   collapseChunk: 10,
   freezeChunk: 10,
   sectionTokens: 2000,
+  responsesSectionTokens: 0,
   // GPT path: OpenAI's resize bounds (2048-bbox / 768 short side) permit the tall
   // strip — do NOT re-link to render.ts MAX_HEIGHT_PX (Anthropic's 1568/1.15 MP clamp).
   maxHeightPx: GPT_MAX_HEIGHT_PX,
@@ -141,7 +145,7 @@ export interface HistoryTurn {
 }
 
 export interface ResponsesPairState {
-  /** Strict adjacent call/output pairs found in the original request. */
+  /** All supported completed call/output pairs (function + Codex custom tools). */
   completedPairs: number;
   /** Newest completed pairs deliberately retained as native Responses items. */
   recentCompletedPairs: number;
@@ -153,13 +157,33 @@ export interface ResponsesPairState {
   orphanOutputs: number;
   /** Duplicate, reversed, or non-adjacent shapes that cannot be paired safely. */
   malformedItems: number;
+  /** Function-tool subset retained for backwards-compatible telemetry. */
+  completedFunctionPairs: number;
+  recentFunctionPairs: number;
+  oldFunctionPairs: number;
+  openFunctionCalls: number;
+  orphanFunctionOutputs: number;
+  malformedFunctionItems: number;
+  /** Codex custom-tool subset. */
+  completedCustomToolPairs: number;
+  recentCustomToolPairs: number;
+  oldCustomToolPairs: number;
+  openCustomToolCalls: number;
+  orphanCustomToolOutputs: number;
+  malformedCustomToolItems: number;
   /** Original-request o200k bucket share belonging to eligible old pairs. */
   imageableFunctionCallTokens: number;
   imageableFunctionOutputTokens: number;
+  imageableCustomToolCallTokens: number;
+  imageableCustomToolOutputTokens: number;
   /** Eligible pairs actually removed from native input and represented by images. */
   collapsedPairs: number;
+  collapsedFunctionPairs: number;
   collapsedFunctionCallTokens: number;
   collapsedFunctionOutputTokens: number;
+  collapsedCustomToolPairs: number;
+  collapsedCustomToolCallTokens: number;
+  collapsedCustomToolOutputTokens: number;
 }
 
 export interface ResponsesPairCollapseSegment {
@@ -522,9 +546,8 @@ function gptCountTokens(text: string): number {
 
 function responseCallText(item: Record<string, unknown>): string {
   const name = typeof item.name === 'string' ? item.name : 'tool';
-  const args = typeof item.arguments === 'string'
-    ? item.arguments
-    : safeJson(item.arguments);
+  const payload = item.arguments !== undefined ? item.arguments : item.input;
+  const args = typeof payload === 'string' ? payload : safeJson(payload);
   return `[tool_use ${name}]\n${args}`;
 }
 
@@ -533,9 +556,40 @@ function responseOutputText(item: Record<string, unknown>): string {
   return `[tool_result]\n${output}`;
 }
 
+function responsePairKindForCallType(type: string): ResponsesPairKind | null {
+  if (type === 'function_call') return 'function';
+  if (type === 'custom_tool_call') return 'custom';
+  return null;
+}
+
+function responseExpectedOutputType(type: string): string | null {
+  if (type === 'function_call') return 'function_call_output';
+  if (type === 'custom_tool_call') return 'custom_tool_call_output';
+  return null;
+}
+
+function responsePairKindForOutputType(type: string): ResponsesPairKind | null {
+  if (type === 'function_call_output') return 'function';
+  if (type === 'custom_tool_call_output') return 'custom';
+  return null;
+}
+
+function isSupportedResponseCallType(type: string): boolean {
+  return responsePairKindForCallType(type) !== null;
+}
+
+function isSupportedResponseOutputType(type: string): boolean {
+  return responsePairKindForOutputType(type) !== null;
+}
+
+type ResponsesPairKind = 'function' | 'custom';
+
 interface ResponsesCompletedPair {
+  kind: ResponsesPairKind;
   callIndex: number;
   outputIndex: number;
+  callType: string;
+  outputType: string;
   text: string;
   callTokens: number;
   outputTokens: number;
@@ -659,102 +713,138 @@ function classifyResponsesPairs(
   items: unknown[],
   keepRecentPairs: number,
 ): { old: ResponsesCompletedRound[]; state: ResponsesPairState } {
+  type KindCounts = Record<ResponsesPairKind, number>;
+  const zeroKinds = (): KindCounts => ({ function: 0, custom: 0 });
   const calls = new Map<string, number[]>();
   const outputs = new Map<string, number[]>();
-  let missingIdItems = 0;
+  const keyKind = new Map<string, ResponsesPairKind>();
+  const keyFor = (kind: ResponsesPairKind, id: string): string => `${kind}\u0000${id}`;
+  const missingId = zeroKinds();
+
   for (let i = 0; i < items.length; i++) {
     const type = responseItemType(items[i]);
-    if (type !== 'function_call' && type !== 'function_call_output') continue;
+    const callKind = responsePairKindForCallType(type);
+    const outputKind = responsePairKindForOutputType(type);
+    const kind = callKind ?? outputKind;
+    if (!kind) continue;
     const id = responseCallId(items[i]);
-    if (!id) { missingIdItems++; continue; }
-    const map = type === 'function_call' ? calls : outputs;
-    const at = map.get(id) ?? [];
+    if (!id) {
+      missingId[kind] += 1;
+      continue;
+    }
+    const key = keyFor(kind, id);
+    keyKind.set(key, kind);
+    const map = callKind ? calls : outputs;
+    const at = map.get(key) ?? [];
     at.push(i);
-    map.set(id, at);
+    map.set(key, at);
   }
 
   const pairByCallIndex = new Map<number, ResponsesCompletedPair>();
-  let openCalls = 0;
-  let orphanOutputs = 0;
-  let malformedItems = missingIdItems;
-  const ids = new Set([...calls.keys(), ...outputs.keys()]);
-  for (const id of ids) {
-    const cs = calls.get(id) ?? [];
-    const os = outputs.get(id) ?? [];
+  const openByKind = zeroKinds();
+  const orphanByKind = zeroKinds();
+  const malformedByKind = { ...missingId };
+  const keys = new Set([...calls.keys(), ...outputs.keys()]);
+  for (const key of keys) {
+    const kind = keyKind.get(key)!;
+    const cs = calls.get(key) ?? [];
+    const os = outputs.get(key) ?? [];
     if (cs.length === 1 && os.length === 1 && cs[0]! < os[0]!) {
       const callIndex = cs[0]!;
       const outputIndex = os[0]!;
       const call = items[callIndex] as Record<string, unknown>;
       const output = items[outputIndex] as Record<string, unknown>;
+      const callType = responseItemType(call);
+      const outputType = responseItemType(output);
+      if (responseExpectedOutputType(callType) !== outputType) {
+        malformedByKind[kind] += 2;
+        continue;
+      }
       pairByCallIndex.set(callIndex, {
+        kind,
         callIndex,
         outputIndex,
+        callType,
+        outputType,
         text: `${responseCallText(call)}\n${responseOutputText(output)}`,
-        // Match measureResponsesComposition exactly so the share is comparable
-        // to its functionCalls/functionOutputs buckets.
+        // Call JSON is model-visible in full. For the output side preserve the
+        // historical conservative baseline: count only the payload, not wrapper
+        // fields, so savings are never credited for protocol metadata.
         callTokens: gptCountTokens(JSON.stringify(call)),
         outputTokens: gptCountTokens(
           typeof output.output === 'string' ? output.output : safeJson(output.output),
         ),
       });
-    } else if (cs.length > 0 && os.length === 0) openCalls += cs.length;
-    else if (os.length > 0 && cs.length === 0) orphanOutputs += os.length;
-    else malformedItems += cs.length + os.length;
+    } else if (cs.length > 0 && os.length === 0) {
+      openByKind[kind] += cs.length;
+    } else if (os.length > 0 && cs.length === 0) {
+      orphanByKind[kind] += os.length;
+    } else {
+      malformedByKind[kind] += cs.length + os.length;
+    }
   }
 
-  // Discover contiguous calls* + outputs* rounds. A candidate unique pair that
-  // does not fit one of these rounds is non-adjacent protocol state and remains
-  // native. This is the shape OpenCode uses for parallel tool calls.
+  // Discover protocol-atomic calls* + outputs* rounds. This accepts function
+  // calls and Codex custom-tool calls, including a mixed parallel round, but
+  // never crosses an unknown/intervening item and never selects only one side.
   const completed: ResponsesCompletedRound[] = [];
   const acceptedCallIndices = new Set<number>();
   for (let i = 0; i < items.length;) {
-    if (responseItemType(items[i]) !== 'function_call' || !pairByCallIndex.has(i)) {
+    const firstType = responseItemType(items[i]);
+    if (!isSupportedResponseCallType(firstType) || !pairByCallIndex.has(i)) {
       i++;
       continue;
     }
-    const calls: ResponsesCompletedPair[] = [];
+    const roundCalls: ResponsesCompletedPair[] = [];
     let j = i;
-    while (responseItemType(items[j]) === 'function_call' && pairByCallIndex.has(j)) {
-      calls.push(pairByCallIndex.get(j)!);
+    while (
+      j < items.length
+      && isSupportedResponseCallType(responseItemType(items[j]))
+      && pairByCallIndex.has(j)
+    ) {
+      roundCalls.push(pairByCallIndex.get(j)!);
       j++;
     }
-    const roundOutputIndices = new Set(calls.map((pair) => pair.outputIndex));
-    const outputs: number[] = [];
-    // Do not absorb an output belonging to orphan/other state into this round.
+    const roundOutputIndices = new Set(roundCalls.map((pair) => pair.outputIndex));
+    const roundOutputs: number[] = [];
     while (
-      responseItemType(items[j]) === 'function_call_output'
+      j < items.length
+      && isSupportedResponseOutputType(responseItemType(items[j]))
       && roundOutputIndices.has(j)
     ) {
-      outputs.push(j);
+      roundOutputs.push(j);
       j++;
     }
-    const outputSet = new Set(outputs);
-    const valid = calls.length > 0
-      && outputs.length === calls.length
-      && calls.every((pair) => outputSet.has(pair.outputIndex));
+    const outputSet = new Set(roundOutputs);
+    const valid = roundCalls.length > 0
+      && roundOutputs.length === roundCalls.length
+      && roundCalls.every((pair) => outputSet.has(pair.outputIndex));
     if (!valid) {
       i++;
       continue;
     }
-    const byOutput = [...calls].sort((a, b) => a.outputIndex - b.outputIndex);
+    const byOutput = [...roundCalls].sort((a, b) => a.outputIndex - b.outputIndex);
     const indices = [
-      ...calls.map((pair) => pair.callIndex),
+      ...roundCalls.map((pair) => pair.callIndex),
       ...byOutput.map((pair) => pair.outputIndex),
     ];
     completed.push({
-      pairs: calls,
+      pairs: roundCalls,
       indices,
       startIndex: i,
       endIndex: j - 1,
       text: byOutput.map((pair) => pair.text).join('\n\n'),
-      callTokens: calls.reduce((sum, pair) => sum + pair.callTokens, 0),
-      outputTokens: calls.reduce((sum, pair) => sum + pair.outputTokens, 0),
+      callTokens: roundCalls.reduce((sum, pair) => sum + pair.callTokens, 0),
+      outputTokens: roundCalls.reduce((sum, pair) => sum + pair.outputTokens, 0),
     });
-    for (const pair of calls) acceptedCallIndices.add(pair.callIndex);
+    for (const pair of roundCalls) acceptedCallIndices.add(pair.callIndex);
     i = j;
   }
+
+  // A unique call/output that could not form one contiguous protocol round is
+  // still malformed for collapse purposes. Keep it byte-exact and count it.
   for (const pair of pairByCallIndex.values()) {
-    if (!acceptedCallIndices.has(pair.callIndex)) malformedItems += 2;
+    if (!acceptedCallIndices.has(pair.callIndex)) malformedByKind[pair.kind] += 2;
   }
 
   const keep = Math.max(0, Math.floor(keepRecentPairs));
@@ -765,24 +855,48 @@ function classifyResponsesPairs(
     recentPairs += completed[recentStart]!.pairs.length;
   }
   const old = completed.slice(0, recentStart);
-  const completedPairs = completed.reduce((n, round) => n + round.pairs.length, 0);
-  const oldPairs = old.reduce((n, round) => n + round.pairs.length, 0);
-  const imageableFunctionCallTokens = old.reduce((n, round) => n + round.callTokens, 0);
-  const imageableFunctionOutputTokens = old.reduce((n, round) => n + round.outputTokens, 0);
+  const recent = completed.slice(recentStart);
+
+  const pairsOf = (rounds: ResponsesCompletedRound[], kind?: ResponsesPairKind): ResponsesCompletedPair[] =>
+    rounds.flatMap((round) => kind ? round.pairs.filter((pair) => pair.kind === kind) : round.pairs);
+  const completedAll = pairsOf(completed);
+  const recentAll = pairsOf(recent);
+  const oldAll = pairsOf(old);
+  const oldFunction = pairsOf(old, 'function');
+  const oldCustom = pairsOf(old, 'custom');
+
   return {
     old,
     state: {
-      completedPairs,
-      recentCompletedPairs: completedPairs - oldPairs,
-      oldCompletedPairs: oldPairs,
-      openCalls,
-      orphanOutputs,
-      malformedItems,
-      imageableFunctionCallTokens,
-      imageableFunctionOutputTokens,
+      completedPairs: completedAll.length,
+      recentCompletedPairs: recentAll.length,
+      oldCompletedPairs: oldAll.length,
+      openCalls: openByKind.function + openByKind.custom,
+      orphanOutputs: orphanByKind.function + orphanByKind.custom,
+      malformedItems: malformedByKind.function + malformedByKind.custom,
+      completedFunctionPairs: pairsOf(completed, 'function').length,
+      recentFunctionPairs: pairsOf(recent, 'function').length,
+      oldFunctionPairs: oldFunction.length,
+      openFunctionCalls: openByKind.function,
+      orphanFunctionOutputs: orphanByKind.function,
+      malformedFunctionItems: malformedByKind.function,
+      completedCustomToolPairs: pairsOf(completed, 'custom').length,
+      recentCustomToolPairs: pairsOf(recent, 'custom').length,
+      oldCustomToolPairs: oldCustom.length,
+      openCustomToolCalls: openByKind.custom,
+      orphanCustomToolOutputs: orphanByKind.custom,
+      malformedCustomToolItems: malformedByKind.custom,
+      imageableFunctionCallTokens: oldFunction.reduce((sum, pair) => sum + pair.callTokens, 0),
+      imageableFunctionOutputTokens: oldFunction.reduce((sum, pair) => sum + pair.outputTokens, 0),
+      imageableCustomToolCallTokens: oldCustom.reduce((sum, pair) => sum + pair.callTokens, 0),
+      imageableCustomToolOutputTokens: oldCustom.reduce((sum, pair) => sum + pair.outputTokens, 0),
       collapsedPairs: 0,
+      collapsedFunctionPairs: 0,
       collapsedFunctionCallTokens: 0,
       collapsedFunctionOutputTokens: 0,
+      collapsedCustomToolPairs: 0,
+      collapsedCustomToolCallTokens: 0,
+      collapsedCustomToolOutputTokens: 0,
     },
   };
 }
@@ -905,43 +1019,101 @@ async function planResponsesMixedCollapse(
     const source = units.map((unit) => unit.text).join('\n\n');
     const safe = neutralizeSentinel(source);
     const renderedText = o.reflow ? reflow(safe) ?? safe : safe;
-    const images = await renderTextToPngs(renderedText, o.cols, o.style ?? DEFAULT_GPT_PROFILE.style, o.maxHeightPx);
+    const images = await renderTextToPngs(
+      renderedText,
+      o.cols,
+      o.style ?? DEFAULT_GPT_PROFILE.style,
+      o.maxHeightPx,
+    );
     return { source, renderedText, images };
   };
 
   const segments: ResponsesPairCollapseSegment[] = [];
   let remainingImages = maxImages;
   let hitImageCap = false;
-  for (const run of runs) {
-    if (remainingImages === 0) { hitImageCap = true; break; }
-    let low = 0;
-    let high = run.length + 1;
-    let best: Awaited<ReturnType<typeof renderUnits>> | undefined;
-    while (low + 1 < high) {
-      const count = Math.floor((low + high) / 2);
-      const rendered = await renderUnits(run.slice(0, count));
-      if (rendered.images.length > 0 && rendered.images.length <= remainingImages) {
-        low = count;
-        best = rendered;
-      } else {
-        high = count;
+
+  if (o.responsesSectionTokens > 0) {
+    // Codex cache-stable mode: seal each contiguous run into deterministic
+    // token-sized sections. The trailing partial section stays native until it
+    // fills. Once sealed, its source range never changes as future items append,
+    // so the old PNG bytes remain a stable prompt-cache prefix.
+    const target = Math.max(1, Math.floor(o.responsesSectionTokens));
+    outer: for (const run of runs) {
+      let sectionStart = 0;
+      let sectionTokens = 0;
+      for (let i = 0; i < run.length; i++) {
+        sectionTokens += run[i]!.baselineTokens;
+        if (sectionTokens < target) continue;
+        const selected = run.slice(sectionStart, i + 1);
+        const rendered = await renderUnits(selected);
+        if (rendered.images.length === 0) {
+          sectionStart = i + 1;
+          sectionTokens = 0;
+          continue;
+        }
+        if (rendered.images.length > remainingImages) {
+          hitImageCap = true;
+          break outer;
+        }
+        const selectedBaselineTokens = selected.reduce((sum, unit) => sum + unit.baselineTokens, 0);
+        if (!isProfitable(rendered.renderedText, o.cols, selectedBaselineTokens)) {
+          // Reaching the token target does not make an under-filled image worth
+          // sending. Keep accumulating this same deterministic section until its
+          // raw image cost beats native text; the first profitable boundary is
+          // then stable for every future append of this trajectory.
+          continue;
+        }
+        const selectedIndices = selected.flatMap((unit) => unit.indices).sort((a, b) => a - b);
+        segments.push({
+          insertAt: selectedIndices[0]!,
+          selectedIndices,
+          images: rendered.images,
+          imageSources: rendered.images.map(() => rendered.source),
+          text: rendered.source,
+          baselineTokens: selectedBaselineTokens,
+        });
+        remainingImages -= rendered.images.length;
+        // Seal only a physically/economically viable section. A tiny trailing
+        // island therefore stays native instead of becoming a cache-hostile PNG.
+        sectionStart = i + 1;
+        sectionTokens = 0;
       }
+      // [sectionStart..end) is intentionally left native until it reaches target.
     }
-    if (!best || low === 0) { hitImageCap = true; break; }
-    const selected = run.slice(0, low);
-    const selectedBaselineTokens = selected.reduce((sum, unit) => sum + unit.baselineTokens, 0);
-    if (!isProfitable(best.renderedText, o.cols, selectedBaselineTokens)) continue;
-    const selectedIndices = selected.flatMap((unit) => unit.indices).sort((a, b) => a - b);
-    segments.push({
-      insertAt: selectedIndices[0]!,
-      selectedIndices,
-      images: best.images,
-      imageSources: best.images.map(() => best.source),
-      text: best.source,
-      baselineTokens: selectedBaselineTokens,
-    });
-    remainingImages -= best.images.length;
-    if (low < run.length) { hitImageCap = true; break; }
+  } else {
+    // Historical generic Responses planner: pack as much of each run as the
+    // physical image budget permits. Kept for non-Codex OpenAI-compatible users.
+    for (const run of runs) {
+      if (remainingImages === 0) { hitImageCap = true; break; }
+      let low = 0;
+      let high = run.length + 1;
+      let best: Awaited<ReturnType<typeof renderUnits>> | undefined;
+      while (low + 1 < high) {
+        const count = Math.floor((low + high) / 2);
+        const rendered = await renderUnits(run.slice(0, count));
+        if (rendered.images.length > 0 && rendered.images.length <= remainingImages) {
+          low = count;
+          best = rendered;
+        } else {
+          high = count;
+        }
+      }
+      if (!best || low === 0) { hitImageCap = true; break; }
+      const selected = run.slice(0, low);
+      const selectedBaselineTokens = selected.reduce((sum, unit) => sum + unit.baselineTokens, 0);
+      if (!isProfitable(best.renderedText, o.cols, selectedBaselineTokens)) continue;
+      const selectedIndices = selected.flatMap((unit) => unit.indices).sort((a, b) => a - b);
+      segments.push({
+        insertAt: selectedIndices[0]!,
+        selectedIndices,
+        images: best.images,
+        imageSources: best.images.map(() => best.source),
+        text: best.source,
+        baselineTokens: selectedBaselineTokens,
+      });
+      remainingImages -= best.images.length;
+      if (low < run.length) { hitImageCap = true; break; }
+    }
   }
 
   if (segments.length === 0) {
@@ -955,9 +1127,16 @@ async function planResponsesMixedCollapse(
   const selectedIndices = segments.flatMap((segment) => segment.selectedIndices).sort((a, b) => a - b);
   const selectedIds = new Set(selectedIndices);
   const selectedRounds = old.filter((round) => round.indices.every((index) => selectedIds.has(index)));
-  state.collapsedPairs = selectedRounds.reduce((n, round) => n + round.pairs.length, 0);
-  state.collapsedFunctionCallTokens = selectedRounds.reduce((n, round) => n + round.callTokens, 0);
-  state.collapsedFunctionOutputTokens = selectedRounds.reduce((n, round) => n + round.outputTokens, 0);
+  const selectedPairs = selectedRounds.flatMap((round) => round.pairs);
+  const selectedFunction = selectedPairs.filter((pair) => pair.kind === 'function');
+  const selectedCustom = selectedPairs.filter((pair) => pair.kind === 'custom');
+  state.collapsedPairs = selectedPairs.length;
+  state.collapsedFunctionPairs = selectedFunction.length;
+  state.collapsedFunctionCallTokens = selectedFunction.reduce((n, pair) => n + pair.callTokens, 0);
+  state.collapsedFunctionOutputTokens = selectedFunction.reduce((n, pair) => n + pair.outputTokens, 0);
+  state.collapsedCustomToolPairs = selectedCustom.length;
+  state.collapsedCustomToolCallTokens = selectedCustom.reduce((n, pair) => n + pair.callTokens, 0);
+  state.collapsedCustomToolOutputTokens = selectedCustom.reduce((n, pair) => n + pair.outputTokens, 0);
   const images = segments.flatMap((segment) => segment.images);
   const imageSources = segments.flatMap((segment) => segment.imageSources);
   const text = segments.map((segment) => segment.text).join('\n\n');
@@ -1085,9 +1264,16 @@ export async function planResponsesPairCollapse(
   const text = segments.map((segment) => segment.text).join('\n\n');
   const selectedIds = new Set(selectedIndices);
   const selectedRounds = old.filter((round) => round.indices.every((index) => selectedIds.has(index)));
-  state.collapsedPairs = selectedRounds.reduce((n, round) => n + round.pairs.length, 0);
-  state.collapsedFunctionCallTokens = selectedRounds.reduce((n, round) => n + round.callTokens, 0);
-  state.collapsedFunctionOutputTokens = selectedRounds.reduce((n, round) => n + round.outputTokens, 0);
+  const selectedPairs = selectedRounds.flatMap((round) => round.pairs);
+  const selectedFunction = selectedPairs.filter((pair) => pair.kind === 'function');
+  const selectedCustom = selectedPairs.filter((pair) => pair.kind === 'custom');
+  state.collapsedPairs = selectedPairs.length;
+  state.collapsedFunctionPairs = selectedFunction.length;
+  state.collapsedFunctionCallTokens = selectedFunction.reduce((n, pair) => n + pair.callTokens, 0);
+  state.collapsedFunctionOutputTokens = selectedFunction.reduce((n, pair) => n + pair.outputTokens, 0);
+  state.collapsedCustomToolPairs = selectedCustom.length;
+  state.collapsedCustomToolCallTokens = selectedCustom.reduce((n, pair) => n + pair.callTokens, 0);
+  state.collapsedCustomToolOutputTokens = selectedCustom.reduce((n, pair) => n + pair.outputTokens, 0);
 
   const droppedCodepoints = new Map<number, number>();
   let droppedChars = 0;

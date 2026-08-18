@@ -4,6 +4,10 @@
  */
 
 import { markCacheDead, noteCacheOutcome, responseLeftNoCache } from './session-state.js';
+import {
+  invalidateCodexCacheState,
+  noteCodexCacheOutcome,
+} from './codex-cache-state.js';
 import { transformRequest, type TransformOptions, type TransformInfo } from './transform.js';
 import { isClaudeModel, transformOpenAIChatCompletions, transformOpenAIResponses } from './openai.js';
 import { isAnthropicMessagesPath, isPxpipeSupportedGptModel, isPxpipeSupportedModel } from './applicability.js';
@@ -54,6 +58,9 @@ export interface ProxyConfig {
    * models retain normal Anthropic routing. */
   openAIModels?: string[];
   cloudflareModels?: string[];
+  /** Enable cache/materiality-aware Responses history admission on the dedicated
+   * Codex route. Generic OpenAI-compatible routes keep their existing policy. */
+  codexOptimization?: boolean;
   /** Pass a function to inject dynamic values per-request (e.g. live charsPerToken);
    *  static object for Workers/tests. */
   transform?: TransformOptions | (() => TransformOptions);
@@ -1412,6 +1419,18 @@ export function createProxy(config: ProxyConfig = {}) {
     const t0 = Date.now();
     const url = new URL(req.url);
     const path = url.pathname + url.search;
+    // Codex exposes a per-thread request identity in a header. Its broader
+    // session/cache lineage may be shared by root and subagent requests, but
+    // adaptive history admission is trajectory-local: fingerprint thread-id so
+    // two threads can never reuse each other's observer state.
+    // Missing thread identity deliberately yields no cache key: the optimizer
+    // then fails closed to a native request instead of guessing a trajectory.
+    const codexThreadId = config.codexOptimization
+      ? req.headers.get('thread-id')?.trim()
+      : undefined;
+    const codexSessionKey = codexThreadId
+      ? (await sha256Text(codexThreadId)).slice(0, 16)
+      : undefined;
 
     // Reversibly disguise the configured upstream id for Claude Code's model
     // picker, matching CLIProxyAPI. The id decodes back to the exact provider
@@ -1676,9 +1695,15 @@ const model = googleModel ?? readModelField(bodyIn);
         if ((bridgedGptMessages || bridgedChatMessages) && effectiveModel) {
           requestModel = effectiveModel;
         }
+        const routeTransformOpts: TransformOptions = {
+          ...transformOpts,
+          ...(config.codexOptimization
+            ? { codexOptimization: true, codexSessionKey }
+            : {}),
+        };
         const effectiveOpts = modelOk
-          ? transformOpts
-          : { ...transformOpts, compress: false };
+          ? routeTransformOpts
+          : { ...routeTransformOpts, compress: false };
         const bridgeBody = bridgedGptMessages
           ? (() => {
               const bridged = JSON.parse(new TextDecoder().decode(
@@ -2040,6 +2065,21 @@ const model = googleModel ?? readModelField(bodyIn);
     responseContentType = upstreamRes.headers.get('content-type') ?? undefined;
     responseContentEncoding = upstreamRes.headers.get('content-encoding') ?? undefined;
 
+    // Native Codex compaction replaces the history while keeping the same
+    // thread-id. A successful compact therefore invalidates the PREVIOUS
+    // trajectory observation before Codex can issue its next regular turn.
+    //
+    // Do this from the HTTP success result rather than waiting for usage:
+    // /responses/compact is deliberately not a Responses-transform/usage-scan
+    // route, and the next request must never see stale pre-compact pressure.
+    if (
+      config.codexOptimization
+      && url.pathname === '/backend-api/codex/responses/compact'
+      && upstreamRes.ok
+    ) {
+      invalidateCodexCacheState(codexSessionKey);
+    }
+
     // Tee: client gets one side; scanner reads the other for usage/measurement/error body.
 let teed: Response;
     let usagePromise: Promise<Usage | undefined>;
@@ -2080,6 +2120,14 @@ let teed: Response;
         usage?.cache_read_input_tokens,
         usage?.cache_creation_input_tokens,
       );
+      if (config.codexOptimization) {
+        noteCodexCacheOutcome(codexSessionKey, {
+          inputTokens: usage?.input_tokens,
+          cachedTokens: usage?.cached_tokens,
+          compressed: Boolean(info?.compressed && (info?.imageCount ?? 0) > 0),
+          historySegmentShas: info?.historySegmentShas,
+        });
+      }
       fire(
         upstreamRes.status,
         info,

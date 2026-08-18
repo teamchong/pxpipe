@@ -1089,7 +1089,7 @@ describe('resolveGptProfile (Claude on Responses)', () => {
         keepRecentPairs: 1,
         minCollapseTokens: 1000,
         framing: 'compact',
-        factSheetScope: 'combined',
+        factSheetScope: 'per-segment',
       });
       expect(sol.factSheetFormat, model).toBe('full');
     }

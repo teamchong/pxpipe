@@ -84,6 +84,21 @@ export interface GptHistoryProfile {
   framing: 'full' | 'compact';
   /** Fact-sheet placement for discontiguous Responses history groups. */
   factSheetScope: 'per-segment' | 'combined';
+  /** Token target for one immutable Responses history section. Once a section
+   *  seals, later turns append new sections rather than re-rendering old pages. */
+  responsesSectionTokens?: number;
+  /** Minimum whole-plan net raw saving after image + PXPipe framing/ledger. */
+  minNetSavingsTokens?: number;
+  /** Minimum whole-plan net raw saving / original represented text. */
+  minNetSavingsRatio?: number;
+  /** Minimum whole-plan net raw saving per physical PNG. */
+  minNetSavingsPerImage?: number;
+  /** Prior provider cache share at/above which changing an existing warm native
+   *  or compressed prefix is refused unless context pressure overrides it. */
+  warmCacheShareBlock?: number;
+  /** Provider-input token level where context preservation may override the
+   *  warm-cache transition guard. Deliberately below the model hard limit. */
+  contextPressureTokens?: number;
 }
 
 export interface GptModelProfile {
@@ -207,7 +222,25 @@ const GPT56_SOL_PROFILE: GptModelProfile = {
     minCollapseTokens: 1000,
     responsesMode: 'mixed',
     framing: 'compact',
-    factSheetScope: 'combined',
+    // Each immutable Codex section owns its own exact-token sheet. A combined
+    // sheet would move/grow whenever a new section sealed and would therefore
+    // invalidate otherwise-stable old segment bytes.
+    factSheetScope: 'per-segment',
+    // Codex already gets very strong automatic prompt caching. Seal substantially
+    // larger immutable history sections so one newly-cold message cannot make an
+    // old image pack churn on every request.
+    responsesSectionTokens: 6_000,
+    // Telemetry from real Codex sessions showed the legacy >0-token gate happily
+    // spending 3-7 PNGs for ~400 raw tokens (~40 cache-weighted tokens). A Codex
+    // transform now has to be materially useful before changing modality.
+    minNetSavingsTokens: 1_024,
+    minNetSavingsRatio: 0.15,
+    minNetSavingsPerImage: 128,
+    // A warm native prefix is usually cheaper than introducing images. Only a
+    // cold/low-cache transition (or genuine context pressure) may establish the
+    // first compressed epoch; once established, later epochs must be append-only.
+    warmCacheShareBlock: 0.50,
+    contextPressureTokens: 800_000,
   },
   style: {
     ...BASE_STYLE,

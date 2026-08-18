@@ -643,3 +643,94 @@ describe('planResponsesPairCollapse — native state classification', () => {
     expect(plan.selectedIndices).not.toContain(5);
   });
 });
+
+describe('planResponsesPairCollapse — Codex custom-tool protocol', () => {
+  const customPair = (id: string, outputWords = 1200): Array<Record<string, unknown>> => [
+    {
+      type: 'custom_tool_call', id: `ct_${id}`, call_id: id,
+      name: 'exec_command', input: `run ${id}`,
+    },
+    {
+      type: 'custom_tool_call_output', call_id: id,
+      output: `${id} ${'result '.repeat(outputWords)}`,
+    },
+  ];
+
+  it('pairs completed custom_tool_call/output state instead of treating it as a barrier', async () => {
+    const items: Array<Record<string, unknown>> = [];
+    for (let i = 0; i < 8; i++) items.push(...customPair(`c${i}`));
+    const plan = await planResponsesPairCollapse(items, yes, {
+      responsesMode: 'mixed', keepRecentPairs: 2, minCollapseTokens: 1, maxImages: 100,
+    });
+    expect(plan.pairState).toMatchObject({
+      completedCustomToolPairs: 8,
+      recentCustomToolPairs: 2,
+      oldCustomToolPairs: 6,
+      openCustomToolCalls: 0,
+      orphanCustomToolOutputs: 0,
+      malformedCustomToolItems: 0,
+    });
+    expect(plan.pairState.collapsedCustomToolPairs).toBeGreaterThan(0);
+    // The newest protected native custom-tool round is a deliberate barrier;
+    // older completed rounds must no longer create one barrier per call.
+    expect(plan.barrierTypes?.get('custom_tool_call') ?? 0).toBeLessThanOrEqual(1);
+    expect(plan.barrierTypes?.has('custom_tool_call_output')).not.toBe(true);
+    const selected = new Set(plan.selectedIndices);
+    for (let i = 0; i < items.length; i += 2) {
+      expect(selected.has(i)).toBe(selected.has(i + 1));
+    }
+  });
+
+  it('keeps incomplete, orphaned and duplicate custom-tool state native', async () => {
+    const items: Array<Record<string, unknown>> = [
+      ...customPair('good'),
+      { type: 'custom_tool_call', call_id: 'open', name: 'shell', input: 'pwd' },
+      { type: 'custom_tool_call_output', call_id: 'orphan', output: 'x' },
+      { type: 'custom_tool_call', call_id: 'dup', name: 'shell', input: 'a' },
+      { type: 'custom_tool_call', call_id: 'dup', name: 'shell', input: 'b' },
+      { type: 'custom_tool_call_output', call_id: 'dup', output: 'x' },
+    ];
+    const plan = await planResponsesPairCollapse(items, yes, {
+      responsesMode: 'mixed', keepRecentPairs: 0, minCollapseTokens: 1, maxImages: 100,
+    });
+    expect(plan.pairState).toMatchObject({
+      completedCustomToolPairs: 1,
+      openCustomToolCalls: 1,
+      orphanCustomToolOutputs: 1,
+      malformedCustomToolItems: 3,
+    });
+    const selected = new Set(plan.selectedIndices);
+    expect(selected.has(0)).toBe(true);
+    expect(selected.has(1)).toBe(true);
+    for (let i = 2; i < items.length; i++) expect(selected.has(i)).toBe(false);
+  });
+
+  it('seals immutable token-sized Responses sections and leaves a partial tail native', async () => {
+    const makeMessage = (i: number): Record<string, unknown> => ({
+      role: i % 2 ? 'assistant' : 'user',
+      content: `turn-${i} ${'alpha beta gamma delta '.repeat(170)}`,
+    });
+    const first = Array.from({ length: 14 }, (_, i) => makeMessage(i));
+    const opts = {
+      responsesMode: 'mixed' as const,
+      keepTail: 1,
+      keepRecentPairs: 0,
+      minCollapseTokens: 1,
+      maxImages: 100,
+      responsesSectionTokens: 1_500,
+    };
+    const p1 = await planResponsesPairCollapse(first, yes, opts);
+    expect(p1.segments.length).toBeGreaterThan(0);
+    const p1Sources = p1.segments.map((s) => s.text);
+    const p1Bytes = p1.segments.flatMap((s) => s.images.map((img) => Buffer.from(img.png).toString('base64')));
+
+    const extended = [...first, makeMessage(14), makeMessage(15), makeMessage(16)];
+    const p2 = await planResponsesPairCollapse(extended, yes, opts);
+    expect(p2.segments.length).toBeGreaterThanOrEqual(p1.segments.length);
+    expect(p2.segments.slice(0, p1Sources.length).map((s) => s.text)).toEqual(p1Sources);
+    const p2Bytes = p2.segments.flatMap((s) => s.images.map((img) => Buffer.from(img.png).toString('base64')));
+    expect(p2Bytes.slice(0, p1Bytes.length)).toEqual(p1Bytes);
+    // Latest protected tail stays native and cannot be selected into a section.
+    expect(p2.selectedIndices).not.toContain(extended.length - 1);
+  });
+});

@@ -125,6 +125,15 @@ export interface TransformOptions {
    *  image(s), keeping the recent tail as text. Independent of the static slab.
    *  Default on. See src/core/openai-history.ts. */
   collapseHistory?: boolean;
+  /** Dedicated Codex-route optimization policy. When true, Responses history
+   *  admission is cache-aware and materiality-gated, and only append-stable
+   *  history packs may extend a warm compressed prefix. Generic OpenAI clients
+   *  keep the historical behavior unless their host explicitly opts in. */
+  codexOptimization?: boolean;
+  /** Opaque per-thread cache-state key supplied by the Codex route. The Node
+   *  host fingerprints Codex's `thread-id` before passing it here; raw thread
+   *  identifiers are never retained by the transform/cache observer. */
+  codexSessionKey?: string;
   /** GPT only: history-collapse tuning overrides (keepTail / collapseChunk / …). */
   gptHistory?: Partial<GptHistoryOptions>;
   /** Re-pack image-bound text into a ↵-delimited stream to fill `cols` (~29%→75-80%
@@ -158,6 +167,8 @@ const DEFAULTS: Required<TransformOptions> = {
   maxImageBytes: 18 * 1024 * 1024,
   charsPerToken: 4,
   historyAmortizationHorizon: 1,
+  codexOptimization: false,
+  codexSessionKey: '',
   priorWarmTokens: 0,
   priorWarmImageTokens: 0,
   reflow: true,
@@ -653,6 +664,34 @@ export interface TransformInfo {
     collapsedFunctionPairs?: number;
     collapsedFunctionCalls?: number;
     collapsedFunctionOutputs?: number;
+    /** Custom-tool protocol accounting (Codex uses custom tools heavily). */
+    customToolCalls?: number;
+    customToolOutputs?: number;
+    completedCustomToolPairs?: number;
+    recentNativeCustomToolPairs?: number;
+    oldCustomToolPairs?: number;
+    openCustomToolCalls?: number;
+    orphanCustomToolOutputs?: number;
+    malformedCustomToolItems?: number;
+    imageableCustomToolCalls?: number;
+    imageableCustomToolOutputs?: number;
+    collapsedCustomToolPairs?: number;
+    collapsedCustomToolCalls?: number;
+    collapsedCustomToolOutputs?: number;
+    /** Cache/materiality decision from the dedicated Codex optimizer. */
+    priorCacheSharePct?: number;
+    historyStablePrefixSegments?: number;
+    historyCandidateRawSaving?: number;
+    historyCandidateRawSavingPct?: number;
+    historyCandidateSavingPerImage?: number;
+    historyCacheDecision?:
+      | 'not_codex'
+      | 'no_prior_usage'
+      | 'cold_or_low_cache'
+      | 'warm_native_blocked'
+      | 'warm_append_only'
+      | 'warm_mutation_blocked'
+      | 'context_pressure_override';
     /** Item `type` values that acted as a hard barrier in the Responses
      *  planner, with occurrence counts (`local_shell_call:12`). Every barrier
      *  forces a page break, so a frequent type here is directly responsible
@@ -750,6 +789,10 @@ export interface TransformInfo {
    *  proves Anthropic's prompt cache can `cache_read` (0.1×) instead of `cache_create`.
    *  A changing hash means cache-key drift is back. Only set when collapse produced images. */
   historyImageSha?: string;
+  /** Per-page sha8 digests for cache-stability comparison on the next Codex
+   *  request. Kept in-memory on TransformInfo; tracker persists only bounded
+   *  diagnostics, never PNG bytes or prompt text. */
+  historySegmentShas?: string[];
   /** Freeze-grid step the history collapse actually used, in messages. Rises when the
    *  adaptive packer merges chunks to fit the image budget; must never fall within a
    *  session (a finer re-cut re-keys every chunk). */
@@ -794,6 +837,8 @@ export interface TransformInfo {
     | 'below_min_chars'
     | 'below_min_tokens'
     | 'not_profitable'
+    | 'not_material'
+    | 'cache_preservation'
     | 'too_many_images'
     /** Rendered, then not applied: the collapse group did not fit the decoded
      *  image-byte budget, so the original text stands. Distinct from

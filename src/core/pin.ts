@@ -42,14 +42,13 @@ const PIN_MAX_CHARS = 300;
 /** Total pinned text emitted at the tail. A pin that dilutes itself is not a pin. */
 const PIN_TOTAL_MAX_CHARS = 2000;
 
-/**
- * `@pxpipe pin <text>` / `@pxpipe unpin`, anchored to a whole line so removal is a
- * whole-line delete — deterministic, with no leftover blank-line ambiguity. That
- * determinism is what lets us MOVE pins (strip from source, emit at tail) instead
- * of copying: the rewrite stays a pure function of the message, so the protected
- * prefix remains byte-stable turn to turn, exactly like demoteProtectedHeadText.
- */
-const PIN_CMD_RE = /^@pxpipe[ \t]+(pin|unpin)\b(.*)$/;
+// `@pxpipe pin <text>` / `@pxpipe unpin`, `>pxpipe pin`, `> pxpipe pin`,
+// anchored to a whole line so removal is a whole-line delete - deterministic,
+// with no leftover blank-line ambiguity. That determinism is what lets us MOVE
+// pins (strip from source, emit at tail) instead of copying: the rewrite stays
+// a pure function of the message, so the protected prefix remains byte-stable
+// turn to turn, exactly like demoteProtectedHeadText.
+const PIN_CMD_RE = /^(?:>[ \t]*)?@?pxpipe[ \t]+(pin|unpin)\b(.*)$/;
 
 /**
  * Parse one line as a pin command. Returns null when it isn't one.

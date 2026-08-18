@@ -330,15 +330,16 @@ function imageTokensCost(
  *  at a lower density than the slab without touching either default. Both are
  *  undefined in every shipped profile, so this returns the dense geometry
  *  unchanged out of the box. */
-function historyGateGeometry(o?: Required<TransformOptions>): GateGeometry {
+function historyGateGeometry(
+  o?: Required<TransformOptions>,
+  callerOverrodeCols: boolean = false,
+): GateGeometry {
   const dense = denseGateGeometry(o);
   const profile = o?.model ? resolveGptProfile(o.model) : undefined;
   if (profile?.historyStripCols === undefined && profile?.historyStyle === undefined) return dense;
   return {
     ...dense,
-    // An explicit `o.cols` is a caller override and still wins, as it does for
-    // the dense path.
-    cols: o?.cols ?? profile.historyStripCols ?? dense.cols,
+    cols: callerOverrodeCols ? o!.cols : profile.historyStripCols ?? dense.cols,
     style: profile.historyStyle ?? dense.style,
   };
 }
@@ -901,6 +902,15 @@ const DYNAMIC_BLOCK_TAGS = [
   // paid for as a create and never read. It was showing up in
   // `unknownStaticTags`, which is exactly the canary that list exists to be.
   'total_tokens',
+  // Newer Claude Code identity/automode block (#234). Left in the static slab
+  // it gets imaged along with the rest of the prefix, and the provider's
+  // subscription-quota recognition on that block breaks -> spurious 429s on
+  // every compressed request. Route it to the dynamic tail instead, same as
+  // total_tokens above.
+  'cc_automode_session_rules',
+  'cc_automode_permissions',
+  'severity',
+  'category',
 ] as const;
 
 // Known-static slab tags — suppresses first-sighting `unknownStaticTags` noise
@@ -1626,13 +1636,25 @@ export function truncateForBudget(
   const originalLines = lines.length;
   const originalChars = text.length;
 
+  // Reflowed text joins logical lines with the ↵ sentinel, which the renderer
+  // treats as an inline glyph that never forces a row break (see countVisualRows
+  // / wrapLines). So many ↵-segments pack into one visual row — charging one row
+  // per segment (lineRows) overstates rows ~6x and over-truncates. Charge the
+  // packed-row DELTA instead: total rows telescope to ceil(keptChars/cols),
+  // matching the renderer, while still binding the row budget for narrow columns
+  // where the char budget alone would under-truncate.
+  const reflowed = nlChar === NL_SENTINEL;
+  const packedRows = (n: number): number => Math.ceil(n / Math.max(1, cols));
+  const rowCost = (seg: string, priorChars: number, addChars: number): number =>
+    reflowed ? packedRows(priorChars + addChars) - packedRows(priorChars) : lineRows(seg, cols);
+
   if (shape === 'structured') {
     let rows = 0;
     let chars = 0;
     let cut = 0;
     for (let i = 0; i < lines.length; i++) {
-      const r = lineRows(lines[i]!, cols);
       const c = lines[i]!.length + (i > 0 ? 1 : 0);
+      const r = rowCost(lines[i]!, chars, c);
       if (rows + r > totalRowBudget || chars + c > totalCharBudget) break;
       rows += r;
       chars += c;
@@ -1667,8 +1689,8 @@ export function truncateForBudget(
   let headChars = 0;
   let headCut = 0;
   for (let i = 0; i < lines.length; i++) {
-    const r = lineRows(lines[i]!, cols);
     const c = lines[i]!.length + (i > 0 ? 1 : 0);
+    const r = rowCost(lines[i]!, headChars, c);
     if (headRows + r > headRowBudget || headChars + c > headCharBudget) break;
     headRows += r;
     headChars += c;
@@ -1679,8 +1701,8 @@ export function truncateForBudget(
   let tailChars = 0;
   let tailStart = lines.length;
   for (let i = lines.length - 1; i >= headCut; i--) {
-    const r = lineRows(lines[i]!, cols);
     const c = lines[i]!.length + (i < lines.length - 1 ? 1 : 0);
+    const r = rowCost(lines[i]!, tailChars, c);
     if (tailRows + r > tailRowBudget || tailChars + c > tailCharBudget) break;
     tailRows += r;
     tailChars += c;
@@ -1945,7 +1967,7 @@ async function runHistoryCollapseAndFinalize(
     // symmetric burn would have kept the slab gate in. Production data
     // 2026-05-23 showed three-turn sessions paying cache_create every
     // turn because the history gate ignored priorWarmImageTokens.
-    const historyGeometry = historyGateGeometry(o);
+    const historyGeometry = historyGateGeometry(o, opts.cols !== undefined);
     const historyProfitable = (text: string, cols: number): boolean => {
       // Gate with the same model profile used by the history renderer.
       return isCompressionProfitableAmortized(
@@ -1967,7 +1989,7 @@ async function runHistoryCollapseAndFinalize(
       req.messages,
       historyProfitable,
       {
-        cols: o.cols,
+        cols: historyGeometry.cols,
         protectedPrefix,
         reflow: o.reflow,
         style: historyGeometry.style,
@@ -2541,7 +2563,7 @@ export async function transformRequest(
       ? o.charsPerToken
       : HISTORY_CHARS_PER_TOKEN;
     const horizon = Math.max(1, Math.floor(o.historyAmortizationHorizon));
-    const historyGeometry = historyGateGeometry(o);
+    const historyGeometry = historyGateGeometry(o, opts.cols !== undefined);
     const historyProfitable = (text: string, cols: number): boolean => {
       // Gate with the same model profile used by the history renderer.
       return isCompressionProfitableAmortized(
@@ -2555,7 +2577,7 @@ export async function transformRequest(
       req.messages,
       historyProfitable,
       {
-        cols: o.cols,
+        cols: historyGeometry.cols,
         protectedPrefix: slabAnchorIdx >= 0 ? slabAnchorIdx + 1 : 0,
         reflow: o.reflow,
         style: historyGeometry.style,

@@ -225,12 +225,21 @@ function stopReason(response: JsonObject, hasToolUse: boolean, sawRefusal = fals
   return 'end_turn';
 }
 
+function reasoningSummary(item: JsonObject): string {
+  if (!Array.isArray(item.summary)) return '';
+  return item.summary.flatMap((raw) => {
+    const part = object(raw);
+    return typeof part?.text === 'string' ? [part.text] : [];
+  }).join('');
+}
+
 /** Convert one completed Responses JSON object into Anthropic Messages JSON. */
 export function openAIResponseToAnthropicMessage(response: unknown, fallbackModel: string): JsonObject {
   const r = object(response) ?? {};
   const content: JsonObject[] = [];
   let hasToolUse = false;
   let sawRefusal = false;
+  let pendingReasoningSummary = '';
   if (Array.isArray(r.output)) {
     for (const rawItem of r.output) {
       const item = object(rawItem);
@@ -253,8 +262,13 @@ export function openAIResponseToAnthropicMessage(response: unknown, fallbackMode
           name: item.name,
           input: parseArguments(item.arguments),
         });
+      } else if (item?.type === 'reasoning') {
+        pendingReasoningSummary += reasoningSummary(item);
       }
     }
+  }
+  if (content.length === 0 && pendingReasoningSummary) {
+    content.push({ type: 'text', text: pendingReasoningSummary });
   }
   const id = typeof r.id === 'string' ? r.id.replace(/^resp_/, 'msg_') : 'msg_pxpipe';
   return {
@@ -295,6 +309,8 @@ interface StreamState {
   sawTextDelta: boolean;
   sawTool: boolean;
   sawRefusal: boolean;
+  pendingReasoningSummary: string;
+  receivedReasoningSummaryDelta: boolean;
   calls: Set<StreamCall>;
   callAliases: Map<string, StreamCall>;
   lastCall?: StreamCall;
@@ -420,35 +436,65 @@ function streamEvent(event: string, value: JsonObject, state: StreamState): stri
     if (!Array.isArray(terminal.output)) return;
     for (let i = 0; i < terminal.output.length; i++) {
       const item = object(terminal.output[i]);
-      if (item?.type === 'message' && !state.sawTextDelta && Array.isArray(item.content)) {
+      if (item?.type === 'reasoning' && !state.receivedReasoningSummaryDelta) {
+        state.pendingReasoningSummary += reasoningSummary(item);
+      } else if (item?.type === 'function_call') {
+        const root = { output_index: i };
+        const call = resolveCall(root, item) ?? makeCall(item, root);
+        hydrateCall(call, item, root);
+        if (reconcileArguments(call, item.arguments)) {
+          startCall(call);
+        }
+      }
+    }
+    let hadMessage = false;
+    for (let i = 0; i < terminal.output.length; i++) {
+      const item = object(terminal.output[i]);
+      if (item?.type === 'message' && Array.isArray(item.content)) {
+        hadMessage = true;
+        emitReasoningSummary();
         const recovered = item.content.flatMap((raw) => {
           const part = object(raw);
           return (part?.type === 'output_text' || part?.type === 'refusal') && typeof part.text === 'string'
             ? [part.text] : [];
         }).join('');
-        if (recovered) {
+        if (recovered && !state.sawTextDelta) {
           openText(); state.sawTextDelta = true;
-          out += sse('content_block_delta', {
-            type: 'content_block_delta', index: state.textIndex!,
-            delta: { type: 'text_delta', text: recovered },
-          });
+          const idx = state.textIndex;
+          if (idx !== undefined) {
+            out += sse('content_block_delta', {
+              type: 'content_block_delta', index: idx,
+              delta: { type: 'text_delta', text: recovered },
+            });
+          }
         }
-      } else if (item?.type === 'function_call') {
-        const root = { output_index: i };
-        const call = resolveCall(root, item) ?? makeCall(item, root);
-        hydrateCall(call, item, root);
-        if (!reconcileArguments(call, item.arguments)) return;
-        startCall(call);
       }
     }
+    if (!hadMessage) emitReasoningSummary();
+  };
+  /** Emit accumulated reasoning summary as Anthropic text delta if no visible text/tools/refusals were emitted. */
+  const emitReasoningSummary = (): void => {
+    if (state.sawTool || state.sawRefusal || state.sawTextDelta || !state.pendingReasoningSummary) return;
+    openText();
+    const idx = state.textIndex;
+    if (idx !== undefined) {
+      out += sse('content_block_delta', {
+        type: 'content_block_delta', index: idx,
+        delta: { type: 'text_delta', text: state.pendingReasoningSummary },
+      });
+    }
+    state.pendingReasoningSummary = '';
   };
 
   if (event === 'response.created' || event === 'response.in_progress') ensureStart();
   else if (event === 'response.output_text.delta' && typeof value.delta === 'string') {
-    openText(); state.sawTextDelta = true;
-    out += sse('content_block_delta', {
-      type: 'content_block_delta', index: state.textIndex!, delta: { type: 'text_delta', text: value.delta },
-    });
+    openText(); state.sawTextDelta = true; state.pendingReasoningSummary = '';
+    const idx = state.textIndex;
+    if (idx !== undefined) {
+      out += sse('content_block_delta', {
+        type: 'content_block_delta', index: idx, delta: { type: 'text_delta', text: value.delta },
+      });
+    }
   } else if (event === 'response.output_item.added') {
     const item = object(value.item);
     if (item?.type === 'function_call') {
@@ -466,8 +512,9 @@ function streamEvent(event: string, value: JsonObject, state: StreamState): stri
     }
   } else if (event === 'response.output_item.done') {
     const item = object(value.item);
-    if (item?.type === 'message' && !state.sawTextDelta && Array.isArray(item.content)) {
-      terminalOutput({ output: [item] }); closeText();
+    if (item?.type === 'message' && Array.isArray(item.content)) {
+      terminalOutput({ output: [item] });
+      if (state.sawTextDelta) closeText();
     } else if (item?.type === 'function_call') {
       const call = resolveCall(value, item) ?? makeCall(item, value);
       hydrateCall(call, item, value);
@@ -478,12 +525,19 @@ function streamEvent(event: string, value: JsonObject, state: StreamState): stri
     closeText();
   } else if (event === 'response.refusal.delta' && typeof value.delta === 'string') {
     openText(); state.sawRefusal = true; state.sawTextDelta = true;
-    out += sse('content_block_delta', {
-      type: 'content_block_delta', index: state.textIndex!, delta: { type: 'text_delta', text: value.delta },
-    });
+    const idx = state.textIndex;
+    if (idx !== undefined) {
+      out += sse('content_block_delta', {
+        type: 'content_block_delta', index: idx, delta: { type: 'text_delta', text: value.delta },
+      });
+    }
+  } else if (event === 'response.reasoning_summary_text.delta' && typeof value.delta === 'string') {
+    state.receivedReasoningSummaryDelta = true;
+    state.pendingReasoningSummary += value.delta;
   } else if (event === 'response.completed' || event === 'response.incomplete') {
     ensureStart();
     if (response) terminalOutput(response);
+    emitReasoningSummary();
     closeText();
     for (const call of state.calls) stopCall(call);
     if (response?.usage) state.usage = anthropicUsage(response.usage);
@@ -524,6 +578,7 @@ export function openAIResponsesStreamToAnthropic(
   const state: StreamState = {
     started: false, terminated: false, id: 'msg_pxpipe', model: fallbackModel, nextIndex: 0,
     textOpen: false, sawTextDelta: false, sawTool: false, sawRefusal: false,
+    pendingReasoningSummary: '', receivedReasoningSummaryDelta: false,
     calls: new Set(), callAliases: new Map(), usage: anthropicUsage(undefined),
   };
   const process = (chunk: string, controller: TransformStreamDefaultController<Uint8Array>, final = false): void => {

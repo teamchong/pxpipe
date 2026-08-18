@@ -11,6 +11,7 @@ import { describe, expect, it } from 'vitest';
 import {
   anthropicMessagesToOpenAIResponses,
   openAIResponseToAnthropicMessage,
+  openAIResponsesStreamToAnthropic,
 } from '../src/core/messages-responses-bridge.js';
 
 const enc = (obj: unknown): Uint8Array => new TextEncoder().encode(JSON.stringify(obj));
@@ -80,5 +81,81 @@ describe('openAIResponseToAnthropicMessage — function-call arguments', () => {
     const toolUse = (msg.content as any[]).find((b) => b.type === 'tool_use');
     expect(toolUse).toMatchObject({ type: 'tool_use', id: 'c1', name: 'now', input: {} });
     expect(msg.stop_reason).toBe('tool_use');
+  });
+});
+
+describe('OpenAI Responses reasoning summaries', () => {
+  it('uses a completed reasoning summary when no output text is present', () => {
+    const msg = openAIResponseToAnthropicMessage({
+      id: 'resp_summary',
+      model: 'gpt',
+      output: [{ type: 'reasoning', summary: [{ type: 'summary_text', text: 'compact summary' }] }],
+    }, 'fallback');
+
+    expect(msg.content).toEqual([{ type: 'text', text: 'compact summary' }]);
+  });
+
+  it('uses output message text over reasoning summary in non-streaming response when both are present', () => {
+    const msg = openAIResponseToAnthropicMessage({
+      id: 'resp_both',
+      model: 'gpt',
+      output: [
+        { type: 'reasoning', summary: [{ type: 'summary_text', text: 'internal thought summary' }] },
+        { type: 'message', content: [{ type: 'output_text', text: 'final answer' }] },
+      ],
+    }, 'fallback');
+
+    expect(msg.content).toEqual([{ type: 'text', text: 'final answer' }]);
+  });
+
+  it('streams a reasoning-summary-only response as Anthropic text', async () => {
+    const source = [
+      ['response.created', { response: { id: 'resp_summary', model: 'gpt' } }],
+      ['response.reasoning_summary_text.delta', { delta: 'compact ' }],
+      ['response.reasoning_summary_text.delta', { delta: 'summary' }],
+      ['response.completed', { response: { id: 'resp_summary', model: 'gpt', output: [] } }],
+    ].map(([event, data]) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`).join('');
+    const input = new Response(source).body!;
+    const output = await new Response(openAIResponsesStreamToAnthropic(input, 'fallback')).text();
+
+    expect(output).toContain('"type":"text_delta","text":"compact summary"');
+    expect(output).toContain('event: message_stop');
+  });
+
+  it('joins multiple reasoning items from a terminal streaming snapshot', async () => {
+    const source = `event: response.completed\ndata: ${JSON.stringify({ response: {
+      id: 'resp_summary', model: 'gpt', output: [
+        { type: 'reasoning', summary: [{ type: 'summary_text', text: 'compact ' }] },
+        { type: 'reasoning', summary: [{ type: 'summary_text', text: 'summary' }] },
+      ],
+    } })}\n\n`;
+    const output = await new Response(openAIResponsesStreamToAnthropic(new Response(source).body!, 'fallback')).text();
+
+    expect(output).toContain('"type":"text_delta","text":"compact summary"');
+  });
+
+  it('emits streamed reasoning summary before unstreamed terminal output item', async () => {
+    const source = [
+      ['response.reasoning_summary_text.delta', { delta: 'streamed summary' }],
+      ['response.output_item.done', { item: { type: 'message', content: [{ type: 'output_text', text: 'final answer' }] } }],
+      ['response.completed', { response: { id: 'resp_summary', model: 'gpt', output: [] } }],
+    ].map(([event, data]) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`).join('');
+    const output = await new Response(openAIResponsesStreamToAnthropic(new Response(source).body!, 'fallback')).text();
+
+    expect(output).toContain('"text":"streamed summary"');
+    expect(output).toContain('"text":"final answer"');
+  });
+
+  it('handles terminal output array with message before reasoning', async () => {
+    const source = `event: response.completed\ndata: ${JSON.stringify({ response: {
+      id: 'resp_summary', model: 'gpt', output: [
+        { type: 'message', content: [{ type: 'output_text', text: 'final answer' }] },
+        { type: 'reasoning', summary: [{ type: 'summary_text', text: 'reasoning text' }] },
+      ],
+    } })}\n\n`;
+    const output = await new Response(openAIResponsesStreamToAnthropic(new Response(source).body!, 'fallback')).text();
+
+    expect(output).toContain('"text":"reasoning text"');
+    expect(output).toContain('"text":"final answer"');
   });
 });

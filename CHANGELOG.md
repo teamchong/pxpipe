@@ -44,6 +44,13 @@ behavioral changes, patch = fixes).
   back the entry it replaced — so the counter climbed until it evicted a cache
   that was nowhere near its budget.
 
+## 0.13.1 — 2026-08-11
+
+### Fixed
+- Opus collapsed-history pages honor their 172-column profile instead of using
+  the dense 312-column width. Pages are now 1556 px wide rather than 2816 px,
+  avoiding server-side downscaling and the 2000 px many-image rejection (#220).
+
 ## 0.13.0 — 2026-08-09
 
 ### Added

@@ -106,6 +106,28 @@ describe('foldPins: system prompt ingestion (OpenCode)', () => {
     const pins = foldPins(msgs, opencodeSystem(AGENTS_MD));
     expect(pins.map((p) => p.text)).toContain('be concise, no walls of text');
   });
+
+  it('folds markdown quote-prefixed pin commands (>pxpipe pin and > pxpipe pin)', () => {
+    const markdownAgents = [
+      '# Personal Rules',
+      '',
+      '>pxpipe pin ## npm Auth',
+      '>pxpipe pin',
+      '>pxpipe pin Every shell command must begin with token refresh',
+      '> pxpipe pin - Be concise',
+      '> @pxpipe pin - No walls of text',
+      'pxpipe pin - Lead with results',
+    ].join('\n');
+    const pins = foldPins([], opencodeSystem(markdownAgents));
+    expect(pins.map((p) => p.text)).toEqual([
+      '## npm Auth',
+      '',
+      'Every shell command must begin with token refresh',
+      '- Be concise',
+      '- No walls of text',
+      '- Lead with results',
+    ]);
+  });
 });
 
 describe('stripPinCommandsFromSystem', () => {
@@ -126,6 +148,7 @@ describe('stripPinCommandsFromSystem', () => {
 
   it('strips a plain-string system field', () => {
     expect(stripPinCommandsFromSystem('keep\n@pxpipe pin go')).toBe('keep');
+    expect(stripPinCommandsFromSystem('keep\n>pxpipe pin go\n> pxpipe pin also')).toBe('keep');
   });
 
   it('hands cache_control forward when a block is emptied', () => {

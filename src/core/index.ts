@@ -41,3 +41,11 @@ export {
   CACHE_CREATE_RATE,
   CACHE_READ_RATE,
 } from './baseline.js';
+export {
+  normalizeAccounting,
+  providerActualInputTokens,
+  type AccountingInput,
+  type AccountingProvider,
+  type NormalizedAccounting,
+  type SavingsEvidence,
+} from './accounting.js';

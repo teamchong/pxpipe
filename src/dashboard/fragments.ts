@@ -92,6 +92,7 @@ const GROK_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
 
 const GEMINI_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
   { id: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash' },
+  { id: 'gemini-3.7-flash', label: 'Gemini 3.7 Flash' },
 ];
 
 export function renderModelsFragment(
@@ -1288,8 +1289,8 @@ pxpipe warp -- cursor-agent</pre>
 </details>
 
 <details class="models-collapse">
-  <summary class="models-summary">Image model scope <span class="hint">Fable 5 and Gemini 3.6 Flash by default · expand to experiment with other families</span></summary>
-  <div class="models-warning">⚠ Image compression is validated for Fable 5 and Gemini 3.6 Flash — other families can use <strong>more</strong> tokens, not less. Opt in only for deliberate experiments.</div>
+  <summary class="models-summary">Image model scope <span class="hint">Fable 5, Gemini 3.6 Flash, and Gemini 3.7 Flash by default · expand to experiment with other families</span></summary>
+  <div class="models-warning">⚠ Image compression is validated for Fable 5, Gemini 3.6 Flash, and Gemini 3.7 Flash — other families can use <strong>more</strong> tokens, not less. Opt in only for deliberate experiments.</div>
   <div id="frag-models" hx-get="/fragments/models" hx-trigger="load, every 2s [!document.activeElement || document.activeElement.id !== 'models-csv']" hx-swap="innerHTML"></div>
   <div class="models-routing"><span class="hint">imaging scope ≠ provider routing — non-Anthropic IDs also need routing env on the proxy</span> <button class="mini-btn" type="button" onclick="document.getElementById('routing-help').showModal()">routing help</button></div>
 </details>

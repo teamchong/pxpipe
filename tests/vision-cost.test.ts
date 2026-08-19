@@ -22,7 +22,7 @@ describe('vision cost is resolved from the profile, not from the model id', () =
   }> = [
     { model: 'claude-opus-5', regime: 'patch28', tier: 'high-res', cacheReadRate: 0.1, outputRate: 5 },
     { model: 'claude-3-5-sonnet', regime: 'patch28', tier: 'standard', cacheReadRate: 0.1, outputRate: 5 },
-    { model: 'gemini-3.6-flash', regime: 'flat', cacheReadRate: 0.5, outputRate: 4 },
+    { model: 'gemini-3.6-flash', regime: 'flat', cacheReadRate: 0.25, outputRate: 4 },
     { model: 'grok-4.5', regime: 'mpix', cacheReadRate: 0.25, outputRate: 3 },
     { model: 'gpt-5.6-sol', regime: 'patch', cacheReadRate: 0.1, outputRate: 8 },
     { model: 'gpt-5.5', regime: 'patch', cacheReadRate: 0.1, outputRate: 8 },
@@ -110,8 +110,11 @@ describe('ids that would be priced with the wrong provider formula are refused',
 
   it('flags family ids that do not resolve to that family profile', () => {
     expect(isMisresolvedModelId('gemini-3.6-pro')).toBe(true);
+    expect(isMisresolvedModelId('gemini-3.7-pro')).toBe(true);
     expect(isMisresolvedModelId('gemini-3.6-flash')).toBe(false);
+    expect(isMisresolvedModelId('gemini-3.7-flash')).toBe(false);
     expect(isMisresolvedModelId('google/gemini-3.6-flash')).toBe(false);
+    expect(isMisresolvedModelId('google/gemini-3.7-flash')).toBe(false);
     expect(isMisresolvedModelId('grok4')).toBe(true);
     expect(isMisresolvedModelId('grok-4.5')).toBe(false);
     // Claude and GPT resolvers accept every id that names them.
@@ -122,7 +125,9 @@ describe('ids that would be priced with the wrong provider formula are refused',
   it('holds even when the scope is configured broadly', () => {
     process.env.PXPIPE_MODELS = 'gemini,grok';
     expect(isPxpipeSupportedModel('gemini-3.6-pro')).toBe(false);
+    expect(isPxpipeSupportedModel('gemini-3.7-pro')).toBe(false);
     expect(isPxpipeSupportedModel('gemini-3.6-flash')).toBe(true);
+    expect(isPxpipeSupportedModel('gemini-3.7-flash')).toBe(true);
     expect(isPxpipeSupportedModel('grok-4.5')).toBe(true);
   });
 });

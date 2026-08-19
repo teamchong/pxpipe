@@ -26,7 +26,7 @@ function baseModelId(model: string): string {
 /** Dashboard runtime override; null = fall back to PXPIPE_MODELS env / built-in default. In-memory only. */
 let runtimeModelBases: readonly string[] | null = null;
 
-/** Built-in default scope when PXPIPE_MODELS is unset: Fable 5 and Gemini 3.6 Flash.
+/** Built-in default scope when PXPIPE_MODELS is unset: Fable 5, Gemini 3.6 Flash, and Gemini 3.7 Flash.
  *  Everything else is opt-in via dashboard chips or PXPIPE_MODELS:
  *  - Opus 4.7/4.8 — worse at reading imaged content (FINDINGS.md 2026-06-16:
  *    Opus 4.8 ~2pp arithmetic, 6/15 dense-hex vs Fable 100/100).
@@ -44,7 +44,7 @@ let runtimeModelBases: readonly string[] | null = null;
  *  The README and this list disagreed once already: Opus 5 was dropped here after
  *  a measured recall regression and stayed in the README's stated default, so a
  *  reader following the docs believed a model was being imaged that was not. */
-export const DEFAULT_MODEL_BASES = ['claude-fable-5', 'gemini-3.6-flash'];
+export const DEFAULT_MODEL_BASES = ['claude-fable-5', 'gemini-3.6-flash', 'gemini-3.7-flash'];
 
 function falsey(v: string): boolean {
   return /^(0|false|no|off|none)$/i.test(v.trim());
@@ -52,7 +52,7 @@ function falsey(v: string): boolean {
 
 /** PXPIPE_MODELS env / built-in default, ignoring the runtime override. One CSV
  *  controls every family (Claude + GPT). Resolution (read per-call so scope flips LIVE):
- *  - unset or empty        → built-in default (Fable 5 + Gemini 3.6 Flash)
+ *  - unset or empty        → built-in default (Fable 5 + Gemini 3.6 Flash + Gemini 3.7 Flash)
  *  - `off`/`0`/`false`/... → compress nothing
  *  - CSV of model bases    → exactly those families (e.g. `claude-fable-5,gpt-5.6-sol`) */
 function envOrDefaultBases(): string[] {

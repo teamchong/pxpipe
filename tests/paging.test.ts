@@ -28,6 +28,7 @@ import {
   DENSE_CONTENT_CHARS_PER_IMAGE,
   DENSE_CONTENT_COLS,
   DENSE_RENDER_STYLE,
+  NL_SENTINEL,
   READABLE_CHARS_PER_IMAGE,
   renderTextToPngsWithCharLimit,
 } from '../src/core/render.js';
@@ -315,6 +316,32 @@ describe('truncateForBudget', () => {
     expect(reportedOmittedLines).toBeLessThan(originalLines);
   });
 
+  it('does not over-truncate REFLOWED text (↵-joined segments pack into rows)', () => {
+    // Production feeds truncateForBudget reflowed text: logical lines joined by
+    // NL_SENTINEL, which the renderer packs many-per-visual-row. Charging one
+    // row per segment (the old lineRows path) overstated rows ~6x and kept only
+    // ~1/6 of what fits, wasting most of the image budget. The kept text must
+    // fill close to the char budget (~280k for a 10-image DENSE budget), not
+    // collapse to ~40k.
+    const cols = DENSE_CONTENT_COLS; // 312
+    const segments: string[] = [];
+    for (let i = 0; i < 10_000; i++) {
+      segments.push(`2026-05-18T12:00:00Z entry ${i} payload content here`); // ~48 chars
+    }
+    const reflowed = segments.join(NL_SENTINEL);
+    expect(reflowed.indexOf('\n')).toBe(-1); // genuinely reflowed: no hard newlines
+
+    const { text: out, truncated } = truncateForBudget(reflowed, 10, cols);
+    expect(truncated).toBe(true);
+    // Char budget for 10 DENSE images is ~280k; the fix keeps most of it.
+    // The old per-segment row charge capped this near ~44k — this bound fails there.
+    expect(out.length).toBeGreaterThan(150_000);
+    // Head + tail, both ends preserved.
+    expect(out).toMatch(/Showing first \d+ lines and last \d+ lines/);
+    expect(out).toContain('entry 0');
+    expect(out).toContain('entry 9999');
+  });
+
   it('always shows at least one head line even on degenerate input', () => {
     // Single huge line — bigger than budget. Should still render with marker.
     const text = 'x'.repeat(500_000);
@@ -457,10 +484,10 @@ describe('paging end-to-end (transformRequest)', () => {
     );
     const { info } = await transformRequest(req, { charsPerToken: 2 });
     expect(info.truncatedToolResults).toBe(2);
-    // Both should have been truncated → omittedChars roughly doubled. The
-    // Exact bound depends on renderer configuration: each image
-    // packs ~19.5k chars worst-case. Threshold below covers the single-col case.
-    expect(info.omittedChars).toBeGreaterThan(600_000);
+    // Both truncated → omittedChars is the sum across the two ~530k results.
+    // Each keeps ~one image budget of content (the reflowed row-cost fix stops
+    // the old ~6x over-truncation), so ~250k is omitted per result, ~500k total.
+    expect(info.omittedChars).toBeGreaterThan(400_000);
   });
 
   it('handles array-shaped tool_result content', async () => {

@@ -2,7 +2,7 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { callGemini } from './gemini-client.mjs';
+import { callGemini, resultFilename } from './gemini-client.mjs';
 import { renderTextToPngs } from '../../dist/core/render.js';
 import { resolveGeminiProfile } from '../../dist/core/gemini-model-profiles.js';
 
@@ -13,7 +13,7 @@ const LIVE = process.env.LIVE === '1';
 const TIMEOUT = Number(process.env.TIMEOUT_MS || 90000);
 const MAX_OUTPUT_TOKENS = Number(process.env.MAX_OUTPUT_TOKENS || 80);
 const trials = JSON.parse(readFileSync(join(ROOT, 'golds.json'), 'utf8'));
-const RESULT = join(HERE, 'verbatim-hex-results.json');
+const RESULT = join(HERE, resultFilename('verbatim-hex', MODEL));
 const profile = resolveGeminiProfile();
 
 function denseLog(trial, totalLines = 80) {

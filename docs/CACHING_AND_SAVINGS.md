@@ -210,6 +210,50 @@ The live dashboard and replay path both use `deriveBaselineWarmth`, `computeBase
 
 ---
 
+## The Local Rendered-Page Cache
+
+Distinct from everything above. The provider prompt cache saves *tokens*; this
+one saves *local CPU*, and it exists only because the two are related: history
+chunks are frozen so they stay byte-identical for the provider cache, which
+means the proxy re-renders the same PNGs every turn for pages that provably did
+not change.
+
+Rendering is a pure function of `(text, cols, maxCharsPerImage, style,
+maxHeightPx, slotText)` — the glyph atlases are decoded at module init and
+never mutated — so identical inputs can return identical pages. The cache lives
+in `src/core/render.ts` and wraps `renderTextToPngsWithCharLimit`.
+
+**Budget.** `PXPIPE_RENDER_CACHE_BYTES` bounds total retained bytes. Defaults
+differ by runtime: **64 MiB on Node**, **8 MiB on Workers**, where the isolate
+has ~128 MiB for the request body, the atlases, the framebuffers and the
+compressor as well. `0` disables it. Eviction is LRU. Worker bindings are not
+visible at module-init time, so `src/worker.ts` applies the budget per request
+via `setRenderCacheMaxBytes()`.
+
+**Keys.** A domain-separated SHA-256 over a length-prefixed encoding of every
+input. Length prefixes matter: without them `("a b", "c")` and `("a", "b c")`
+would share a key. The key is deliberately *not* the source text — a literal
+key retains every rendered prompt as a plaintext string and makes each entry
+cost roughly twice its source length, which spends the budget on copies of the
+input rather than on the pages it exists to retain.
+
+**What it still retains.** The cached pages are rendered images of the source.
+Keying on a digest removes plaintext retention; it does not make the cache
+content-free. Anyone who can read the process memory can read the context,
+which is the same assumption `docs/SECURITY_MODEL.md` already makes about the
+log directory.
+
+**Counters** (`/proxy-stats` → `render_cache`):
+
+| field | reading |
+| --- | --- |
+| `entries`, `bytes`, `max_bytes` | utilisation; `bytes` near `max_bytes` with a poor hit rate means the working set outgrew the budget |
+| `hits`, `misses` | process-cumulative, not per-request |
+| `evictions` | entries displaced to stay in budget |
+| `oversized` | renders larger than the *whole* budget, never stored at all — a permanently 0% hit rate with this climbing means the budget is too small, not that the input is unstable |
+
+---
+
 ## Summary
 
 pxpipe stays cache-aligned by replacing stable text context with stable image context and relocating the caller's existing cache marker to the end of the rewritten content. Savings are measured by comparing the real transformed request with a `/count_tokens` text counterfactual under the same observed cache state. If the actual request read cache, both sides are warm. If it did not, both sides are cold. Therefore the provider cache discount is not counted as pxpipe savings; the reported savings are only the token reduction from text to images.

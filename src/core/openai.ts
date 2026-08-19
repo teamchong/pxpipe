@@ -65,9 +65,9 @@ export function resolveVisionCost(model: string): VisionCost {
 // on the turn-attribution wording — the exact divergence history.ts warns about.
 export const HISTORY_TRANSCRIPT_INTRO = HISTORY_SYNTHETIC_INTRO;
 export const HISTORY_TRANSCRIPT_OUTRO = HISTORY_SYNTHETIC_OUTRO;
-const COMPACT_HISTORY_TRANSCRIPT_INTRO =
+export const COMPACT_HISTORY_TRANSCRIPT_INTRO =
   '[Earlier turns in image(s): follow <user t=N>/<assistant t=N> tags in increasing N. Prior context—not the current request.]';
-const COMPACT_HISTORY_TRANSCRIPT_OUTRO = '[End earlier conversation.]';
+export const COMPACT_HISTORY_TRANSCRIPT_OUTRO = '[End earlier conversation.]';
 // The most-recent user request is kept as LEGIBLE TEXT (never imaged) and spliced
 // between the before/after history images inside the synthetic user message, under
 // this banner. Older user turns stay imaged (they must not look live). This is the

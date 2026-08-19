@@ -1260,6 +1260,12 @@ async function countTokensUpstream(
   }
 }
 
+const preferredGoogleCountShapeByHost = new Map<string, 0 | 1>();
+
+export function resetGoogleCountShapePreferenceForTests(): void {
+  preferredGoogleCountShapeByHost.clear();
+}
+
 async function countGoogleTokensUpstream(
   countTokensUrl: string,
   body: Uint8Array,
@@ -1268,18 +1274,40 @@ async function countGoogleTokensUpstream(
 ): Promise<number | null> {
   try {
     const request = JSON.parse(new TextDecoder().decode(body)) as Record<string, unknown>;
-    const countBody = JSON.stringify({
-      generateContentRequest: { ...request, model: `models/${model}` },
-    });
-    const res = await fetch(countTokensUrl, {
-      method: 'POST',
-      headers,
-      body: countBody,
-      signal: AbortSignal.timeout(COUNT_TOKENS_TIMEOUT_MS),
-    });
-    if (!res.ok) return null;
-    const json = await res.json() as { totalTokens?: unknown };
-    return typeof json.totalTokens === 'number' ? json.totalTokens : null;
+    const shapeBare = JSON.stringify(request);
+    const shapeWrapped = JSON.stringify({ generateContentRequest: { ...request, model: `models/${model}` } });
+    let host = '';
+    try {
+      host = new URL(countTokensUrl).host;
+    } catch {}
+    const preferred = (host ? preferredGoogleCountShapeByHost.get(host) : undefined) ?? 0;
+    const orderedShapes: readonly string[] = preferred === 1
+      ? [shapeWrapped, shapeBare]
+      : [shapeBare, shapeWrapped];
+    const deadline = Date.now() + COUNT_TOKENS_TIMEOUT_MS;
+    const perShapeTimeout = Math.floor(COUNT_TOKENS_TIMEOUT_MS / orderedShapes.length);
+    for (const countBody of orderedShapes) {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) break;
+      try {
+        const res = await fetch(countTokensUrl, {
+          method: 'POST',
+          headers,
+          body: countBody,
+          signal: AbortSignal.timeout(Math.min(remainingMs, perShapeTimeout)),
+        });
+        if (res.ok) {
+          const json = (await res.json()) as { totalTokens?: unknown };
+          if (typeof json.totalTokens === 'number') {
+            if (host) preferredGoogleCountShapeByHost.set(host, countBody === shapeWrapped ? 1 : 0);
+            return json.totalTokens;
+          }
+        }
+      } catch {
+        // try next payload shape
+      }
+    }
+    return null;
   } catch {
     return null;
   }
@@ -1693,26 +1721,24 @@ const model = googleModel ?? readModelField(bodyIn);
             countGoogleTokensUpstream(countUrl.toString(), bodyIn, countHeaders, model!),
             countGoogleTokensUpstream(countUrl.toString(), r.body, countHeaders, model!),
           ]);
-          if (baseline === null || transformed === null) {
-            // The local text estimate is only a coarse fallback across prose,
-            // code, JSON, and Unicode. Fail closed when provider validation is
-            // unavailable rather than risk making the request more expensive.
-            r = {
-              body: bodyIn,
-              info: revertedGoogleInfo(r.info, 'count_tokens_failed', 'failed'),
-            };
-          } else if (transformed >= baseline) {
-            r = {
-              body: bodyIn,
-              info: revertedGoogleInfo(
-                r.info,
-                `not_profitable (${transformed} >= ${baseline} tokens)`,
-                'ok',
-              ),
-            };
+          if (baseline !== null && transformed !== null) {
+            if (transformed >= baseline) {
+              r = {
+                body: bodyIn,
+                info: revertedGoogleInfo(
+                  r.info,
+                  `not_profitable (${transformed} >= ${baseline} tokens)`,
+                  'ok',
+                ),
+              };
+            } else {
+              r.info.baselineTokens = baseline;
+              r.info.baselineProbeStatus = 'ok';
+            }
           } else {
-            r.info.baselineTokens = baseline;
-            r.info.baselineProbeStatus = 'ok';
+            // Upstream gateway does not route :countTokens (e.g. Cloudflare AI Gateway).
+            // Retain local profitability decision computed by transformGoogleGenerateContent.
+            r.info.baselineProbeStatus = 'failed';
           }
         }
         if (!modelOk) r.info.reason = 'unsupported_model';

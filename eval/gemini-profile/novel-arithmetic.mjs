@@ -6,7 +6,7 @@ import { renderTextToPngs } from '../../dist/core/render.js';
 import { resolveGeminiProfile } from '../../dist/core/gemini-model-profiles.js';
 import { factSheetText } from '../../dist/core/factsheet.js';
 import { visionTokensForModel } from '../../dist/core/openai.js';
-import { callGemini } from './gemini-client.mjs';
+import { callGemini, resultFilename } from './gemini-client.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const MODEL = process.env.MODEL || 'gemini-3.6-flash';
@@ -16,7 +16,7 @@ const SEED = Number(process.env.SEED || 20260711);
 const CONCURRENCY = Math.max(1, Number(process.env.CONCURRENCY || 5));
 const TIMEOUT = Number(process.env.TIMEOUT_MS || 180000);
 const profile = resolveGeminiProfile();
-const RESULT = join(HERE, `novel-arithmetic-results.json`);
+const RESULT = join(HERE, resultFilename('novel-arithmetic', MODEL));
 
 function lcg(seed) { let s = seed >>> 0; return () => s = (Math.imul(s, 1664525) + 1013904223) >>> 0; }
 function ri(r, a, b) { return a + (r() % (b - a + 1)); }

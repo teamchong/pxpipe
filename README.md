@@ -125,7 +125,7 @@ without running the proxy.
 - **`claude-opus-5`:** weaker recall than Fable 5 (verbatim **2/15 vs 13/15**), good
   enough otherwise (100/100 arithmetic, 0/16 never-stated), **~4.7×** context before
   `/compact`. Suggested effort: **medium**. Details: [FINDINGS.md](FINDINGS.md).
-- **Model scope:** default `PXPIPE_MODELS=claude-fable-5,gemini-3.6-flash`. Opus 5, Sol, GPT 5.5,
+- **Model scope:** default `PXPIPE_MODELS=claude-fable-5,gemini-3.6-flash,gemini-3.7-flash`. Opus 5, Sol, GPT 5.5,
   and **Grok** are opt-in only (dashboard chips or
   `PXPIPE_MODELS`). The exact Sol id still matters. Sibling variants such as
   `gpt-5.6-terra` do not
@@ -168,11 +168,12 @@ is confabulations, so lower is better.
 | model | arithmetic (N=100) | gist (N=98) | state (N=18) | never-stated (N=16) | dense hex (N=15) | profile provenance and receipts |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
 | `claude-fable-5` | **100/100** | **98/98** | **18/18** | **0/16** | 13/15 | June 2026 production profiles: [arithmetic + hex](FINDINGS.md), [gist/state/guards](eval/gist-recall/) |
-| `google/gemini-3.6-flash` | **100/100** | **98/98** | **18/18** | **0/16** | **14/15** | current shipped profile: [quality results](eval/gemini-profile/QUALITY_RESULTS.md) |
+| `google/gemini-3.6-flash`, `3.7-flash` | **100/100** | **98/98** | **18/18** | **0/16** | **14/15** | current shipped profile: [quality results](eval/gemini-profile/QUALITY_RESULTS.md) |
 | `claude-opus-5` | **100/100** | 94/98 | 17/18 | **0/16** | 2/15 | current profile: [arithmetic](eval/gsm8k/), [gist/state/guards](eval/gist-recall/), [dense hex](eval/verbatim-15/) |
 | `gpt-5.6-sol` | 98/100 | 83/98 | 17/18 | 4/16 | 0/15 | prior 5×8 broad suite; native 14px pilot: 7/8 exact, 0 inventions, gist/guard pass: [pilot](eval/sol-profile/README.md) |
 | `claude-opus-4-8` | 93/100 | 77/98 | **18/18** | **0/16** | 0/15 | historical profile: [arithmetic](eval/gsm8k/), [gist/state/guards](eval/gist-recall/), [dense hex](eval/needle-haystack/) |
 | `grok-4.5` | **100/100** | **97/98** | 17/18 | **0/16** | 0/15 | native 14px/84 quality suite (live profile); [quality](eval/grok-density/QUALITY_RESULTS.md), [native-sweep](eval/grok-density/native-sweep/RESULTS.md) |
+| `grok-4.6` high | **100/100** | **97/98** | 17/18 | **0/16** | 0/15 | native 14px/84, reasoning high; [quality](eval/grok-profile/QUALITY_RESULTS.md) |
 | `moonshotai/kimi-k3` | 79/100 | 84/98 | 15/18 | 1/16 | 0/15 | generic GPT profile: [quality results](eval/sol-profile/KIMI_K3_QUALITY_RESULTS.md) |
 
 ### Native-profile cost check

@@ -4,6 +4,46 @@ All notable changes to pxpipe are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features /
 behavioral changes, patch = fixes).
 
+## Unreleased
+
+### Added
+- **Rendered-page cache, now documented.** It landed in #158 and shipped in
+  0.13.0 with no changelog entry, so this backfills it: identical render inputs
+  return the identical pages instead of being re-rasterized, bounded by total
+  retained bytes via `PXPIPE_RENDER_CACHE_BYTES`. Frozen history chunks are
+  byte-identical across turns by design, so a long session was paying full
+  render cost for pages that provably did not change.
+- Live `render_cache` counters on `/proxy-stats`: `entries`, `bytes`,
+  `max_bytes`, `hits`, `misses`, `evictions`, `oversized`. `renderCacheStats()`
+  previously had no consumer outside the test suite. `oversized` counts renders
+  larger than the entire budget, which are never stored — the failure mode a
+  too-small budget produces, and one that otherwise looks identical to a
+  permanently cold cache (#210).
+- `PXPIPE_RENDER_CACHE_BYTES` is now readable on Workers. Bindings are not
+  visible to core at module-init time, so the Worker entrypoint applies the
+  budget per request through the new `setRenderCacheMaxBytes()`.
+
+### Changed
+- **Render cache keys are a domain-separated SHA-256 over length-prefixed
+  inputs instead of the source text verbatim** (#210). The literal key held
+  every rendered prompt in the heap as plaintext for the process lifetime, and
+  sized each entry at roughly twice its source length — so a budget meant to
+  bound retained *pages* spent most of itself on copies of the input. Entry
+  overhead is now a constant 128 bytes. The pages themselves are still rendered
+  images of the source: this removes plaintext retention, not content
+  retention.
+- **The default budget is 8 MiB on Workers, 64 MiB on Node.** Both runtimes
+  previously took 64 MiB, which on a ~128 MiB isolate that also holds the
+  request body, the decoded atlases and the framebuffers is most of the
+  ceiling.
+
+### Fixed
+- The render cache byte counter no longer drifts upward when two concurrent
+  requests render the same content. Both miss (the lookup precedes the await),
+  both store, and the second store previously added its bytes without crediting
+  back the entry it replaced — so the counter climbed until it evicted a cache
+  that was nowhere near its budget.
+
 ## 0.13.1 — 2026-08-11
 
 ### Fixed

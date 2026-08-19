@@ -13,7 +13,7 @@ import {
   shrinkColsToContent,
   type RenderedImage,
 } from './render.js';
-import { geminiVisionTokens, isGeminiModel, resolveGeminiProfile } from './gemini-model-profiles.js';
+import { geminiVisionTokens, hasGeminiMeasuredProfile, resolveGeminiProfile } from './gemini-model-profiles.js';
 import { bytesToBase64 } from './png.js';
 import { classifyContent, compactSlabWhitespace, type TransformInfo } from './transform.js';
 import {
@@ -23,6 +23,8 @@ import {
   CHAT_HEADER,
   HISTORY_TRANSCRIPT_INTRO,
   HISTORY_TRANSCRIPT_OUTRO,
+  COMPACT_HISTORY_TRANSCRIPT_INTRO,
+  COMPACT_HISTORY_TRANSCRIPT_OUTRO,
 } from './openai.js';
 import { factSheetText } from './factsheet.js';
 import { stripSchemaDescriptions } from './schema-strip.js';
@@ -132,6 +134,90 @@ function record(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
+function readString(value: unknown): string | undefined {
+  return typeof value === 'string' && value ? value : undefined;
+}
+
+/** Gemini 3+ replay token. Present on the part, thought block, or nested on functionCall. */
+function readGeminiThoughtSignature(part: unknown): string | undefined {
+  const rec = record(part);
+  if (!rec) return undefined;
+  const direct = readString(rec.thoughtSignature) ?? readString(rec.thought_signature) ?? readString(rec.signature);
+  if (direct) return direct;
+  const functionCall = record(rec.functionCall);
+  if (functionCall) {
+    const fcSig = readString(functionCall.thoughtSignature) ?? readString(functionCall.thought_signature) ?? readString(functionCall.signature);
+    if (fcSig) return fcSig;
+  }
+  return undefined;
+}
+
+function isGeminiFunctionCallPart(part: unknown): boolean {
+  return record(part)?.functionCall !== undefined;
+}
+
+function cleanGeminiFunctionCall(fc: unknown): { cleaned: Record<string, unknown> | undefined; changed: boolean } {
+  const rec = record(fc);
+  if (!rec) return { cleaned: undefined, changed: false };
+  // FunctionCall in Gemini protobuf only permits `name`, `args`, and `id`.
+  // Discard any thought_signature / thoughtSignature mistakenly attached to functionCall itself.
+  if ('thoughtSignature' in rec || 'thought_signature' in rec || 'signature' in rec) {
+    const { thoughtSignature, thought_signature, signature, ...rest } = rec;
+    return { cleaned: rest, changed: true };
+  }
+  return { cleaned: rec, changed: false };
+}
+
+/** Copy a turn or session's existing signature onto unsigned sibling functionCall parts. Does not invent one. */
+function stampGeminiThoughtSignatures(contents: GoogleContent[]): GoogleContent[] {
+  let changed = false;
+  let lastKnownDonor: string | undefined;
+
+  const next = contents.map((content) => {
+    if (!Array.isArray(content.parts) || content.parts.length === 0) return content;
+    // Find donor from ANY part in this turn (thought part, text part, functionCall part)
+    const turnDonor = content.parts
+      .map(readGeminiThoughtSignature)
+      .find((sig) => sig !== undefined);
+
+    const donor = turnDonor ?? lastKnownDonor;
+    if (turnDonor) {
+      lastKnownDonor = turnDonor;
+    }
+    if (!donor) return content;
+
+    let partsChanged = false;
+    const parts = content.parts.map((part) => {
+      if (!isGeminiFunctionCallPart(part)) return part;
+      const rec = record(part) ?? {};
+      const { cleaned: fc, changed: fcChanged } = cleanGeminiFunctionCall(rec.functionCall);
+      const existing = readGeminiThoughtSignature(part);
+      const sigToUse = existing ?? donor;
+      if (!sigToUse) {
+        if (fcChanged) {
+          partsChanged = true;
+          return { ...rec, functionCall: fc };
+        }
+        return part;
+      }
+      const directSig = readString(rec.thoughtSignature) ?? readString(rec.thought_signature);
+      if (directSig === sigToUse && !fcChanged) {
+        return part;
+      }
+      partsChanged = true;
+      return {
+        ...rec,
+        thoughtSignature: sigToUse,
+        ...(fc ? { functionCall: fc } : {}),
+      };
+    });
+    if (!partsChanged) return content;
+    changed = true;
+    return { ...content, parts };
+  });
+  return changed ? next : contents;
+}
+
 function safeJson(value: unknown): string {
   try {
     return JSON.stringify(value) ?? '';
@@ -223,9 +309,6 @@ function googleHistoryUnit(content: GoogleContent, index: number): GoogleHistory
       continue;
     }
     if (part.functionResponse) {
-      if (Array.isArray(part.functionResponse.parts) && part.functionResponse.parts.length > 0) {
-        opaque = true;
-      }
       const name = typeof part.functionResponse.name === 'string' ? part.functionResponse.name : 'tool';
       closes.push(name);
       text.push(googlePartText(part));
@@ -271,8 +354,8 @@ async function compressGoogleToolResults(
   });
   if (options.compressToolResults === false) return empty();
 
-  const profile = resolveGeminiProfile();
-  const minChars = Math.max(0, options.minToolResultChars ?? 6000);
+  const profile = resolveGeminiProfile(modelName);
+  const minChars = Math.max(0, options.minToolResultChars ?? 4500);
   const perResultCap = Math.max(1, options.maxImagesPerToolResult ?? 10);
   const allImages: RenderedImage[] = [];
   const imageSources: string[] = [];
@@ -410,45 +493,79 @@ async function planGoogleHistory(
   modelName: string,
   reflowEnabled: boolean,
 ): Promise<GoogleHistoryPlan | null> {
-  const profile = resolveGeminiProfile();
+  const profile = resolveGeminiProfile(modelName);
   const units = contents.map(googleHistoryUnit);
   const cutoff = Math.max(0, units.length - profile.history.keepTail);
-  // In autonomous OpenCode turns the user's live task can be the oldest item,
-  // followed by a long tool loop. Keep that request native instead of making it OCR-only.
-  let latestPlainUser = -1;
-  for (let i = units.length - 1; i >= 0; i--) {
-    const content = contents[i]!;
-    if (content.role !== 'user' || !Array.isArray(content.parts)) continue;
-    if (content.parts.some((part) => typeof part.text === 'string' && part.text.trim())) {
-      latestPlainUser = i;
-      break;
+  // If there's only 1 user turn in the entire session (autonomous single-prompt agent),
+  // keep turn 0 native so the prompt stays visible outside the image. In multi-turn
+  // chat, the active user turn is already in the kept tail, so collapse from turn 0.
+  const userTurns: number[] = [];
+  for (let i = 0; i < contents.length; i++) {
+    const c = contents[i];
+    if (c?.role === 'user' && Array.isArray(c.parts) && c.parts.some((p) => typeof p.text === 'string' && p.text.trim())) {
+      userTurns.push(i);
     }
   }
-  const start = latestPlainUser >= 0 && latestPlainUser < cutoff
-    ? latestPlainUser + 1
-    : 0;
+  const start = userTurns.length === 1 && userTurns[0] === 0 ? 1 : 0;
   const boundary = googleClosedBoundary(units, start, cutoff);
-  if (boundary < start || boundary + 1 - start < 10) return null;
+  if (boundary < start || boundary + 1 - start < 4) return null;
   const selected = units.slice(start, boundary + 1);
-  const text = selected.map((unit) => unit.text).filter(Boolean).join('\n\n');
-  const baselineTokens = selected.reduce((sum, unit) => sum + unit.baselineTokens, 0);
+  const eligibleTokens = selected.reduce((sum, unit) => sum + unit.baselineTokens, 0);
+  if (eligibleTokens < profile.history.minCollapseTokens) return null;
+
+  // Admit only complete turns whose rendered pages fit. Rendering the entire history and
+  // slicing its PNGs would remove an unrendered suffix from the native request.
+  const admitted: GoogleHistoryUnit[] = [];
+  const images: RenderedImage[] = [];
+  const imageSources: string[] = [];
+  const chunkSize = 8;
+  let cursor = 0;
+  while (cursor < selected.length && images.length < profile.history.maxImages) {
+    const remaining = profile.history.maxImages - images.length;
+    let candidateEnd = googleClosedBoundary(
+      selected,
+      cursor,
+      Math.min(selected.length, cursor + chunkSize),
+    ) + 1;
+    let accepted = false;
+    while (candidateEnd > cursor) {
+      const chunk = selected.slice(cursor, candidateEnd);
+      const chunkText = chunk.map((unit) => unit.text).filter(Boolean).join('\n\n');
+      const safe = neutralizeSentinel(chunkText);
+      const renderedText = reflowEnabled ? reflow(safe) ?? safe : safe;
+      const chunkImages = await renderTextToPngs(
+        renderedText,
+        profile.stripCols,
+        profile.style,
+        profile.maxHeightPx,
+      );
+      if (chunkImages.length > 0 && chunkImages.length <= remaining) {
+        admitted.push(...chunk);
+        images.push(...chunkImages);
+        imageSources.push(...chunkImages.map(() => chunkText));
+        cursor = candidateEnd;
+        accepted = true;
+        break;
+      }
+      candidateEnd = googleClosedBoundary(selected, cursor, candidateEnd - 1) + 1;
+    }
+    if (!accepted) break;
+  }
+
+  if (admitted.length < 4 || images.length === 0) return null;
+  const text = admitted.map((unit) => unit.text).filter(Boolean).join('\n\n');
+  const baselineTokens = admitted.reduce((sum, unit) => sum + unit.baselineTokens, 0);
   if (!text || baselineTokens < profile.history.minCollapseTokens) return null;
-  const safe = neutralizeSentinel(text);
-  const renderedText = reflowEnabled ? reflow(safe) ?? safe : safe;
-  const images = await renderTextToPngs(
-    renderedText,
-    profile.stripCols,
-    profile.style,
-    profile.maxHeightPx,
-  );
-  if (images.length === 0 || images.length > profile.history.maxImages) return null;
   const imageTokens = images.reduce(
     (sum, image) => sum + geminiVisionTokens(modelName, image.width, image.height),
     0,
   );
   const factSheet = factSheetText(text, profile.factSheetFormat);
+  const compactFraming = profile.history.framing === 'compact';
+  const intro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_INTRO : HISTORY_TRANSCRIPT_INTRO;
+  const outro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_OUTRO : HISTORY_TRANSCRIPT_OUTRO;
   const nativeTokens = googleTextTokens(
-    HISTORY_TRANSCRIPT_INTRO + factSheet + HISTORY_TRANSCRIPT_OUTRO,
+    intro + factSheet + outro,
   );
   if (imageTokens + nativeTokens >= baselineTokens) return null;
   const droppedCodepoints = new Map<number, number>();
@@ -461,14 +578,14 @@ async function planGoogleHistory(
   }
   return {
     start,
-    endExclusive: boundary + 1,
+    endExclusive: start + admitted.length,
     images,
-    imageSources: images.map(() => text),
+    imageSources,
     text,
     factSheet,
     baselineTokens,
     nativeTokens,
-    collapsedTurns: boundary + 1 - start,
+    collapsedTurns: admitted.length,
     droppedChars,
     droppedCodepoints,
   };
@@ -481,6 +598,39 @@ function imagePart(image: RenderedImage): GooglePart {
       data: bytesToBase64(image.png),
     },
   };
+}
+
+/**
+ * Normalizes Google turn roles so that:
+ * 1. Adjacent turns with the same role are merged.
+ * 2. The conversation starts with a user turn.
+ * 3. The conversation ends with a user turn (never a model turn), avoiding
+ *    Google AI Studio's 400 "Requests ending with a model turn are not supported."
+ */
+export function normalizeGoogleTurnRoles(contents: GoogleContent[]): GoogleContent[] {
+  if (contents.length === 0) return contents;
+  const merged: GoogleContent[] = [];
+  for (const turn of contents) {
+    // Google AI Studio rejects empty-parts turns; skip turns with no content.
+    if (!turn || !Array.isArray(turn.parts) || turn.parts.length === 0) continue;
+    const role = turn.role === 'model' ? 'model' : 'user';
+    const last = merged[merged.length - 1];
+    if (last && last.role === role) {
+      merged[merged.length - 1] = { ...last, parts: [...(last.parts ?? []), ...turn.parts] };
+    } else {
+      merged.push({ ...turn, role, parts: [...turn.parts] });
+    }
+  }
+  if (merged.length === 0) return [];
+  const first = merged[0];
+  if (first && first.role === 'model') {
+    merged.unshift({ role: 'user', parts: [{ text: ' ' }] });
+  }
+  const last = merged[merged.length - 1];
+  if (last && last.role === 'model') {
+    merged.push({ role: 'user', parts: [{ text: ' ' }] });
+  }
+  return merged;
 }
 
 export async function transformGoogleGenerateContent(
@@ -497,11 +647,12 @@ export async function transformGoogleGenerateContent(
     reflow?: boolean;
   } = {},
 ): Promise<{ body: Uint8Array; info: TransformInfo }> {
-  if (!isGeminiModel(modelName)) {
+  if (!hasGeminiMeasuredProfile(modelName)) {
     const info = createDefaultInfo(modelName);
     info.reason = 'unsupported_model';
     return { body: bodyBytes, info };
   }
+
   const text = new TextDecoder().decode(bodyBytes);
   let parsed: unknown;
   try {
@@ -510,13 +661,15 @@ export async function transformGoogleGenerateContent(
     return { body: bodyBytes, info: createDefaultInfo(modelName) };
   }
   const reqRecord = record(parsed);
-  if (!reqRecord) return { body: bodyBytes, info: createDefaultInfo(modelName) };
+  if (!reqRecord) {
+    return { body: bodyBytes, info: createDefaultInfo(modelName) };
+  }
   const req = reqRecord as GoogleGenerateContentRequest;
 
   const info = createDefaultInfo(modelName);
   if (options.compress === false) {
     info.reason = 'compression_disabled';
-    return { body: bodyBytes, info };
+    return withStampedThoughtSignatures(req, bodyBytes, info);
   }
 
   // Extract system instructions
@@ -547,7 +700,7 @@ export async function transformGoogleGenerateContent(
   const combinedRaw = [authorityText, toolRewrite.docs].filter(Boolean).join('\n\n');
   info.origChars = combinedRaw.length;
 
-  const profile = resolveGeminiProfile();
+  const profile = resolveGeminiProfile(modelName);
   let staticImages: RenderedImage[] = [];
   let staticProfitable = false;
   let textTokens = 0;
@@ -618,12 +771,15 @@ export async function transformGoogleGenerateContent(
     : await planGoogleHistory(originalContents, modelName, options.reflow !== false);
   let contents = originalContents;
   if (historyPlan) {
+    const compactFraming = resolveGeminiProfile(modelName).history.framing === 'compact';
+    const intro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_INTRO : HISTORY_TRANSCRIPT_INTRO;
+    const outro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_OUTRO : HISTORY_TRANSCRIPT_OUTRO;
     const historyParts: GooglePart[] = [
-      { text: HISTORY_TRANSCRIPT_INTRO },
+      { text: intro },
       ...historyPlan.images.map(imagePart),
     ];
     if (historyPlan.factSheet) historyParts.push({ text: historyPlan.factSheet });
-    historyParts.push({ text: HISTORY_TRANSCRIPT_OUTRO });
+    historyParts.push({ text: outro });
     if (historyPlan.start > 0 && contents[historyPlan.start - 1]?.role === 'user') {
       // Keep Gemini's alternating role shape: append the synthetic prior-context
       // parts to the preceding live user turn rather than emitting user→user.
@@ -655,7 +811,7 @@ export async function transformGoogleGenerateContent(
     } else if (!staticProfitable) {
       info.reason = 'not_profitable';
     }
-    return { body: bodyBytes, info };
+    return withStampedThoughtSignatures(req, bodyBytes, info);
   }
 
   if (hasStaticCompression) {
@@ -674,11 +830,13 @@ export async function transformGoogleGenerateContent(
     }
   }
 
+  const normalizedContents = stampGeminiThoughtSignatures(normalizeGoogleTurnRoles(contents));
+
   // Keep a native system-level pointer so the imaged instruction retains its
   // original authority instead of being demoted to ordinary user content.
   const transformedReq: GoogleGenerateContentRequest = {
     ...req,
-    contents,
+    contents: normalizedContents,
     ...(hasStaticCompression && toolRewrite.tools !== undefined ? { tools: toolRewrite.tools } : {}),
     ...(hasStaticCompression
       ? {
@@ -758,6 +916,35 @@ export async function transformGoogleGenerateContent(
 
   const transformedBytes = new TextEncoder().encode(JSON.stringify(transformedReq));
   return { body: transformedBytes, info };
+}
+
+function isNormalizedGoogleTurnRoles(contents: GoogleContent[]): boolean {
+  if (contents.length === 0) return true;
+  for (let i = 0; i < contents.length; i++) {
+    const turn = contents[i];
+    if (!turn || !Array.isArray(turn.parts) || turn.parts.length === 0) return false;
+    const expectedRole = i % 2 === 0 ? 'user' : 'model';
+    const role = turn.role === 'model' ? 'model' : 'user';
+    if (role !== expectedRole) return false;
+  }
+  return contents.length % 2 === 1;
+}
+
+function withStampedThoughtSignatures(
+  req: GoogleGenerateContentRequest,
+  bodyBytes: Uint8Array,
+  info: TransformInfo,
+): { body: Uint8Array; info: TransformInfo } {
+  if (!Array.isArray(req.contents)) return { body: bodyBytes, info };
+  const normalized = isNormalizedGoogleTurnRoles(req.contents)
+    ? req.contents
+    : normalizeGoogleTurnRoles(req.contents);
+  const stamped = stampGeminiThoughtSignatures(normalized);
+  if (stamped === req.contents && normalized === req.contents) return { body: bodyBytes, info };
+  return {
+    body: new TextEncoder().encode(JSON.stringify({ ...req, contents: stamped })),
+    info,
+  };
 }
 
 function createDefaultInfo(_model: string): TransformInfo {

@@ -21,7 +21,7 @@
  * sizing and font geometry differ.
  */
 import { type RenderFont } from './render.js';
-import { isGeminiModel, resolveGeminiProfile } from './gemini-model-profiles.js';
+import { hasGeminiMeasuredProfile, resolveGeminiProfile } from './gemini-model-profiles.js';
 import { isClaudeModel, resolveClaudeProfile } from './claude-model-profiles.js';
 import { BASE_HISTORY, BASE_PRICING, BASE_STYLE } from './profile-base.js';
 
@@ -331,7 +331,7 @@ const BUILTIN_RULES: ProfileRule[] = [
  * resolves to one of their profiles.
  */
 const FAMILY_ID_GUARDS: ReadonlyArray<{ mentions: RegExp; matches: (m: string) => boolean }> = [
-  { mentions: /gemini/, matches: isGeminiModel },
+  { mentions: /gemini/, matches: hasGeminiMeasuredProfile },
   { mentions: /grok/, matches: isGrokModel },
 ];
 
@@ -554,7 +554,8 @@ export function resolveGptProfile(model: string | null | undefined): GptModelPro
   // do not define a different visual reader profile.
   const m = (model ?? '').toLowerCase().replace(/\[[^\]]*\]/g, '');
   const ids = candidateIds(m);
-  if (ids.some(isGeminiModel)) return resolveGeminiProfile();
+  const geminiId = ids.find(hasGeminiMeasuredProfile);
+  if (geminiId) return resolveGeminiProfile(geminiId);
   const env = envProfiles();
   if (env.size > 0) {
     let best: GptModelProfile | undefined;

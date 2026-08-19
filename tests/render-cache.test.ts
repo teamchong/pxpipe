@@ -91,7 +91,43 @@ describe('rendered-page cache', () => {
     expect(stats.bytes).toBeGreaterThan(0);
 
     clearRenderCache();
-    expect(renderCacheStats()).toEqual({ entries: 0, bytes: 0, hits: 0, misses: 0 });
+    expect(renderCacheStats()).toEqual({
+      entries: 0,
+      bytes: 0,
+      hits: 0,
+      misses: 0,
+      evictions: 0,
+      oversized: 0,
+    });
+  });
+
+  // The point of keying on a digest instead of the source text (#210): an entry's
+  // retained cost is the pages, plus a constant. With a verbatim key the overhead
+  // term was `2 × source length`, so a budget meant to bound rendered pages spent
+  // most of itself on copies of the prompt — and kept those copies as plaintext.
+  it('retains a fixed-size key regardless of how long the source text is', async () => {
+    const short = 'x '.repeat(50);
+    const long = 'x '.repeat(50_000);
+
+    const sumPng = (imgs: { png: Uint8Array }[]) =>
+      imgs.reduce((n, img) => n + img.png.byteLength, 0);
+
+    clearRenderCache();
+    const shortImgs = await renderTextToPngsWithCharLimit(short, 64);
+    expect(renderCacheStats().entries).toBe(1); // premise: it was actually stored
+    const shortOverhead = renderCacheStats().bytes - sumPng(shortImgs);
+
+    clearRenderCache();
+    const longImgs = await renderTextToPngsWithCharLimit(long, 64);
+    expect(renderCacheStats().entries).toBe(1);
+    const longOverhead = renderCacheStats().bytes - sumPng(longImgs);
+
+    // Same constant both times, and small — a 64-char hex digest at 2 bytes/unit.
+    expect(longOverhead).toBe(shortOverhead);
+    expect(shortOverhead).toBe(128);
+    // Guard the premise: the two inputs really do differ by ~1000× in length, so a
+    // key that embedded the text could not possibly have produced equal overhead.
+    expect(long.length).toBeGreaterThan(short.length * 500);
   });
 });
 
@@ -132,6 +168,7 @@ describe('rendered-page cache budget', () => {
     const stats = mod.renderCacheStats();
     expect(stats.bytes).toBeLessThanOrEqual(Math.floor(oneEntry * 2.5));
     expect(stats.entries).toBe(2); // A was evicted to make room for C
+    expect(stats.evictions).toBe(1); // and the operator can see that it happened
 
     // The survivors still hit; the evicted entry must miss and be re-rendered.
     const before = mod.renderCacheStats();
@@ -164,13 +201,23 @@ describe('rendered-page cache budget', () => {
     expect(m3.renderCacheStats()).toMatchObject({ entries: 2, hits: 1, bytes: bytesA + bytesB });
   });
 
-  it('never stores an entry larger than the whole budget', async () => {
-    const mod = await freshRender('2000'); // smaller than a single page
+  it('never stores an entry larger than the whole budget, and counts it', async () => {
+    // Below the 128-byte key alone, so no render can ever fit regardless of how
+    // well its pixels happen to compress. The old 2000-byte budget only worked
+    // because the verbatim key was itself ~8 KB for this input; with a
+    // fixed-width key, a page of repeating 'x ' deflates small enough to slip
+    // under 2000 and the case would stop testing the branch it names.
+    const mod = await freshRender('100');
     await mod.renderTextToPngsWithCharLimit('x '.repeat(2000), 64);
 
     const stats = mod.renderCacheStats();
     expect(stats.entries).toBe(0);
     expect(stats.bytes).toBe(0);
+    // Distinct from an eviction: nothing was displaced, the render simply never
+    // fit. Without this counter a too-small budget looks identical to a cold
+    // cache — permanent 0% hit rate with no signal saying why.
+    expect(stats.oversized).toBe(1);
+    expect(stats.evictions).toBe(0);
   });
 
   it('PXPIPE_RENDER_CACHE_BYTES=0 disables caching entirely', async () => {
@@ -178,6 +225,106 @@ describe('rendered-page cache budget', () => {
     await mod.renderTextToPngsWithCharLimit('hello world', 64);
     await mod.renderTextToPngsWithCharLimit('hello world', 64);
 
-    expect(mod.renderCacheStats()).toEqual({ entries: 0, bytes: 0, hits: 0, misses: 0 });
+    expect(mod.renderCacheStats()).toEqual({
+      entries: 0,
+      bytes: 0,
+      hits: 0,
+      misses: 0,
+      evictions: 0,
+      oversized: 0,
+    });
+  });
+});
+
+// A Worker never sees PXPIPE_RENDER_CACHE_BYTES through process.env — bindings arrive
+// per request, long after this module evaluated — so the budget has to be settable
+// after load. src/worker.ts calls this on every request.
+describe('setRenderCacheMaxBytes', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.resetModules();
+  });
+
+  it('does not double-count bytes when the same key is stored twice', async () => {
+    // Two concurrent requests rendering the same slab both miss (the lookup runs
+    // before the await), both render, and both store. One entry must cost one
+    // entry's bytes, or the counter drifts up and starts evicting a cache that is
+    // nowhere near full.
+    const mod = await freshRender(String(64 * 1024 * 1024));
+    const text = 'gamma gamma gamma\n'.repeat(40);
+
+    await mod.renderTextToPngsWithCharLimit(text, 64);
+    const single = mod.renderCacheStats().bytes;
+
+    mod.clearRenderCache();
+    await Promise.all([
+      mod.renderTextToPngsWithCharLimit(text, 64),
+      mod.renderTextToPngsWithCharLimit(text, 64),
+    ]);
+
+    const stats = mod.renderCacheStats();
+    expect(stats.entries).toBe(1);
+    expect(stats.bytes).toBe(single);
+    expect(stats.misses).toBe(2); // both really did miss — the race is the premise
+  });
+
+  it('shrinks the budget and evicts down to it immediately', async () => {
+    const A = 'alpha alpha alpha\n'.repeat(40);
+    const B = 'beta beta beta\n'.repeat(40);
+
+    const mod = await freshRender(String(64 * 1024 * 1024));
+    await mod.renderTextToPngsWithCharLimit(A, 64);
+    await mod.renderTextToPngsWithCharLimit(B, 64);
+    expect(mod.renderCacheStats().entries).toBe(2);
+
+    // One byte under what both entries occupy, derived from the real total rather
+    // than a guessed multiple of one entry's size: exactly one eviction is needed,
+    // and the older entry (A) is the one that must go.
+    const shrunk = mod.renderCacheStats().bytes - 1;
+    mod.setRenderCacheMaxBytes(shrunk);
+
+    const stats = mod.renderCacheStats();
+    expect(stats.entries).toBe(1);
+    expect(stats.bytes).toBeLessThanOrEqual(shrunk);
+    expect(stats.evictions).toBe(1);
+    expect(mod.renderCacheMaxBytes()).toBe(shrunk);
+
+    // B survived, A did not.
+    const before = mod.renderCacheStats();
+    await mod.renderTextToPngsWithCharLimit(B, 64);
+    expect(mod.renderCacheStats().hits).toBe(before.hits + 1);
+  });
+
+  it('treats 0 as disable-and-drop while keeping the counter history', async () => {
+    const mod = await freshRender(String(64 * 1024 * 1024));
+    await mod.renderTextToPngsWithCharLimit('hello world', 64);
+    await mod.renderTextToPngsWithCharLimit('hello world', 64);
+    expect(mod.renderCacheStats()).toMatchObject({ entries: 1, hits: 1, misses: 1 });
+
+    mod.setRenderCacheMaxBytes(0);
+    expect(mod.renderCacheStats()).toMatchObject({ entries: 0, bytes: 0 });
+    // Shrinking the budget is a configuration change, not a reason to erase the
+    // hit/miss history an operator is reading off the dashboard.
+    expect(mod.renderCacheStats()).toMatchObject({ hits: 1, misses: 1 });
+
+    // Disabled: renders still work, nothing is retained, nothing is counted.
+    await mod.renderTextToPngsWithCharLimit('hello world', 64);
+    await mod.renderTextToPngsWithCharLimit('hello world', 64);
+    expect(mod.renderCacheStats()).toMatchObject({ entries: 0, hits: 1, misses: 1 });
+  });
+
+  it('ignores a negative or non-finite budget rather than obeying it', async () => {
+    const mod = await freshRender(String(64 * 1024 * 1024));
+    const original = mod.renderCacheMaxBytes();
+
+    mod.setRenderCacheMaxBytes(-1);
+    expect(mod.renderCacheMaxBytes()).toBe(original);
+    mod.setRenderCacheMaxBytes(Number.NaN);
+    expect(mod.renderCacheMaxBytes()).toBe(original);
+
+    // A broken value must not read as "unbounded" — the cache still caches.
+    await mod.renderTextToPngsWithCharLimit('hello world', 64);
+    await mod.renderTextToPngsWithCharLimit('hello world', 64);
+    expect(mod.renderCacheStats()).toMatchObject({ entries: 1, hits: 1 });
   });
 });

@@ -4,9 +4,14 @@ All notable changes to pxpipe are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features /
 behavioral changes, patch = fixes).
 
-## Unreleased
+## 0.13.2 — 2026-08-18
 
 ### Added
+- `createProviderRouter`: explicit `/providers/<id>/<upstream-path>`
+  multiplexing of several proxy configs behind one listener, exported from
+  core. Provider ids are taken from the URL path only, never from headers or
+  the body. No in-tree callers yet; groundwork for the Codex integration
+  (#223, #224).
 - **Rendered-page cache, now documented.** It landed in #158 and shipped in
   0.13.0 with no changelog entry, so this backfills it: identical render inputs
   return the identical pages instead of being re-rasterized, bounded by total
@@ -38,11 +43,28 @@ behavioral changes, patch = fixes).
   ceiling.
 
 ### Fixed
+- Gemini history collapse is capped at 32 images (was 72) to prevent
+  vision-side TTFT stalls on long sessions.
+- Claude Code's `cc_automode_session_rules` / `cc_automode_permissions` /
+  `severity` / `category` blocks route into the dynamic tail instead of baking
+  into the static slab image. On newer Claude Code builds they change between
+  turns, which re-rendered every slab page each request and forced a full
+  cache write per turn — the likely mechanism behind the repeated-429 loop in
+  #234 (#236).
+- `truncateForBudget` no longer over-truncates reflowed tool results. The
+  per-segment row charge overstated visual rows ~6× on ↵-joined text (the
+  renderer packs many segments per row), so a result that fit ~280k chars kept
+  ~44k and wasted most of its image budget (#226).
 - The render cache byte counter no longer drifts upward when two concurrent
   requests render the same content. Both miss (the lookup precedes the await),
   both store, and the second store previously added its bytes without crediting
   back the entry it replaced — so the counter climbed until it evicted a cache
   that was nowhere near its budget.
+- Typecheck survives `@cloudflare/workers-types` 5.20260809.1, which added a
+  global `declare const process: any` that clobbered `@types/node` —
+  `process.exit()` stopped narrowing and `process.env` went untyped. The
+  package left tsconfig `types`; `worker.ts` imports `ExecutionContext` as a
+  module instead (#231).
 
 ## 0.13.1 — 2026-08-11
 

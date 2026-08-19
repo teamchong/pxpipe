@@ -11,6 +11,7 @@
  * Config lives in wrangler.toml.
  */
 
+import type { ExecutionContext } from '@cloudflare/workers-types';
 import { createProxy, type ProxyConfig } from './core/proxy.js';
 import type { TransformOptions } from './core/transform.js';
 import { toTrackEvent, JsonLogTracker, noopTracker, type Tracker } from './core/tracker.js';

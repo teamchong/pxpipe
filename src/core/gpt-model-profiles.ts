@@ -229,8 +229,10 @@ const isMiniNanoPatch = (m: string): boolean =>
 /** Grok ids pxpipe has a measured profile for. */
 const isGrokModel = (m: string): boolean => /^grok-/.test(m);
 
-/** Qwen ids pxpipe has a measured profile for (e.g. Qwen 3.8 / Qwen 2.5). */
-const isQwenModel = (m: string): boolean => /qwen/i.test(m);
+/** Qwen 3.8 27B ids — the only Qwen geometry pxpipe has measured. Other Qwen
+ *  variants deliberately do NOT match: the family-id guard below refuses them
+ *  instead of gating an unmeasured model with this profile. */
+const isQwenModel = (m: string): boolean => /qwen3\.8-27b/i.test(m);
 
 /** Shared GPT geometry for the small patch-billed models; only the patch
  *  multiplier and the family list prices differ between the rules below. */
@@ -327,7 +329,7 @@ const BUILTIN_RULES: ProfileRule[] = [
     },
   },
 
-  // Qwen (Workers AI / open weights). Native 14px / 84 cols / maxH 512 is required
+  // Qwen 3.8 27B (Workers AI / open weights). Native 14px / 84 cols / maxH 512 is required
   // because 5x8 bitmap glyphs are illegible to Qwen vision (0/15 hex vs 11/15 on 14px).
   // History image count capped at 24 images to stay safely below Workers AI's 32-image limit.
   {

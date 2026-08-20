@@ -373,7 +373,7 @@ function responsesEndpoint() {
   if (!raw) throw new Error('OPENAI_BASE_URL (or SOL_PROFILE_BASE_URL) is required for a live run');
   const url = new URL(raw);
   // Current pxpipe listener from the pilot brief. The eval must hit the direct
-  // upstream Responses endpoint (currently ocproxy on 127.0.0.1:8082), not pxpipe.
+  // upstream Responses endpoint (the configured gateway upstream), not pxpipe.
   invariant(url.port !== '47821', 'Refusing pxpipe port 47821: raw image eval must bypass pxpipe');
   const base = raw.replace(/\/$/, '');
   return base.endsWith('/responses') ? base : `${base}/responses`;

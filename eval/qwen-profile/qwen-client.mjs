@@ -1,19 +1,13 @@
-// Qwen 3.8 Workers AI client through ocproxy / Cloudflare AI Gateway.
-import { readFileSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
-
+// Qwen 3.8 Workers AI client through a local OpenAI-compatible gateway
+// (e.g. a Cloudflare AI Gateway). Requires OPENAI_BASE_URL, and OPENAI_API_KEY
+// when the gateway authenticates.
 function getAuthToken() {
-  if (process.env.OPENAI_API_KEY) return process.env.OPENAI_API_KEY;
-  if (process.env.OCPROXY_TOKEN) return process.env.OCPROXY_TOKEN;
-  const tokenPath = join(process.env.HOME || '', '.local/state/ocproxy/dashboard.token');
-  if (existsSync(tokenPath)) {
-    return readFileSync(tokenPath, 'utf8').trim();
-  }
-  return '';
+  return process.env.OPENAI_API_KEY ?? '';
 }
 
 function gatewayEndpoint() {
-  const base = (process.env.OPENAI_BASE_URL || 'http://127.0.0.1:8082/v1').replace(/\/$/, '');
+  const base = (process.env.OPENAI_BASE_URL ?? '').replace(/\/$/, '');
+  if (!base) throw new Error('OPENAI_BASE_URL is required (point it at your gateway)');
   return base.endsWith('/chat/completions') ? base : `${base}/chat/completions`;
 }
 

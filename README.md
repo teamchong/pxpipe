@@ -72,7 +72,7 @@ provider over some other base URL need a rule for it, and a rule that names a
 port matches only that port:
 
 ```bash
-pxpipe warp --route '127.0.0.1:8082/v1/*=http://127.0.0.1:47821' -- codex
+pxpipe warp --route '127.0.0.1:9090/v1/*=http://127.0.0.1:47821' -- codex
 ```
 
 ## Offline export (no proxy)

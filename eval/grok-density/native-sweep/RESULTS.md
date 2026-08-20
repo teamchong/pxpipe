@@ -1,7 +1,7 @@
 # Grok 4.5 native JetBrains Mono 8–16px blind sweep
 
 Date: 2026-07-23. Model: `grok-4.5` via direct Responses (`OPENAI_BASE_URL`
-upstream `:8082`, pxpipe port 47821 rejected by the client).
+upstream local gateway; pxpipe port 47821 rejected by the client).
 
 ## Protocol (same spirit as Opus / Sol native sweeps)
 
@@ -58,7 +58,7 @@ evidence; this sweep is the native-size negative result.
 # atlases already built under eval/opus-density/native-sweep/atlases (symlinked)
 node eval/grok-density/native-sweep/gen-fixture.mjs   # fresh truth (optional)
 node eval/grok-density/native-sweep/render-ladder.mjs # swaps atlas*, rebuilds, restores
-OPENAI_BASE_URL=http://127.0.0.1:8082/v1 OPENAI_API_KEY=… \
+OPENAI_BASE_URL=http://127.0.0.1:<GATEWAY_PORT>/v1 OPENAI_API_KEY=… \
   bash eval/grok-density/native-sweep/_ask_all.sh     # locks answers-*.json
 node eval/grok-density/native-sweep/score-all.mjs
 ```

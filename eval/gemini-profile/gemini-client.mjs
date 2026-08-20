@@ -1,7 +1,8 @@
 // Google AI Studio eval client through the local Cloudflare AI Gateway.
 
 function gatewayOrigin() {
-  const base = (process.env.OPENAI_BASE_URL || 'http://127.0.0.1:8082/v1').replace(/\/$/, '');
+  const base = (process.env.OPENAI_BASE_URL ?? '').replace(/\/$/, '');
+  if (!base) throw new Error('OPENAI_BASE_URL is required (point it at your gateway)');
   return new URL(base).origin;
 }
 

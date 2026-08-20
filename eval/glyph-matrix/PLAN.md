@@ -7,7 +7,7 @@
 ## What this measures
 
 Per-character confusion matrix for 12-char hex IDs read back through the
-pixelpipe render path, across render-style arms — the precision-tier
+pxpipe render path, across render-style arms — the precision-tier
 failure mode that gist-recall (98/98) structurally cannot surface and
 needle-haystack only bracketed (~87% exact-match on worst-case hex at
 prod style).

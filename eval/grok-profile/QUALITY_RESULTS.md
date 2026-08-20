@@ -26,7 +26,7 @@ Receipts:
 - `verbatim-hex-grok-4.6-results.json`
 
 ```bash
-export OPENAI_BASE_URL=http://127.0.0.1:8082/v1
+export OPENAI_BASE_URL=http://127.0.0.1:<GATEWAY_PORT>/v1
 export OPENAI_API_KEY=…
 GROK_QUALITY_LIVE=1 N=100 node eval/grok-profile/novel-arithmetic.mjs
 GROK_QUALITY_LIVE=1 node eval/grok-profile/gist-recall.mjs

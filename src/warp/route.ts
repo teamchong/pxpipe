@@ -24,7 +24,7 @@ export interface Route {
   readonly hostRe: RegExp;
   /**
    * Whether the pattern named a port. Loopback targets make the port the only
-   * thing distinguishing two hosts (127.0.0.1:8082 vs 127.0.0.1:47821), so a
+   * thing distinguishing two hosts (127.0.0.1:9090 vs 127.0.0.1:47821), so a
    * pattern that names one must be matched against "host:port" and a pattern
    * that does not must keep matching any port.
    */

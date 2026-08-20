@@ -230,7 +230,7 @@ Usage:
                         api.anthropic.com/v1/messages is routed by default;
                         --route adds rules for agents that talk to another
                         base URL, e.g.
-                          --route '127.0.0.1:8082/v1/*=http://127.0.0.1:47821'
+                          --route '127.0.0.1:9090/v1/*=http://127.0.0.1:47821'
   pxpipe stats [--json] [--file <p>]
                         summarize the events log offline (no server needed),
                         incl. measured savings; defaults to $PXPIPE_LOG

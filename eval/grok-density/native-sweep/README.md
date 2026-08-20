@@ -10,7 +10,7 @@ atlas swap → rebuild → render, live ask locks answers before truth is scored
 ```bash
 node eval/grok-density/native-sweep/gen-fixture.mjs
 node eval/grok-density/native-sweep/render-ladder.mjs
-OPENAI_BASE_URL=http://127.0.0.1:8082/v1 OPENAI_API_KEY=… \
+OPENAI_BASE_URL=http://127.0.0.1:<GATEWAY_PORT>/v1 OPENAI_API_KEY=… \
   bash eval/grok-density/native-sweep/_ask_all.sh
 node eval/grok-density/native-sweep/score-all.mjs
 ```

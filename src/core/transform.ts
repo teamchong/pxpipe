@@ -2078,7 +2078,7 @@ export async function transformRequest(
   // Merge caller opts over DEFAULTS, but treat explicit `undefined` as "not
   // provided" so it falls through to the default. Without this, a caller that
   // passes `{ minToolResultChars: undefined }` (common when forwarding partial
-  // options from upstream — e.g. ocproxy's handler) would silently disable the
+   // options from upstream — e.g. an upstream gateway's handler) would silently disable the
   // tool_result text-passthrough gate and route everything through the
   // renderer.
   const definedOpts = Object.fromEntries(

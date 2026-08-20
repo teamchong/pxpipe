@@ -4,7 +4,7 @@ Grok is evaluated through the OpenAI-compatible Responses endpoint used by
 Codex. Fable and Opus use the Claude harnesses.
 
 ```bash
-export OPENAI_BASE_URL=http://127.0.0.1:8082/v1
+export OPENAI_BASE_URL=http://127.0.0.1:<GATEWAY_PORT>/v1
 export OPENAI_API_KEY=…
 export SOL_QUALITY_MODEL=grok-4.5
 export SOL_QUALITY_LIVE=1

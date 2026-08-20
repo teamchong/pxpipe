@@ -20,7 +20,7 @@ density, matching how fable's matrix cells are scored at fable's `5x8`.
   pageWidthPx}`; `run*.py` **preflight-aborts before any API call** if the
   corpus manifest model ≠ the model under test (guards silent profile/model
   mismatch).
-- Model reached via **upstream (`:8082`), pxpipe-bypassed** — so pxpipe's own
+- Model reached via **the gateway upstream, pxpipe-bypassed** — so pxpipe's own
   text→image rendering does not contaminate the arms; the model still gets the
   images. Concurrency 3, `CCI_READY_TIMEOUT=120`, `CCI_TIMEOUT=210`.
 - Raw results: `work/results.opus-14px.jsonl`, `work2/…`, `work3/…`.

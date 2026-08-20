@@ -176,7 +176,7 @@ describe('provider-prefixed passthrough routing', () => {
     const cap: { url?: string; headers?: Headers } = {};
     stubFetch(cap);
     await createProxy({
-      upstream: 'http://ocproxy.test',
+      upstream: 'http://gateway.test',
       openAIUpstream: 'http://openai.test',
     })(
       new Request('http://localhost/google-ai-studio/v1beta/models/gemini-2.5:generateContent?alt=sse', {
@@ -186,7 +186,7 @@ describe('provider-prefixed passthrough routing', () => {
       }),
     );
 
-    expect(cap.url).toBe('http://ocproxy.test/google-ai-studio/v1beta/models/gemini-2.5:generateContent?alt=sse');
+    expect(cap.url).toBe('http://gateway.test/google-ai-studio/v1beta/models/gemini-2.5:generateContent?alt=sse');
     expect(cap.headers?.get('authorization')).toBe('Bearer local-token');
   });
 
@@ -194,7 +194,7 @@ describe('provider-prefixed passthrough routing', () => {
     const cap: { url?: string; headers?: Headers } = {};
     stubFetch(cap);
     await createProxy({
-      upstream: 'http://ocproxy.test',
+      upstream: 'http://gateway.test',
       apiKey: 'sk-anthropic-test',
     })(
       new Request('http://localhost/compat/v1/chat/completions', {
@@ -204,7 +204,7 @@ describe('provider-prefixed passthrough routing', () => {
       }),
     );
 
-    expect(cap.url).toBe('http://ocproxy.test/compat/v1/chat/completions');
+    expect(cap.url).toBe('http://gateway.test/compat/v1/chat/completions');
     expect(cap.headers?.get('authorization')).toBe('Bearer local-token');
     expect(cap.headers?.get('x-api-key')).toBeNull();
   });

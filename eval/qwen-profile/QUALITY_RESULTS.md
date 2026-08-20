@@ -1,6 +1,6 @@
 # Qwen 3.8 quality results
 
-Model: `workers-ai/@cf/qwen/qwen3.8-27b` (`qwen 3.8`) through Cloudflare Workers AI via ocproxy.
+Model: `workers-ai/@cf/qwen/qwen3.8-27b` (`qwen 3.8`) through Cloudflare Workers AI (via a local gateway).
 
 ## Benchmark Summary
 

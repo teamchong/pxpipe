@@ -1,6 +1,6 @@
 // Live-call grok-4.5 on one rendered rung. Blind: never opens truth.json.
 // Writes answers-<label>.json with per-token answer + conf.
-// Run: OPENAI_BASE_URL=http://127.0.0.1:8082/v1 OPENAI_API_KEY=… \
+// Run: OPENAI_BASE_URL=http://127.0.0.1:<GATEWAY_PORT>/v1 OPENAI_API_KEY=… \
 //      node eval/grok-density/native-sweep/ask.mjs jbmono14
 import { readFileSync, writeFileSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';

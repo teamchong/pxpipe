@@ -1903,7 +1903,7 @@ const model = googleModel ?? readModelField(bodyIn);
     }
 
     // Gateway OpenAI routes drop the `/v1` prefix; provider-prefixed passthrough
-    // routes keep their full path so ocproxy-style upstreams see `/openai/*`,
+    // routes keep their full path so prefix-routing gateways see `/openai/*`,
     // `/google-ai-studio/*`, etc. exactly as the client sent them.
     // The chat bridge forwards to the configured Cloudflare upstream at its
     // /chat/completions endpoint (chatCompletionsUrl normalizes a bare base,

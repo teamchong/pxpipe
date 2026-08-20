@@ -1279,7 +1279,7 @@ export function renderPage(port: number, hostLabel = ''): string {
   <pre>pxpipe warp -- claude
 pxpipe warp -- codex
 pxpipe warp -- cursor-agent</pre>
-  <p>Aliases work too (<code>pxpipe warp -- pp</code>), and <code>--route PATTERN=http://host:port</code> adds routes beyond <code>api.anthropic.com</code> (a PATTERN that names a port matches only that port, e.g. <code>--route '127.0.0.1:8082/v1/*=http://127.0.0.1:${port}'</code> warps an agent pointed at another local proxy). Without warp, point the agent at <code>ANTHROPIC_BASE_URL=http://127.0.0.1:${port}</code> yourself.</p>
+  <p>Aliases work too (<code>pxpipe warp -- pp</code>), and <code>--route PATTERN=http://host:port</code> adds routes beyond <code>api.anthropic.com</code> (a PATTERN that names a port matches only that port, e.g. <code>--route '127.0.0.1:9090/v1/*=http://127.0.0.1:${port}'</code> warps an agent pointed at another local proxy). Without warp, point the agent at <code>ANTHROPIC_BASE_URL=http://127.0.0.1:${port}</code> yourself.</p>
   <p>Pin instructions from inside the session — they get moved to the end of every request, where the model actually reads them:</p>
   <pre>@pxpipe pin be concise, no walls of text
 @pxpipe unpin 2

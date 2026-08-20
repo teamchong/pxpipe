@@ -5,7 +5,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { isPxpipeSupportedGptModel } from '../src/core/applicability.js';
 import { openAIVisionTokens, visionTokensForModel, isClaudeModel, resolveVisionCost, transformOpenAIChatCompletions, transformOpenAIResponses } from '../src/core/openai.js';
-import { resolveGptProfile } from '../src/core/gpt-model-profiles.js';
+import { resolveGptProfile, isMisresolvedModelId } from '../src/core/gpt-model-profiles.js';
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -1028,7 +1028,8 @@ describe('image parts request detail = "original" (avoid downscale of dense text
     const result = await transformOpenAIChatCompletions(body, { charsPerToken: 1, minCompressChars: 1 });
     expect(result.info.compressed).toBe(true);
     const out = JSON.parse(dec.decode(result.body)) as { messages: Array<{ role: string; content: unknown }> };
-    const firstUser = out.messages.find((m) => m.role === 'user')!;
+    const firstUser = out.messages.find((m) => m.role === 'user');
+    if (!firstUser) throw new Error('transformed output has no user item');
     const parts = firstUser.content as Array<{ type: string; image_url?: { detail?: string } }>;
     const imgs = parts.filter((p) => p.type === 'image_url');
     expect(imgs.length).toBeGreaterThan(0);
@@ -1046,7 +1047,8 @@ describe('image parts request detail = "original" (avoid downscale of dense text
     const result = await transformOpenAIChatCompletions(body, { charsPerToken: 1, minCompressChars: 1 });
     expect(result.info.compressed).toBe(true);
     const out = JSON.parse(dec.decode(result.body)) as { messages: Array<{ role: string; content: unknown }> };
-    const firstUser = out.messages.find((m) => m.role === 'user')!;
+    const firstUser = out.messages.find((m) => m.role === 'user');
+    if (!firstUser) throw new Error('transformed output has no user item');
     const parts = firstUser.content as Array<{ type: string; image_url?: { detail?: string } }>;
     const imgs = parts.filter((p) => p.type === 'image_url');
     expect(imgs.length).toBeGreaterThan(0);
@@ -1062,7 +1064,8 @@ describe('image parts request detail = "original" (avoid downscale of dense text
     const result = await transformOpenAIResponses(body, { charsPerToken: 1, minCompressChars: 1 });
     expect(result.info.compressed).toBe(true);
     const out = JSON.parse(dec.decode(result.body)) as { input: Array<{ role?: string; content?: unknown }> };
-    const firstUser = out.input.find((m) => m.role === 'user')!;
+    const firstUser = out.input.find((m) => m.role === 'user');
+    if (!firstUser) throw new Error('transformed output has no user item');
     const parts = firstUser.content as Array<{ type: string; detail?: string }>;
     const imgs = parts.filter((p) => p.type === 'input_image');
     expect(imgs.length).toBeGreaterThan(0);
@@ -1078,7 +1081,8 @@ describe('image parts request detail = "original" (avoid downscale of dense text
     const result = await transformOpenAIResponses(body, { charsPerToken: 1, minCompressChars: 1 });
     expect(result.info.compressed).toBe(true);
     const out = JSON.parse(dec.decode(result.body)) as { input: Array<{ role?: string; content?: unknown }> };
-    const firstUser = out.input.find((m) => m.role === 'user')!;
+    const firstUser = out.input.find((m) => m.role === 'user');
+    if (!firstUser) throw new Error('transformed output has no user item');
     const parts = firstUser.content as Array<{ type: string; detail?: string }>;
     const imgs = parts.filter((p) => p.type === 'input_image');
     expect(imgs.length).toBeGreaterThan(0);
@@ -1215,7 +1219,15 @@ describe('resolveGptProfile (Qwen)', () => {
     expect(p.maxHeightPx).toBe(512);
     expect(p.style.font).toBe('jetbrains-mono-14');
     expect(p.history.maxImages).toBe(24);
-    expect(resolveGptProfile('qwen-3.8-27b').stripCols).toBe(84);
+    // Keyed to the exact measured model id, not to any 'qwen' substring.
+    expect(resolveGptProfile('qwen3.8-27b').stripCols).toBe(84);
+  });
+
+  it('refuses unmeasured Qwen variants instead of applying this profile', () => {
+    for (const id of ['qwen2.5-72b-instruct', 'qwen3-30b', 'qwen-3.8-27b']) {
+      expect(resolveGptProfile(id).stripCols).not.toBe(84);
+      expect(isMisresolvedModelId(id)).toBe(true);
+    }
   });
 });
 

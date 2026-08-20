@@ -826,7 +826,11 @@ async function applyChatHistoryCollapse(
 ): Promise<boolean> {
   const profitable = (text: string, cols: number, baselineTextTokens?: number) =>
     evalOpenAIGate(req.model, text, cols, o.charsPerToken, baselineTextTokens).profitable;
-  const existingImages = (info.imageCount ?? 0) + countRequestImages(req.messages);
+  // Count images already in the request. At the main call site the static slab
+  // images are inserted into req.messages before this runs, so walking the
+  // messages (instead of also adding info.imageCount) avoids double-counting
+  // the slab and matches the Responses path's budget math.
+  const existingImages = countRequestImages(req.messages);
   const plan = await planGptCollapse(
     chatMessagesToTurns(req.messages),
     protectedPrefix,

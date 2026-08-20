@@ -76,6 +76,10 @@ export async function callQwen({
       throw new Error(`HTTP ${response.status}: ${msg}`);
     }
 
+    if (!response.body) {
+      throw new Error(`HTTP ${response.status}: empty body`);
+    }
+
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let text = '';

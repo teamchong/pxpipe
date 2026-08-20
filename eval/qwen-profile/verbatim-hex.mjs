@@ -25,12 +25,22 @@ function writeResult(rows) {
     n: trials.length,
     rows,
   };
-  writeFileSync(RESULT, JSON.stringify(result, null, 2));
+  writeFileSync(RESULT, JSON.stringify(result, null, 2) + '\n');
   return result;
 }
 
+const pageCache = new Map();
+function getPagePng(page) {
+  let png = pageCache.get(page);
+  if (!png) {
+    png = readFileSync(join(ROOT, `page${page}.png`));
+    pageCache.set(page, png);
+  }
+  return png;
+}
+
 async function callImage(trial) {
-  const png = readFileSync(join(ROOT, `page${trial.page}.png`));
+  const png = getPagePng(trial.page);
   const content = [
     {
       type: 'input_image',
@@ -47,9 +57,6 @@ async function callImage(trial) {
 const existingRows = existsSync(RESULT)
   ? JSON.parse(readFileSync(RESULT, 'utf8')).rows || []
   : [];
-const completedIndices = new Set(
-  existingRows.filter((r) => !r.error).map((r, i) => i)
-);
 
 const rows = [...existingRows];
 

@@ -37,7 +37,10 @@ function correct(p, a) {
   const g = norm(p.gold);
   if (p.type === 'unanswerable') return x === 'unknown';
   if (p.type === 'numeric') return new RegExp(`(?:^|\\D)${g}(?:\\D|$)`).test(x);
-  if (p.type === 'negation') return x.includes('off') && !x.includes('enabled');
+  if (p.type === 'negation') {
+    if (g === 'off') return x.includes('off') && !x.includes('enabled');
+    if (g === 'enabled') return x.includes('enabled') && !x.includes('off');
+  }
   return x.includes(g);
 }
 
@@ -57,7 +60,7 @@ function writeProgress(rows) {
     unanswerable: { confabulated: done(guards).filter((r) => !r.ok).length, completed: done(guards).length, n: guards.length },
     rows,
   };
-  writeFileSync(RESULT, JSON.stringify(out, null, 2));
+  writeFileSync(RESULT, JSON.stringify(out, null, 2) + '\n');
   return out;
 }
 

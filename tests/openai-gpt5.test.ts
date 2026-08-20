@@ -1035,6 +1035,24 @@ describe('image parts request detail = "original" (avoid downscale of dense text
     for (const p of imgs) expect(p.image_url!.detail).toBe('original');
   });
 
+  it('Chat Completions image_url parts use detail:"high" for non-gpt5 models (Workers AI / Qwen / GPT-4o)', async () => {
+    const body = enc.encode(JSON.stringify({
+      model: 'workers-ai/@cf/qwen/qwen3.8-27b',
+      messages: [
+        { role: 'system', content: BIG_SYSTEM },
+        { role: 'user', content: 'hello' },
+      ],
+    }));
+    const result = await transformOpenAIChatCompletions(body, { charsPerToken: 1, minCompressChars: 1 });
+    expect(result.info.compressed).toBe(true);
+    const out = JSON.parse(dec.decode(result.body)) as { messages: Array<{ role: string; content: unknown }> };
+    const firstUser = out.messages.find((m) => m.role === 'user')!;
+    const parts = firstUser.content as Array<{ type: string; image_url?: { detail?: string } }>;
+    const imgs = parts.filter((p) => p.type === 'image_url');
+    expect(imgs.length).toBeGreaterThan(0);
+    for (const p of imgs) expect(p.image_url!.detail).toBe('high');
+  });
+
   it('Responses input_image parts use detail:"original"', async () => {
     const body = enc.encode(JSON.stringify({
       model: 'gpt-5.6-sol',
@@ -1049,6 +1067,22 @@ describe('image parts request detail = "original" (avoid downscale of dense text
     const imgs = parts.filter((p) => p.type === 'input_image');
     expect(imgs.length).toBeGreaterThan(0);
     for (const p of imgs) expect(p.detail).toBe('original');
+  });
+
+  it('Responses input_image parts use detail:"high" for non-gpt5 models', async () => {
+    const body = enc.encode(JSON.stringify({
+      model: 'workers-ai/@cf/qwen/qwen3.8-27b',
+      instructions: BIG_INSTRUCTIONS,
+      input: [{ role: 'user', content: [{ type: 'input_text', text: 'hello' }] }],
+    }));
+    const result = await transformOpenAIResponses(body, { charsPerToken: 1, minCompressChars: 1 });
+    expect(result.info.compressed).toBe(true);
+    const out = JSON.parse(dec.decode(result.body)) as { input: Array<{ role?: string; content?: unknown }> };
+    const firstUser = out.input.find((m) => m.role === 'user')!;
+    const parts = firstUser.content as Array<{ type: string; detail?: string }>;
+    const imgs = parts.filter((p) => p.type === 'input_image');
+    expect(imgs.length).toBeGreaterThan(0);
+    for (const p of imgs) expect(p.detail).toBe('high');
   });
 });
 

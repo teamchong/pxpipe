@@ -475,22 +475,26 @@ function rewriteFlatToolsForGpt(tools: unknown[] | undefined): {
   return { tools: changed ? rewritten : tools, docs: docs.join('\n\n') };
 }
 
-function openAIImagePart(img: RenderedImage): OpenAIImagePart {
+function isGpt5Family(model?: string): boolean {
+  return typeof model === 'string' && /^gpt-5/i.test(model);
+}
+
+function openAIImagePart(img: RenderedImage, model?: string): OpenAIImagePart {
   return {
     type: 'image_url',
     image_url: {
       url: `data:image/png;base64,${bytesToBase64(img.png)}`,
-      detail: 'original', // GPT-5.6 preserves submitted dimensions; older profiles retain their own cost caps.
+      detail: isGpt5Family(model) ? 'original' : 'high',
     },
   };
 }
 
 /** Build a Responses API input_image part. */
-function responsesImagePart(img: RenderedImage): ResponsesInputImagePart {
+function responsesImagePart(img: RenderedImage, model?: string): ResponsesInputImagePart {
   return {
     type: 'input_image',
     image_url: `data:image/png;base64,${bytesToBase64(img.png)}`,
-    detail: 'original', // see openAIImagePart: avoid 'high' downscale of dense text
+    detail: isGpt5Family(model) ? 'original' : 'high',
   };
 }
 
@@ -820,10 +824,10 @@ async function applyChatHistoryCollapse(
   const outro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_OUTRO : HISTORY_TRANSCRIPT_OUTRO;
   const histFactSheet = factSheetText(plan.text, profile.factSheetFormat);
   const content: OpenAIContentPart[] = [{ type: 'text', text: intro }];
-  for (const img of plan.images) content.push(openAIImagePart(img));
+  for (const img of plan.images) content.push(openAIImagePart(img, req.model));
   if (plan.pinText !== undefined) {
     content.push({ type: 'text', text: pinnedRequestBlock(plan.pinText) });
-    for (const img of plan.imagesAfter) content.push(openAIImagePart(img));
+    for (const img of plan.imagesAfter) content.push(openAIImagePart(img, req.model));
   }
   if (histFactSheet) content.push({ type: 'text', text: histFactSheet });
   content.push({ type: 'text', text: outro });
@@ -890,7 +894,7 @@ async function applyResponsesHistoryCollapse(
     const segment = plan.segments[segmentIndex]!;
     const content: ResponsesContentPart[] = [
       { type: 'input_text', text: intro },
-      ...segment.images.map(responsesImagePart),
+      ...segment.images.map((img) => responsesImagePart(img, req.model)),
     ];
     const sheet = profile.history.factSheetScope === 'combined'
       ? (segmentIndex === plan.segments.length - 1 ? combinedSheet : '')
@@ -1052,7 +1056,7 @@ export async function transformOpenAIChatCompletions(
   const topDropped = droppedCodepointsTop(droppedCodepoints);
   if (topDropped) info.droppedCodepointsTop = topDropped;
 
-  const imageParts: OpenAIImagePart[] = images.map(openAIImagePart);
+  const imageParts: OpenAIImagePart[] = images.map((img) => openAIImagePart(img, req.model));
   info.imageCount = images.length;
   // GPT savings basis: vision tokens the images actually cost vs the text tokens
   // the same content would have cost unproxied. req.tools is still the original
@@ -1296,7 +1300,7 @@ export async function transformOpenAIResponses(
   info.imageSourceText = renderedText.slice(0, 65_536);
   info.imageSourceTexts = images.map(() => info.imageSourceText);
 
-  const imagePartsResp: ResponsesInputImagePart[] = images.map(responsesImagePart);
+  const imagePartsResp: ResponsesInputImagePart[] = images.map((img) => responsesImagePart(img, req.model));
   const endMarker: ResponsesInputTextPart = { type: 'input_text', text: '[End of rendered GPT system/tool context.]' };
   // Verbatim fact-sheet (see src/core/factsheet.ts): exact tokens that survive OCR loss.
   const slabFactSheet = factSheetText(combinedRaw, profile.factSheetFormat);

@@ -94,7 +94,7 @@ const count = (k) => rows.filter((r) => r[k]).length;
 const summary = {
   generatedAt: new Date().toISOString(),
   model: MODEL,
-  live: true,
+  live: LIVE,
   n: N,
   seed: SEED,
   recipe: { cols: profile.stripCols, maxH: profile.maxHeightPx, style: profile.style, factsheet: true },
@@ -106,5 +106,5 @@ const summary = {
   prodPct: 100 * count('prodOk') / N,
   rows,
 };
-writeFileSync(RESULT, JSON.stringify(summary, null, 2));
+writeFileSync(RESULT, JSON.stringify(summary, null, 2) + '\n');
 console.log(`\nSUMMARY text ${summary.textCorrect}/${N} (${summary.textPct}%) · pure ${summary.pureCorrect}/${N} (${summary.purePct}%) · prod ${summary.prodCorrect}/${N} (${summary.prodPct}%)`);

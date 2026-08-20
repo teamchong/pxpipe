@@ -270,7 +270,12 @@ function gptHistoryOpts(
   existingImages = 0,
 ): Partial<GptHistoryOptions> {
   const configuredMax = o.gptHistory?.maxImages ?? configuredHistoryMaxImages(model);
-  const remainingMax = Math.max(0, configuredMax - existingImages);
+  // Providers with a hard total-image cap budget against the remaining headroom
+  // (client-attached images included) instead of subtracting from the history
+  // cap, which would starve history once the request already carries images.
+  const remainingMax = profile.providerImageCap !== undefined
+    ? Math.max(0, Math.min(configuredMax, profile.providerImageCap - existingImages))
+    : Math.max(0, configuredMax - existingImages);
   return {
     ...o.gptHistory,
     reflow: o.reflow,

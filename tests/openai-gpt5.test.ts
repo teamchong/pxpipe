@@ -1213,12 +1213,13 @@ describe('resolveGptProfile (Grok)', () => {
 });
 
 describe('resolveGptProfile (Qwen)', () => {
-  it('uses native 14px packing and 24 max images under Workers AI 32-image cap', () => {
+  it('uses native 14px packing and the 32-image provider cap', () => {
     const p = resolveGptProfile('workers-ai/@cf/qwen/qwen3.8-27b');
     expect(p.stripCols).toBe(84);
     expect(p.maxHeightPx).toBe(512);
     expect(p.style.font).toBe('jetbrains-mono-14');
     expect(p.history.maxImages).toBe(24);
+    expect(p.providerImageCap).toBe(32);
     // Keyed to the exact measured model id, not to any 'qwen' substring.
     expect(resolveGptProfile('qwen3.8-27b').stripCols).toBe(84);
   });
@@ -1228,6 +1229,34 @@ describe('resolveGptProfile (Qwen)', () => {
       expect(resolveGptProfile(id).stripCols).not.toBe(84);
       expect(isMisresolvedModelId(id)).toBe(true);
     }
+  });
+});
+
+describe('Qwen provider image cap — dynamic history budget', () => {
+  it('budgets history against 32 minus the images already in the request', async () => {
+    const tinyPng = { url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==' };
+    const messages = buildChatMessages(20);
+    // The client already attached 24 images to the conversation prefix.
+    for (let i = 0; i < 24; i++) {
+      messages.splice(2, 0, { role: 'user', content: [{ type: 'image_url', image_url: tinyPng }] });
+    }
+    const result = await transformOpenAIChatCompletions(
+      enc.encode(JSON.stringify({ model: 'workers-ai/@cf/qwen/qwen3.8-27b', messages })),
+      { charsPerToken: 1, minCompressChars: 1 },
+    );
+    expect(result.info.compressed).toBe(true);
+    expect(result.info.historyReason).toBe('collapsed');
+    // With the old subtractive budget (24 − 24 − slab) this would be 0.
+    expect(result.info.collapsedImages ?? 0).toBeGreaterThan(0);
+
+    const out = JSON.parse(dec.decode(result.body)) as { messages: Array<{ role: string; content: unknown }> };
+    let totalImages = 0;
+    for (const m of out.messages) {
+      if (Array.isArray(m.content)) {
+        totalImages += (m.content as Array<{ type?: string }>).filter((p) => p.type === 'image_url').length;
+      }
+    }
+    expect(totalImages).toBeLessThanOrEqual(32);
   });
 });
 

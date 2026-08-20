@@ -155,6 +155,13 @@ export interface GptModelProfile {
    *  text's own token count. Profiles that pin an exact static slab set this;
    *  it is a property of the profile, not of one model id. */
   exactStaticBaseline?: boolean;
+  /** Hard provider cap on TOTAL images in one request (slab + history +
+   *  client-attached). When set, the history-collapse budget becomes dynamic:
+   *  min(configured history cap, this cap − images already in the request), so
+   *  client-attached images consume the same headroom pxpipe's own images do
+   *  and the final request can never overshoot the provider's limit. Set only
+   *  from a documented provider limit (Workers AI 3.8: 32). */
+  providerImageCap?: number;
 }
 
 /** Default downscale-safe strip width (768px). Exported as the global cols default. */
@@ -331,13 +338,15 @@ const BUILTIN_RULES: ProfileRule[] = [
 
   // Qwen 3.8 27B (Workers AI / open weights). Native 14px / 84 cols / maxH 512 is required
   // because 5x8 bitmap glyphs are illegible to Qwen vision (0/15 hex vs 11/15 on 14px).
-  // History image count capped at 24 images to stay safely below Workers AI's 32-image limit.
+  // Workers AI hard-rejects requests over 32 images, so providerImageCap makes the
+  // history budget dynamic: 32 minus every image already in the request.
   {
     test: isQwenModel,
     profile: {
       vision: { regime: 'mpix', tokensPerMegapixel: 1000 },
       cacheReadRate: 0.25,
       outputRate: 3,
+      providerImageCap: 32,
       stripCols: 84,
       maxHeightPx: 512,
       minCompressTokens: 500,

@@ -105,7 +105,7 @@ describe('proxy usage extraction', () => {
 
     let captured: ProxyEvent | undefined;
     const proxy = createProxy({
-      upstream: 'http://ocproxy.test',
+      upstream: 'http://gateway.test',
       transform: { compress: false },
       onRequest: (event) => {
         captured = event;
@@ -157,7 +157,7 @@ describe('proxy usage extraction', () => {
     });
     let captured: ProxyEvent | undefined;
     const proxy = createProxy({
-      upstream: 'http://ocproxy.test',
+      upstream: 'http://gateway.test',
       transform: { compress: true },
       onRequest: (event) => { captured = event; },
     });
@@ -204,7 +204,7 @@ describe('proxy usage extraction', () => {
     });
     let captured: ProxyEvent | undefined;
     const proxy = createProxy({
-      upstream: 'http://ocproxy.test',
+      upstream: 'http://gateway.test',
       transform: { compress: true },
       onRequest: (event) => { captured = event; },
     });
@@ -238,7 +238,7 @@ describe('proxy usage extraction', () => {
     });
     let captured: ProxyEvent | undefined;
     const proxy = createProxy({
-      upstream: 'http://ocproxy.test',
+      upstream: 'http://gateway.test',
       transform: { compress: true },
       onRequest: (event) => { captured = event; },
     });
@@ -284,7 +284,7 @@ describe('proxy usage extraction', () => {
     const restore = restoreFetch;
     let captured: ProxyEvent | undefined;
     const proxy = createProxy({
-      upstream: 'http://ocproxy.test',
+      upstream: 'http://gateway.test',
       transform: { compress: true },
       onRequest: (event) => { captured = event; },
     });
@@ -321,7 +321,7 @@ describe('proxy usage extraction', () => {
     });
     let captured: ProxyEvent | undefined;
     const proxy = createProxy({
-      upstream: 'http://ocproxy.test',
+      upstream: 'http://gateway.test',
       transform: { compress: true },
       onRequest: (event) => { captured = event; },
     });
@@ -354,7 +354,7 @@ describe('proxy usage extraction', () => {
     });
     let captured: ProxyEvent | undefined;
     const proxy = createProxy({
-      upstream: 'http://ocproxy.test',
+      upstream: 'http://gateway.test',
       onRequest: (event) => { captured = event; },
     });
     const body = JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'hi' }] }] });
@@ -430,7 +430,7 @@ describe('proxy usage extraction', () => {
 
     let captured: ProxyEvent | undefined;
     const proxy = createProxy({
-      upstream: 'http://ocproxy.test',
+      upstream: 'http://gateway.test',
       apiKey: 'sk-anthropic-test',
       transform: { charsPerToken: 1, minCompressChars: 1 },
       onRequest: (e) => {
@@ -456,13 +456,13 @@ describe('proxy usage extraction', () => {
     await new Promise((r) => setTimeout(r, 20));
     restore();
 
-    const main = upstreamRequests.find((r) => r.url === 'http://ocproxy.test/anthropic/messages');
+    const main = upstreamRequests.find((r) => r.url === 'http://gateway.test/anthropic/messages');
     expect(main).toBeDefined();
     expect(captured?.model).toBe('claude-fable-5');
     expect(captured?.info?.compressed).toBe(true);
     // count_tokens probe mirrors the request path under the same prefix.
     expect(
-      upstreamRequests.some((r) => r.url === 'http://ocproxy.test/anthropic/messages/count_tokens'),
+      upstreamRequests.some((r) => r.url === 'http://gateway.test/anthropic/messages/count_tokens'),
     ).toBe(true);
   });
 
@@ -652,7 +652,7 @@ describe('proxy usage extraction', () => {
     expect(output).toEqual([
       { type: 'input_text', text: '[Tool execution failed]' },
       { type: 'input_text', text: 'failed' },
-      { type: 'input_image', image_url: 'data:image/png;base64,YWJj', detail: 'high' },
+      { type: 'input_image', image_url: 'data:image/png;base64,YWJj', detail: 'original' },
     ]);
   });
 
@@ -1206,7 +1206,7 @@ describe('proxy usage extraction', () => {
     });
 
     const proxy = createProxy({
-      upstream: 'http://ocproxy.test',
+      upstream: 'http://gateway.test',
       openAIUpstream: 'https://api.openai.test',
       transform: { charsPerToken: 1, minCompressChars: 1 },
     });
@@ -1230,7 +1230,7 @@ describe('proxy usage extraction', () => {
     restore();
 
     expect(upstreamRequests).toHaveLength(1);
-    expect(upstreamRequests[0]!.url).toBe('http://ocproxy.test/openai/v1/chat/completions');
+    expect(upstreamRequests[0]!.url).toBe('http://gateway.test/openai/v1/chat/completions');
     expect(upstreamRequests[0]!.headers.get('authorization')).toBe('Bearer local-token');
     const sent = JSON.parse(await upstreamRequests[0]!.text()) as any;
     const firstUser = sent.messages.find((m: any) => m.role === 'user');
@@ -1254,7 +1254,7 @@ describe('proxy usage extraction', () => {
 
     let captured: ProxyEvent | undefined;
     const proxy = createProxy({
-      upstream: 'http://ocproxy.test',
+      upstream: 'http://gateway.test',
       openAIUpstream: 'https://api.openai.test',
       transform: { charsPerToken: 1, minCompressChars: 1 },
       onRequest: (e) => {
@@ -1280,7 +1280,7 @@ describe('proxy usage extraction', () => {
     restore();
 
     expect(upstreamRequests).toHaveLength(1);
-    expect(upstreamRequests[0]!.url).toBe('http://ocproxy.test/openai/responses');
+    expect(upstreamRequests[0]!.url).toBe('http://gateway.test/openai/responses');
     expect(upstreamRequests[0]!.headers.get('authorization')).toBe('Bearer local-token');
     const sent = JSON.parse(await upstreamRequests[0]!.text()) as any;
     const firstUser = sent.input.find((m: any) => m.role === 'user');

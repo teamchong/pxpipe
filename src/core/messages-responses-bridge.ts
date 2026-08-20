@@ -36,7 +36,14 @@ function imageUrl(source: unknown): string | undefined {
   return undefined;
 }
 
-function inputParts(content: unknown, location = 'message', role = 'user'): JsonObject[] {
+/** Mirrors isGpt5Family in src/core/openai.ts: only the GPT-5 family accepts
+ *  detail:'original'; every other upstream (Workers AI, GPT-4o, …) validates
+ *  detail against 'auto'|'low'|'high' and 400s on 'original'. */
+function imageDetailFor(model: unknown): string {
+  return typeof model === 'string' && /^gpt-5/i.test(model) ? 'original' : 'high';
+}
+
+function inputParts(content: unknown, location = 'message', role = 'user', imageDetail = 'high'): JsonObject[] {
   // Responses requires assistant-role message text to be `output_text`;
   // `input_text` is only valid for user/system. Emitting input_text under
   // role:"assistant" (any replayed assistant turn) is a 400.
@@ -51,7 +58,7 @@ function inputParts(content: unknown, location = 'message', role = 'user'): Json
     } else if (part?.type === 'image') {
       const image_url = imageUrl(part.source);
       if (!image_url) invalidRequest(`Unsupported ${location} image source`);
-      out.push({ type: 'input_image', image_url, detail: 'high' });
+      out.push({ type: 'input_image', image_url, detail: imageDetail });
     } else {
       invalidRequest(`Unsupported ${location} content block: ${String(part?.type ?? 'invalid')}`);
     }
@@ -59,7 +66,7 @@ function inputParts(content: unknown, location = 'message', role = 'user'): Json
   return out;
 }
 
-function functionOutput(content: unknown, isError: boolean): string | JsonObject[] {
+function functionOutput(content: unknown, isError: boolean, imageDetail = 'high'): string | JsonObject[] {
   if (typeof content === 'string') {
     return isError
       ? [{ type: 'input_text', text: '[Tool execution failed]' }, { type: 'input_text', text: content }]
@@ -81,7 +88,7 @@ function functionOutput(content: unknown, isError: boolean): string | JsonObject
     else if (part?.type === 'image') {
       const image_url = imageUrl(part.source);
       if (!image_url) invalidRequest('Unsupported tool_result image source');
-      pieces.push({ type: 'input_image', image_url, detail: 'high' });
+      pieces.push({ type: 'input_image', image_url, detail: imageDetail });
     } else {
       invalidRequest(`Unsupported tool_result content block: ${String(part?.type ?? 'invalid')}`);
     }
@@ -106,6 +113,7 @@ function mapToolChoice(value: unknown): unknown {
 /** Convert a Claude Code Messages request into an OpenAI Responses request. */
 export function anthropicMessagesToOpenAIResponses(body: Uint8Array): Uint8Array {
   const req = JSON.parse(new TextDecoder().decode(body)) as JsonObject;
+  const imageDetail = imageDetailFor(req.model);
   const input: JsonObject[] = [];
 
   if (Array.isArray(req.messages)) {
@@ -124,7 +132,7 @@ export function anthropicMessagesToOpenAIResponses(body: Uint8Array): Uint8Array
       }
       const content = message.content;
       if (!Array.isArray(content)) {
-        const ordinary = inputParts(content, `${String(message.role)} message`, String(message.role));
+        const ordinary = inputParts(content, `${String(message.role)} message`, String(message.role), imageDetail);
         if (ordinary.length) input.push({ role: message.role, content: ordinary });
         continue;
       }
@@ -150,10 +158,10 @@ export function anthropicMessagesToOpenAIResponses(body: Uint8Array): Uint8Array
           input.push({
             type: 'function_call_output',
             call_id: part.tool_use_id,
-            output: functionOutput(part.content, part.is_error === true),
+            output: functionOutput(part.content, part.is_error === true, imageDetail),
           });
         } else {
-          ordinary.push(...inputParts([rawPart], `${String(message.role)} message`, String(message.role)));
+          ordinary.push(...inputParts([rawPart], `${String(message.role)} message`, String(message.role), imageDetail));
         }
       }
       flushOrdinary();

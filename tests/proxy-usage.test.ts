@@ -652,7 +652,7 @@ describe('proxy usage extraction', () => {
     expect(output).toEqual([
       { type: 'input_text', text: '[Tool execution failed]' },
       { type: 'input_text', text: 'failed' },
-      { type: 'input_image', image_url: 'data:image/png;base64,YWJj', detail: 'original' },
+      { type: 'input_image', image_url: 'data:image/png;base64,YWJj', detail: 'high' },
     ]);
   });
 

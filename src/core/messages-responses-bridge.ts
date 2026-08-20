@@ -51,7 +51,7 @@ function inputParts(content: unknown, location = 'message', role = 'user'): Json
     } else if (part?.type === 'image') {
       const image_url = imageUrl(part.source);
       if (!image_url) invalidRequest(`Unsupported ${location} image source`);
-      out.push({ type: 'input_image', image_url, detail: 'original' });
+      out.push({ type: 'input_image', image_url, detail: 'high' });
     } else {
       invalidRequest(`Unsupported ${location} content block: ${String(part?.type ?? 'invalid')}`);
     }
@@ -81,7 +81,7 @@ function functionOutput(content: unknown, isError: boolean): string | JsonObject
     else if (part?.type === 'image') {
       const image_url = imageUrl(part.source);
       if (!image_url) invalidRequest('Unsupported tool_result image source');
-      pieces.push({ type: 'input_image', image_url, detail: 'original' });
+      pieces.push({ type: 'input_image', image_url, detail: 'high' });
     } else {
       invalidRequest(`Unsupported tool_result content block: ${String(part?.type ?? 'invalid')}`);
     }

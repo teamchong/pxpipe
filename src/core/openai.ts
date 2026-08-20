@@ -249,11 +249,28 @@ function configuredHistoryMaxImages(model: string): number {
   return Number.isFinite(parsed) ? Math.max(1, Math.min(100, parsed)) : fallback;
 }
 
+function countRequestImages(messages: OpenAIChatMessage[]): number {
+  let count = 0;
+  for (const msg of messages) {
+    if (Array.isArray(msg.content)) {
+      for (const part of msg.content) {
+        if (typeof part === 'object' && part !== null && 'type' in part && (part as { type?: string }).type === 'image_url') {
+          count++;
+        }
+      }
+    }
+  }
+  return count;
+}
+
 function gptHistoryOpts(
   model: string,
   o: OpenAIResolvedOptions,
   profile: ReturnType<typeof resolveGptProfile>,
+  existingImages = 0,
 ): Partial<GptHistoryOptions> {
+  const configuredMax = o.gptHistory?.maxImages ?? configuredHistoryMaxImages(model);
+  const remainingMax = Math.max(0, configuredMax - existingImages);
   return {
     ...o.gptHistory,
     reflow: o.reflow,
@@ -264,7 +281,7 @@ function gptHistoryOpts(
     cols: o.gptHistory?.cols ?? profile.stripCols,
     maxHeightPx: o.gptHistory?.maxHeightPx ?? profile.maxHeightPx,
     style: o.gptHistory?.style ?? profile.style,
-    maxImages: o.gptHistory?.maxImages ?? configuredHistoryMaxImages(model),
+    maxImages: remainingMax,
   };
 }
 
@@ -809,11 +826,12 @@ async function applyChatHistoryCollapse(
 ): Promise<boolean> {
   const profitable = (text: string, cols: number, baselineTextTokens?: number) =>
     evalOpenAIGate(req.model, text, cols, o.charsPerToken, baselineTextTokens).profitable;
+  const existingImages = (info.imageCount ?? 0) + countRequestImages(req.messages);
   const plan = await planGptCollapse(
     chatMessagesToTurns(req.messages),
     protectedPrefix,
     profitable,
-    gptHistoryOpts(req.model, o, profile),
+    gptHistoryOpts(req.model, o, profile, existingImages),
   );
   foldGptHistory(info, req.model, plan);
   const allImages = [...plan.images, ...plan.imagesAfter];
@@ -853,10 +871,11 @@ async function applyResponsesHistoryCollapse(
 ): Promise<boolean> {
   const profitable = (text: string, cols: number, baselineTextTokens?: number) =>
     evalOpenAIGate(req.model, text, cols, o.charsPerToken, baselineTextTokens).profitable;
+  const existingImages = info.imageCount ?? 0;
   const plan = await planResponsesPairCollapse(
     inputItems,
     profitable,
-    gptHistoryOpts(req.model, o, profile),
+    gptHistoryOpts(req.model, o, profile, existingImages),
   );
   const ps = plan.pairState;
   const rc = info.responsesComposition!;

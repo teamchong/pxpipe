@@ -1208,6 +1208,17 @@ describe('resolveGptProfile (Grok)', () => {
   });
 });
 
+describe('resolveGptProfile (Qwen)', () => {
+  it('uses native 14px packing and 24 max images under Workers AI 32-image cap', () => {
+    const p = resolveGptProfile('workers-ai/@cf/qwen/qwen3.8-27b');
+    expect(p.stripCols).toBe(84);
+    expect(p.maxHeightPx).toBe(512);
+    expect(p.style.font).toBe('jetbrains-mono-14');
+    expect(p.history.maxImages).toBe(24);
+    expect(resolveGptProfile('qwen-3.8-27b').stripCols).toBe(84);
+  });
+});
+
 describe('resolveGptProfile style overrides', () => {
   it('merges every render knob into the selected model profile', () => {
     const prev = process.env.PXPIPE_GPT_PROFILES;

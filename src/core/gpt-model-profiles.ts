@@ -229,6 +229,9 @@ const isMiniNanoPatch = (m: string): boolean =>
 /** Grok ids pxpipe has a measured profile for. */
 const isGrokModel = (m: string): boolean => /^grok-/.test(m);
 
+/** Qwen ids pxpipe has a measured profile for (e.g. Qwen 3.8 / Qwen 2.5). */
+const isQwenModel = (m: string): boolean => /qwen/i.test(m);
+
 /** Shared GPT geometry for the small patch-billed models; only the patch
  *  multiplier and the family list prices differ between the rules below. */
 const miniNanoProfile = (
@@ -323,6 +326,30 @@ const BUILTIN_RULES: ProfileRule[] = [
       },
     },
   },
+
+  // Qwen (Workers AI / open weights). Native 14px / 84 cols / maxH 512 is required
+  // because 5x8 bitmap glyphs are illegible to Qwen vision (0/15 hex vs 11/15 on 14px).
+  // History image count capped at 24 images to stay safely below Workers AI's 32-image limit.
+  {
+    test: isQwenModel,
+    profile: {
+      vision: { regime: 'mpix', tokensPerMegapixel: 1000 },
+      cacheReadRate: 0.25,
+      outputRate: 3,
+      stripCols: 84,
+      maxHeightPx: 512,
+      minCompressTokens: 500,
+      factSheetFormat: 'full',
+      history: { ...BASE_HISTORY, maxImages: 24 },
+      style: {
+        ...BASE_STYLE,
+        font: 'jetbrains-mono-14',
+        aa: true,
+        grid: false,
+        gridCols: 0,
+      },
+    },
+  },
 ];
 
 /**
@@ -333,6 +360,7 @@ const BUILTIN_RULES: ProfileRule[] = [
 const FAMILY_ID_GUARDS: ReadonlyArray<{ mentions: RegExp; matches: (m: string) => boolean }> = [
   { mentions: /gemini/, matches: hasGeminiMeasuredProfile },
   { mentions: /grok/, matches: isGrokModel },
+  { mentions: /qwen/, matches: isQwenModel },
 ];
 
 /** True when the operator declared this id in PXPIPE_GPT_PROFILES. The guards

@@ -168,46 +168,36 @@ function cleanGeminiFunctionCall(fc: unknown): { cleaned: Record<string, unknown
   return { cleaned: rec, changed: false };
 }
 
-/** Copy a turn or session's existing signature onto unsigned sibling functionCall parts. Does not invent one. */
-function stampGeminiThoughtSignatures(contents: GoogleContent[]): GoogleContent[] {
+/** Normalize signature placement without changing Gemini's signed part sequence. */
+function normalizeGeminiThoughtSignatures(contents: GoogleContent[]): GoogleContent[] {
   let changed = false;
-  let lastKnownDonor: string | undefined;
 
   const next = contents.map((content) => {
     if (!Array.isArray(content.parts) || content.parts.length === 0) return content;
-    // Find donor from ANY part in this turn (thought part, text part, functionCall part)
-    const turnDonor = content.parts
-      .map(readGeminiThoughtSignature)
-      .find((sig) => sig !== undefined);
-
-    const donor = turnDonor ?? lastKnownDonor;
-    if (turnDonor) {
-      lastKnownDonor = turnDonor;
-    }
-    if (!donor) return content;
 
     let partsChanged = false;
     const parts = content.parts.map((part) => {
       if (!isGeminiFunctionCallPart(part)) return part;
       const rec = record(part) ?? {};
       const { cleaned: fc, changed: fcChanged } = cleanGeminiFunctionCall(rec.functionCall);
-      const existing = readGeminiThoughtSignature(part);
-      const sigToUse = existing ?? donor;
-      if (!sigToUse) {
+      const signature = readGeminiThoughtSignature(part);
+      const hasCanonicalSignature = readString(rec.thoughtSignature) === signature;
+      const hasLegacySignature = 'thought_signature' in rec || 'signature' in rec;
+      if (!signature) {
         if (fcChanged) {
           partsChanged = true;
           return { ...rec, functionCall: fc };
         }
         return part;
       }
-      const directSig = readString(rec.thoughtSignature) ?? readString(rec.thought_signature);
-      if (directSig === sigToUse && !fcChanged) {
+      if (hasCanonicalSignature && !hasLegacySignature && !fcChanged) {
         return part;
       }
+      const { thought_signature, signature: legacySignature, ...rest } = rec;
       partsChanged = true;
       return {
-        ...rec,
-        thoughtSignature: sigToUse,
+        ...rest,
+        thoughtSignature: signature,
         ...(fc ? { functionCall: fc } : {}),
       };
     });
@@ -830,7 +820,7 @@ export async function transformGoogleGenerateContent(
     }
   }
 
-  const normalizedContents = stampGeminiThoughtSignatures(normalizeGoogleTurnRoles(contents));
+  const normalizedContents = normalizeGeminiThoughtSignatures(normalizeGoogleTurnRoles(contents));
 
   // Keep a native system-level pointer so the imaged instruction retains its
   // original authority instead of being demoted to ordinary user content.
@@ -939,10 +929,10 @@ function withStampedThoughtSignatures(
   const normalized = isNormalizedGoogleTurnRoles(req.contents)
     ? req.contents
     : normalizeGoogleTurnRoles(req.contents);
-  const stamped = stampGeminiThoughtSignatures(normalized);
-  if (stamped === req.contents && normalized === req.contents) return { body: bodyBytes, info };
+  const normalizedSignatures = normalizeGeminiThoughtSignatures(normalized);
+  if (normalizedSignatures === req.contents && normalized === req.contents) return { body: bodyBytes, info };
   return {
-    body: new TextEncoder().encode(JSON.stringify({ ...req, contents: stamped })),
+    body: new TextEncoder().encode(JSON.stringify({ ...req, contents: normalizedSignatures })),
     info,
   };
 }

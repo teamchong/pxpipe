@@ -1137,6 +1137,11 @@ function chatContentToText(content: unknown): string {
 function chatMessageToTurn(msg: unknown, idx: number): HistoryTurn {
   const o = (msg ?? {}) as Record<string, unknown>;
   const role = typeof o.role === 'string' ? o.role : '';
+  const hasImage = Array.isArray(o.content) && o.content.some((part) => {
+    if (!part || typeof part !== 'object') return false;
+    const type = (part as { type?: string }).type;
+    return type === 'image_url' || type === 'input_image' || type === 'image';
+  });
   const body = chatContentToText(o.content);
   if (role === 'tool') {
     const id = typeof o.tool_call_id === 'string' ? o.tool_call_id : '';
@@ -1144,7 +1149,7 @@ function chatMessageToTurn(msg: unknown, idx: number): HistoryTurn {
       text: `[tool_result]\n${body}`,
       openIds: [],
       closeIds: id ? [id] : [],
-      opaque: false,
+      opaque: hasImage,
     };
   }
   if (role === 'assistant') {
@@ -1169,16 +1174,16 @@ function chatMessageToTurn(msg: unknown, idx: number): HistoryTurn {
       text: text.trim() ? `<assistant t="${idx}">\n${text}\n</assistant>` : '',
       openIds,
       closeIds: [],
-      opaque: false,
+      opaque: hasImage,
     };
   }
-  if (!body.trim()) return { text: '', openIds: [], closeIds: [], opaque: false };
+  if (!body.trim()) return { text: '', openIds: [], closeIds: [], opaque: hasImage };
   const tag = role === 'user' ? 'user' : role || 'user';
   return {
     text: `<${tag} t="${idx}">\n${body}\n</${tag}>`,
     openIds: [],
     closeIds: [],
-    opaque: false,
+    opaque: hasImage,
     userText: role === 'user' ? body : undefined,
   };
 }

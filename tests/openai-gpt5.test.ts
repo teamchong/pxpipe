@@ -1218,7 +1218,8 @@ describe('resolveGptProfile (Qwen)', () => {
     expect(p.stripCols).toBe(84);
     expect(p.maxHeightPx).toBe(512);
     expect(p.style.font).toBe('jetbrains-mono-14');
-    expect(p.history.maxImages).toBe(24);
+    expect(p.history.maxImages).toBe(32);
+    expect(p.history.keepTail).toBe(1);
     expect(p.providerImageCap).toBe(32);
     // Keyed to the exact measured model id, not to any 'qwen' substring.
     expect(resolveGptProfile('qwen3.8-27b').stripCols).toBe(84);
@@ -1236,10 +1237,11 @@ describe('Qwen provider image cap — dynamic history budget', () => {
   it('budgets history against 32 minus the images already in the request', async () => {
     const tinyPng = { url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==' };
     const messages = buildChatMessages(20);
-    // The client already attached 24 images to the conversation prefix.
-    for (let i = 0; i < 24; i++) {
-      messages.splice(2, 0, { role: 'user', content: [{ type: 'image_url', image_url: tinyPng }] });
-    }
+    // The client attached 24 images to the live request, outside collapsed history.
+    messages.at(-1)!.content = [
+      { type: 'text', text: messages.at(-1)!.content },
+      ...Array.from({ length: 24 }, () => ({ type: 'image_url', image_url: tinyPng })),
+    ];
     const result = await transformOpenAIChatCompletions(
       enc.encode(JSON.stringify({ model: 'workers-ai/@cf/qwen/qwen3.8-27b', messages })),
       { charsPerToken: 1, minCompressChars: 1 },
@@ -1256,7 +1258,25 @@ describe('Qwen provider image cap — dynamic history budget', () => {
         totalImages += (m.content as Array<{ type?: string }>).filter((p) => p.type === 'image_url').length;
       }
     }
+    expect(JSON.stringify(out.messages).match(/iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ/g)?.length).toBe(24);
     expect(totalImages).toBeLessThanOrEqual(32);
+  });
+
+  it('keeps static context native when client images leave insufficient headroom', async () => {
+    const tinyPng = { url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==' };
+    const messages: Array<Record<string, unknown>> = [
+      { role: 'system', content: BIG_SLAB },
+      {
+        role: 'user',
+        content: Array.from({ length: 31 }, () => ({ type: 'image_url', image_url: tinyPng })),
+      },
+    ];
+    const body = enc.encode(JSON.stringify({ model: 'workers-ai/@cf/qwen/qwen3.8-27b', messages }));
+    const result = await transformOpenAIChatCompletions(body, { minCompressChars: 1 });
+
+    expect(result.info.compressed).toBe(false);
+    expect(result.info.reason).toBe('provider_image_cap');
+    expect(result.body).toEqual(body);
   });
 });
 

@@ -351,7 +351,7 @@ const BUILTIN_RULES: ProfileRule[] = [
       maxHeightPx: 512,
       minCompressTokens: 500,
       factSheetFormat: 'full',
-      history: { ...BASE_HISTORY, maxImages: 24 },
+      history: { ...BASE_HISTORY, maxImages: 32, keepTail: 1 },
       style: {
         ...BASE_STYLE,
         font: 'jetbrains-mono-14',

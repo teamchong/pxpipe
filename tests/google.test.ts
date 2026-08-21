@@ -328,7 +328,7 @@ describe('transformGoogleGenerateContent', () => {
     expect(JSON.stringify(out)).not.toContain('src/file-1199.ts:1200');
   });
 
-  it('collapses closed history with thought signatures while stamping and preserving tail signatures', async () => {
+  it('collapses closed history with thought signatures while preserving tail signatures', async () => {
     const contents: Array<Record<string, unknown>> = [
       { role: 'user', parts: [{ text: 'Initial prompt for task.' }] },
     ];
@@ -365,11 +365,10 @@ describe('transformGoogleGenerateContent', () => {
     const out = JSON.parse(new TextDecoder().decode(result.body));
     const serialized = JSON.stringify(out.contents);
     expect(serialized).toContain('Earlier turns in image(s)');
-    // The native kept-tail turns retain their thought signatures
     expect(serialized).toContain('sig-19');
   });
 
-  it('stamps thought signature onto unsigned sibling function calls in the same turn', async () => {
+  it('keeps unsigned parallel function calls unsigned', async () => {
     const sampleBody = {
       contents: [
         { role: 'user', parts: [{ text: 'Run tools' }] },
@@ -402,12 +401,12 @@ describe('transformGoogleGenerateContent', () => {
 
     const out = JSON.parse(new TextDecoder().decode(result.body));
     expect(out.contents[1].parts[0].thoughtSignature).toBe('shared_turn_signature');
-    expect(out.contents[1].parts[1].thoughtSignature).toBe('shared_turn_signature');
+    expect(out.contents[1].parts[1].thoughtSignature).toBeUndefined();
     expect(out.contents[1].parts[1].functionCall.thoughtSignature).toBeUndefined();
     expect(out.contents[1].parts[1].functionCall.thought_signature).toBeUndefined();
   });
 
-  it('stamps thought signature from thought block onto unsigned functionCall parts including position 2', async () => {
+  it('relocates only a functionCall part own nested thought signature', async () => {
     const sampleBody = {
       contents: [
         { role: 'user', parts: [{ text: 'Run complex task' }] },
@@ -444,14 +443,40 @@ describe('transformGoogleGenerateContent', () => {
 
     const out = JSON.parse(new TextDecoder().decode(result.body));
     const modelTurn = out.contents[1];
-    // Position 1: read_file (stamped from thought block donor)
-    expect(modelTurn.parts[1].thoughtSignature).toBe('sig_from_thought_block');
+    expect(modelTurn.parts[1].thoughtSignature).toBeUndefined();
     expect(modelTurn.parts[1].functionCall.thought_signature).toBeUndefined();
     expect(modelTurn.parts[1].functionCall.thoughtSignature).toBeUndefined();
-    // Position 2: default_api:task (cleans misplaced functionCall.thought_signature and sets part.thoughtSignature)
     expect(modelTurn.parts[2].thoughtSignature).toBe('nested_sig');
     expect(modelTurn.parts[2].functionCall.thought_signature).toBeUndefined();
     expect(modelTurn.parts[2].functionCall.thoughtSignature).toBeUndefined();
+  });
+
+  it('removes legacy aliases when a canonical thought signature is present', async () => {
+    const sampleBody = {
+      contents: [
+        { role: 'user', parts: [{ text: 'Run tool' }] },
+        {
+          role: 'model',
+          parts: [{
+            functionCall: { name: 'read_file', args: { path: 'foo.ts' } },
+            thoughtSignature: 'canonical_sig',
+            thought_signature: 'legacy_sig',
+            signature: 'older_sig',
+          }],
+        },
+        { role: 'user', parts: [{ functionResponse: { name: 'read_file', response: { content: 'ok' } } }] },
+      ],
+    };
+    const result = await transformGoogleGenerateContent(
+      new TextEncoder().encode(JSON.stringify(sampleBody)),
+      'gemini-3.6-flash',
+      { compress: false },
+    );
+
+    const out = JSON.parse(new TextDecoder().decode(result.body));
+    expect(out.contents[1].parts[0].thoughtSignature).toBe('canonical_sig');
+    expect(out.contents[1].parts[0].thought_signature).toBeUndefined();
+    expect(out.contents[1].parts[0].signature).toBeUndefined();
   });
 
   it.each([

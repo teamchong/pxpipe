@@ -1080,6 +1080,27 @@ export async function transformOpenAIChatCompletions(
     return { body, info };
   }
 
+  // A hard provider cap makes static-first allocation pathological on long Qwen
+  // chats: the repeated system slab consumes slots that could replace much more
+  // history. Plan against the full cap first and keep static text native when the
+  // two image sets cannot coexist.
+  if (o.collapseHistory && profile.providerImageCap !== undefined) {
+    const historyReq = structuredClone(req);
+    const historyInfo = structuredClone(info);
+    if (await applyChatHistoryCollapse(
+      historyReq, historyInfo, o, profile, firstUserIdx + 1,
+    ) && countRequestImages(historyReq.messages) + images.length > profile.providerImageCap) {
+      historyInfo.outgoingTextChars = countOutgoingTextChars(historyReq);
+      historyInfo.compressed = true;
+      return { body: new TextEncoder().encode(JSON.stringify(historyReq)), info: historyInfo };
+    }
+  }
+  if (profile.providerImageCap !== undefined &&
+      countRequestImages(req.messages) + images.length > profile.providerImageCap) {
+    info.reason = 'provider_image_cap';
+    return { body, info };
+  }
+
   const { droppedCodepoints } = accumulateRenderedImages(images, info);
   const topDropped = droppedCodepointsTop(droppedCodepoints);
   if (topDropped) info.droppedCodepointsTop = topDropped;

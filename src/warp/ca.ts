@@ -22,7 +22,7 @@ import {
 } from 'node:crypto';
 import { createSecureContext, type SecureContext } from 'node:tls';
 import { isIP } from 'node:net';
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import {
@@ -160,6 +160,31 @@ function privateKeyPem(key: KeyObject): string {
   return key.export({ type: 'pkcs8', format: 'pem' }).toString();
 }
 
+/**
+ * Where the OS keeps its public root bundle. `SSL_CERT_FILE`,
+ * `CURL_CA_BUNDLE` and `REQUESTS_CA_BUNDLE` REPLACE the trust store rather
+ * than extend it, so a file holding only our CA would make every non-pxpipe
+ * HTTPS call in the child fail verification (gcloud, gws, pip: #245). The
+ * first path that exists wins; none found means the bundle is CA-only and the
+ * caller is told so.
+ */
+const SYSTEM_ROOT_BUNDLES = [
+  '/etc/ssl/cert.pem', // macOS, Alpine, FreeBSD
+  '/etc/ssl/certs/ca-certificates.crt', // Debian, Ubuntu, Arch
+  '/etc/pki/tls/certs/ca-bundle.crt', // RHEL, Fedora, CentOS
+  '/etc/ssl/ca-bundle.pem', // openSUSE
+];
+
+export function findSystemRootBundle(candidates: readonly string[] = SYSTEM_ROOT_BUNDLES): string | null {
+  const fromEnv = process.env.SSL_CERT_FILE;
+  // An operator-supplied bundle is the trust store the child would have had
+  // without us; prefer it over the platform guess. Skip it if it is already
+  // one of our own files, or the bundle would nest on every warp restart.
+  if (fromEnv && existsSync(fromEnv) && !/warp-ca(-bundle)?\.pem$/.test(fromEnv)) return fromEnv;
+  for (const p of candidates) if (existsSync(p)) return p;
+  return null;
+}
+
 export class CertificateAuthority {
   private readonly leaves = new Map<string, SecureContext>();
 
@@ -169,7 +194,32 @@ export class CertificateAuthority {
     private readonly leafKey: KeyObject,
     private readonly leafKeyPem: string,
     readonly certPath: string,
+    /** Our CA followed by the system roots; see {@link writeBundle}. */
+    readonly bundlePath: string,
+    /** Null when no system root bundle was found and `bundlePath` is CA-only. */
+    readonly systemRootsPath: string | null,
   ) {}
+
+  /**
+   * Write `warp-ca-bundle.pem` = our CA + the system roots, for the env vars
+   * that replace the trust store. Regenerated on every load: the system bundle
+   * rotates underneath us and the cost is one file write.
+   */
+  private static writeBundle(dir: string, certPem: string): { bundlePath: string; systemRootsPath: string | null } {
+    const bundlePath = join(dir, 'warp-ca-bundle.pem');
+    const systemRootsPath = findSystemRootBundle();
+    let roots = '';
+    if (systemRootsPath) {
+      try {
+        roots = readFileSync(systemRootsPath, 'utf8');
+      } catch {
+        /* unreadable: fall back to CA-only, reported via systemRootsPath */
+      }
+    }
+    const sep = roots && !roots.endsWith('\n') ? '\n' : '';
+    writeFileSync(bundlePath, certPem + roots + sep, { mode: 0o644 });
+    return { bundlePath, systemRootsPath: roots ? systemRootsPath : null };
+  }
 
   /**
    * Load the persisted CA, or create and persist one. A CA that fails to load
@@ -189,12 +239,15 @@ export class CertificateAuthority {
       if (new Date(parsed.validTo).getTime() > Date.now()) {
         const caKey = createPrivateKey(keyPem);
         const leaf = newKeyPair();
+        const bundle = CertificateAuthority.writeBundle(dir, certPem);
         return new CertificateAuthority(
           certPem,
           caKey,
           leaf.publicKey,
           privateKeyPem(leaf.privateKey),
           certPath,
+          bundle.bundlePath,
+          bundle.systemRootsPath,
         );
       }
     } catch {
@@ -224,12 +277,15 @@ export class CertificateAuthority {
     chmodSync(keyPath, 0o600);
 
     const leaf = newKeyPair();
+    const bundle = CertificateAuthority.writeBundle(dir, certPem);
     return new CertificateAuthority(
       certPem,
       ca.privateKey,
       leaf.publicKey,
       privateKeyPem(leaf.privateKey),
       certPath,
+      bundle.bundlePath,
+      bundle.systemRootsPath,
     );
   }
 

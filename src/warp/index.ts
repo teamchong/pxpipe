@@ -174,10 +174,15 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
     // Node script, so the Node-only variable alone would silently fail to make
     // it trust us. Set every convention — they are inert for runtimes that
     // ignore them, and one of them is the one that counts.
+    // NODE_EXTRA_CA_CERTS appends to Node's built-in roots, so the CA-only
+    // file is right there. The other three REPLACE the trust store: handing
+    // them a 1-cert file strips the public roots from every other HTTPS client
+    // in the session (gcloud, gws, pip all fail verification — #245). They get
+    // the bundle: our CA followed by the system roots.
     env.NODE_EXTRA_CA_CERTS = ca.certPath; // Node, and Bun-compiled binaries
-    env.SSL_CERT_FILE = ca.certPath; // OpenSSL: curl, Rust, Go with cgo
-    env.CURL_CA_BUNDLE = ca.certPath; // libcurl
-    env.REQUESTS_CA_BUNDLE = ca.certPath; // Python requests / httpx
+    env.SSL_CERT_FILE = ca.bundlePath; // OpenSSL: curl, Rust, Go with cgo
+    env.CURL_CA_BUNDLE = ca.bundlePath; // libcurl
+    env.REQUESTS_CA_BUNDLE = ca.bundlePath; // Python requests / httpx
 
     const child = spawnResolved(command, env);
     // The child's proxy and CA point at this process. If warp dies for any
@@ -263,6 +268,14 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
       console.error(`[pxpipe] warp route → ${route.pattern} → ${routeDestination(route)}`);
     }
     console.error(`[pxpipe] warp CA → ${ca.certPath}`);
+    if (ca.systemRootsPath) {
+      console.error(`[pxpipe] warp CA bundle → ${ca.bundlePath} (+ system roots from ${ca.systemRootsPath})`);
+    } else {
+      console.error(
+        `[pxpipe] warp CA bundle → ${ca.bundlePath} (no system root bundle found; ` +
+          `non-pxpipe HTTPS in the child may fail verification — set SSL_CERT_FILE to your OS bundle before warp)`,
+      );
+    }
     console.error(`[pxpipe] warp exec → ${command.join(' ')}`);
 
     proxy.on('error', (err) => {

@@ -75,6 +75,9 @@ interface RuntimeConfig {
   captureErrorReqBody: boolean;
   /** Exact trusted proxy address for loopback-published dashboard traffic. */
   trustedDashboardProxy?: string;
+  /** Public origins accepted for dashboard mutations behind a reverse proxy
+   * (PXPIPE_DASHBOARD_ORIGINS, comma-separated). */
+  dashboardOrigins?: readonly string[];
   /** Explicit acknowledgement that an external boundary (for example the
    * bundled Compose loopback port publication) protects a non-loopback bind
    * that injects server-owned upstream credentials. */
@@ -175,6 +178,8 @@ function parseCli(argv: string[]): RuntimeConfig {
     // Opt in for debugging only. (issue #69)
     captureErrorReqBody: process.env.PXPIPE_DEBUG_CAPTURE_4XX === '1',
     trustedDashboardProxy: process.env.PXPIPE_TRUSTED_DASHBOARD_PROXY?.trim() || undefined,
+    dashboardOrigins: process.env.PXPIPE_DASHBOARD_ORIGINS
+      ?.split(',').map((s) => s.trim()).filter(Boolean),
     allowNonLoopbackCredentials:
       process.env.PXPIPE_ALLOW_NON_LOOPBACK_CREDENTIALS === '1',
   };
@@ -251,6 +256,16 @@ Environment:
                           set to 1 only when an external access boundary protects
                           a non-loopback HOST (the bundled loopback-only Compose
                           publication sets this explicitly)
+  PXPIPE_TRUSTED_DASHBOARD_PROXY
+                          exact source address of a trusted reverse proxy in
+                          front of the dashboard; such a request is allowed
+                          without a loopback Host. Host validation stays
+                          mandatory for every other source.
+  PXPIPE_DASHBOARD_ORIGINS
+                          comma-separated public origins accepted for dashboard
+                          mutations behind that proxy (e.g.
+                          https://pxpipe.example.com). Cross-site writes are
+                          still rejected via Sec-Fetch-Site.
 
 Use with Claude Code:
   ANTHROPIC_BASE_URL=http://127.0.0.1:47821 claude
@@ -438,10 +453,12 @@ function isAllowedDashboardClient(
   hostname: string,
   trustedDashboardProxy: string | undefined,
 ): boolean {
-  // Host validation remains mandatory. Compose trusts only its fixed bridge
-  // gateway, never arbitrary peers attached to that network.
-  return isLoopbackHostname(hostname)
-    && (isLoopbackAddress(address) || address === trustedDashboardProxy);
+  // A request from the explicitly configured trusted proxy has already passed
+  // the operator's access boundary; requiring a loopback Host on top of that
+  // only forces the proxy to forge one. Host validation stays mandatory for
+  // every other source.
+  if (trustedDashboardProxy && address === trustedDashboardProxy) return true;
+  return isLoopbackHostname(hostname) && isLoopbackAddress(address);
 }
 
 function injectedCredentialSources(opts: RuntimeConfig): string[] {
@@ -482,13 +499,20 @@ function isDashboardMutation(route: DashboardRoute, method: string): boolean {
 }
 
 /** Reject browser cross-site writes to the unauthenticated loopback dashboard. */
-function isSameOriginDashboardRequest(req: IncomingMessage, url: URL): boolean {
+function isSameOriginDashboardRequest(
+  req: IncomingMessage,
+  url: URL,
+  allowedOrigins: readonly string[] = [],
+): boolean {
   const fetchSite = req.headers['sec-fetch-site'];
   if (fetchSite === 'cross-site') return false;
   const origin = req.headers.origin;
   if (origin === undefined) return true; // local CLI/curl clients do not send Origin
   try {
-    return new URL(origin).origin === url.origin;
+    const reqOrigin = new URL(origin).origin;
+    // Same origin, or an operator-declared public origin for a reverse-proxied
+    // dashboard (PXPIPE_DASHBOARD_ORIGINS).
+    return reqOrigin === url.origin || allowedOrigins.includes(reqOrigin);
   } catch {
     return false;
   }
@@ -1436,7 +1460,7 @@ async function main(): Promise<void> {
             return;
           }
           if (isDashboardMutation(route, req.method ?? 'GET')
-            && !isSameOriginDashboardRequest(req, url)) {
+            && !isSameOriginDashboardRequest(req, url, opts.dashboardOrigins)) {
             await writeWebResponse(new Response('cross-origin dashboard mutation denied', { status: 403 }), res);
             return;
           }

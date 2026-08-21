@@ -51,6 +51,7 @@ import {
   ANTHROPIC_MAX_IMAGES,
   ANTHROPIC_HISTORY_IMAGE_BUDGET,
 } from './history.js';
+import type { HistoryCollapseInfo } from './history.js';
 import { noteHistoryRequest, recordFreezeStep } from './session-state.js';
 import type { GptHistoryOptions } from './openai-history.js';
 import { CACHE_CREATE_RATE, CACHE_READ_RATE } from './baseline.js';
@@ -812,6 +813,11 @@ export interface TransformInfo {
    *  didn't (exclude from rollup — cacheable=0 fallback is dishonest). 'failed': no
    *  baseline. undefined: no probe attempted. */
   baselineProbeStatus?: 'ok' | 'partial' | 'failed';
+  /** The model's legible history render (jetbrains-mono-14, #170) overflowed the
+   *  decoded image-byte budget, so the collapse was re-rendered at the dense
+   *  geometry and admitted instead of being abandoned to a raw-text forward
+   *  (#216). Diagnostic only. */
+  historyDegradedDense?: boolean;
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -1939,6 +1945,79 @@ function historyGridTuning(
   return { imageBudget, packFill: session.cold, minFreezeStep: session.minFreezeStep };
 }
 
+/** Collapse the history at the model's default (possibly legible) history
+ *  geometry, and — when that render overflows the decoded image-byte budget —
+ *  retry once at the dense geometry before giving up.
+ *
+ *  #216: since #170, misread-prone Claude models (e.g. `claude-opus-5`) default
+ *  to the legible history geometry (`jetbrains-mono-14`), which renders several
+ *  times heavier per char than dense (`spleen-5x8`). On a long session the
+ *  legible collapse can exceed the 18 MiB headroom while the dense render still
+ *  fits. The atomic-admission check then abandoned the collapse and forwarded
+ *  the raw history as text — a request LARGER than the render it refused (raw
+ *  forwards of 1.65-1.73M tokens observed, upstream 400s). Degrading to dense
+ *  keeps the collapse (and its token saving); only a history too big for even
+ *  the dense geometry falls through to the original text passthrough. */
+async function collapseHistoryWithinByteBudget(
+  messages: Message[],
+  info: TransformInfo,
+  o: Required<TransformOptions>,
+  opts: TransformOptions,
+  protectedPrefix: number,
+  tuning: { imageBudget: number; packFill: boolean; minFreezeStep: number },
+): Promise<{ messages: Message[]; info: HistoryCollapseInfo; degradedToDense: boolean }> {
+  const historyCpt = opts.charsPerToken !== undefined
+    ? o.charsPerToken
+    : HISTORY_CHARS_PER_TOKEN;
+  const horizon = Math.max(1, Math.floor(o.historyAmortizationHorizon));
+  const collapseAt = (geometry: GateGeometry) => {
+    // Gate with the same model geometry the history renderer will use. The
+    // symmetric warm-cache burn (priorWarmImageTokens) is passed through here
+    // too: without it the history gate flipped sessions out of image mode even
+    // when symmetric burn would have kept the slab gate in (prod 2026-05-23,
+    // three-turn sessions paying cache_create every turn).
+    const profitable = (text: string, _cols: number): boolean =>
+      isCompressionProfitableAmortized(
+        text, geometry.cols, undefined, historyCpt, horizon,
+        o.priorWarmTokens, o.priorWarmImageTokens, true, geometry.maxChars, geometry,
+      );
+    return collapseHistory(messages, profitable, {
+      cols: geometry.cols,
+      protectedPrefix,
+      reflow: o.reflow,
+      style: geometry.style,
+      maxHeightPx: geometry.maxHeightPx,
+      pageChars: geometry.maxChars,
+      imageBudget: tuning.imageBudget,
+      packFill: tuning.packFill,
+      minFreezeStep: tuning.minFreezeStep,
+    });
+  };
+  const overflows = (histInfo: HistoryCollapseInfo): boolean =>
+    histInfo.collapsedTurns > 0 &&
+    histInfo.collapsedImageBytes > imageByteHeadroom(info, o.maxImageBytes);
+
+  const first = await collapseAt(historyGateGeometry(o, opts.cols !== undefined));
+  if (!overflows(first.info)) return { ...first, degradedToDense: false };
+
+  // The retry only helps when the model actually renders history legibly; when
+  // the history geometry already IS the dense one (Fable, GPT), re-rendering
+  // would reproduce the same overflow. `historyGateGeometry` diverges from dense
+  // exactly when the profile sets a history override, so mirror that condition.
+  const profile = o.model ? resolveGptProfile(o.model) : undefined;
+  const rendersLegibleHistory =
+    profile?.historyStripCols !== undefined || profile?.historyStyle !== undefined;
+  if (!rendersLegibleHistory) return { ...first, degradedToDense: false };
+
+  const retry = await collapseAt(denseGateGeometry(o));
+  // Keep the dense collapse only when it fits; otherwise the original atomic
+  // admission stands (a history too big for any geometry keeps its text).
+  if (retry.info.collapsedTurns > 0 && !overflows(retry.info)) {
+    return { ...retry, degradedToDense: true };
+  }
+  return { ...first, degradedToDense: false };
+}
+
 async function runHistoryCollapseAndFinalize(
   req: MessagesRequest,
   info: TransformInfo,
@@ -1957,24 +2036,6 @@ async function runHistoryCollapseAndFinalize(
     info.imageBudgetSkips = (info.imageBudgetSkips ?? 0) + 1;
     info.historyReason ??= 'too_many_images';
   } else if (Array.isArray(req.messages) && req.messages.length > 0) {
-    const historyCpt = opts.charsPerToken !== undefined
-      ? o.charsPerToken
-      : HISTORY_CHARS_PER_TOKEN;
-    const horizon = Math.max(1, Math.floor(o.historyAmortizationHorizon));
-    // Pass the symmetric warm-cache burn through to the history-collapse
-    // gate as well. The slab gate alone got the symmetric treatment, which
-    // let the history gate flip a session out of image mode even when
-    // symmetric burn would have kept the slab gate in. Production data
-    // 2026-05-23 showed three-turn sessions paying cache_create every
-    // turn because the history gate ignored priorWarmImageTokens.
-    const historyGeometry = historyGateGeometry(o, opts.cols !== undefined);
-    const historyProfitable = (text: string, cols: number): boolean => {
-      // Gate with the same model profile used by the history renderer.
-      return isCompressionProfitableAmortized(
-        text, historyGeometry.cols, undefined, historyCpt, horizon,
-        o.priorWarmTokens, o.priorWarmImageTokens, true, historyGeometry.maxChars, historyGeometry,
-      );
-    };
     // The slab needs no shield here: this path runs only when the slab did NOT
     // image (it stays as text in req.system). But project instructions do.
     // CLAUDE.md arrives in the FIRST user message wrapped in <system-reminder>,
@@ -1985,31 +2046,20 @@ async function runHistoryCollapseAndFinalize(
     // non-collapse path already keeps <system-reminder> as text below.
     const protectedPrefix = firstMessageHasSystemReminder(req.messages) ? 1 : 0;
     const tuning = historyGridTuning(info);
-    const { messages: newMessages, info: histInfo } = await collapseHistory(
-      req.messages,
-      historyProfitable,
-      {
-        cols: historyGeometry.cols,
-        protectedPrefix,
-        reflow: o.reflow,
-        style: historyGeometry.style,
-        maxHeightPx: historyGeometry.maxHeightPx,
-        pageChars: historyGeometry.maxChars,
-        imageBudget: tuning.imageBudget,
-        packFill: tuning.packFill,
-        minFreezeStep: tuning.minFreezeStep,
-      },
-    );
+    // Collapses at the model geometry, degrading legible -> dense if that render
+    // overflows the byte budget instead of abandoning the collapse (#216).
+    const { messages: newMessages, info: histInfo, degradedToDense } =
+      await collapseHistoryWithinByteBudget(req.messages, info, o, opts, protectedPrefix, tuning);
     recordFreezeStep(info.firstUserSha8, histInfo.freezeStep);
     if (histInfo.freezeStep !== undefined) info.historyFreezeStep = histInfo.freezeStep;
     if (histInfo.budgetTrimmed) info.historyBudgetTrimmed = true;
     if (tuning.packFill) info.historyPackFill = true;
+    if (degradedToDense) info.historyDegradedDense = true;
     // Atomic admission by weight. The collapse is one semantic group: applying
     // it means every collapsed message becomes pages, so a group that does not
     // fit the byte budget is not applied at all and the original text stands.
-    // Rendering it first and discarding it costs CPU, which is the cheap half of
-    // the trade: the alternative is estimating PNG size from character counts and
-    // being wrong on the request that mattered.
+    // Reaching the bail here means even the dense re-render overflowed, so no
+    // geometry fits and the original text is the only safe forward.
     if (
       histInfo.collapsedTurns > 0 &&
       histInfo.collapsedImageBytes > imageByteHeadroom(info, o.maxImageBytes)
@@ -2559,45 +2609,24 @@ export async function transformRequest(
   // protectedPrefix excludes the slab-bearing first user message — collapsing it
   // would reduce slab images to [image] placeholders and destroy the cache anchor.
   if (Array.isArray(req.messages) && req.messages.length > 0) {
-    const historyCpt = opts.charsPerToken !== undefined
-      ? o.charsPerToken
-      : HISTORY_CHARS_PER_TOKEN;
-    const horizon = Math.max(1, Math.floor(o.historyAmortizationHorizon));
-    const historyGeometry = historyGateGeometry(o, opts.cols !== undefined);
-    const historyProfitable = (text: string, cols: number): boolean => {
-      // Gate with the same model profile used by the history renderer.
-      return isCompressionProfitableAmortized(
-        text, historyGeometry.cols, undefined, historyCpt, horizon,
-        o.priorWarmTokens, o.priorWarmImageTokens, true, historyGeometry.maxChars, historyGeometry,
-      );
-    };
     const slabAnchorIdx = (req.messages ?? []).findIndex((m) => m.role === 'user');
     const tuning = historyGridTuning(info);
-    const { messages: newMessages, info: histInfo } = await collapseHistory(
-      req.messages,
-      historyProfitable,
-      {
-        cols: historyGeometry.cols,
-        protectedPrefix: slabAnchorIdx >= 0 ? slabAnchorIdx + 1 : 0,
-        reflow: o.reflow,
-        style: historyGeometry.style,
-        maxHeightPx: historyGeometry.maxHeightPx,
-        pageChars: historyGeometry.maxChars,
-        imageBudget: tuning.imageBudget,
-        packFill: tuning.packFill,
-        minFreezeStep: tuning.minFreezeStep,
-      },
-    );
+    // Collapses at the model geometry, degrading legible -> dense if that render
+    // overflows the byte budget instead of abandoning the collapse (#216).
+    const { messages: newMessages, info: histInfo, degradedToDense } =
+      await collapseHistoryWithinByteBudget(
+        req.messages, info, o, opts, slabAnchorIdx >= 0 ? slabAnchorIdx + 1 : 0, tuning,
+      );
     recordFreezeStep(info.firstUserSha8, histInfo.freezeStep);
     if (histInfo.freezeStep !== undefined) info.historyFreezeStep = histInfo.freezeStep;
     if (histInfo.budgetTrimmed) info.historyBudgetTrimmed = true;
     if (tuning.packFill) info.historyPackFill = true;
+    if (degradedToDense) info.historyDegradedDense = true;
     // Atomic admission by weight. The collapse is one semantic group: applying
     // it means every collapsed message becomes pages, so a group that does not
     // fit the byte budget is not applied at all and the original text stands.
-    // Rendering it first and discarding it costs CPU, which is the cheap half of
-    // the trade: the alternative is estimating PNG size from character counts and
-    // being wrong on the request that mattered.
+    // Reaching the bail here means even the dense re-render overflowed, so no
+    // geometry fits and the original text is the only safe forward.
     if (
       histInfo.collapsedTurns > 0 &&
       histInfo.collapsedImageBytes > imageByteHeadroom(info, o.maxImageBytes)

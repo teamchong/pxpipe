@@ -18,7 +18,7 @@
  *
  * Run just this file:  pnpm vitest run tests/image-byte-budget.test.ts
  */
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   countNativeImageBytes,
   imageByteHeadroom,
@@ -144,6 +144,110 @@ describe('a group that does not fit keeps its text', () => {
       { maxImageBytes: limit },
     );
     expect(wireImageBytes(dec(out).messages)).toBeLessThanOrEqual(limit);
+  });
+});
+
+describe('a legible history that overflows degrades to dense before abandoning the collapse (#216)', () => {
+  // Since #170, misread-prone Claude ids (claude-opus-5) default to the legible
+  // history geometry (jetbrains-mono-14), which renders several times heavier per
+  // char than dense (spleen-5x8). On a long session the legible collapse can blow
+  // the byte budget while the dense render still fits. The old atomic-admission
+  // check then abandoned the collapse and forwarded the RAW history as text — a
+  // request larger than the render it refused, which the upstream 400s. The fix
+  // re-renders at dense and admits it; only a history too big for dense too still
+  // falls back to text.
+  const TURNS = 100;
+  const REP = 50;
+  const IMAGED_SLAB_CHARS = 12_000; // above minCompressChars -> slab is imaged (site: transformRequest inline)
+  const TINY_SLAB_CHARS = 50; // below minCompressChars -> slab stays text (site: runHistoryCollapseAndFinalize)
+  const HUGE_BUDGET = 100 * 1024 * 1024; // never binds; used only to measure the render size
+
+  beforeEach(() => {
+    resetSessionState();
+    process.env.PXPIPE_MODELS = 'claude-opus-5,claude-fable-5';
+  });
+  afterEach(() => {
+    delete process.env.PXPIPE_MODELS;
+  });
+
+  /** A long collapsible history behind a slab of the given size. */
+  function longHistory(model: string, slabChars: number): Uint8Array {
+    const bulk =
+      'commit a1b2c3d4e5f6 sha 9f8e7d6c ts 2026-07-04T14:50:50Z ratio 0.734 $30.99 Tampa-0 stock 120 reorder 40. ';
+    const messages: unknown[] = [];
+    for (let i = 0; i < TURNS; i++) {
+      messages.push({
+        role: i % 2 === 0 ? 'user' : 'assistant',
+        content: [{ type: 'text', text: bulk.repeat(REP) + ` turn ${i}` }],
+      });
+    }
+    messages.push({ role: 'user', content: [{ type: 'text', text: 'continue' }] });
+    return enc({
+      model,
+      max_tokens: 1024,
+      system: [{ type: 'text', text: 'S'.repeat(slabChars), cache_control: { type: 'ephemeral' } }],
+      messages,
+    });
+  }
+
+  async function render(model: string, slabChars: number, maxImageBytes: number) {
+    resetSessionState();
+    return transformRequest(longHistory(model, slabChars), { model, maxImageBytes });
+  }
+
+  // Both admission sites share the bug; exercise each. Site 2 is the inline path
+  // in transformRequest (slab imaged); site 1 is runHistoryCollapseAndFinalize
+  // (slab below the gate, history still collapses — the "tiny system, huge
+  // messages" shape).
+  for (const [siteLabel, slabChars] of [
+    ['imaged-slab path', IMAGED_SLAB_CHARS],
+    ['text-slab path', TINY_SLAB_CHARS],
+  ] as const) {
+    it(`re-renders the collapse at dense instead of forwarding raw text (${siteLabel})`, async () => {
+      // Measure both geometries with a non-binding budget: legible must be the
+      // heavier of the two, or there is nothing to degrade.
+      const dense = (await render('claude-fable-5', slabChars, HUGE_BUDGET)).info;
+      const legible = (await render('claude-opus-5', slabChars, HUGE_BUDGET)).info;
+      expect(dense.historyReason, 'fixture must collapse at dense').toBe('collapsed');
+      expect(legible.historyReason, 'fixture must collapse at legible').toBe('collapsed');
+      expect(legible.imageBytes).toBeGreaterThan(dense.imageBytes);
+
+      // A budget between the two: legible overflows, dense fits.
+      const between = Math.floor((dense.imageBytes + legible.imageBytes) / 2);
+      const { info } = await render('claude-opus-5', slabChars, between);
+
+      // Fixed: the collapse is admitted at the dense geometry, not abandoned.
+      expect(info.historyReason).toBe('collapsed');
+      expect(info.historyDegradedDense).toBe(true);
+      expect(info.imageByteSkips ?? 0).toBe(0);
+      // The admitted render stays within the budget it was given, and matches
+      // the dense measurement — i.e. it really is the dense re-render, not the
+      // legible one squeaking under a coincidental budget.
+      expect(info.imageBytes).toBeLessThanOrEqual(between);
+      expect(info.imageBytes).toBe(dense.imageBytes);
+    });
+  }
+
+  it('leaves Fable (already dense) on the original atomic-admission bail', async () => {
+    // Fable renders history dense by default, so there is no legible->dense step
+    // to take: a budget under its render must still bail, not loop.
+    const dense = (await render('claude-fable-5', IMAGED_SLAB_CHARS, HUGE_BUDGET)).info;
+    const tight = Math.floor(dense.imageBytes / 2);
+    const { info } = await render('claude-fable-5', IMAGED_SLAB_CHARS, tight);
+    expect(info.historyReason).toBe('image_bytes');
+    expect(info.imageByteSkips ?? 0).toBeGreaterThan(0);
+    expect(info.historyDegradedDense ?? false).toBe(false);
+  });
+
+  it('still bails when even the dense render overflows the budget', async () => {
+    // A history too big for any geometry keeps its text — the atomic-admission
+    // guarantee must survive the degrade path.
+    const dense = (await render('claude-fable-5', IMAGED_SLAB_CHARS, HUGE_BUDGET)).info;
+    const tooTight = Math.floor(dense.imageBytes / 2); // below the dense render too
+    const { info } = await render('claude-opus-5', IMAGED_SLAB_CHARS, tooTight);
+    expect(info.historyReason).toBe('image_bytes');
+    expect(info.imageByteSkips ?? 0).toBeGreaterThan(0);
+    expect(info.historyDegradedDense ?? false).toBe(false);
   });
 });
 

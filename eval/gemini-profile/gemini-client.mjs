@@ -50,7 +50,9 @@ export async function callGeminiRequest({ model = 'gemini-3.6-flash', request, m
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}: ${json?.error?.message || raw.slice(0, 160)}`);
     }
-    const text = json.candidates?.[0]?.content?.parts?.map((p) => p.text).filter(Boolean).join('') || '';
+    const candidateParts = json.candidates?.[0]?.content?.parts || [];
+    const nonThoughtText = candidateParts.filter((p) => !p.thought).map((p) => p.text).filter(Boolean).join('');
+    const text = nonThoughtText || candidateParts.map((p) => p.text).filter(Boolean).join('') || '';
     return { text: text.trim(), usage: json.usageMetadata || null, ms: Date.now() - started };
   } finally {
     clearTimeout(timer);

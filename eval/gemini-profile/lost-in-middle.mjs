@@ -101,6 +101,8 @@ function buildScenario(depth, repeat, targetChars) {
     parts: [{ text: 'Telemetry ingest initialized. Disaster recovery policies active.' }],
   });
 
+  const distClusters = CLUSTERS.filter((c) => c !== targetCluster && c !== backupCluster);
+
   let lineCount = 0;
   for (let t = 0; t < turns; t++) {
     const lines = [];
@@ -108,14 +110,10 @@ function buildScenario(depth, repeat, targetChars) {
       if (t === targetTurnIdx && l === Math.floor(linesPerTurn / 2)) {
         lines.push(criticalEvent);
       } else if (l === 10 && t !== targetTurnIdx) {
-        // Inject distractor state transitions for other clusters to make it a realistic needle-among-needles task
-        const distCluster = CLUSTERS[(t + 1) % CLUSTERS.length];
-        if (distCluster !== targetCluster) {
-          const distStatus = STATUSES[t % STATUSES.length];
-          lines.push(`>>> STATE UPDATE [EVENT_${t * 100 + l}] <<< CLUSTER: ${distCluster} | STATUS: ${distStatus} | ACTION: auto_remediate | ROUTE: internal_mesh | CODE: 200`);
-        } else {
-          lines.push(generateLogLine(rand, lineCount++));
-        }
+        // Inject distractor state transitions ONLY for other clusters (never target/backup)
+        const distCluster = distClusters[t % distClusters.length];
+        const distStatus = STATUSES[t % STATUSES.length];
+        lines.push(`>>> STATE UPDATE [EVENT_${t * 100 + l}] <<< CLUSTER: ${distCluster} | STATUS: ${distStatus} | ACTION: auto_remediate | ROUTE: internal_mesh | CODE: 200`);
       } else {
         lines.push(generateLogLine(rand, lineCount++));
       }
@@ -216,7 +214,7 @@ async function runEval() {
           const rawRes = await callGeminiRequest({
             model: MODEL,
             request: scenario.request,
-            maxOutputTokens: 4096,
+            maxOutputTokens: 8192,
             timeoutMs: TIMEOUT,
           });
           rawAns = rawRes.text;
@@ -246,7 +244,7 @@ async function runEval() {
           const pxRes = await callGeminiRequest({
             model: MODEL,
             request: transformedRequest,
-            maxOutputTokens: 4096,
+            maxOutputTokens: 8192,
             timeoutMs: TIMEOUT,
           });
           pxAns = pxRes.text;

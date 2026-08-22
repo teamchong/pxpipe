@@ -16,7 +16,7 @@ still forwards to the passthrough upstream.
 
 | model rule | default | cell | columns | max height | evidence |
 |---|:---:|---|---:|---:|---|
-| `claude-*` / `anthropic-*` | yes | Spleen 5×8 | 312 | 728 px | established Claude suites |
+| `claude-*` / `anthropic-*` | yes | JetBrains Mono 14px, 9×16 | 172 | 728 px | established Claude suites; Fable keeps dense (Spleen 5×8, 312 cols) |
 | `gpt-5.6-sol*` | opt-in | JetBrains Mono 14px, 9×16 | 84 | 1954 px | 7/8 exact, 0 inventions, gist and guard pass |
 | `grok-*` | opt-in | JetBrains Mono 14px, 9×16 | 84 | 512 px | 100/100 arith, 97/98 gist, 17/18 state; hex 0/15 |
 | other GPT/o-series | opt-in | Spleen 5×8 | 152 | 1932 px | conservative fallback |

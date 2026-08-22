@@ -72,8 +72,10 @@ describe('Qwen provider image cap — dynamic history budget', () => {
   it('budgets history against 32 minus the images already in the request', async () => {
     const tinyPng = { url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==' };
     const messages = buildChatMessages(20);
-    messages.at(-1)!.content = [
-      { type: 'text', text: messages.at(-1)!.content },
+    const lastMsg = messages.at(-1);
+    if (!lastMsg) throw new Error('messages must not be empty');
+    lastMsg.content = [
+      { type: 'text', text: lastMsg.content },
       ...Array.from({ length: 24 }, () => ({ type: 'image_url', image_url: tinyPng })),
     ];
     const result = await transformOpenAIChatCompletions(

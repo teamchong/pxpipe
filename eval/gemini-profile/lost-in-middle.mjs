@@ -239,6 +239,7 @@ async function runEval() {
           const transformed = await transformGoogleGenerateContent(bodyBytes, MODEL, {
             compress: true,
             collapseHistory: true,
+            compressToolResults: false,
           });
           const transformedRequest = JSON.parse(new TextDecoder().decode(transformed.body));
           const pxRes = await callGeminiRequest({
@@ -282,13 +283,15 @@ async function runEval() {
 
   for (const d of DEPTHS) {
     const dRows = results.filter((r) => r.depth === d);
+    const rawActive = dRows.filter((r) => r.raw.score !== null);
+    const pxActive = dRows.filter((r) => r.pxpipe.score !== null);
     summary.byDepth[d] = {
-      raw_reasoning_acc: (dRows.filter((r) => r.raw.score?.reasoningSuccess).length / dRows.length),
-      pxpipe_reasoning_acc: (dRows.filter((r) => r.pxpipe.score?.reasoningSuccess).length / dRows.length),
-      raw_multihop_acc: (dRows.filter((r) => r.raw.score?.fullMultiHopSuccess).length / dRows.length),
-      pxpipe_multihop_acc: (dRows.filter((r) => r.pxpipe.score?.fullMultiHopSuccess).length / dRows.length),
-      raw_avg_ms: Math.round(dRows.reduce((a, b) => a + (b.raw.ms || 0), 0) / dRows.length),
-      pxpipe_avg_ms: Math.round(dRows.reduce((a, b) => a + (b.pxpipe.ms || 0), 0) / dRows.length),
+      raw_reasoning_acc: rawActive.length > 0 ? (rawActive.filter((r) => r.raw.score?.reasoningSuccess).length / rawActive.length) : null,
+      pxpipe_reasoning_acc: pxActive.length > 0 ? (pxActive.filter((r) => r.pxpipe.score?.reasoningSuccess).length / pxActive.length) : null,
+      raw_multihop_acc: rawActive.length > 0 ? (rawActive.filter((r) => r.raw.score?.fullMultiHopSuccess).length / rawActive.length) : null,
+      pxpipe_multihop_acc: pxActive.length > 0 ? (pxActive.filter((r) => r.pxpipe.score?.fullMultiHopSuccess).length / pxActive.length) : null,
+      raw_avg_ms: rawActive.length > 0 ? Math.round(rawActive.reduce((a, b) => a + (b.raw.ms || 0), 0) / rawActive.length) : 0,
+      pxpipe_avg_ms: pxActive.length > 0 ? Math.round(pxActive.reduce((a, b) => a + (b.pxpipe.ms || 0), 0) / pxActive.length) : 0,
     };
   }
 
@@ -298,7 +301,7 @@ async function runEval() {
     results,
   };
 
-  writeFileSync(RESULT, JSON.stringify(out, null, 2));
+  writeFileSync(RESULT, JSON.stringify(out, null, 2) + '\n');
   console.log(`\n=== Benchmark Results Saved to ${RESULT} ===`);
   console.table(summary.byDepth);
 }

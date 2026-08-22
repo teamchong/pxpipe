@@ -50,8 +50,14 @@ describe('per-content-class render geometry', () => {
     // jetbrains-mono-14. Fable read 25/26 at dense, so it keeps the 5.28x
     // geometry; non-Claude families are untouched by this PR.
     const opus = resolveGptProfile('claude-opus-5');
+    expect(opus.stripCols).toBe(172);
+    expect(opus.style.font).toBe('jetbrains-mono-14');
     expect(opus.historyStripCols).toBe(172);
     expect(opus.historyStyle?.font).toBe('jetbrains-mono-14');
+
+    const sonnet = resolveGptProfile('claude-sonnet-4-5');
+    expect(sonnet.stripCols).toBe(172);
+    expect(sonnet.style.font).toBe('jetbrains-mono-14');
     for (const m of ['claude-fable-5', 'gpt-5.6-sol', 'moonshotai/kimi-k3']) {
       const p = resolveGptProfile(m);
       expect(p.historyStripCols, `${m} must stay dense by default`).toBeUndefined();

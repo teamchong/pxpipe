@@ -1090,6 +1090,49 @@ describe('image parts request detail = "original" (avoid downscale of dense text
   });
 });
 
+describe('resolveGptProfile (GPT-5.6 Sol)', () => {
+  it('uses native 14px packing, 1954px height, and NATIVE_14PX_HISTORY', () => {
+    for (const model of [
+      'gpt-5.6-sol',
+      'gpt-5.6-sol[1m]',
+      'gpt-5.6-sol-codex',
+      'gpt-5.6-sol-codex[1m]',
+      'gpt-5.6-sol-2026-07-09',
+    ]) {
+      const sol = resolveGptProfile(model);
+      expect(sol.maxHeightPx, model).toBe(1954);
+      expect(sol.stripCols, model).toBe(84);
+      expect(sol.minCompressTokens, model).toBe(500);
+      expect(sol.style.font, model).toBe('jetbrains-mono-14');
+      expect(sol.style.cellWBonus, model).toBe(0);
+      expect(sol.style.cellHBonus, model).toBe(0);
+      expect(sol.style.aa, model).toBe(true);
+      expect(sol.history, model).toMatchObject({
+        responsesMode: 'mixed',
+        maxImages: 64,
+        keepTail: 1,
+        keepRecentPairs: 1,
+        minCollapseTokens: 0,
+        minCollapsePrefix: 1,
+        collapseChunk: 1,
+        freezeChunk: 1,
+        framing: 'compact',
+        factSheetScope: 'combined',
+      });
+      expect(sol.factSheetFormat, model).toBe('full');
+    }
+    for (const model of ['gpt-5.6', 'gpt-5.6-terra', 'gpt-5.6-terra[1m]']) {
+      const notSol = resolveGptProfile(model);
+      expect(notSol.stripCols, model).toBe(152);
+      expect(notSol.style.font, model).toBe('spleen-5x8');
+      expect(notSol.history.responsesMode, model).toBe('pairs');
+      expect(notSol.history.maxImages, model).toBe(32);
+      expect(notSol.factSheetFormat, model).toBe('full');
+    }
+    expect(resolveGptProfile('gpt-5.6-sol').maxSerializedRequestBytes).toBeUndefined();
+  });
+});
+
 describe('resolveGptProfile style overrides', () => {
   it('merges every render knob into the selected model profile', () => {
     const prev = process.env.PXPIPE_GPT_PROFILES;

@@ -148,10 +148,10 @@ without running the proxy.
   recent/open tool state stays native.
   [Sol receipts](eval/sol-profile/QUALITY_RESULTS.md) and
   [profile evidence](docs/MODEL_RENDER_PROFILES.md).
-- **Grok 4.5 (opt-in):** native 14px / 84 cols / maxH 512 (100/100 arith, 97/98 gist).
-  Off by default (dense hex still 0/15).
-  Enable with
-  `PXPIPE_MODELS=claude-fable-5,grok-4.5` or the dashboard chip.
+- **Grok 4.5 / 4.6 (opt-in):** native 14px / 84 cols / maxH 512 (100/100 arith, 97/98 gist).
+  Off by default (dense hex still 0/15). History uses mixed collapse so Codex
+  assistant messages between tool rounds still image. Enable with
+  `PXPIPE_MODELS=claude-fable-5,grok-4.6` or the dashboard chip.
   [eval/grok-density/QUALITY_RESULTS.md](eval/grok-density/QUALITY_RESULTS.md).
 
 </details>

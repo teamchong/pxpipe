@@ -87,6 +87,7 @@ const GPT_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
 ];
 
 const GROK_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
+  { id: 'grok-4.6', label: 'Grok 4.6' },
   { id: 'grok-4.5', label: 'Grok 4.5' },
 ];
 

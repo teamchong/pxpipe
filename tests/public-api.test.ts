@@ -133,14 +133,17 @@ describe('public library API', () => {
     try {
       delete process.env.PXPIPE_MODELS;
       expect(isPxpipeSupportedGptModel('grok-4.5')).toBe(false);
+      expect(isPxpipeSupportedGptModel('grok-4.6')).toBe(false);
       expect(isPxpipeSupportedGptModel('grok-4')).toBe(false);
       expect(isPxpipeSupportedGptModel('grok-4.20')).toBe(false);
       expect(getAllowedModelBases()).not.toContain('grok-4.5');
+      expect(getAllowedModelBases()).not.toContain('grok-4.6');
       expect(getAllowedModelBases()).toEqual(['claude-fable-5', 'gemini-3.6-flash', 'gemini-3.7-flash']);
 
-      process.env.PXPIPE_MODELS = 'claude-fable-5,gpt-5.6-sol,grok-4.5';
-      expect(isPxpipeSupportedGptModel('grok-4.5')).toBe(true);
-      expect(isPxpipeSupportedGptModel('grok-4.5-fast')).toBe(true); // -suffix alias
+      process.env.PXPIPE_MODELS = 'claude-fable-5,gpt-5.6-sol,grok-4.6';
+      expect(isPxpipeSupportedGptModel('grok-4.6')).toBe(true);
+      expect(isPxpipeSupportedGptModel('grok-4.6-fast')).toBe(true); // -suffix alias
+      expect(isPxpipeSupportedGptModel('grok-4.5')).toBe(false);
       expect(isPxpipeSupportedGptModel('gpt-5.6-sol')).toBe(true);
     } finally {
       if (prev === undefined) delete process.env.PXPIPE_MODELS;

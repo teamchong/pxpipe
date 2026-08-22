@@ -283,6 +283,15 @@ function gptHistoryOpts(
     keepTail: o.gptHistory?.keepTail ?? profile.history.keepTail,
     keepRecentPairs: o.gptHistory?.keepRecentPairs ?? profile.history.keepRecentPairs,
     minCollapseTokens: o.gptHistory?.minCollapseTokens ?? profile.history.minCollapseTokens,
+    ...(o.gptHistory?.minCollapsePrefix !== undefined || profile.history.minCollapsePrefix !== undefined
+      ? { minCollapsePrefix: o.gptHistory?.minCollapsePrefix ?? profile.history.minCollapsePrefix }
+      : {}),
+    ...(o.gptHistory?.collapseChunk !== undefined || profile.history.collapseChunk !== undefined
+      ? { collapseChunk: o.gptHistory?.collapseChunk ?? profile.history.collapseChunk }
+      : {}),
+    ...(o.gptHistory?.freezeChunk !== undefined || profile.history.freezeChunk !== undefined
+      ? { freezeChunk: o.gptHistory?.freezeChunk ?? profile.history.freezeChunk }
+      : {}),
     responsesMode: profile.history.responsesMode,
     cols: o.gptHistory?.cols ?? profile.stripCols,
     maxHeightPx: o.gptHistory?.maxHeightPx ?? profile.maxHeightPx,

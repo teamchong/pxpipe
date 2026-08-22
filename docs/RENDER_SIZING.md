@@ -19,7 +19,7 @@ grows with content until the profile cap, then overflow becomes another page.
 
 | model rule | atlas / effective cell | columns | full width | max height |
 |---|---|---:|---:|---:|
-| Claude / Anthropic | Spleen + Unifont, 5×8 | 312 | 1568 px | 728 px |
+| Claude / Anthropic | JetBrains Mono 14px, native 9×16 | 172 | 1556 px | 728 px |
 | opt-in `gpt-5.6-sol` | JetBrains Mono 14px, native 9×16 | 84 | 764 px | 1954 px |
 | opt-in Grok 4.5 | JetBrains Mono 14px, native 9×16 + IDS + factsheet | 84 | 764 px | 512 px |
 | other OpenAI fallback | Spleen + Unifont, 5×8 | 152 | 768 px | 1932 px |

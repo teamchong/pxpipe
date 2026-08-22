@@ -23,7 +23,7 @@
 import { type RenderFont } from './render.js';
 import { hasGeminiMeasuredProfile, resolveGeminiProfile } from './gemini-model-profiles.js';
 import { isClaudeModel, resolveClaudeProfile } from './claude-model-profiles.js';
-import { BASE_HISTORY, BASE_PRICING, BASE_STYLE } from './profile-base.js';
+import { BASE_HISTORY, BASE_PRICING, BASE_STYLE, NATIVE_14PX_HISTORY } from './profile-base.js';
 
 export const GPT_MAX_HEIGHT_PX = 1932;
 
@@ -78,6 +78,15 @@ export interface GptHistoryProfile {
   keepRecentPairs: number;
   /** Local o200k floor before history profitability is evaluated. */
   minCollapseTokens: number;
+  /** Chat-completions only: minimum closed turns before history images.
+   *  Undefined keeps the planner default (10). */
+  minCollapsePrefix?: number;
+  /** Chat-completions only: snap the collapse boundary to this many turns.
+   *  Undefined keeps the planner default (10). Native-14px sets 1. */
+  collapseChunk?: number;
+  /** Chat-completions only: freeze imaged chunks on this turn grid.
+   *  Undefined keeps the planner default (10). Native-14px sets 1. */
+  freezeChunk?: number;
   /** Responses items eligible for history images. */
   responsesMode: 'pairs' | 'mixed';
   /** Native text bracketing each history image group. */
@@ -204,17 +213,10 @@ const GPT56_SOL_PROFILE: GptModelProfile = {
   minCompressTokens: 500,
   factSheetFormat: 'full',
   history: {
-    ...BASE_HISTORY,
+    ...NATIVE_14PX_HISTORY,
+    // Taller 1954px pages: more chars/image, so Sol can hold a larger budget
+    // without the 512px latency cliff that Grok/Qwen hit.
     maxImages: 64,
-    // The latest user request is protected independently by the Responses
-    // planner. Keep only one additional recent message/pair native so closed,
-    // unreferenced history does not dominate long stateless requests.
-    keepTail: 1,
-    keepRecentPairs: 1,
-    minCollapseTokens: 1000,
-    responsesMode: 'mixed',
-    framing: 'compact',
-    factSheetScope: 'combined',
   },
   style: {
     ...BASE_STYLE,
@@ -325,7 +327,11 @@ const BUILTIN_RULES: ProfileRule[] = [
       maxHeightPx: 512,
       minCompressTokens: 500,
       factSheetFormat: 'full',
-      history: { ...BASE_HISTORY, maxImages: 24 },
+      // pairs only groups INDEX-CONTIGUOUS tool rounds. Codex puts an assistant
+      // message between rounds, so every round is its own run and leftover
+      // history stays text — which is why grok-4.6 showed ~0 saved. mixed
+      // groups safe messages with completed pairs.
+      history: { ...NATIVE_14PX_HISTORY },
       style: {
         ...BASE_STYLE,
         font: 'jetbrains-mono-14',
@@ -351,7 +357,7 @@ const BUILTIN_RULES: ProfileRule[] = [
       maxHeightPx: 512,
       minCompressTokens: 500,
       factSheetFormat: 'full',
-      history: { ...BASE_HISTORY, maxImages: 32, keepTail: 1 },
+      history: { ...NATIVE_14PX_HISTORY },
       style: {
         ...BASE_STYLE,
         font: 'jetbrains-mono-14',
@@ -529,6 +535,15 @@ function parseEnvProfiles(raw: string): Map<string, GptModelProfile> {
       keepTail: nonNegativeInt(historyIn?.keepTail, baseHistory.keepTail),
       keepRecentPairs: nonNegativeInt(historyIn?.keepRecentPairs, baseHistory.keepRecentPairs),
       minCollapseTokens: nonNegativeInt(historyIn?.minCollapseTokens, baseHistory.minCollapseTokens),
+      minCollapsePrefix: historyIn?.minCollapsePrefix === undefined
+        ? baseHistory.minCollapsePrefix
+        : nonNegativeInt(historyIn.minCollapsePrefix, baseHistory.minCollapsePrefix ?? 10),
+      collapseChunk: historyIn?.collapseChunk === undefined
+        ? baseHistory.collapseChunk
+        : nonNegativeInt(historyIn.collapseChunk, baseHistory.collapseChunk ?? 10),
+      freezeChunk: historyIn?.freezeChunk === undefined
+        ? baseHistory.freezeChunk
+        : nonNegativeInt(historyIn.freezeChunk, baseHistory.freezeChunk ?? 10),
       responsesMode: responsesMode(historyIn?.responsesMode, baseHistory.responsesMode),
       framing: historyFraming(historyIn?.framing, baseHistory.framing),
       factSheetScope: factSheetScope(historyIn?.factSheetScope, baseHistory.factSheetScope),

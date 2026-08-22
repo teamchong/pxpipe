@@ -17,6 +17,7 @@ import {
 import { extractFactSheetTokensAllPages, extractFactSheetTokens } from '../src/core/factsheet.js';
 import { DENSE_CONTENT_CHARS_PER_IMAGE } from '../src/core/render.js';
 import { patchTokens } from '../src/core/anthropic-vision.js';
+import { resolveGptProfile } from '../src/core/gpt-model-profiles.js';
 
 // ---------------------------------------------------------------------------
 // Temp-dir helpers
@@ -120,6 +121,11 @@ describe('parseExportArgv', () => {
   it('returns help when -h is passed', () => {
     expect(parseExportArgv(['-h'])).toEqual({ kind: 'help' });
     expect(parseExportArgv(['--help'])).toEqual({ kind: 'help' });
+  });
+
+  it('DEFAULT_EXPORT_COLS is 172 matching default export model', () => {
+    expect(DEFAULT_EXPORT_COLS).toBe(172);
+    expect(DEFAULT_EXPORT_COLS).toBe(resolveGptProfile(DEFAULT_EXPORT_MODEL).stripCols);
   });
 
   it('returns defaults when argv is empty', () => {

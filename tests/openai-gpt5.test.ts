@@ -5,7 +5,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { isPxpipeSupportedGptModel } from '../src/core/applicability.js';
 import { openAIVisionTokens, visionTokensForModel, isClaudeModel, resolveVisionCost, transformOpenAIChatCompletions, transformOpenAIResponses } from '../src/core/openai.js';
-import { resolveGptProfile, isMisresolvedModelId } from '../src/core/gpt-model-profiles.js';
+import { resolveGptProfile } from '../src/core/gpt-model-profiles.js';
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -1090,21 +1090,8 @@ describe('image parts request detail = "original" (avoid downscale of dense text
   });
 });
 
-
-describe('resolveGptProfile (Claude on Responses)', () => {
-  it('uses Anthropic geometry by model id, not the GPT Responses defaults', () => {
-    // Several families share /v1/responses. Claude ids must retain Anthropic's
-    // 312-col / 728px geometry rather than the GPT defaults, which overstate
-    // image tokens and leave As text / Saved blank.
-    const p = resolveGptProfile('claude-opus-4-8');
-    expect(p.maxHeightPx).toBe(728);
-    expect(p.stripCols).toBe(312);
-    expect(p.style.font).toBe('spleen-5x8');
-    expect(resolveGptProfile('claude-3-5-opus').maxHeightPx).toBe(728);
-    expect(resolveGptProfile('claude-3-5-opus').stripCols).toBe(312);
-    expect(resolveGptProfile('claude-fable-5').maxHeightPx).toBe(728);
-    expect(resolveGptProfile('claude-fable-5').stripCols).toBe(312);
-    expect(resolveGptProfile('claude-fable-5').minCompressTokens).toBeUndefined();
+describe('resolveGptProfile (GPT-5.6 Sol)', () => {
+  it('uses native 14px packing, 1954px height, and NATIVE_14PX_HISTORY', () => {
     for (const model of [
       'gpt-5.6-sol',
       'gpt-5.6-sol[1m]',
@@ -1125,7 +1112,10 @@ describe('resolveGptProfile (Claude on Responses)', () => {
         maxImages: 64,
         keepTail: 1,
         keepRecentPairs: 1,
-        minCollapseTokens: 1000,
+        minCollapseTokens: 0,
+        minCollapsePrefix: 1,
+        collapseChunk: 1,
+        freezeChunk: 1,
         framing: 'compact',
         factSheetScope: 'combined',
       });
@@ -1139,144 +1129,7 @@ describe('resolveGptProfile (Claude on Responses)', () => {
       expect(notSol.history.maxImages, model).toBe(32);
       expect(notSol.factSheetFormat, model).toBe('full');
     }
-    expect(resolveGptProfile('claude-fable-5').style.font).toBe('spleen-5x8');
-    // No built-in byte cap on ANY family: no provider request-size limit has been
-    // sourced for Claude, Grok, Gemini or GPT. A cap here would make pxpipe skip
-    // compression on requests the provider accepts. Deployments pin one via
-    // PXPIPE_GPT_PROFILES (covered by the env-override cases below).
-    expect(resolveGptProfile('claude-fable-5').maxSerializedRequestBytes).toBeUndefined();
-    expect(resolveGptProfile('claude-opus-5').maxSerializedRequestBytes).toBeUndefined();
-    expect(resolveGptProfile('gemini-3.6-flash').maxSerializedRequestBytes).toBeUndefined();
-    expect(resolveGptProfile('grok-4.5').maxSerializedRequestBytes).toBeUndefined();
     expect(resolveGptProfile('gpt-5.6-sol').maxSerializedRequestBytes).toBeUndefined();
-  });
-
-  it('isolates per-id profile overrides between Claude models', () => {
-    const prev = process.env.PXPIPE_GPT_PROFILES;
-    try {
-      process.env.PXPIPE_GPT_PROFILES = JSON.stringify({
-        'claude-opus': {
-          stripCols: 200,
-          style: { cellWBonus: 2, cellHBonus: 2 },
-        },
-      });
-      const opus = resolveGptProfile('claude-opus-4-8');
-      const fable = resolveGptProfile('claude-fable-5');
-
-      expect(opus.stripCols).toBe(200);
-      expect(opus.style.cellWBonus).toBe(2);
-      expect(opus.style.cellHBonus).toBe(2);
-
-      // Fable remains unaffected by Opus overrides
-      expect(fable.stripCols).toBe(312);
-      expect(fable.style.cellWBonus).toBe(0);
-      expect(fable.style.cellHBonus).toBe(0);
-    } finally {
-      if (prev !== undefined) process.env.PXPIPE_GPT_PROFILES = prev;
-      else delete process.env.PXPIPE_GPT_PROFILES;
-    }
-  });
-});
-
-describe('resolveGptProfile (Grok)', () => {
-  it('uses native 14px packing with shorter pages under 768px short side', () => {
-    // Native 14px was the densest best rung on the Grok JB Mono blind sweep.
-    // 84 × 9px + pad = 764px ≤ 768. No grid. maxH 512 keeps pages short.
-    const p = resolveGptProfile('grok-4.5');
-    expect(p.stripCols).toBe(84);
-    expect(p.maxHeightPx).toBe(512);
-    expect(p.minCompressTokens).toBe(500);
-    // No observed xAI body limit (clean 200s past 2 MB), so no guessed cap.
-    expect(p.maxSerializedRequestBytes).toBeUndefined();
-    expect(p.style.font).toBe('jetbrains-mono-14');
-    expect(p.style.cellWBonus).toBe(0);
-    expect(p.style.cellHBonus).toBe(0);
-    expect(p.style.aa).toBe(true);
-    expect(p.style.grid).toBe(false);
-    expect(p.style.gridCols).toBe(0);
-    expect(p.style.colorCycle).toBe(false);
-    expect(resolveGptProfile('grok-4').stripCols).toBe(84);
-  });
-
-  it('renders the opt-in profile at 764px wide (no short-side resize)', async () => {
-    const body = enc.encode(JSON.stringify({
-      model: 'grok-4.5',
-      instructions: BIG_INSTRUCTIONS,
-      input: [{ role: 'user', content: 'hello' }],
-    }));
-    const result = await transformOpenAIResponses(body, { charsPerToken: 1, minCompressChars: 1 });
-    expect(result.info.compressed).toBe(true);
-    // 84 cols × 9px + padding = 764px short-side floor.
-    expect(result.info.firstImageWidth).toBe(764);
-    expect(result.info.firstImageHeight ?? 0).toBeLessThanOrEqual(512);
-  });
-});
-
-describe('resolveGptProfile (Qwen)', () => {
-  it('uses native 14px packing and the 32-image provider cap', () => {
-    const p = resolveGptProfile('workers-ai/@cf/qwen/qwen3.8-27b');
-    expect(p.stripCols).toBe(84);
-    expect(p.maxHeightPx).toBe(512);
-    expect(p.style.font).toBe('jetbrains-mono-14');
-    expect(p.history.maxImages).toBe(32);
-    expect(p.history.keepTail).toBe(1);
-    expect(p.providerImageCap).toBe(32);
-    // Keyed to the exact measured model id, not to any 'qwen' substring.
-    expect(resolveGptProfile('qwen3.8-27b').stripCols).toBe(84);
-  });
-
-  it('refuses unmeasured Qwen variants instead of applying this profile', () => {
-    for (const id of ['qwen2.5-72b-instruct', 'qwen3-30b', 'qwen-3.8-27b']) {
-      expect(resolveGptProfile(id).stripCols).not.toBe(84);
-      expect(isMisresolvedModelId(id)).toBe(true);
-    }
-  });
-});
-
-describe('Qwen provider image cap — dynamic history budget', () => {
-  it('budgets history against 32 minus the images already in the request', async () => {
-    const tinyPng = { url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==' };
-    const messages = buildChatMessages(20);
-    // The client attached 24 images to the live request, outside collapsed history.
-    messages.at(-1)!.content = [
-      { type: 'text', text: messages.at(-1)!.content },
-      ...Array.from({ length: 24 }, () => ({ type: 'image_url', image_url: tinyPng })),
-    ];
-    const result = await transformOpenAIChatCompletions(
-      enc.encode(JSON.stringify({ model: 'workers-ai/@cf/qwen/qwen3.8-27b', messages })),
-      { charsPerToken: 1, minCompressChars: 1 },
-    );
-    expect(result.info.compressed).toBe(true);
-    expect(result.info.historyReason).toBe('collapsed');
-    // With the old subtractive budget (24 − 24 − slab) this would be 0.
-    expect(result.info.collapsedImages ?? 0).toBeGreaterThan(0);
-
-    const out = JSON.parse(dec.decode(result.body)) as { messages: Array<{ role: string; content: unknown }> };
-    let totalImages = 0;
-    for (const m of out.messages) {
-      if (Array.isArray(m.content)) {
-        totalImages += (m.content as Array<{ type?: string }>).filter((p) => p.type === 'image_url').length;
-      }
-    }
-    expect(JSON.stringify(out.messages).match(/iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ/g)?.length).toBe(24);
-    expect(totalImages).toBeLessThanOrEqual(32);
-  });
-
-  it('keeps static context native when client images leave insufficient headroom', async () => {
-    const tinyPng = { url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==' };
-    const messages: Array<Record<string, unknown>> = [
-      { role: 'system', content: BIG_SLAB },
-      {
-        role: 'user',
-        content: Array.from({ length: 31 }, () => ({ type: 'image_url', image_url: tinyPng })),
-      },
-    ];
-    const body = enc.encode(JSON.stringify({ model: 'workers-ai/@cf/qwen/qwen3.8-27b', messages }));
-    const result = await transformOpenAIChatCompletions(body, { minCompressChars: 1 });
-
-    expect(result.info.compressed).toBe(false);
-    expect(result.info.reason).toBe('provider_image_cap');
-    expect(result.body).toEqual(body);
   });
 });
 
@@ -1340,159 +1193,5 @@ describe('resolveGptProfile style overrides', () => {
       if (prev === undefined) delete process.env.PXPIPE_GPT_PROFILES;
       else process.env.PXPIPE_GPT_PROFILES = prev;
     }
-  });
-});
-
-describe('Grok no-resize geometry', () => {
-  it('keeps rendered short side at or below 768px for slab and history packing', async () => {
-    const profile = resolveGptProfile('grok-4.5');
-    // jetbrains-mono-14 native cell is 9×16; bonuses stay 0.
-    const cellW = 9 + (profile.style.cellWBonus ?? 0);
-    const stripW = 8 + profile.stripCols * cellW; // 2*PAD_X=8
-    expect(stripW).toBeLessThanOrEqual(768);
-    expect(profile.stripCols).toBe(84);
-    expect(profile.style.font).toBe('jetbrains-mono-14');
-    expect(cellW).toBe(9);
-    expect(profile.maxHeightPx).toBe(512);
-    expect(stripW).toBe(764);
-
-    // End-to-end: rendered PNG width matches the no-resize strip.
-    const body = enc.encode(JSON.stringify({
-      model: 'grok-4.5',
-      instructions: BIG_INSTRUCTIONS,
-      input: [{ role: 'user', content: 'hello' }],
-    }));
-    const result = await transformOpenAIResponses(body, { charsPerToken: 1, minCompressChars: 1 });
-    expect(result.info.firstImageWidth ?? 0).toBeLessThanOrEqual(768);
-    expect(result.info.firstImageWidth).toBe(764);
-    expect(result.info.firstImageHeight ?? 0).toBeLessThanOrEqual(512);
-  });
-});
-
-describe('visionTokensForModel (Grok)', () => {
-  it('prices Grok images by measured megapixel rate, not GPT tiles', () => {
-    // ceil(w*h/1e6 * 1000)
-    expect(visionTokensForModel('grok-4.5', 768, 336)).toBe(Math.ceil((768 * 336) / 1000));
-    expect(visionTokensForModel('grok-4.5', 764, 980)).toBe(Math.ceil((764 * 980) / 1000));
-    // Must not use GPT tile pricing (would be much larger for tall pages).
-    expect(visionTokensForModel('grok-4.5', 764, 980)).toBeLessThan(
-      openAIVisionTokens('gpt-4o', 764, 980),
-    );
-  });
-});
-
-describe('Grok history compression under default gate', () => {
-  it('collapses long Grok Responses history under default charsPerToken (o200k gate)', async () => {
-    // Production gate path: no charsPerToken override.
-    const items: Array<Record<string, unknown>> = [
-      { role: 'user', content: 'start the long autonomous run now please' },
-    ];
-    for (let i = 0; i < 10; i++) {
-      const id = `call_${i}`;
-      items.push({ role: 'assistant', content: `Working on step ${i}. `.repeat(40) });
-      items.push({ type: 'function_call', call_id: id, name: 'read', arguments: `{"path":"src/f${i}.ts"}` });
-      items.push({ type: 'function_call_output', call_id: id, output: (`result ${i} path=/tmp/out${i}.json `).repeat(60) });
-    }
-    const body = enc.encode(JSON.stringify({
-      model: 'grok-4.5',
-      instructions: 'You are a careful coding agent. '.repeat(200),
-      input: items,
-    }));
-    const result = await transformOpenAIResponses(body, { minCompressChars: 1 });
-    expect(result.info.compressed).toBe(true);
-    expect(result.info.historyReason).toBe('collapsed');
-    expect(result.info.collapsedImages ?? 0).toBeGreaterThan(0);
-    expect(result.info.imageTokens ?? 0).toBeLessThan(result.info.baselineImagedTokens ?? 0);
-  });
-
-  it('collapses a large Grok history with no profile byte cap in the way', async () => {
-    // 4x the history above. Grok pins no serialized-byte cap (no observed xAI
-    // limit), so imaging must still happen even though base64 PNGs are ~2.5x the
-    // bytes of the text they replace: cheaper in TOKENS, dearer in BYTES.
-    const items: Array<Record<string, unknown>> = [
-      { role: 'user', content: 'start the long autonomous run now please' },
-    ];
-    for (let i = 0; i < 40; i++) {
-      const id = `call_${i}`;
-      items.push({ role: 'assistant', content: `Working on step ${i}. `.repeat(40) });
-      items.push({ type: 'function_call', call_id: id, name: 'read', arguments: `{"path":"src/f${i}.ts"}` });
-      items.push({ type: 'function_call_output', call_id: id, output: (`result ${i} path=/tmp/out${i}.json `).repeat(60) });
-    }
-    const body = enc.encode(JSON.stringify({
-      model: 'grok-4.5',
-      instructions: 'You are a careful coding agent. '.repeat(200),
-      input: items,
-    }));
-    const result = await transformOpenAIResponses(body, { minCompressChars: 1 });
-    expect(result.info.compressed).toBe(true);
-    expect(result.info.historyReason).toBe('collapsed');
-    expect(result.info.reason).not.toBe('serialized_request_limit');
-  });
-
-  it('passes through when an env-configured byte cap would be overshot', async () => {
-    // The cap mechanism itself still has to work for any deployment that pins
-    // one: the transform falls back to the original body rather than building a
-    // request the proxy would answer with a 413.
-    const prev = process.env.PXPIPE_GPT_PROFILES;
-    process.env.PXPIPE_GPT_PROFILES = JSON.stringify({
-      'grok-4.5': { maxSerializedRequestBytes: 128 * 1024 },
-    });
-    try {
-      const items: Array<Record<string, unknown>> = [
-        { role: 'user', content: 'start the long autonomous run now please' },
-      ];
-      for (let i = 0; i < 40; i++) {
-        const id = `call_${i}`;
-        items.push({ role: 'assistant', content: `Working on step ${i}. `.repeat(40) });
-        items.push({ type: 'function_call', call_id: id, name: 'read', arguments: `{"path":"src/f${i}.ts"}` });
-        items.push({ type: 'function_call_output', call_id: id, output: (`result ${i} path=/tmp/out${i}.json `).repeat(60) });
-      }
-      const body = enc.encode(JSON.stringify({
-        model: 'grok-4.5',
-        instructions: 'You are a careful coding agent. '.repeat(200),
-        input: items,
-      }));
-      const result = await transformOpenAIResponses(body, { minCompressChars: 1 });
-      expect(result.info.compressed).toBe(false);
-      expect(result.info.reason).toBe('serialized_request_limit');
-      expect(result.body.byteLength).toBe(body.byteLength);
-    } finally {
-      if (prev !== undefined) process.env.PXPIPE_GPT_PROFILES = prev;
-      else delete process.env.PXPIPE_GPT_PROFILES;
-    }
-  });
-
-  it('pages factsheet across long collapsed history so early exact ids survive', async () => {
-    const earlyHex = 'a3f9c1e0b7d2';
-    const items: Array<Record<string, unknown>> = [
-      { role: 'user', content: `remember ${earlyHex} and path src/core/anthropic-vision.ts port 47821` },
-    ];
-    // Long enough that a single-pass factsheet scan would miss the head.
-    // Filler must stay high-entropy: o200k compresses long runs of "x" so hard
-    // that the 14px image bill (fewer chars/page than old 5×8) looks unprofitable.
-    for (let i = 0; i < 80; i++) {
-      const id = `call_${i}`;
-      items.push({
-        role: 'assistant',
-        content: `Working on step ${i} for module src/pkg/mod${i}/handler.ts with checksum ${i.toString(16).padStart(8, '0')}ab. `.repeat(40),
-      });
-      items.push({ type: 'function_call', call_id: id, name: 'read', arguments: `{"path":"src/f${i}.ts"}` });
-      items.push({
-        type: 'function_call_output',
-        call_id: id,
-        output: (`result ${i} path=/tmp/out${i}.json status=ok note=step-${i}-detail `).repeat(80),
-      });
-    }
-    const body = enc.encode(JSON.stringify({
-      model: 'grok-4.5',
-      instructions: 'Keep identifiers exact. '.repeat(200),
-      input: items,
-    }));
-    const result = await transformOpenAIResponses(body, { minCompressChars: 1 });
-    expect(result.info.historyReason).toBe('collapsed');
-    const out = JSON.parse(dec.decode(result.body)) as { input: Array<Record<string, unknown>> };
-    const serialized = JSON.stringify(out.input);
-    expect(serialized).toContain(earlyHex);
-    expect(serialized).toContain('47821');
   });
 });

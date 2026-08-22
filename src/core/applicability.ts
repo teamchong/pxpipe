@@ -33,7 +33,7 @@ let runtimeModelBases: readonly string[] | null = null;
  *  - GPT 5.5 — degrades on imaged history/context.
  *  - GPT 5.6 Sol — 98/100 production arithmetic, but 79/93 completed gist,
  *    4/15 completed guard confabulations, and 0/15 dense hex.
- *  - Grok 4.5 — native 14px: 100/100 arithmetic, 97/98 gist, 17/18 state; hex 0/15.
+ *  - Grok 4.5/4.6 — native 14px: 100/100 arithmetic, 97/98 gist, 17/18 state; hex 0/15.
  *  - Opus 5 — 2/15 exact recall on imaged context (DeepSWE v1.1 eval);
  *    task pass rate holds but dense recall does not.
  *  All remain available for explicit opt-in.

@@ -8,8 +8,7 @@
  */
 
 import {
-  DENSE_CONTENT_CHARS_PER_IMAGE,
-  DENSE_CONTENT_COLS,
+  maxCharsPerImage,
   renderCellHeight,
   renderCellWidth,
 } from './render.js';
@@ -33,8 +32,8 @@ import {
 export const DEFAULT_EXPORT_MODEL = 'claude-sonnet-4-5';
 // Chars-per-token for the reporting estimate now lives in transform.ts as
 // REPORT_CHARS_PER_TOKEN (single source of truth for all token-estimate constants).
-/** Default column width — dense content mode (312 cols = 1568 px). */
-export const DEFAULT_EXPORT_COLS: number = DENSE_CONTENT_COLS;
+/** Default column width (172 cols for default 14px legible model). */
+export const DEFAULT_EXPORT_COLS: number = 172;
 
 // ---------------------------------------------------------------------------
 // Glob matching (no external glob library — node:fs only per convention)
@@ -156,7 +155,6 @@ export function parseExportArgv(
   let git = false;
   let diff: string | undefined;
   let stdin = false;
-  let cols = DENSE_CONTENT_COLS;
   let out =
     defaultOut ??
     (typeof process !== 'undefined'
@@ -232,7 +230,7 @@ export function parseExportArgv(
     }
   }
 
-  cols = resolveGptProfile(model).stripCols;
+  const cols = resolveGptProfile(model).stripCols;
   return {
     kind: 'opts',
     parsed: { targets, include, exclude, git, diff, stdin, cols, out, model, json, open },
@@ -296,7 +294,7 @@ export function computeTokenReport(
   const profile = resolveGptProfile(model);
   const stripW = 8 + cols * renderCellWidth(profile.style);
   const linesPerImage = Math.max(1, Math.floor((profile.maxHeightPx - 8) / renderCellHeight(profile.style)));
-  const estImages = estimateImageCount(sourceText, cols, DENSE_CONTENT_CHARS_PER_IMAGE, linesPerImage);
+  const estImages = estimateImageCount(sourceText, cols, maxCharsPerImage(cols), linesPerImage);
   const perStrip = exportImageTokens(model, stripW, profile.maxHeightPx);
   const imageTokens = Math.round(estImages * perStrip);
   const textTokens = Math.round(sourceText.length / REPORT_CHARS_PER_TOKEN);
@@ -304,7 +302,7 @@ export function computeTokenReport(
     textTokens > 0
       ? Math.round(((textTokens - imageTokens) / textTokens) * 1000) / 10
       : 0;
-  const { kept, dropped } = extractFactSheetTokensAllPages(sourceText, DENSE_CONTENT_CHARS_PER_IMAGE);
+  const { kept, dropped } = extractFactSheetTokensAllPages(sourceText, maxCharsPerImage(cols));
   return {
     textTokens,
     imageTokens,
@@ -448,7 +446,7 @@ export async function runExportCore(
   // Extract factsheet tokens across ALL pages so identifiers from page 3+ are covered.
   const { kept: fsKept, dropped: fsDropped } = extractFactSheetEntriesAllPages(
     sourceText,
-    DENSE_CONTENT_CHARS_PER_IMAGE,
+    maxCharsPerImage(opts.cols),
   );
   const fsText = factSheetTextFromEntries(fsKept);
   const tokenReport: ExportTokenReport = {

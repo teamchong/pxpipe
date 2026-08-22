@@ -91,11 +91,10 @@ export const CLAUDE_LEGACY_PROFILE: GptModelProfile = {
  * jetbrains-mono-14 Opus read 100/100. 172 cols at this font still fits
  * 1568x728, so nothing is downscaled. Cost on live transcript: dense is 5.28x
  * cheaper than text, legible 1.47x — still a saving, so misread-prone models
- * get legibility by default rather than behind a flag. Only history pays the
- * wider geometry: the static slab and tool-result pages hold no exact values
- * and stay dense.
+ * get legibility by default rather than behind a flag. Uses unified 14px
+ * JetBrains Mono @ 172 cols across all page types (slabs, tools, and history).
  */
-const CLAUDE_HISTORY_STRIP_COLS = 172;
+export const CLAUDE_HISTORY_STRIP_COLS = 172;
 const CLAUDE_HISTORY_STYLE: GptRenderStyle = {
   ...BASE_STYLE,
   font: 'jetbrains-mono-14',
@@ -103,14 +102,16 @@ const CLAUDE_HISTORY_STYLE: GptRenderStyle = {
 
 export const CLAUDE_LEGIBLE_PROFILE: GptModelProfile = {
   ...CLAUDE_PROFILE,
-  style: { ...BASE_STYLE },
+  stripCols: CLAUDE_HISTORY_STRIP_COLS,
+  style: { ...CLAUDE_HISTORY_STYLE },
   historyStripCols: CLAUDE_HISTORY_STRIP_COLS,
   historyStyle: { ...CLAUDE_HISTORY_STYLE },
 };
 
 export const CLAUDE_LEGACY_LEGIBLE_PROFILE: GptModelProfile = {
   ...CLAUDE_LEGACY_PROFILE,
-  style: { ...BASE_STYLE },
+  stripCols: CLAUDE_HISTORY_STRIP_COLS,
+  style: { ...CLAUDE_HISTORY_STYLE },
   historyStripCols: CLAUDE_HISTORY_STRIP_COLS,
   historyStyle: { ...CLAUDE_HISTORY_STYLE },
 };

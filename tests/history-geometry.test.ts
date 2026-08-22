@@ -50,8 +50,14 @@ describe('per-content-class render geometry', () => {
     // jetbrains-mono-14. Fable read 25/26 at dense, so it keeps the 5.28x
     // geometry; non-Claude families are untouched by this PR.
     const opus = resolveGptProfile('claude-opus-5');
+    expect(opus.stripCols).toBe(172);
+    expect(opus.style.font).toBe('jetbrains-mono-14');
     expect(opus.historyStripCols).toBe(172);
     expect(opus.historyStyle?.font).toBe('jetbrains-mono-14');
+
+    const sonnet = resolveGptProfile('claude-sonnet-4-5');
+    expect(sonnet.stripCols).toBe(172);
+    expect(sonnet.style.font).toBe('jetbrains-mono-14');
     for (const m of ['claude-fable-5', 'gpt-5.6-sol', 'moonshotai/kimi-k3']) {
       const p = resolveGptProfile(m);
       expect(p.historyStripCols, `${m} must stay dense by default`).toBeUndefined();
@@ -61,25 +67,32 @@ describe('per-content-class render geometry', () => {
 
   it('accepts historyStripCols and historyStyle from PXPIPE_GPT_PROFILES', () => {
     process.env[ENV] = JSON.stringify({
-      'claude-opus-5': { historyStripCols: 172, historyStyle: { font: 'jetbrains-mono-14' } },
+      'claude-fable-5': { historyStripCols: 172, historyStyle: { font: 'jetbrains-mono-14' } },
     });
-    const p = resolveGptProfile('claude-opus-5');
+    const p = resolveGptProfile('claude-fable-5');
+    expect(p.stripCols).toBe(312);
+    expect(p.style.font).toBe('spleen-5x8');
     expect(p.historyStripCols).toBe(172);
     expect(p.historyStyle?.font).toBe('jetbrains-mono-14');
-    // The slab and tool-result geometry must not move with it.
-    expect(p.stripCols).toBe(resolveGptProfile('claude-fable-5').stripCols);
-    expect(p.style.font).toBe(resolveGptProfile('claude-fable-5').style.font);
   });
 
-  it('leaves the dense geometry alone when only the history override is given', () => {
-    const before = resolveGptProfile('claude-opus-5');
+  it('leaves the profile stripCols alone when only the history override is given', () => {
+    const beforeFable = resolveGptProfile('claude-fable-5');
+    const beforeOpus = resolveGptProfile('claude-opus-5');
     process.env[ENV] = JSON.stringify({
-      'claude-opus-5': { historyStripCols: 172, historyStyle: { font: 'jetbrains-mono-14' } },
+      'claude-fable-5': { historyStripCols: 172, historyStyle: { font: 'jetbrains-mono-14' } },
+      'claude-opus-5': { historyStripCols: 100, historyStyle: { font: 'jetbrains-mono-14' } },
     });
-    const after = resolveGptProfile('claude-opus-5');
-    expect(after.stripCols).toBe(before.stripCols);
-    expect(after.maxHeightPx).toBe(before.maxHeightPx);
-    expect(after.style).toEqual(before.style);
+    const afterFable = resolveGptProfile('claude-fable-5');
+    expect(afterFable.stripCols).toBe(beforeFable.stripCols);
+    expect(afterFable.maxHeightPx).toBe(beforeFable.maxHeightPx);
+    expect(afterFable.style).toEqual(beforeFable.style);
+
+    const afterOpus = resolveGptProfile('claude-opus-5');
+    expect(afterOpus.stripCols).toBe(beforeOpus.stripCols);
+    expect(afterOpus.maxHeightPx).toBe(beforeOpus.maxHeightPx);
+    expect(afterOpus.style).toEqual(beforeOpus.style);
+    expect(afterOpus.historyStripCols).toBe(100);
   });
 
   it('renders history at the legible geometry by default, costing more image tokens for the same text', async () => {

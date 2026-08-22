@@ -50,3 +50,22 @@ export const BASE_HISTORY: GptHistoryProfile = {
   framing: 'full',
   factSheetScope: 'per-segment',
 };
+
+/** Shared history policy for every native-14px profile (Sol, Grok, Qwen).
+ *  14px packs ~3× fewer chars/page than 5×8, so a 6-turn tail + 1000-token
+ *  floor + pairs planner leaves most of a completions chat as text (~0.3%
+ *  saved on grok-4.6). Mixed + 1-turn tail + no token floor is what actually
+ *  images that bulk. Sol keeps a higher maxImages because its pages are taller. */
+export const NATIVE_14PX_HISTORY: GptHistoryProfile = {
+  ...BASE_HISTORY,
+  maxImages: 32,
+  keepTail: 1,
+  keepRecentPairs: 1,
+  minCollapseTokens: 0,
+  minCollapsePrefix: 1,
+  collapseChunk: 1,
+  freezeChunk: 1,
+  responsesMode: 'mixed',
+  framing: 'compact',
+  factSheetScope: 'combined',
+};

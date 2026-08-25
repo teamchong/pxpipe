@@ -17,6 +17,7 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { accessSync, constants, existsSync } from 'node:fs';
 import { createServer } from 'node:http';
+import { connect as netConnect } from 'node:net';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -278,15 +279,22 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
     }
     console.error(`[pxpipe] warp exec → ${command.join(' ')}`);
 
-    proxy.on('error', (err) => {
-      console.error(`[pxpipe] warp: proxy listener failed: ${err.message}`);
-      process.exit(1);
+    const testSocket = netConnect({ host: '127.0.0.1', port }, () => {
+      testSocket.destroy();
+      console.error(`[pxpipe] warp → reusing running proxy at http://127.0.0.1:${port}`);
+      spawnChild(command, `http://127.0.0.1:${port}`);
     });
-    proxy.listen(0, '127.0.0.1', () => {
-      const address = proxy.address();
-      const proxyUrl = `http://127.0.0.1:${typeof address === 'object' && address ? address.port : 0}`;
-      console.error(`[pxpipe] warp proxy → ${proxyUrl} (child only)`);
-      spawnChild(command, proxyUrl);
+    testSocket.on('error', () => {
+      proxy.on('error', (err) => {
+        console.error(`[pxpipe] warp: proxy listener failed: ${err.message}`);
+        process.exit(1);
+      });
+      proxy.listen(0, '127.0.0.1', () => {
+        const address = proxy.address();
+        const proxyUrl = `http://127.0.0.1:${typeof address === 'object' && address ? address.port : 0}`;
+        console.error(`[pxpipe] warp proxy → ${proxyUrl} (child only)`);
+        spawnChild(command, proxyUrl);
+      });
     });
   };
 

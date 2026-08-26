@@ -213,7 +213,7 @@ export async function renderTextToImages(
   const cellH = renderCellHeight(style);
 
   // Use opts.width directly so we don't reverse-engineer and add 8px
-  const targetWidth = opts.width ?? (opts.cols !== undefined ? opts.cols * cellW + 8 : (isGeminiModel(opts.model) ? 1536 : 1568));
+  const targetWidth = opts.width ?? (isGeminiModel(opts.model) ? 1536 : (opts.cols !== undefined ? opts.cols * cellW + 8 : 1568));
   const targetHeight = opts.maxHeightPx ?? profile?.maxHeightPx ?? MAX_HEIGHT_PX;
 
   // Auto-calculate optimal capacity based on active font cell size

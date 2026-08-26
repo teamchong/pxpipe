@@ -5,6 +5,9 @@
  *
  * Pure-ish: no argv, no stdout, no process.exit, no fs calls — all I/O is
  * delegated to the thin CLI runner in src/node.ts.
+ * Rendering goes through `renderTextToDensePage` via the same /transform
+ * entry external consumers import (pxpipe-proxy/transform et al use renderTextToImages),
+ * NOT the internal leaf renderer.
  */
 
 import {
@@ -12,6 +15,7 @@ import {
   DENSE_CONTENT_COLS,
   renderCellHeight,
   renderCellWidth,
+  computeCanvasGeometry,
 } from './render.js';
 // Dogfood the public SDK: render via the same `./transform` entry external
 // consumers import (pxpipe-proxy/transform → renderTextToImages), not the
@@ -20,6 +24,7 @@ import { renderTextToImages } from './library.js';
 import { estimateImageCount, REPORT_CHARS_PER_TOKEN } from './transform.js';
 import { visionTokensForModel } from './openai.js';
 import { resolveGptProfile } from './gpt-model-profiles.js';
+import { resolveGeminiProfile, isGeminiModel } from './gemini-model-profiles.js';
 import {
   factSheetTextFromEntries,
   extractFactSheetTokensAllPages,
@@ -128,6 +133,9 @@ export interface ExportParsed {
   diff: string | undefined;
   stdin: boolean;
   cols: number;
+  width?: number;
+  height?: number;
+  columns?: number;
   out: string;
   model: string;
   json: boolean;
@@ -157,6 +165,9 @@ export function parseExportArgv(
   let diff: string | undefined;
   let stdin = false;
   let cols = DENSE_CONTENT_COLS;
+  let width: number | undefined;
+  let height: number | undefined;
+  let columns: number | undefined;
   let out =
     defaultOut ??
     (typeof process !== 'undefined'
@@ -221,6 +232,50 @@ export function parseExportArgv(
       const v = a.slice('--model='.length);
       if (!v) return { kind: 'error', message: '--model= requires a non-empty value' };
       model = v;
+    } else if (a === '--width') {
+      i++;
+      const val = argv[i];
+      if (val === undefined || val.startsWith('-')) return { kind: 'error', message: '--width requires a value' };
+      const v = parseInt(val, 10);
+      if (isNaN(v) || v <= 0) return { kind: 'error', message: '--width requires a positive number' };
+      width = v;
+    } else if (a.startsWith('--width=')) {
+      const v = parseInt(a.slice('--width='.length), 10);
+      if (isNaN(v) || v <= 0) return { kind: 'error', message: '--width= requires a positive number' };
+      width = v;
+    } else if (a === '--height') {
+      i++;
+      const val = argv[i];
+      if (val === undefined || val.startsWith('-')) return { kind: 'error', message: '--height requires a value' };
+      const v = parseInt(val, 10);
+      if (isNaN(v) || v <= 0) return { kind: 'error', message: '--height requires a positive number' };
+      height = v;
+    } else if (a.startsWith('--height=')) {
+      const v = parseInt(a.slice('--height='.length), 10);
+      if (isNaN(v) || v <= 0) return { kind: 'error', message: '--height= requires a positive number' };
+      height = v;
+    } else if (a === '--columns') {
+      i++;
+      const val = argv[i];
+      if (val === undefined || val.startsWith('-')) return { kind: 'error', message: '--columns requires a value' };
+      const v = parseInt(val, 10);
+      if (isNaN(v) || v <= 0) return { kind: 'error', message: '--columns requires a positive number' };
+      columns = v;
+    } else if (a.startsWith('--columns=')) {
+      const v = parseInt(a.slice('--columns='.length), 10);
+      if (isNaN(v) || v <= 0) return { kind: 'error', message: '--columns= requires a positive number' };
+      columns = v;
+    } else if (a === '--cols') {
+      i++;
+      const val = argv[i];
+      if (val === undefined || val.startsWith('-')) return { kind: 'error', message: '--cols requires a value' };
+      const v = parseInt(val, 10);
+      if (isNaN(v) || v <= 0) return { kind: 'error', message: '--cols requires a positive number' };
+      cols = v;
+    } else if (a.startsWith('--cols=')) {
+      const v = parseInt(a.slice('--cols='.length), 10);
+      if (isNaN(v) || v <= 0) return { kind: 'error', message: '--cols= requires a positive number' };
+      cols = v;
     } else if (a === '--json') {
       json = true;
     } else if (a === '--open') {
@@ -232,10 +287,20 @@ export function parseExportArgv(
     }
   }
 
-  cols = resolveGptProfile(model).stripCols;
+  const profile = isGeminiModel(model) ? resolveGeminiProfile(model) : resolveGptProfile(model);
+  if (width !== undefined) {
+    const cellW = renderCellWidth(profile.style);
+    const cellH = renderCellHeight(profile.style);
+    const targetH = height ?? profile.maxHeightPx;
+    // Derive maximum column capacity using dynamic margins
+    cols = computeCanvasGeometry(width, targetH, cellW, cellH).cols;
+  } else {
+    cols = profile.stripCols;
+  }
+
   return {
     kind: 'opts',
-    parsed: { targets, include, exclude, git, diff, stdin, cols, out, model, json, open },
+    parsed: { targets, include, exclude, git, diff, stdin, cols, width, height, columns, out, model, json, open },
   };
 }
 
@@ -293,7 +358,7 @@ export function computeTokenReport(
   cols: number,
   model: string,
 ): ExportTokenReport {
-  const profile = resolveGptProfile(model);
+  const profile = isGeminiModel(model) ? resolveGeminiProfile(model) : resolveGptProfile(model);
   const stripW = 8 + cols * renderCellWidth(profile.style);
   const linesPerImage = Math.max(1, Math.floor((profile.maxHeightPx - 8) / renderCellHeight(profile.style)));
   const estImages = estimateImageCount(sourceText, cols, DENSE_CONTENT_CHARS_PER_IMAGE, linesPerImage);
@@ -323,6 +388,9 @@ export interface ExportPageInfo {
   bytes: number;
   width: number;
   height: number;
+  lines: number;
+  chars: number;
+  tokens: number;
 }
 
 export interface ExportManifest {
@@ -331,6 +399,15 @@ export interface ExportManifest {
   pages: ExportPageInfo[];
   cols: number;
   model: string;
+  layoutInfo?: {
+    font: string;
+    cellW: number;
+    cellH: number;
+    padXLeft: number;
+    padXRight: number;
+    padYTop: number;
+    padYBottom: number;
+  };
   generatedAt: string;
   tokenReport: ExportTokenReport;
 }
@@ -349,6 +426,9 @@ export interface ExportCoreOptions {
   /** Relative file paths listed in the manifest and prompt (display only). */
   sourceFiles: string[];
   cols: number;
+  width?: number;
+  height?: number;
+  columns?: number;
   model: string;
 }
 
@@ -427,7 +507,10 @@ export async function runExportCore(
   const { pages: images } = await renderTextToImages(sourceText, {
     model: opts.model,
     cols: opts.cols,
-    shrink: true,
+    width: opts.width,
+    columns: opts.columns,
+    maxHeightPx: opts.height,
+    shrink: opts.width !== undefined ? false : true,
     reflow: true,
   });
 
@@ -459,18 +542,29 @@ export async function runExportCore(
     factsheetDropped: fsDropped,
   };
 
+  const profile = isGeminiModel(opts.model) ? resolveGeminiProfile(opts.model) : resolveGptProfile(opts.model);
+  const cellW = renderCellWidth(profile.style);
+  const cellH = renderCellHeight(profile.style);
+  const targetW = opts.width ?? (opts.cols ? opts.cols * cellW + 8 : 1536);
+  const targetH = opts.height ?? profile.maxHeightPx;
+  const geom = computeCanvasGeometry(targetW, targetH, cellW, cellH);
+
   // Build artifacts
   const artifacts: ExportArtifact[] = [];
   const pages: ExportPageInfo[] = [];
 
   for (const [i, img] of images.entries()) {
     const filename = `page-${String(i + 1).padStart(3, '0')}.png`;
+    const tokens = exportImageTokens(opts.model, img.width, img.height);
     artifacts.push({ filename, data: img.png });
     pages.push({
       filename,
       bytes: img.png.byteLength,
       width: img.width,
       height: img.height,
+      lines: img.lines,
+      chars: img.chars,
+      tokens,
     });
   }
 
@@ -484,6 +578,15 @@ export async function runExportCore(
     pages,
     cols: opts.cols,
     model: opts.model,
+    layoutInfo: {
+      font: profile.style.font ?? 'spleen-5x8',
+      cellW,
+      cellH,
+      padXLeft: geom.padXLeft,
+      padXRight: geom.padXRight,
+      padYTop: geom.padYTop,
+      padYBottom: geom.padYBottom,
+    },
     generatedAt,
     tokenReport,
   };
@@ -493,8 +596,16 @@ export async function runExportCore(
   });
 
   // prompt.txt
-  const promptText = buildPromptText(images.length, fsText, opts.sourceFiles, fsDropped);
-  artifacts.push({ filename: 'prompt.txt', data: enc.encode(promptText) });
+  const promptText = buildPromptText(
+    images.length,
+    fsText,
+    opts.sourceFiles,
+    fsDropped,
+  );
+  artifacts.push({
+    filename: 'prompt.txt',
+    data: enc.encode(promptText),
+    });
 
   return { manifest, artifacts };
 }

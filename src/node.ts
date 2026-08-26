@@ -792,6 +792,10 @@ Options:
   --stdin            read source text from stdin instead of files
   --out <dir>        base output directory (default \$TMPDIR or /tmp)
   --model <id>       model id for vision-token estimate (default claude-sonnet-4-5)
+  --width <px>       target canvas width in pixels (e.g. 1536, 1912)
+  --height <px>      target max canvas height in pixels (e.g. 1536, 1912)
+  --columns <1|2>    number of side-by-side text columns per page (default 1)
+  --cols <n>         character wrap-width cap (default auto-derived from width/font)
   --json             print report as JSON
   --open             reveal the output folder when done (macOS) so you can
                      drag the PNG pages straight into your chat
@@ -810,11 +814,13 @@ Report columns:
   % saved       (text − image) / text × 100
 
 Examples:
-  pxpipe export .                              # whole directory
-  pxpipe export --include "*.ts" src/          # TypeScript files only
-  pxpipe export --git                          # uncommitted changes
-  pxpipe export --diff HEAD~3                  # last 3 commits
-  pxpipe export --open src/                    # render src/, then reveal the folder
+  pxpipe export .                                            # whole directory
+  pxpipe export --include "*.ts" src/                        # TypeScript files only
+  pxpipe export --model gemini-2.0-flash --width 1536        # Gemini 1536x1536 canvas
+  pxpipe export --width 1912 --height 1912 --columns 2 src/  # 2-column wide layout
+  pxpipe export --git                                        # uncommitted changes
+  pxpipe export --diff HEAD~3                                # last 3 commits
+  pxpipe export --open src/                                  # render src/, then reveal the folder
   cat big-file.txt | pxpipe export --stdin
 `);
 }
@@ -959,9 +965,15 @@ function formatNumber(n: number): string {
   return n.toLocaleString('en-US');
 }
 
-function printExportReport(opts: ExportParsed, outDir: string, sourceFiles: string[], result: ExportResult): void {
+function printExportReport(
+  opts: ExportParsed,
+  outDir: string,
+  sourceFiles: string[],
+  result: ExportResult
+): void {
   const { manifest } = result;
-  const { tokenReport, pages } = manifest;
+  const { pages, tokenReport, layoutInfo } = manifest;
+
   const totalPngBytes = pages.reduce((s, p) => s + p.bytes, 0);
 
   if (opts.json) {
@@ -979,6 +991,7 @@ function printExportReport(opts: ExportParsed, outDir: string, sourceFiles: stri
         factsheetDropped: tokenReport.factsheetDropped,
         model: manifest.model,
         cols: manifest.cols,
+        layoutInfo,
         generatedAt: manifest.generatedAt,
       }) + '\n',
     );
@@ -990,12 +1003,35 @@ function printExportReport(opts: ExportParsed, outDir: string, sourceFiles: stri
   const droppedNote = tokenReport.factsheetDropped > 0
     ? ` (${tokenReport.factsheetDropped} dropped)`
     : '';
+
+  const layoutDetails = layoutInfo
+    ? ` [font: ${layoutInfo.font} @ ${layoutInfo.cellW}x${layoutInfo.cellH}px | grid: ${manifest.cols} cols | padX: ${layoutInfo.padXLeft}L/${layoutInfo.padXRight}R | padY: ${layoutInfo.padYTop}T/${layoutInfo.padYBottom}B]`
+    : '';
+
+  const pageTree = pages.map((page, idx) => {
+    const isLast = idx === pages.length - 1;
+    const branch = isLast ? '    └─' : '    ├─';
+    const tileCount = Math.ceil(page.width / 768) * Math.ceil(page.height / 768);
+    const tileLabel = (tileCount === 1 ? '1 tile' : `${tileCount} tiles`).padEnd(7);
+
+    const fileCol = `${page.filename}:`.padEnd(14);
+    const dimCol = `${page.width}x${page.height}px`.padStart(11);
+    const linesCol = `${page.lines} lines`.padStart(9);
+    const charsCol = `${formatNumber(page.chars)} chars`.padStart(13);
+    const bytesCol = `${formatNumber(page.bytes)} B`.padStart(11);
+    const tokensCol = `${tileLabel} (~${formatNumber(page.tokens)} tokens)`;
+
+    return `${branch} ${fileCol} ${dimCol} | ${linesCol} | ${charsCol} | ${bytesCol} | ${tokensCol}`;
+  }).join('\n');
+
   console.log(
     `\npxpipe export\n` +
     `  out:            ${outDir}\n` +
+    `  model:          ${manifest.model}${layoutDetails}\n` +
     `  files:          ${formatNumber(sourceFiles.length)}\n` +
     `  source chars:   ${formatNumber(manifest.sourceChars)}\n` +
     `  pages:          ${pages.length} (${formatNumber(totalPngBytes)} bytes)\n` +
+    (pageTree ? `${pageTree}\n` : '') +
     `  text tokens:    ~${formatNumber(tokenReport.textTokens)}\n` +
     `  image tokens:   ~${formatNumber(tokenReport.imageTokens)}  (${savedStr})\n` +
     `  factsheet:      ${tokenReport.factsheetItemCount} items${droppedNote}\n`,
@@ -1036,6 +1072,9 @@ async function runExport(argv: string[]): Promise<void> {
   const result = await runExportCore(sourceText, {
     sourceFiles,
     cols: opts.cols,
+    width: opts.width,
+    height: opts.height,
+    columns: opts.columns,
     model: opts.model,
   });
 

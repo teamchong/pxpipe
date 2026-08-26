@@ -336,6 +336,54 @@ export function renderCellHeight(style: RenderStyle = {}): number {
   return atlas.cellH + Math.max(0, Math.floor(style.cellHBonus ?? DEFAULT_CELL_H_BONUS));
 }
 
+export interface CanvasGeometry {
+  cols: number;
+  lines: number;
+  padXLeft: number;
+  padXRight: number;
+  padYTop: number;
+  padYBottom: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * Universally computes optimal columns, lines, and asymmetric margins
+ * for any arbitrary (targetWidth, targetHeight).
+ * Any odd remainder pixel is strictly allocated to the left margin.
+ */
+export function computeCanvasGeometry(
+  targetWidth: number,
+  targetHeight: number,
+  cellW: number,
+  cellH: number,
+  minMargin: number = 2
+): CanvasGeometry {
+  const cols = Math.max(1, Math.floor((targetWidth - 2 * minMargin) / cellW));
+  const lines = Math.max(1, Math.floor((targetHeight - 2 * minMargin) / cellH));
+
+  const slackX = Math.max(0, targetWidth - cols * cellW);
+  const slackY = Math.max(0, targetHeight - lines * cellH);
+
+  // Left-weighted remainder: Math.ceil allocates the extra pixel to padXLeft
+  const padXLeft = Math.ceil(slackX / 2);
+  const padXRight = slackX - padXLeft;
+
+  const padYTop = Math.ceil(slackY / 2);
+  const padYBottom = slackY - padYTop;
+
+  return {
+    cols,
+    lines,
+    padXLeft,
+    padXRight,
+    padYTop,
+    padYBottom,
+    width: padXLeft + cols * cellW + padXRight,
+    height: padYTop + lines * cellH + padYBottom,
+  };
+}
+
 // --- column-aware wrapping -------------------------------------------------
 
 /** Visual width of a codepoint in cells (1 = Latin, 2 = East Asian Wide).
@@ -883,6 +931,8 @@ export async function renderChunkToPng(
   style: RenderStyle = {},
   maxHeightPx: number = MAX_HEIGHT_PX,
   slotText?: string,
+  numColumns: number = 1,
+  targetWidthPx?: number,
 ): Promise<RenderedImage> {
   const useAA = style.aa === true;
   const selected = atlasSet(style.font);
@@ -891,18 +941,34 @@ export async function renderChunkToPng(
   const markerScale = Math.max(1, Math.floor(style.markerScale ?? 1));
   const cellH = renderCellHeight(style);
   const cellW = renderCellWidth(style);
-  const lines = wrapLines(text, cols, markerScale, style.font);
+
+  // Exact target width resolution (e.g. 1912px, 1536px, 1024px, 768px)
+  const targetW = targetWidthPx ?? (cols * cellW <= 1530 && cols * cellW >= 1525 ? 1536 : cols * cellW + 2 * PAD_X);
+  const geom = computeCanvasGeometry(targetW, maxHeightPx, cellW, cellH);
+  const padXLeft = geom.padXLeft;
+  const padXRight = geom.padXRight;
+  const padYTop = geom.padYTop;
+  const padYBottom = geom.padYBottom;
+
+  // 2-Column Geometry Calculation
+  const isMultiCol = numColumns === 2;
+  const gutterCols = isMultiCol ? (cols % 2 === 0 ? 2 : 3) : 0;
+  const colWrapWidth = isMultiCol ? Math.max(1, Math.floor((cols - gutterCols) / 2)) : cols;
+
+  const lines = wrapLines(text, colWrapWidth, markerScale, style.font);
   // Slot string carries role attribution by position. It is width-identical to
   // `text`, so wrapLines splits it into the exact same rows — fitSlotLines[r] aligns
   // codepoint-for-codepoint with fitLines[r]. Only built when coloring is on.
   const slotLines: string[] | null =
     style.colorByRole === true && slotText !== undefined
-      ? wrapLines(slotText, cols, markerScale, style.font)
+      ? wrapLines(slotText, colWrapWidth, markerScale, style.font)
       : null;
 
-  const maxLines = Math.max(1, Math.floor((maxHeightPx - 2 * PAD_Y) / cellH));
-  const fitLines = lines.slice(0, maxLines);
-  const fitSlotLines = slotLines ? slotLines.slice(0, maxLines) : null;
+  const maxLinesPerCol = geom.lines;
+  const maxLinesTotal = isMultiCol ? maxLinesPerCol * 2 : maxLinesPerCol;
+
+  const fitLines = lines.slice(0, maxLinesTotal);
+  const fitSlotLines = slotLines ? slotLines.slice(0, maxLinesTotal) : null;
 
   // charsRendered = input codepoints covered by this image (for..of counts by codepoint, not code unit).
   let charsRendered: number;
@@ -920,9 +986,12 @@ export async function renderChunkToPng(
     charsRendered = n;
   }
 
-  // Widen by overhang when cellW < atlasW so the last glyph stays inside the framebuffer.
-  const width = 2 * PAD_X + cols * cellW + Math.max(0, atlasW - cellW);
-  const height = 2 * PAD_Y + fitLines.length * cellH;
+  // Exact canvas dimensions (overhang is absorbed by padXRight >= 2px)
+  const width = padXLeft + cols * cellW + padXRight;
+  const linesInCol1 = Math.min(fitLines.length, maxLinesPerCol);
+  const linesInCol2 = isMultiCol ? Math.max(0, fitLines.length - maxLinesPerCol) : 0;
+  const maxRenderedRows = Math.max(linesInCol1, linesInCol2);
+  const height = padYTop + maxRenderedRows * cellH + padYBottom;
 
   // Black canvas — inverted to black-on-white after blitting (matches Python proxy convention).
   const fb = new Uint8Array(width * height);
@@ -958,18 +1027,22 @@ export async function renderChunkToPng(
   let droppedChars = 0;
   const droppedCodepoints = new Map<number, number>();
   let glyphIndex = 0; // every cell including spaces/missing
-  for (let row = 0; row < fitLines.length; row++) {
-    const line = fitLines[row]!;
-    const baseY = PAD_Y + row * cellH;
+  for (let idx = 0; idx < fitLines.length; idx++) {
+    const isSecondCol = isMultiCol && idx >= maxLinesPerCol;
+    const row = isSecondCol ? idx - maxLinesPerCol : idx;
+    const colXOffset = isSecondCol ? colWrapWidth + gutterCols : 0;
+
+    const line = fitLines[idx]!;
+    const baseY = padYTop + row * cellH;
     let col = 0;
     // Per-row slot codepoints, aligned 1:1 with `line` (same wrap, width-preserved).
     const slotRow: string[] | null =
-      fitSlotLines ? Array.from(fitSlotLines[row] ?? '') : null;
+      fitSlotLines ? Array.from(fitSlotLines[idx] ?? '') : null;
     let charIdx = 0;
     for (const ch of line) {
-      if (col >= cols) break; // shouldn't happen — wrap prevents this
+      if (col >= colWrapWidth) break; // shouldn't happen — wrap prevents this
       const codepoint = ch.codePointAt(0)!;
-      const baseX = PAD_X + col * cellW;
+      const baseX = padXLeft + (colXOffset + col) * cellW;
       const isMarker = codepoint === NL_SENTINEL_CP;
       const colorSlot = useColorByRole
         ? (slotRow ? slotForMarkCp(slotRow[charIdx]?.codePointAt(0)) : 0) // 0 = body (black); only tags carry a role hue
@@ -997,8 +1070,15 @@ export async function renderChunkToPng(
     }
   }
 
+  // Draw vertical gutter divider line down the middle for 2-column mode
+  if (isMultiCol && linesInCol2 > 0) {
+    const gutterDividerX = padXLeft + Math.floor((colWrapWidth + gutterCols / 2) * cellW);
+    for (let y = padYTop; y < height - padYBottom; y++) {
+      fb[y * width + gutterDividerX] = 180; // Crisp vertical divider bar
+    }
+  }
   if (style.grid) {
-    drawGrid(fb, width, height, fitLines.length, Math.max(0, Math.floor(style.gridCols ?? 0)), cellH, cellW, atlasH);
+    drawGrid(fb, width, height, maxRenderedRows, Math.max(0, Math.floor(style.gridCols ?? 0)), cellH, cellW, atlasH);
   }
 
   // Optional ink dilate (pre-invert): thickens glyphs without changing cell pitch.
@@ -1299,9 +1379,11 @@ export async function renderTextToPngsWithCharLimit(
   style: RenderStyle = {},
   maxHeightPx: number = MAX_HEIGHT_PX,
   slotText?: string,
+  columns: number = 1,
+  targetWidthPx?: number,
 ): Promise<RenderedImage[]> {
   if (renderCacheMaxBytesValue === 0) {
-    return renderTextToPngsUncached(text, cols, maxCharsPerImage, style, maxHeightPx, slotText);
+    return renderTextToPngsUncached(text, cols, maxCharsPerImage, style, maxHeightPx, slotText, columns, targetWidthPx);
   }
   const key = await renderCacheKey(text, cols, maxCharsPerImage, maxHeightPx, style, slotText);
   const hit = renderCache.get(key);
@@ -1313,7 +1395,7 @@ export async function renderTextToPngsWithCharLimit(
   }
   renderCacheMisses++;
 
-  const images = await renderTextToPngsUncached(text, cols, maxCharsPerImage, style, maxHeightPx, slotText);
+  const images = await renderTextToPngsUncached(text, cols, maxCharsPerImage, style, maxHeightPx, slotText, columns, targetWidthPx);
 
   // Key strings are UTF-16 in memory; 2 bytes/unit is the honest estimate. The digest
   // is fixed-width, so this term is now a constant per entry rather than a second copy
@@ -1346,30 +1428,38 @@ async function renderTextToPngsUncached(
   style: RenderStyle,
   maxHeightPx: number,
   slotText?: string,
+  columns: number = 1,
+  targetWidthPx?: number,
 ): Promise<RenderedImage[]> {
+  const isMultiCol = columns === 2;
+  const gutterCols = isMultiCol ? (cols % 2 === 0 ? 2 : 3) : 0;
+  const colWrapWidth = isMultiCol ? Math.max(1, Math.floor((cols - gutterCols) / 2)) : cols;
+
   const markerScale = Math.max(1, Math.floor(style.markerScale ?? 1));
   const cellH = renderCellHeight(style);
-  const lines = wrapLines(text, cols, markerScale, style.font);
+  const lines = wrapLines(text, colWrapWidth, markerScale, style.font);
   // Width-identical slot rows align 1:1 with `lines`; pages are contiguous slices,
   // so the same index range gives each page its slot half. Only built when coloring.
   const slotLines: string[] | null =
     style.colorByRole === true && slotText !== undefined
-      ? wrapLines(slotText, cols, markerScale, style.font)
+      ? wrapLines(slotText, colWrapWidth, markerScale, style.font)
       : null;
+
   const hardLinesPerImg = Math.max(1, Math.floor((maxHeightPx - 2 * PAD_Y) / cellH));
   // Dense pages (DENSE_CONTENT_CHARS_PER_IMAGE) fill the full 1932 px height;
   // the slab budget (READABLE_CHARS_PER_IMAGE) keeps its shorter row cap.
-  const linesPerImg = Math.min(hardLinesPerImg, Math.max(1, Math.floor(maxCharsPerImage / cols)));
+  const linesPerImage = isMultiCol ? hardLinesPerImg * 2 : hardLinesPerImg;
+  const pages = splitWrappedLinesIntoReadablePages(lines, linesPerImage, maxCharsPerImage);
 
   const images: RenderedImage[] = [];
   let slotCursor = 0;
-  for (const page of splitWrappedLinesIntoReadablePages(lines, linesPerImg, maxCharsPerImage)) {
-    const chunk = page.join('\n');
+  for (const chunk of pages) {
+    const chunkText = chunk.join('\n');
     const slotChunk = slotLines
-      ? slotLines.slice(slotCursor, slotCursor + page.length).join('\n')
+      ? slotLines.slice(slotCursor, slotCursor + chunk.length).join('\n')
       : undefined;
-    slotCursor += page.length;
-    images.push(await renderChunkToPng(chunk, cols, style, maxHeightPx, slotChunk));
+    slotCursor += chunk.length;
+    images.push(await renderChunkToPng(chunkText, cols, style, maxHeightPx, slotChunk, columns, targetWidthPx));
   }
   return images;
 }

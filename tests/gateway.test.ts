@@ -1,6 +1,6 @@
 /**
- * Cloudflare AI Gateway provider mode. All URLs and tokens here are fake —
- * the suite never touches the network (global fetch is stubbed).
+ * Cloudflare AI Gateway and OrcaRouter provider modes. All URLs and tokens
+ * here are fake — the suite never touches the network (global fetch is stubbed).
  */
 import { afterEach, describe, expect, it } from 'vitest';
 import { createProxy, parseGatewayHeaders, resolveUpstreams } from '../src/core/proxy.js';
@@ -35,6 +35,23 @@ describe('resolveUpstreams', () => {
     expect(() => resolveUpstreams({ provider: 'cloudflare-ai-gateway' })).toThrow(
       /gatewayBaseUrl/,
     );
+  });
+
+  it('routes orcarouter through the default OrcaRouter base with /v1 kept', () => {
+    expect(resolveUpstreams({ provider: 'orcarouter' })).toEqual({
+      anthropic: 'https://api.orcarouter.ai',
+      openai: 'https://api.orcarouter.ai',
+      stripOpenAIV1: false,
+    });
+  });
+
+  it('honors a gatewayBaseUrl override for orcarouter', () => {
+    expect(resolveUpstreams({ provider: 'orcarouter', gatewayBaseUrl: 'https://orca.example.test' }))
+      .toEqual({
+        anthropic: 'https://orca.example.test',
+        openai: 'https://orca.example.test',
+        stripOpenAIV1: false,
+      });
   });
 });
 
@@ -168,6 +185,57 @@ describe('gateway end-to-end routing (stubbed fetch)', () => {
     );
     expect(await res.text()).toBe(sse);
     expect(res.headers.get('content-type')).toBe('text/event-stream');
+  });
+});
+
+describe('orcarouter end-to-end routing (stubbed fetch)', () => {
+  const proxy = () =>
+    createProxy({
+      provider: 'orcarouter',
+      gatewayHeaders: { 'x-orca-extra': '1' },
+    });
+
+  it('routes Anthropic /v1/messages to the orcarouter /v1 namespace', async () => {
+    const cap: { url?: string; headers?: Headers } = {};
+    stubFetch(cap);
+    const res = await proxy()(
+      new Request('http://localhost/v1/messages', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': 'fake-anthropic-key' },
+        body: JSON.stringify({ model: 'claude-fable-5', max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] }),
+      }),
+    );
+    expect(res.status).toBe(200);
+    expect(cap.url).toBe('https://api.orcarouter.ai/v1/messages');
+    expect(cap.headers?.get('x-orca-extra')).toBe('1');
+    expect(cap.headers?.get('x-api-key')).toBe('fake-anthropic-key');
+  });
+
+  it('routes OpenAI /v1/responses to the orcarouter /v1 namespace keeping /v1', async () => {
+    const cap: { url?: string; headers?: Headers } = {};
+    stubFetch(cap);
+    await proxy()(
+      new Request('http://localhost/v1/responses', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: 'Bearer fake-openai-key' },
+        body: JSON.stringify({ model: 'gpt-fake', input: 'hi' }),
+      }),
+    );
+    expect(cap.url).toBe('https://api.orcarouter.ai/v1/responses');
+    expect(cap.headers?.get('x-orca-extra')).toBe('1');
+  });
+
+  it('routes OpenAI /v1/chat/completions to the orcarouter /v1 namespace keeping /v1', async () => {
+    const cap: { url?: string; headers?: Headers } = {};
+    stubFetch(cap);
+    await proxy()(
+      new Request('http://localhost/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: 'Bearer fake-openai-key' },
+        body: JSON.stringify({ model: 'gpt-fake', messages: [{ role: 'user', content: 'hi' }] }),
+      }),
+    );
+    expect(cap.url).toBe('https://api.orcarouter.ai/v1/chat/completions');
   });
 });
 

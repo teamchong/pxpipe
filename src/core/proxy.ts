@@ -28,8 +28,10 @@ import { resolveGptProfile } from './gpt-model-profiles.js';
 
 export interface ProxyConfig {
   /** 'cloudflare-ai-gateway': routes both families through gatewayBaseUrl;
-   *  OpenAI paths drop the `/v1` prefix to match gateway shape. */
-  provider?: 'cloudflare-ai-gateway';
+   *  OpenAI paths drop the `/v1` prefix to match gateway shape.
+   *  'orcarouter': routes both families through OrcaRouter's OpenAI/Anthropic-
+   *  compatible gateway at https://api.orcarouter.ai (or gatewayBaseUrl). */
+  provider?: 'cloudflare-ai-gateway' | 'orcarouter';
   /** Gateway base URL (account/gateway-scoped). Required when provider is set. */
   gatewayBaseUrl?: string;
   /** Extra headers injected on every upstream request (e.g. gateway auth). */
@@ -1054,6 +1056,7 @@ function teeForUsage(
 
 const DEFAULT_UPSTREAM = 'https://api.anthropic.com';
 const DEFAULT_OPENAI_UPSTREAM = 'https://api.openai.com';
+const DEFAULT_ORCAROUTER_UPSTREAM = 'https://api.orcarouter.ai';
 
 /** Headers we strip on the way out — they're hop-by-hop or proxy-injected. */
 const STRIP_REQ_HEADERS = new Set([
@@ -1341,6 +1344,13 @@ export function resolveUpstreams(config: ProxyConfig): {
     }
     return { anthropic: `${base}/anthropic`, openai: `${base}/openai`, stripOpenAIV1: true };
   }
+  if (config.provider === 'orcarouter') {
+    // OrcaRouter exposes every wire protocol under one standard `/v1` namespace
+    // (Anthropic Messages, OpenAI Responses and Chat Completions), so both
+    // families resolve to the same base and keep their `/v1` path segments.
+    const base = (config.gatewayBaseUrl ?? DEFAULT_ORCAROUTER_UPSTREAM).trim().replace(/\/+$/, '');
+    return { anthropic: base, openai: base, stripOpenAIV1: false };
+  }
   return {
     anthropic: (config.upstream ?? DEFAULT_UPSTREAM).trim().replace(/\/+$/, ''),
     openai: (config.openAIUpstream ?? DEFAULT_OPENAI_UPSTREAM).trim().replace(/\/+$/, ''),
@@ -1400,7 +1410,8 @@ export function createProxy(config: ProxyConfig = {}) {
   // (e.g. /openai/*, /google-ai-studio/*) safe from env whitespace — see the
   // JSDoc on resolveUpstreams for the full rationale.
   const passthroughUpstream = config.provider === 'cloudflare-ai-gateway'
-    ? (config.gatewayBaseUrl ?? '').trim().replace(/\/+$/, '')
+    || config.provider === 'orcarouter'
+    ? (config.gatewayBaseUrl ?? DEFAULT_ORCAROUTER_UPSTREAM).trim().replace(/\/+$/, '')
     : upstream;
   const gatewayHeaders = config.gatewayHeaders ?? {};
   const applyGatewayHeaders = (h: Headers): Headers => {

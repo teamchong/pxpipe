@@ -7,6 +7,7 @@ import { mkdir, rm, readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
+import path from 'node:path';
 
 const require = createRequire(import.meta.url);
 
@@ -29,7 +30,9 @@ await mkdir(OUT, { recursive: true });
 // TS 7 no longer exports './bin/tsc', so resolve it via the bin field of the
 // (still-exported) package.json instead of a direct subpath require.
 const tsPkgPath = require.resolve('typescript/package.json');
-const tscBin = new URL(require('typescript/package.json').bin.tsc, `file://${tsPkgPath}`).pathname;
+const tsPkgDir = path.dirname(tsPkgPath);
+const tscRelative = require('typescript/package.json').bin.tsc;
+const tscBin = path.resolve(tsPkgDir, tscRelative);
 const tsc = spawnSync(process.execPath, [tscBin, '-p', 'tsconfig.json'], {
   stdio: 'inherit',
 });

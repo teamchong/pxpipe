@@ -1,23 +1,26 @@
-import {
-  MAX_HEIGHT_PX as ANTHROPIC_MAX_HEIGHT_PX,
-  ANTHROPIC_SLAB_COLS as ANTHROPIC_STRIP_COLS,
-} from './render.js';
 import { BASE_PRICING } from './profile-base.js';
 import { visionTokens } from './vision-cost.js';
 import type { GptModelProfile } from './gpt-model-profiles.js';
 
-/** Dedicated profile for the validated Gemini 3.6 Flash model. The production
- *  1568×728 geometry measured 1,078 image tokens. */
+/**
+ * Dedicated profile for Gemini models (Google AI Studio).
+ * - Canvas width: 1536px (382 columns with 4px cell width).
+ * - Max canvas height: 1536px (2x2 tile grid = 1,081 tokens).
+ */
 export const GEMINI_3_6_FLASH_PROFILE: GptModelProfile = {
   // Flat per-image charge. Live usage measured the exact production canvas at
-  // 1,078 IMAGE tokens; other measured shapes ranged up to 1,113 and Google's
-  // Gemini 3 docs publish an approximate 1,120-token default/high image budget,
+  // 1,078-1,081 image tokens; other measured shapes ranged up to 1,113 and Google's
+  // Gemini docs publish an approximate 1,120-token default/high image budget,
   // so that documented ceiling prices partial pages and width-shrunk slabs.
-  vision: { regime: 'flat', tokens: 1120, exact: { widthPx: 1568, heightPx: 728, tokens: 1078 } },
+  vision: {
+    regime: 'flat',
+    tokens: 1120,
+    exact: { widthPx: 1536, heightPx: 1536, tokens: 1081 },
+  },
   ...BASE_PRICING,
   cacheReadRate: 0.25,
-  stripCols: ANTHROPIC_STRIP_COLS,
-  maxHeightPx: ANTHROPIC_MAX_HEIGHT_PX,
+  stripCols: 306, // 306 cols * 5px + 6px padding = 1536px
+  maxHeightPx: 1536, // Standard 2x2 grid max height
   minCompressTokens: 500,
   factSheetFormat: 'compact',
   history: {
@@ -52,9 +55,33 @@ export const GEMINI_3_7_FLASH_PROFILE: GptModelProfile = {
   style: { ...GEMINI_3_6_FLASH_PROFILE.style },
 };
 
+export const GEMINI_2_0_FLASH_PROFILE: GptModelProfile = {
+  ...GEMINI_3_6_FLASH_PROFILE,
+  vision: { ...GEMINI_3_6_FLASH_PROFILE.vision },
+  history: { ...GEMINI_3_6_FLASH_PROFILE.history },
+  style: { ...GEMINI_3_6_FLASH_PROFILE.style },
+};
+
+export const GEMINI_1_5_FLASH_PROFILE: GptModelProfile = {
+  ...GEMINI_3_6_FLASH_PROFILE,
+  vision: { ...GEMINI_3_6_FLASH_PROFILE.vision },
+  history: { ...GEMINI_3_6_FLASH_PROFILE.history },
+  style: { ...GEMINI_3_6_FLASH_PROFILE.style },
+};
+
+export const GEMINI_1_5_PRO_PROFILE: GptModelProfile = {
+  ...GEMINI_3_6_FLASH_PROFILE,
+  vision: { ...GEMINI_3_6_FLASH_PROFILE.vision },
+  history: { ...GEMINI_3_6_FLASH_PROFILE.history },
+  style: { ...GEMINI_3_6_FLASH_PROFILE.style },
+};
+
 const GEMINI_MEASURED_PROFILES: Readonly<Record<string, GptModelProfile>> = {
   'gemini-3.6-flash': GEMINI_3_6_FLASH_PROFILE,
   'gemini-3.7-flash': GEMINI_3_7_FLASH_PROFILE,
+  'gemini-2.0-flash': GEMINI_2_0_FLASH_PROFILE,
+  'gemini-1.5-flash': GEMINI_1_5_FLASH_PROFILE,
+  'gemini-1.5-pro': GEMINI_1_5_PRO_PROFILE,
 };
 
 function normalizeGeminiId(model: string | null | undefined): string {

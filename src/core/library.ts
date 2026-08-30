@@ -4,6 +4,9 @@ import {
   renderTextToPngsWithCharLimit,
   measureContentCols,
   reflow,
+  renderCellHeight,
+  renderCellWidth,
+  computeCanvasGeometry,
   DENSE_CONTENT_COLS,
   DENSE_CONTENT_CHARS_PER_IMAGE,
   DENSE_RENDER_STYLE,
@@ -18,6 +21,7 @@ import {
   type RecoverableBlock,
 } from './transform.js';
 import { resolveGptProfile } from './gpt-model-profiles.js';
+import { resolveGeminiProfile, isGeminiModel } from './gemini-model-profiles.js';
 
 export type { KeepSharpBlock, RecoverableBlock };
 
@@ -150,8 +154,12 @@ export async function transformAnthropicMessages(
 export interface RenderTextToImagesOptions {
   /** Model whose complete built-in render profile supplies defaults. */
   readonly model?: string;
+  /** Explicit target canvas width in pixels (e.g., 1912, 1536, 1024, 768). */
+  readonly width?: number;
   /** Wrap-width cap. Defaults to the model profile when `model` is set. */
   readonly cols?: number;
+  /** Number of parallel columns across the canvas (1 or 2). Default 1. */
+  readonly columns?: number;
   /** Shrink the canvas to the widest actual line (default true). `false` keeps the
    *  full `cols` width — the proxy's eval-backed full-canvas behavior. */
   readonly shrink?: boolean;
@@ -171,6 +179,8 @@ export interface RenderedTextImage {
   readonly png: Uint8Array;
   readonly width: number;
   readonly height: number;
+  readonly lines: number;
+  readonly chars: number;
 }
 
 export interface RenderTextToImagesResult {
@@ -192,11 +202,32 @@ export async function renderTextToImages(
   text: string,
   opts: RenderTextToImagesOptions = {},
 ): Promise<RenderTextToImagesResult> {
-  const profile = opts.model ? resolveGptProfile(opts.model) : undefined;
-  const maxCols = Math.max(1, (opts.cols ?? profile?.stripCols ?? DENSE_CONTENT_COLS) | 0);
+  const profile = opts.model
+    ? isGeminiModel(opts.model)
+      ? resolveGeminiProfile(opts.model)
+      : resolveGptProfile(opts.model)
+    : undefined;
+
   const style = opts.style ?? profile?.style ?? DENSE_RENDER_STYLE;
-  const maxHeightPx = opts.maxHeightPx ?? profile?.maxHeightPx ?? MAX_HEIGHT_PX;
-  const maxChars = opts.maxCharsPerImage ?? DENSE_CONTENT_CHARS_PER_IMAGE;
+  const cellW = renderCellWidth(style);
+  const cellH = renderCellHeight(style);
+
+  // Use opts.width directly so we don't reverse-engineer and add 8px
+  const targetWidth = opts.width ?? (isGeminiModel(opts.model) ? 1536 : (opts.cols !== undefined ? opts.cols * cellW + 8 : 1568));
+  const targetHeight = opts.maxHeightPx ?? profile?.maxHeightPx ?? MAX_HEIGHT_PX;
+
+  // Auto-calculate optimal capacity based on active font cell size
+  const geom = computeCanvasGeometry(targetWidth, targetHeight, cellW, cellH);
+  const maxCols = Math.max(1, (opts.cols ?? geom.cols) | 0);
+  const maxHeightPx = Math.max(1, targetHeight | 0);
+  const numColumns = opts.columns === 2 ? 2 : 1;
+
+  // Scaled line and character budget (accounts for exact lines without early split)
+  // Double the character budget headroom so lineLimit doesn't trigger a page split early
+  // 2-column mode doubles the line & character capacity per image
+  const maxLines = numColumns === 2 ? geom.lines * 2 : geom.lines;
+  const dynamicCharBudget = maxLines * maxCols * 2;
+  const maxChars = opts.maxCharsPerImage ?? Math.max(DENSE_CONTENT_CHARS_PER_IMAGE, dynamicCharBudget);
 
   // Reflow (the proxy's dense default; opt-in here): minify trailing whitespace + collapse
   // blank-line runs, then join hard newlines with the ↵ sentinel so short lines PACK into
@@ -211,7 +242,9 @@ export async function renderTextToImages(
   // Measure the content width. Reflowed source is one joined full-width line, so this is
   // byte-identical to the proxy's history render.
   const cols = opts.shrink === false ? maxCols : measureContentCols(source, maxCols);
-  const imgs = await renderTextToPngsWithCharLimit(source, cols, maxChars, style, maxHeightPx);
+
+  // Pass targetWidth to lock image framebuffer to exact pixel width
+  const imgs = await renderTextToPngsWithCharLimit(source, cols, maxChars, style, maxHeightPx, undefined, numColumns, targetWidth);
 
   let droppedChars = 0;
   let pixels = 0;
@@ -220,7 +253,13 @@ export async function renderTextToImages(
     pixels += im.width * im.height;
   }
   return {
-    pages: imgs.map((im) => ({ png: im.png, width: im.width, height: im.height })),
+    pages: imgs.map((im) => ({
+      png: im.png,
+      width: im.width,
+      height: im.height,
+      lines: Math.max(1, Math.floor((im.height - (geom.padYTop + geom.padYBottom)) / cellH)),
+      chars: im.charsRendered,
+    })),
     droppedChars,
     pixels,
   };

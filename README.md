@@ -163,19 +163,23 @@ without running the proxy.
 This matrix shows coverage as well as scores. `—` means the model was not run
 on that test; it does not mean zero. Arithmetic uses novel random-number
 problems. Gist, state, and never-stated probes share one corpus. Never-stated
-is confabulations, so lower is better.
+is confabulations, so lower is better. The **numbers at** column is the render
+geometry the row's scores were measured at; a model's shipped profile can
+differ (Sol and Qwen ship the measured 14px/84 geometry, but their broad-suite
+numbers predate it).
 
-| model | arithmetic (N=100) | gist (N=98) | state (N=18) | never-stated (N=16) | dense hex (N=15) | profile provenance and receipts |
-| --- | ---: | ---: | ---: | ---: | ---: | --- |
-| `claude-fable-5` | **100/100** | **98/98** | **18/18** | **0/16** | 13/15 | June 2026 production profiles: [arithmetic + hex](FINDINGS.md), [gist/state/guards](eval/gist-recall/) |
-| `google/gemini-3.6-flash`, `3.7-flash` | **100/100** | **98/98** | **18/18** | **0/16** | **14/15** | current shipped profile: [quality results](eval/gemini-profile/QUALITY_RESULTS.md) |
-| `claude-opus-5` | **100/100** | 94/98 | 17/18 | **0/16** | 2/15 | current profile: [arithmetic](eval/gsm8k/), [gist/state/guards](eval/gist-recall/), [dense hex](eval/verbatim-15/) |
-| `gpt-5.6-sol` | 98/100 | 83/98 | 17/18 | 4/16 | 0/15 | prior 5×8 broad suite; native 14px pilot: 7/8 exact, 0 inventions, gist/guard pass: [pilot](eval/sol-profile/README.md) |
-| `claude-opus-4-8` | 93/100 | 77/98 | **18/18** | **0/16** | 0/15 | historical profile: [arithmetic](eval/gsm8k/), [gist/state/guards](eval/gist-recall/), [dense hex](eval/needle-haystack/) |
-| `grok-4.5` | **100/100** | **97/98** | 17/18 | **0/16** | 0/15 | native 14px/84 quality suite (live profile); [quality](eval/grok-density/QUALITY_RESULTS.md), [native-sweep](eval/grok-density/native-sweep/RESULTS.md) |
-| `grok-4.6` high | **100/100** | **97/98** | 17/18 | **0/16** | 0/15 | native 14px/84, reasoning high; [quality](eval/grok-profile/QUALITY_RESULTS.md) |
-| `moonshotai/kimi-k3` | 79/100 | 84/98 | 15/18 | 1/16 | 0/15 | generic GPT profile: [quality results](eval/sol-profile/KIMI_K3_QUALITY_RESULTS.md) |
-| `qwen-3.8` (`@cf/qwen/qwen3.8-27b`) | 98/100 | 72/98 | 11/18 | **0/16** | 0/15 | prior 5×8 broad suite (0/15 hex); native 14px pilot: 8/8 exact, 0 inventions, 11/15 hex: [pilot & quality](eval/qwen-profile/QUALITY_RESULTS.md) |
+| model | numbers at | arithmetic (N=100) | gist (N=98) | state (N=18) | never-stated (N=16) | dense hex (N=15) | profile provenance and receipts |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `claude-fable-5` | Spleen 5×8, 312 cols (shipped) | **100/100** | **98/98** | **18/18** | **0/16** | 13/15 | June 2026 production profiles: [arithmetic + hex](FINDINGS.md), [gist/state/guards](eval/gist-recall/) |
+| `google/gemini-3.6-flash`, `3.7-flash` | Spleen 5×8, 312 cols (shipped) | **100/100** | **98/98** | **18/18** | **0/16** | **14/15** | current shipped profile: [quality results](eval/gemini-profile/QUALITY_RESULTS.md) |
+| `claude-opus-5` | Spleen 5×8, 312 cols (shipped) | **100/100** | 94/98 | 17/18 | **0/16** | 2/15 | current profile: [arithmetic](eval/gsm8k/), [gist/state/guards](eval/gist-recall/), [dense hex](eval/verbatim-15/) |
+| `gpt-5.6-sol` | Spleen 5×8, 152 cols; **ships 14px/84** | 98/100 | 83/98 | 17/18 | 4/16 | 0/15 | broad suite predates the shipped 14px profile; 14px pilot: 7/8 exact, 0 inventions, gist/guard pass: [pilot](eval/sol-profile/README.md) |
+| `claude-opus-4-8` | Spleen 5×8, 312 cols (historical) | 93/100 | 77/98 | **18/18** | **0/16** | 0/15 | historical profile: [arithmetic](eval/gsm8k/), [gist/state/guards](eval/gist-recall/), [dense hex](eval/needle-haystack/) |
+| `grok-4.5` | JetBrains Mono 14px, 84 cols (shipped) | **100/100** | **97/98** | 17/18 | **0/16** | 0/15 | native 14px/84 quality suite (live profile); [quality](eval/grok-density/QUALITY_RESULTS.md), [native-sweep](eval/grok-density/native-sweep/RESULTS.md) |
+| `grok-4.6` high | JetBrains Mono 14px, 84 cols (shipped) | **100/100** | **97/98** | 17/18 | **0/16** | 0/15 | native 14px/84, reasoning high; [quality](eval/grok-profile/QUALITY_RESULTS.md) |
+| `moonshotai/kimi-k3` | Spleen 5×8, 152 cols (generic default) | 79/100 | 84/98 | 15/18 | 1/16 | 0/15 | generic GPT profile, no measured geometry of its own: [quality results](eval/sol-profile/KIMI_K3_QUALITY_RESULTS.md) |
+| `qwen-3.8` (`@cf/qwen/qwen3.8-27b`) | Spleen 5×8, 152 cols; **ships 14px/84** | 98/100 | 72/98 | 11/18 | **0/16** | 0/15 | broad suite predates the shipped 14px profile; 14px pilot: 8/8 exact, 0 inventions, 11/15 hex: [pilot & quality](eval/qwen-profile/QUALITY_RESULTS.md) |
+| `glm-5.3-flash` (`@cf/zai-org/glm-5.3-flash`) | Spleen 5×8, 152 cols (default fallback, nothing shipped) | 36/100 | 57/98 | 6/18 | **0/16** | 0/15 | 5×8 is illegible to GLM (0/15 hex); 14px pilot: 10/15 hex, all misses single-glyph confabs, guards 0/16: [pilot & quality](eval/glm-profile/QUALITY_RESULTS.md) |
 
 ### Native-profile cost check
 

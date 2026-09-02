@@ -493,7 +493,7 @@ async function planGoogleHistory(
   const userTurns: number[] = [];
   for (let i = 0; i < contents.length; i++) {
     const c = contents[i];
-    if (c?.role === 'user' && Array.isArray(c.parts) && c.parts.some((p) => typeof p.text === 'string' && p.text.trim())) {
+    if (c?.role === 'user' && Array.isArray(c.parts) && c.parts.some((p) => p && typeof p.text === 'string' && p.text.trim())) {
       userTurns.push(i);
     }
   }

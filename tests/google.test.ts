@@ -485,6 +485,10 @@ describe('transformGoogleGenerateContent', () => {
     '42',
     JSON.stringify({ systemInstruction: { parts: 'bad' } }),
     JSON.stringify({ systemInstruction: { parts: [null] } }),
+    // A null element inside a contents turn's parts must not throw in
+    // planGoogleHistory's user-turn scan — it passes through like any other
+    // malformed shape rather than 502-ing the request.
+    JSON.stringify({ contents: [{ role: 'user', parts: [null] }] }),
     JSON.stringify({ systemInstruction: { parts: [{ text: 'x'.repeat(10000) }] }, contents: 'bad' }),
   ])('passes unsupported request shape through unchanged: %s', async (raw) => {
     const bytes = new TextEncoder().encode(raw);

@@ -378,8 +378,9 @@ function isPinReply(m: Message | undefined): boolean {
   const blocks = Array.isArray(m.content) ? m.content : [];
   if (typeof m.content === 'string') return m.content.startsWith(PIN_REPLY_MARK);
   if (blocks.length !== 1) return false;
-  const blk = blocks[0]!;
-  return (blk as { type?: string }).type === 'text'
+  const blk = blocks[0];
+  return !!blk && typeof blk === 'object'
+    && (blk as { type?: string }).type === 'text'
     && typeof (blk as TextBlock).text === 'string'
     && (blk as TextBlock).text.startsWith(PIN_REPLY_MARK);
 }

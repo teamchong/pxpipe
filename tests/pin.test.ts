@@ -206,6 +206,19 @@ describe('Claude Code path is unaffected', () => {
   });
 });
 
+describe('stripPinCommands: malformed input', () => {
+  it('does not throw on a null assistant content block after a pin command', () => {
+    // A null block passes isPinReply's length check; without the element guard
+    // (that every sibling has) blocks[0].type throws, silently disabling pinning
+    // for the whole request instead of passing the malformed turn through.
+    const messages: Message[] = [
+      { role: 'user', content: '@pxpipe pin be concise' },
+      { role: 'assistant', content: [null as unknown as TextBlock] },
+    ];
+    expect(() => stripPinCommands(messages)).not.toThrow();
+  });
+});
+
 describe('emission', () => {
   it('renders file pins unbulleted, preserving the user’s own markdown', () => {
     // Pinning is per line and opt-in: unmarked prose stays in the file, and a

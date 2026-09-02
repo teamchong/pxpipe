@@ -52,9 +52,29 @@ export const GEMINI_3_7_FLASH_PROFILE: GptModelProfile = {
   style: { ...GEMINI_3_6_FLASH_PROFILE.style },
 };
 
+export const GEMINI_3_8_FLASH_PROFILE: GptModelProfile = {
+  ...GEMINI_3_6_FLASH_PROFILE,
+  vision: { ...GEMINI_3_6_FLASH_PROFILE.vision },
+  history: { ...GEMINI_3_6_FLASH_PROFILE.history },
+  style: { ...GEMINI_3_6_FLASH_PROFILE.style },
+};
+
+export const GEMINI_3_1_FLASH_PROFILE: GptModelProfile = {
+  ...GEMINI_3_6_FLASH_PROFILE,
+  vision: { ...GEMINI_3_6_FLASH_PROFILE.vision },
+  history: { ...GEMINI_3_6_FLASH_PROFILE.history },
+  style: { ...GEMINI_3_6_FLASH_PROFILE.style },
+};
+
 const GEMINI_MEASURED_PROFILES: Readonly<Record<string, GptModelProfile>> = {
   'gemini-3.6-flash': GEMINI_3_6_FLASH_PROFILE,
   'gemini-3.7-flash': GEMINI_3_7_FLASH_PROFILE,
+  'gemini-3.8-flash': GEMINI_3_8_FLASH_PROFILE,
+  'gemini-3.8-flash-high': GEMINI_3_8_FLASH_PROFILE,
+  'gemini-3.8-flash-medium': GEMINI_3_8_FLASH_PROFILE,
+  'gemini-3.8-flash-low': GEMINI_3_8_FLASH_PROFILE,
+  'gemini-3.1-flash': GEMINI_3_1_FLASH_PROFILE,
+  'gemini-3.1-flash-lite': GEMINI_3_1_FLASH_PROFILE,
 };
 
 function normalizeGeminiId(model: string | null | undefined): string {

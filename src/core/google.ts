@@ -68,10 +68,15 @@ export interface GoogleGenerateContentRequest {
 }
 
 const GOOGLE_ROUTE = /^\/google-ai-studio\/(?:v1|v1beta)\/models\/([^/:]+):(generateContent|streamGenerateContent)$/;
+const CLOUDCODE_PA_INFERENCE_ROUTE = /^\/v1internal:(?:generateContent|streamGenerateContent)$/;
 
 export function parseGoogleModelFromPath(pathname: string): string | null {
   const match = GOOGLE_ROUTE.exec(pathname);
   return match && match[1] ? match[1] : null;
+}
+
+export function isGoogleInferencePath(pathname: string): boolean {
+  return parseGoogleModelFromPath(pathname) !== null || CLOUDCODE_PA_INFERENCE_ROUTE.test(pathname);
 }
 
 const SYSTEM_POINTER =
@@ -655,17 +660,22 @@ export async function transformGoogleGenerateContent(
   if (!reqRecord) {
     return { body: bodyBytes, info: createDefaultInfo(modelName) };
   }
-  const req = reqRecord as GoogleGenerateContentRequest;
+  const isEnvelope = Boolean(
+    reqRecord.request
+    && typeof reqRecord.request === 'object'
+    && !Array.isArray(reqRecord.request),
+  );
+  const req = (isEnvelope ? reqRecord.request : reqRecord) as GoogleGenerateContentRequest;
 
   const info = createDefaultInfo(modelName);
   const pinChars = relocateGooglePins(req);
   if (pinChars > 0) info.pinChars = pinChars;
   const pinBody = pinChars > 0
-    ? new TextEncoder().encode(JSON.stringify(req))
+    ? new TextEncoder().encode(JSON.stringify(isEnvelope ? { ...reqRecord, request: req } : req))
     : bodyBytes;
   if (options.compress === false) {
     info.reason = 'compression_disabled';
-    return withStampedThoughtSignatures(req, pinBody, info);
+    return withStampedThoughtSignatures(req, pinBody, info, isEnvelope ? reqRecord : undefined);
   }
 
   // Extract system instructions
@@ -807,7 +817,7 @@ export async function transformGoogleGenerateContent(
     } else if (!staticProfitable) {
       info.reason = 'not_profitable';
     }
-    return withStampedThoughtSignatures(req, pinBody, info);
+    return withStampedThoughtSignatures(req, pinBody, info, isEnvelope ? reqRecord : undefined);
   }
 
   if (hasStaticCompression) {
@@ -910,7 +920,8 @@ export async function transformGoogleGenerateContent(
     info.droppedChars = (info.droppedChars ?? 0) + toolResultPlan.droppedChars;
   }
 
-  const transformedBytes = new TextEncoder().encode(JSON.stringify(transformedReq));
+  const outPayload = isEnvelope ? { ...reqRecord, request: transformedReq } : transformedReq;
+  const transformedBytes = new TextEncoder().encode(JSON.stringify(outPayload));
   return { body: transformedBytes, info };
 }
 
@@ -930,6 +941,7 @@ function withStampedThoughtSignatures(
   req: GoogleGenerateContentRequest,
   bodyBytes: Uint8Array,
   info: TransformInfo,
+  envelopeRecord?: Record<string, unknown>,
 ): { body: Uint8Array; info: TransformInfo } {
   if (!Array.isArray(req.contents)) return { body: bodyBytes, info };
   const normalized = isNormalizedGoogleTurnRoles(req.contents)
@@ -937,8 +949,11 @@ function withStampedThoughtSignatures(
     : normalizeGoogleTurnRoles(req.contents);
   const normalizedSignatures = normalizeGeminiThoughtSignatures(normalized);
   if (normalizedSignatures === req.contents && normalized === req.contents) return { body: bodyBytes, info };
+  const outObj = envelopeRecord
+    ? { ...envelopeRecord, request: { ...req, contents: normalizedSignatures } }
+    : { ...req, contents: normalizedSignatures };
   return {
-    body: new TextEncoder().encode(JSON.stringify({ ...req, contents: normalizedSignatures })),
+    body: new TextEncoder().encode(JSON.stringify(outObj)),
     info,
   };
 }

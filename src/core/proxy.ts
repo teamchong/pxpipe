@@ -22,7 +22,12 @@ import {
   openAIChatToAnthropicResponse,
 } from './messages-chat-bridge.js';
 import { pinCommandResponse, pinCommandResponseOpenAI } from './pin.js';
-import { parseGoogleModelFromPath, transformGoogleGenerateContent } from './google.js';
+import {
+  isGoogleInternalPath,
+  parseGoogleModelFromPath,
+  readGoogleInternalModel,
+  transformGoogleGenerateContent,
+} from './google.js';
 import { isGeminiModel } from './gemini-model-profiles.js';
 import { resolveGptProfile } from './gpt-model-profiles.js';
 
@@ -45,6 +50,9 @@ export interface ProxyConfig {
   authToken?: string | (() => string | undefined);
   /** OpenAI API base for GPT chat completions, no trailing slash. */
   openAIUpstream?: string;
+  /** Cloud Code internal API base for `/v1internal:*generateContent` (Antigravity,
+   *  Gemini CLI), no trailing slash. Defaults to cloudcode-pa.googleapis.com. */
+  googleUpstream?: string;
   /** Override or supply an OpenAI API key. If unset, we forward Authorization. */
   openAIApiKey?: string;
   /** Cloudflare's OpenAI-compatible Chat Completions endpoint and bearer key. */
@@ -1054,6 +1062,7 @@ function teeForUsage(
 
 const DEFAULT_UPSTREAM = 'https://api.anthropic.com';
 const DEFAULT_OPENAI_UPSTREAM = 'https://api.openai.com';
+const DEFAULT_GOOGLE_INTERNAL_UPSTREAM = 'https://cloudcode-pa.googleapis.com';
 
 /** Headers we strip on the way out — they're hop-by-hop or proxy-injected. */
 const STRIP_REQ_HEADERS = new Set([
@@ -1402,6 +1411,8 @@ export function createProxy(config: ProxyConfig = {}) {
   const passthroughUpstream = config.provider === 'cloudflare-ai-gateway'
     ? (config.gatewayBaseUrl ?? '').trim().replace(/\/+$/, '')
     : upstream;
+  const googleInternalUpstream = (config.googleUpstream ?? DEFAULT_GOOGLE_INTERNAL_UPSTREAM)
+    .trim().replace(/\/+$/, '');
   const gatewayHeaders = config.gatewayHeaders ?? {};
   const applyGatewayHeaders = (h: Headers): Headers => {
     for (const [k, v] of Object.entries(gatewayHeaders)) h.set(k, v);
@@ -1559,16 +1570,19 @@ let responseContentType: string | undefined;
     const googleModel = req.method === 'POST'
       ? parseGoogleModelFromPath(url.pathname)
       : null;
-    const isGoogleRoute = googleModel !== null;
+    const isGoogleInternal = req.method === 'POST' && isGoogleInternalPath(url.pathname);
+    const isGoogleRoute = googleModel !== null || isGoogleInternal;
     const isGoogle = isGoogleRoute && !bypass;
     const isOpenAIPath = isCanonicalOpenAIPath(
       url.pathname,
       req.headers,
       config.openAIApiKey !== undefined,
     );
-    const upstreamBase = isGoogleRoute || providerPrefixed
-      ? passthroughUpstream
-      : isOpenAIPath ? openAIUpstream : upstream;
+    const upstreamBase = isGoogleInternal
+      ? googleInternalUpstream
+      : isGoogleRoute || providerPrefixed
+        ? passthroughUpstream
+        : isOpenAIPath ? openAIUpstream : upstream;
 
     let bodyOut: BodyInit | null = null;
     let info: TransformInfo | undefined;
@@ -1619,7 +1633,8 @@ let responseContentType: string | undefined;
         const transformOpts =
           typeof config.transform === 'function' ? config.transform() : config.transform;
         // Fail-closed: unreadable model → no compression, not a risky guess.
-const model = googleModel ?? readModelField(bodyIn);
+        const model = googleModel
+          ?? (isGoogleInternal ? readGoogleInternalModel(bodyIn) : readModelField(bodyIn));
         if (isOpenAIResponses) responsesStreaming = readStreamField(bodyIn);
         requestModel = model ?? undefined;
         // A turn whose only content is `@pxpipe pin` / `@pxpipe unpin` is
@@ -1706,7 +1721,9 @@ const model = googleModel ?? readModelField(bodyIn);
               ? await transformOpenAIChatCompletions(bodyIn, effectiveOpts)
               : await transformOpenAIResponses(bodyIn, effectiveOpts);
         transformMs = Date.now() - tTransform;
-        if (isGoogle && r.info.compressed) {
+        // The Cloud Code internal API has no public countTokens shape worth
+        // probing; keep the local profitability decision there.
+        if (isGoogle && !isGoogleInternal && r.info.compressed) {
           const countHeaders = applyGatewayHeaders(filterHeaders(req.headers, STRIP_REQ_HEADERS));
           countHeaders.set('content-type', 'application/json');
           const countUrl = new URL(
@@ -1880,6 +1897,9 @@ const model = googleModel ?? readModelField(bodyIn);
         else if (decision.action === 'replace') outHeaders.set('authorization', `Bearer ${bridgeKey}`);
         // 'keep-inbound' leaves the header filterHeaders already copied.
       }
+    } else if (isGoogleInternal) {
+      // Cloud Code takes the client's own OAuth bearer; never an Anthropic key.
+      outHeaders.delete('x-api-key');
     } else if (!providerPrefixed || url.pathname.startsWith('/anthropic/')) {
       if (config.apiKey) outHeaders.set('x-api-key', config.apiKey);
       const bearer = resolveAuthToken(config);

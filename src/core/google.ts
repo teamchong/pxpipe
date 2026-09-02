@@ -68,10 +68,52 @@ export interface GoogleGenerateContentRequest {
 }
 
 const GOOGLE_ROUTE = /^\/google-ai-studio\/(?:v1|v1beta)\/models\/([^/:]+):(generateContent|streamGenerateContent)$/;
+/** Cloud Code internal API (Antigravity, Gemini CLI, Gemini Code Assist):
+ *  `POST /v1internal:streamGenerateContent` on cloudcode-pa.googleapis.com. The
+ *  model is not in the path; it lives in the body next to a wrapped request. */
+const GOOGLE_INTERNAL_ROUTE = /^(?:\/[a-z0-9][a-z0-9._-]*)?\/v1internal:(generateContent|streamGenerateContent)$/;
+
+/** Wrapper keys the Cloud Code API and countTokens use around a generateContent body. */
+const GOOGLE_WRAPPER_KEYS = ['request', 'generateContentRequest'] as const;
 
 export function parseGoogleModelFromPath(pathname: string): string | null {
   const match = GOOGLE_ROUTE.exec(pathname);
   return match && match[1] ? match[1] : null;
+}
+
+export function isGoogleInternalPath(pathname: string): boolean {
+  return GOOGLE_INTERNAL_ROUTE.test(pathname);
+}
+
+/** Unwrap a Cloud Code envelope: `{ model, project, request: {...} }`. Returns the
+ *  wrapper key and inner request, or null when the body is a bare request. */
+export function unwrapGoogleRequest(
+  body: Record<string, unknown>,
+): { key: string; inner: Record<string, unknown> } | null {
+  if (Array.isArray(body.contents)) return null;
+  for (const key of GOOGLE_WRAPPER_KEYS) {
+    const inner = body[key];
+    if (inner && typeof inner === 'object' && !Array.isArray(inner)) {
+      return { key, inner: inner as Record<string, unknown> };
+    }
+  }
+  return null;
+}
+
+/** Model id for an internal-route body: top-level `model`, else the wrapped one. */
+export function readGoogleInternalModel(bodyBytes: Uint8Array): string | null {
+  let body: Record<string, unknown> | null;
+  try {
+    body = record(JSON.parse(new TextDecoder().decode(bodyBytes)));
+  } catch {
+    return null;
+  }
+  if (!body) return null;
+  const wrapped = unwrapGoogleRequest(body);
+  for (const candidate of [body.model, wrapped?.inner.model]) {
+    if (typeof candidate === 'string' && candidate.length <= 200) return candidate;
+  }
+  return null;
 }
 
 const SYSTEM_POINTER =
@@ -654,6 +696,18 @@ export async function transformGoogleGenerateContent(
   const reqRecord = record(parsed);
   if (!reqRecord) {
     return { body: bodyBytes, info: createDefaultInfo(modelName) };
+  }
+  const wrapped = unwrapGoogleRequest(reqRecord);
+  if (wrapped) {
+    // Cloud Code envelope: transform the inner request, put it back in place.
+    const innerBytes = new TextEncoder().encode(JSON.stringify(wrapped.inner));
+    const result = await transformGoogleGenerateContent(innerBytes, modelName, options);
+    if (result.body === innerBytes) return { body: bodyBytes, info: result.info };
+    const innerOut: unknown = JSON.parse(new TextDecoder().decode(result.body));
+    return {
+      body: new TextEncoder().encode(JSON.stringify({ ...reqRecord, [wrapped.key]: innerOut })),
+      info: result.info,
+    };
   }
   const req = reqRecord as GoogleGenerateContentRequest;
 

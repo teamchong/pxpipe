@@ -79,6 +79,17 @@ export function responseBody(model, content, maxOutputTokens) {
 }
 
 export async function callResponses({ model, content, maxOutputTokens, timeoutMs }) {
+  if (/^claude-/i.test(model || '')) {
+    // Max-subscription tty harness (eval/lib/anthropic-client.mjs); no API key.
+    const { createClient } = await import('../lib/anthropic-client.mjs');
+    const started = Date.now();
+    const res = await createClient({ model }).messages({
+      messages: [{ role: 'user', content: anthropicContent(content) }],
+      max_tokens: maxOutputTokens,
+    });
+    const text = (res.content || []).filter((c) => c.type === 'text').map((c) => c.text).join('\n');
+    return { text: text.trim(), usage: res.usage || null, ms: Date.now() - started };
+  }
   if (isKimi(model)) {
     const key = process.env.KIMI_QUALITY_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN;
     if (!key) throw new Error('KIMI_QUALITY_API_KEY or ANTHROPIC_AUTH_TOKEN is required');

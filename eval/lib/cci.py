@@ -112,10 +112,20 @@ def parse_context(text):
 
 def extract_reply(lines):
     """Reply = the last assistant bullet block (lines under a leading '⏺')."""
+    # A blank line is NOT a boundary: the TUI renders a paragraph break inside
+    # one bullet as an empty row, e.g.
+    #
+    #     ⏺ ... Then 391 + 5 = 396.
+    #
+    #       ANSWER: 396
+    #
+    # Closing the block on the blank dropped the ANSWER line (every arithmetic
+    # score came back NaN). The block ends only at a real status/prompt row.
     def is_boundary(s):
-        return ((not s) or s.startswith("❯") or s.startswith("✻")
+        return (s.startswith("❯") or s.startswith("✻")
                 or s.startswith("⎿") or "bypass permissions" in s
-                or "esc to interrupt" in s or set(s) <= set("─╌╭╮╰╯│ "))
+                or "esc to interrupt" in s
+                or (bool(s) and set(s) <= set("─╌╭╮╰╯│ ")))
 
     # Collect EVERY bullet block, then take the last non-empty one. The old
     # code broke out of the scan at the first boundary line, which is the blank

@@ -47,6 +47,8 @@ export interface ProxyConfig {
   openAIUpstream?: string;
   /** Override or supply an OpenAI API key. If unset, we forward Authorization. */
   openAIApiKey?: string;
+  /** Google API base for Gemini / CloudCode inference, no trailing slash. */
+  googleUpstream?: string;
   /** Cloudflare's OpenAI-compatible Chat Completions endpoint and bearer key. */
   cloudflareUpstream?: string;
   cloudflareApiKey?: string;
@@ -1380,6 +1382,17 @@ export function parseGatewayHeaders(spec: string | undefined): Record<string, st
   return out;
 }
 
+function extractHostname(hostHeader: string | null): string {
+  if (!hostHeader) return '';
+  const trimmed = hostHeader.trim().toLowerCase();
+  if (trimmed.startsWith('[')) {
+    const end = trimmed.indexOf(']');
+    return end !== -1 ? trimmed.slice(1, end) : trimmed;
+  }
+  const colon = trimmed.indexOf(':');
+  return colon !== -1 ? trimmed.slice(0, colon) : trimmed;
+}
+
 function resolveGoogleUpstream(
   req: Request,
   pathname: string,
@@ -1389,12 +1402,14 @@ function resolveGoogleUpstream(
   if (config.provider === 'cloudflare-ai-gateway' || passthroughUpstream !== DEFAULT_UPSTREAM) {
     return passthroughUpstream;
   }
-  const host = req.headers.get('host') ?? '';
-  if (host.includes('daily-cloudcode-pa.googleapis.com') || pathname.startsWith('/v1internal:')) {
-    return 'https://daily-cloudcode-pa.googleapis.com';
+  if (config.googleUpstream) {
+    return config.googleUpstream.trim().replace(/\/+$/, '');
   }
-  if (host.includes('googleapis.com')) {
-    return `https://${host}`;
+  const host = extractHostname(req.headers.get('host'));
+  if (host === 'daily-cloudcode-pa.googleapis.com' || host === 'cloudcode-pa.googleapis.com' || pathname.startsWith('/v1internal:')) {
+    return host === 'cloudcode-pa.googleapis.com'
+      ? 'https://cloudcode-pa.googleapis.com'
+      : 'https://daily-cloudcode-pa.googleapis.com';
   }
   return 'https://generativelanguage.googleapis.com';
 }

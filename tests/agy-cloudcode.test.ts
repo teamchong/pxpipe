@@ -103,4 +103,71 @@ describe('Antigravity CloudCode PA inference routing', () => {
     expect(capturedHeaders?.get('authorization')).toBe('Bearer ya29.test-google-token');
     expect(capturedHeaders?.get('x-api-key')).toBeNull();
   });
+
+  it('strips port from host header and correctly matches daily-cloudcode-pa', async () => {
+    let capturedUrl: string | undefined;
+    globalThis.fetch = async (input: RequestInfo | URL) => {
+      capturedUrl = input.toString();
+      return new Response('data: {}\n\n', { status: 200, headers: { 'content-type': 'text/event-stream' } });
+    };
+
+    const proxy = createProxy();
+    const req = new Request('http://127.0.0.1:47821/v1internal:streamGenerateContent?alt=sse', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'host': 'daily-cloudcode-pa.googleapis.com:443',
+      },
+      body: JSON.stringify({ model: 'gemini-3.8-flash-high', request: { contents: [{ role: 'user', parts: [{ text: 'hi' }] }] } }),
+    });
+
+    await proxy(req);
+    expect(capturedUrl).toBe('https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse');
+  });
+
+  it('safely rejects spoofed or substring-matched hosts without SSRF', async () => {
+    let capturedUrl: string | undefined;
+    globalThis.fetch = async (input: RequestInfo | URL) => {
+      capturedUrl = input.toString();
+      return new Response('data: {}\n\n', { status: 200, headers: { 'content-type': 'text/event-stream' } });
+    };
+
+    const proxy = createProxy();
+    // Path for standard Gemini models with an attacker-controlled Host header
+    const req = new Request('http://127.0.0.1:47821/google-ai-studio/v1beta/models/gemini-3.8-flash-high:generateContent', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'host': 'evil-googleapis.com',
+      },
+      body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'hi' }] }] }),
+    });
+
+    await proxy(req);
+    // Must NOT send to evil-googleapis.com; must use standard Generative Language endpoint
+    expect(capturedUrl).toBe('https://generativelanguage.googleapis.com/google-ai-studio/v1beta/models/gemini-3.8-flash-high:generateContent');
+  });
+
+  it('respects googleUpstream config override if supplied', async () => {
+    let capturedUrl: string | undefined;
+    globalThis.fetch = async (input: RequestInfo | URL) => {
+      capturedUrl = input.toString();
+      return new Response('data: {}\n\n', { status: 200, headers: { 'content-type': 'text/event-stream' } });
+    };
+
+    const proxy = createProxy({
+      googleUpstream: 'https://mock-google-gateway.internal',
+    });
+    const req = new Request('http://127.0.0.1:47821/v1internal:streamGenerateContent?alt=sse', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'host': 'daily-cloudcode-pa.googleapis.com',
+      },
+      body: JSON.stringify({ model: 'gemini-3.8-flash-high', request: { contents: [{ role: 'user', parts: [{ text: 'hi' }] }] } }),
+    });
+
+    await proxy(req);
+    expect(capturedUrl).toBe('https://mock-google-gateway.internal/v1internal:streamGenerateContent?alt=sse');
+  });
 });

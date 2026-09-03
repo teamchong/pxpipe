@@ -6,7 +6,7 @@
 import { markCacheDead, noteCacheOutcome, responseLeftNoCache } from './session-state.js';
 import { transformRequest, type TransformOptions, type TransformInfo } from './transform.js';
 import { isClaudeModel, transformOpenAIChatCompletions, transformOpenAIResponses } from './openai.js';
-import { getAllowedModelBases, isAnthropicMessagesPath, isPxpipeSupportedGptModel, isPxpipeSupportedModel } from './applicability.js';
+import { isAnthropicMessagesPath, isPxpipeSupportedGptModel, isPxpipeSupportedModel } from './applicability.js';
 import {
   buildBaselineCountTokensBody,
   buildCacheablePrefixCountTokensBody,
@@ -23,7 +23,7 @@ import {
 } from './messages-chat-bridge.js';
 import { pinCommandResponse, pinCommandResponseOpenAI } from './pin.js';
 import { isGoogleInferencePath, parseGoogleModelFromPath, transformGoogleGenerateContent } from './google.js';
-import { hasGeminiMeasuredProfile, isGeminiModel } from './gemini-model-profiles.js';
+import { isGeminiModel } from './gemini-model-profiles.js';
 import { resolveGptProfile } from './gpt-model-profiles.js';
 
 export interface ProxyConfig {
@@ -1723,10 +1723,10 @@ let responseContentType: string | undefined;
         bridgedChatMessages = forceChat;
         const chatStamp = bridgedChatMessages ? routedModel : undefined;
         const effectiveModel = (bridgedGptMessages || bridgedChatMessages) ? routedModel : model;
-        const geminiAllowed = isGeminiModel(model)
-          && (isPxpipeSupportedModel(model) || (getAllowedModelBases().length > 0 && hasGeminiMeasuredProfile(model)));
+        // Gemini is in DEFAULT_MODEL_BASES as the family base `gemini`; the same
+        // allowlist gates it so PXPIPE_MODELS / the chip can opt out.
         const modelOk = isGoogle
-          ? geminiAllowed
+          ? (isGeminiModel(model) && isPxpipeSupportedModel(model))
           : isMessages
             ? (messagesAnthropic && isPxpipeSupportedModel(model))
               || bridgedGptMessages

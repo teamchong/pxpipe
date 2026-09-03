@@ -10,6 +10,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   isPxpipeSupportedGptModel,
+  isPxpipeSupportedModel,
   setAllowedModelBases,
 } from '../src/core/applicability.js';
 import {
@@ -53,6 +54,37 @@ describe('scope matching for gateway-qualified ids', () => {
     setAllowedModelBases(['gemini-3.6-flash']);
     expect(isPxpipeSupportedGptModel('google/gemini-3.6-flash')).toBe(true);
     expect(isPxpipeSupportedGptModel('google/gemini-3.6-pro')).toBe(false);
+  });
+});
+
+describe('Gemini family default and opt-out', () => {
+  const prevEnv = process.env.PXPIPE_MODELS;
+  afterEach(() => {
+    if (prevEnv === undefined) delete process.env.PXPIPE_MODELS;
+    else process.env.PXPIPE_MODELS = prevEnv;
+  });
+
+  it('the `gemini` family base admits every Gemini id with no configuration', () => {
+    delete process.env.PXPIPE_MODELS;
+    setAllowedModelBases(null);
+    for (const id of ['gemini-3.6-flash', 'gemini-3.8-flash', 'gemini-pro', 'gemini-4', 'gemini-5-pro', 'google/gemini-4-flash']) {
+      expect(isPxpipeSupportedModel(id), id).toBe(true);
+    }
+  });
+
+  it('dropping `gemini` from PXPIPE_MODELS opts the whole family out', () => {
+    process.env.PXPIPE_MODELS = 'claude-fable-5';
+    setAllowedModelBases(null);
+    expect(isPxpipeSupportedModel('claude-fable-5')).toBe(true);
+    for (const id of ['gemini-3.6-flash', 'gemini-4', 'gemini-pro']) {
+      expect(isPxpipeSupportedModel(id), id).toBe(false);
+    }
+  });
+
+  it('a per-version base narrows instead of widening', () => {
+    setAllowedModelBases(['gemini-3.6-flash']);
+    expect(isPxpipeSupportedModel('gemini-3.6-flash')).toBe(true);
+    expect(isPxpipeSupportedModel('gemini-4')).toBe(false);
   });
 });
 

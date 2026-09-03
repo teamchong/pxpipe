@@ -4,6 +4,19 @@ All notable changes to pxpipe are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features /
 behavioral changes, patch = fixes).
 
+## Unreleased
+
+### Changed
+- **Gemini is on by default for every version, and opt-out works again.** The
+  built-in scope is now `PXPIPE_MODELS=claude-fable-5,gemini`; the `gemini`
+  family base matches `gemini-3.6-flash`, `gemini-4`, `gemini-pro`, and future
+  ids through the ordinary prefix rule. The Google gate in the proxy and the
+  dashboard totals previously admitted any measured Gemini model whenever the
+  allowlist was non-empty, which made `PXPIPE_MODELS=claude-fable-5` (and the
+  dashboard chip) unable to turn Gemini off. That bypass is removed; the
+  allowlist is the only gate. Dashboard: one "Gemini (all versions)" chip plus
+  per-version chips for narrowing.
+
 ## 0.13.2 — 2026-08-18
 
 ### Added

@@ -195,6 +195,10 @@ describe('serveFragment', () => {
       expect(off).toContain('value="claude-fable-5,gemini-3.6-flash,gemini-3.7-flash"');
       expect(off).toContain('GPT 5.6 Sol</button>');
       expect(off).toContain('GPT 5.5</button>');
+      expect(off).toContain('Gemini 3.8 Flash</button>');
+      expect(off).toContain('Gemini Pro</button>');
+      expect(off).toContain('Gemini 4</button>');
+      expect(off).toContain('Gemini 5</button>');
       // Sol remains available and ordered before GPT 5.5.
       expect(off.indexOf('GPT 5.6 Sol')).toBeLessThan(off.indexOf('GPT 5.5'));
       expect(getAllowedModelBases()).toContain('claude-fable-5');
@@ -809,6 +813,28 @@ describe('Gemini savings split', () => {
     expect(recent.recent.at(-1)?.baseline_input).toBe(4100);
     expect(recent.recent.at(-1)?.actual_input).toBe(1200);
     expect(recent.recent.at(-1)?.session_saved_so_far_delta).toBe(2900);
+  });
+
+  it('counts forward-compatible Gemini models in enabled totals without warming-up zero counts', async () => {
+    dash.update({
+      method: 'POST',
+      path: '/google-ai-studio/v1beta/models/gemini-3.8-flash:generateContent',
+      model: 'gemini-3.8-flash',
+      accountingProvider: 'google',
+      status: 200,
+      durationMs: 100,
+      usage: { input_tokens: 150, output_tokens: 20 },
+      info: {
+        compressed: true,
+        baselineTokens: 500,
+        baselineProbeStatus: 'ok',
+        imageCount: 1,
+      },
+    } as never);
+
+    const stats = (await dash.serveStats().json()) as StatsPayload;
+    expect(stats.compressed_requests).toBe(1);
+    expect(stats.saved_input_tokens).toBe(350);
   });
 });
 

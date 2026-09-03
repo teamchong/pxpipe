@@ -76,6 +76,10 @@ import {
   isPxpipeSupportedModel,
   setAllowedModelBases,
 } from './core/applicability.js';
+import {
+  hasGeminiMeasuredProfile,
+  isGeminiModel,
+} from './core/gemini-model-profiles.js';
 import type {
   StatsPayload,
   RecentPayload,
@@ -595,7 +599,9 @@ export class DashboardState {
   private enabledTotals(): Totals {
     const combined = emptyTotals(this.startedAt);
     for (const [model, totals] of this.totalsByModel) {
-      if (!isPxpipeSupportedModel(model)) continue;
+      const geminiAllowed = isGeminiModel(model)
+        && (isPxpipeSupportedModel(model) || (getAllowedModelBases().length > 0 && hasGeminiMeasuredProfile(model)));
+      if (!isPxpipeSupportedModel(model) && !geminiAllowed) continue;
       for (const key of Object.keys(combined) as Array<keyof Totals>) {
         if (key !== 'startedAt') combined[key] += totals[key];
       }

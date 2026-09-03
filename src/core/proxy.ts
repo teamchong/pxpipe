@@ -1393,6 +1393,14 @@ function extractHostname(hostHeader: string | null): string {
   return colon !== -1 ? trimmed.slice(0, colon) : trimmed;
 }
 
+function stripTrailingSlashes(str: string): string {
+  let end = str.length;
+  while (end > 0 && str.charCodeAt(end - 1) === 47) {
+    end--;
+  }
+  return str.slice(0, end);
+}
+
 function resolveGoogleUpstream(
   req: Request,
   pathname: string,
@@ -1403,7 +1411,7 @@ function resolveGoogleUpstream(
     return passthroughUpstream;
   }
   if (config.googleUpstream) {
-    return config.googleUpstream.trim().replace(/\/+$/, '');
+    return stripTrailingSlashes(config.googleUpstream.trim());
   }
   const host = extractHostname(req.headers.get('host'));
   if (host === 'daily-cloudcode-pa.googleapis.com' || host === 'cloudcode-pa.googleapis.com' || pathname.startsWith('/v1internal:')) {

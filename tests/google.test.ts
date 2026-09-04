@@ -7,6 +7,8 @@ import {
   transformGoogleGenerateContent,
   parseGoogleModelFromPath,
   normalizeGoogleTurnRoles,
+  isGoogleInternalPath,
+  readGoogleInternalModel,
 } from '../src/core/google.js';
 import { geminiVisionTokens } from '../src/core/gemini-model-profiles.js';
 
@@ -18,6 +20,58 @@ describe('parseGoogleModelFromPath', () => {
     expect(parseGoogleModelFromPath('/foo/google-ai-studio/v1beta/models/gemini-3.6-flash:generateContent')).toBeNull();
     expect(parseGoogleModelFromPath('/google-ai-studio/v1beta/models/gemini-3.6-flash:countTokens')).toBeNull();
     expect(parseGoogleModelFromPath('/v1/messages')).toBeNull();
+  });
+});
+
+describe('Cloud Code internal route (Antigravity / Gemini CLI)', () => {
+  it('matches /v1internal:*generateContent with or without a provider prefix', () => {
+    expect(isGoogleInternalPath('/v1internal:streamGenerateContent')).toBe(true);
+    expect(isGoogleInternalPath('/v1internal:generateContent')).toBe(true);
+    expect(isGoogleInternalPath('/google/v1internal:streamGenerateContent')).toBe(true);
+    expect(isGoogleInternalPath('/v1internal:countTokens')).toBe(false);
+    expect(isGoogleInternalPath('/v1internal:loadCodeAssist')).toBe(false);
+    expect(isGoogleInternalPath('/v1beta/models/gemini-3.6-flash:streamGenerateContent')).toBe(false);
+  });
+
+  it('reads the model from the envelope, then from the wrapped request', () => {
+    const enc = (v: unknown) => new TextEncoder().encode(JSON.stringify(v));
+    expect(readGoogleInternalModel(enc({ model: 'gemini-3.6-flash', project: 'p', request: {} }))).toBe('gemini-3.6-flash');
+    expect(readGoogleInternalModel(enc({ request: { model: 'models/gemini-3.6-flash' } }))).toBe('models/gemini-3.6-flash');
+    expect(readGoogleInternalModel(enc({ contents: [] }))).toBeNull();
+    expect(readGoogleInternalModel(new TextEncoder().encode('nope'))).toBeNull();
+  });
+
+  it('compresses the wrapped request and keeps the envelope intact', async () => {
+    const envelope = {
+      model: 'gemini-3.6-flash',
+      project: 'antigravity-project',
+      user_prompt_id: 'abc',
+      request: {
+        systemInstruction: {
+          parts: [{ text: 'System instruction text testing Google transformer. '.repeat(300) }],
+        },
+        contents: [{ role: 'user', parts: [{ text: 'User question' }] }],
+      },
+    };
+    const result = await transformGoogleGenerateContent(
+      new TextEncoder().encode(JSON.stringify(envelope)),
+      'gemini-3.6-flash',
+      { compress: true },
+    );
+    expect(result.info.compressed).toBe(true);
+    const out = JSON.parse(new TextDecoder().decode(result.body));
+    expect(out.model).toBe('gemini-3.6-flash');
+    expect(out.project).toBe('antigravity-project');
+    expect(out.user_prompt_id).toBe('abc');
+    expect(out.request.systemInstruction.parts[0].text).toContain('same authority');
+    expect(out.request.contents[0].parts[0].inlineData.mimeType).toBe('image/png');
+  });
+
+  it('returns the envelope bytes unchanged when the wrapped request is not transformed', async () => {
+    const raw = JSON.stringify({ model: 'gemini-3.6-flash', request: { contents: [{ role: 'user', parts: [{ text: 'hi' }] }] } });
+    const result = await transformGoogleGenerateContent(new TextEncoder().encode(raw), 'gemini-3.6-flash', { compress: true });
+    expect(result.info.compressed).toBe(false);
+    expect(new TextDecoder().decode(result.body)).toBe(raw);
   });
 });
 

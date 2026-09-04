@@ -190,6 +190,35 @@ describe('provider-prefixed passthrough routing', () => {
     expect(cap.headers?.get('authorization')).toBe('Bearer local-token');
   });
 
+  it('routes /v1internal:streamGenerateContent to the Cloud Code upstream with the client bearer', async () => {
+    const cap: { url?: string; headers?: Headers } = {};
+    stubFetch(cap);
+    const body = {
+      model: 'gemini-3.6-flash',
+      project: 'p',
+      request: { contents: [{ role: 'user', parts: [{ text: 'hi' }] }] },
+    };
+    await createProxy({ upstream: 'http://gateway.test', apiKey: 'sk-anthropic-test' })(
+      new Request('http://localhost/v1internal:streamGenerateContent?alt=sse', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: 'Bearer oauth-token' },
+        body: JSON.stringify(body),
+      }),
+    );
+    expect(cap.url).toBe('https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse');
+    expect(cap.headers?.get('authorization')).toBe('Bearer oauth-token');
+    expect(cap.headers?.get('x-api-key')).toBeNull();
+
+    await createProxy({ googleUpstream: 'http://cloudcode.test/' })(
+      new Request('http://localhost/v1internal:generateContent', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      }),
+    );
+    expect(cap.url).toBe('http://cloudcode.test/v1internal:generateContent');
+  });
+
   it('does not inject the Anthropic API key into non-Anthropic provider prefixes', async () => {
     const cap: { url?: string; headers?: Headers } = {};
     stubFetch(cap);

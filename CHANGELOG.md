@@ -4,6 +4,20 @@ All notable changes to pxpipe are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features /
 behavioral changes, patch = fixes).
 
+## Unreleased
+
+### Added
+- Cloud Code internal API route: `POST /v1internal:generateContent` and
+  `:streamGenerateContent` (Antigravity, Gemini CLI, Gemini Code Assist) are
+  now transformed like Google AI Studio requests. The body is a
+  `{ model, project, request: {...} }` envelope (`generateContentRequest` is
+  also accepted); the inner request is compressed and the envelope is kept
+  byte-for-byte. Forwards to `https://cloudcode-pa.googleapis.com` by default,
+  override with `GOOGLE_UPSTREAM` (or `googleUpstream` in `ProxyConfig`). The
+  client's own OAuth bearer is forwarded; the Anthropic key is never injected
+  on this route. No upstream countTokens probe: the local profitability gate
+  decides.
+
 ## 0.13.2 — 2026-08-18
 
 ### Added

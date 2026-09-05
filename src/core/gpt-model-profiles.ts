@@ -237,6 +237,7 @@ const GPT56_SOL_PROFILE: GptModelProfile = {
 
 const GPT6_PROFILE: GptModelProfile = {
   ...DEFAULT_GPT_PROFILE,
+  imageDetail: 'original',
   vision: { regime: 'patch', multiplier: 1.2 },
   stripCols: 152,
   cacheReadRate: 0.1,

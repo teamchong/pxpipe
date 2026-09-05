@@ -5,9 +5,9 @@ import { openAIImageDetail } from '../src/core/openai.js';
 const original = process.env.PXPIPE_GPT_PROFILES;
 afterEach(() => { if (original === undefined) delete process.env.PXPIPE_GPT_PROFILES; else process.env.PXPIPE_GPT_PROFILES = original; });
 describe('profile-controlled outbound image detail', () => {
-  it('retains the existing defaults', () => {
+  it('uses original for GPT-6 and preserves other model defaults', () => {
     delete process.env.PXPIPE_GPT_PROFILES;
-    expect(openAIImageDetail('gpt-6-astra')).toBe('high');
+    expect(openAIImageDetail('gpt-6-astra')).toBe('original');
     expect(openAIImageDetail('gpt-5.6-sol')).toBe('original');
     expect(openAIImageDetail('unknown-model')).toBe('high');
   });
@@ -18,6 +18,6 @@ describe('profile-controlled outbound image detail', () => {
   });
   it('does not forward an unsupported detail value', () => {
     process.env.PXPIPE_GPT_PROFILES = JSON.stringify({ 'gpt-6-astra': { imageDetail: 'invalid' } });
-    expect(openAIImageDetail('gpt-6-astra')).toBe('high');
+    expect(openAIImageDetail('gpt-6-astra')).toBe('original');
   });
 });

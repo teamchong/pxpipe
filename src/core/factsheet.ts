@@ -278,18 +278,25 @@ export function factSheetTextFromEntries(
  *  ids are not dropped by MAX_SCAN. Short text is one page (same as before). */
 export function factSheetText(text: string, format: FactSheetFormat = 'full', coveredText?: string | ReadonlySet<string>): string {
   if (!text) return '';
+  return prepareFactSheet(text, format)(coveredText);
+}
+
+/** Extract once; coverage remains an emission-time input, never cached state. */
+export function prepareFactSheet(text: string, format: FactSheetFormat = 'full'): (coveredText?: string | ReadonlySet<string>) => string {
+  if (!text) return () => '';
   const entries = text.length <= MAX_SCAN
     ? extractFactSheetEntries(text)
     : extractFactSheetEntriesAllPages(text, FACTSHEET_PAGE_CHARS).kept;
-  return factSheetTextFromEntries(
-    coveredText === undefined ? entries : entries.filter((entry) => {
+  const full = factSheetTextFromEntries(entries, format);
+  return (coveredText) => {
+    if (coveredText === undefined || (typeof coveredText === 'string' ? coveredText.length === 0 : coveredText.size === 0)) return full;
+    return factSheetTextFromEntries(entries.filter((entry) => {
       const covered = typeof coveredText === 'string'
         ? coveredText.includes(entry.token)
         : coveredText.has(entry.token);
       if (!covered) return true;
       const first = text.indexOf(entry.token);
       return text.indexOf(entry.token, first + entry.token.length) !== -1;
-    }),
-    format,
-  );
+    }), format);
+  };
 }

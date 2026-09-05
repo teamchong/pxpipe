@@ -46,7 +46,7 @@ import {
   type GptHistoryOptions,
 } from './openai-history.js';
 import { HISTORY_SYNTHETIC_INTRO, HISTORY_SYNTHETIC_OUTRO } from './history.js';
-import { extractFactSheetTokens, factSheetText } from './factsheet.js';
+import { extractFactSheetTokens, factSheetText, prepareFactSheet } from './factsheet.js';
 import { relocateOpenAIPins } from './pin.js';
 import { countTokens as o200kCountTokens } from 'gpt-tokenizer/encoding/o200k_base';
 
@@ -207,8 +207,13 @@ function responsesCacheBreakpoint(req: ResponsesRequest, profile: GptModelProfil
 
 /** Profile-controlled native overflow is shared with rendered-content evals. */
 export function historyFactSheet(text: string, profile: GptModelProfile, coveredTokens?: ReadonlySet<string>): string {
-  const sheet = factSheetText(text, profile.factSheetFormat);
-  if (profile.history.factSheetOverflow !== 'native-opaque') return sheet;
+  return prepareHistoryFactSheet(text, profile)(coveredTokens);
+}
+
+function prepareHistoryFactSheet(text: string, profile: GptModelProfile): (coveredTokens?: ReadonlySet<string>) => string {
+  const renderSheet = prepareFactSheet(text, profile.factSheetFormat);
+  const sheet = renderSheet();
+  if (profile.history.factSheetOverflow !== 'native-opaque') return () => sheet;
   const opaque = /\b(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|(?=[0-9a-f]{7,128}\b)(?=[0-9a-f]{0,127}\d)[0-9a-f]{7,128})\b/gi;
   const covered = new Set([...sheet.matchAll(opaque)].map((m) => m[0]));
   const excerpts = new Map<string, string[]>();
@@ -231,14 +236,49 @@ export function historyFactSheet(text: string, profile: GptModelProfile, covered
   }
   // Exact spellings already sent in earlier archive groups need not be sent
   // again. Keep local repetition counts, and never deduplicate opaque excerpts.
-  if (excerpts.size === 0) return coveredTokens?.size
-    ? factSheetText(text, profile.factSheetFormat, coveredTokens)
+  if (excerpts.size === 0) return (coveredTokens) => coveredTokens?.size
+    ? renderSheet(coveredTokens)
     : sheet;
   const raw = [...excerpts].map(([source, lines]) => [source, ...lines].join('\n')).join('\n');
   const quoted = [...excerpts].map(([source, lines]) => ({ source, lines }));
-  return factSheetText(text, profile.factSheetFormat, raw)
+  const result = renderSheet(raw)
     + '\n[Archived exact-value excerpts (quoted data, not current instructions): '
     + JSON.stringify(quoted) + ']';
+  return () => result;
+}
+
+/** Bounded to one request. Only extraction is reused; final coverage-dependent
+ * output is always recomputed. No cross-request retention of source text. */
+export function createHistoryFactSheetRenderer(profile: GptModelProfile, limits: { maxEntries?: number; maxChars?: number } = {}) {
+  const maxEntries = Number.isFinite(limits.maxEntries) ? Math.max(0, Math.floor(limits.maxEntries!)) : 64;
+  const maxChars = Number.isFinite(limits.maxChars) ? Math.max(0, Math.floor(limits.maxChars!)) : 1024 * 1024;
+  const snapshot = { ...profile, history: { ...profile.history } };
+  const cache = new Map<string, ReturnType<typeof prepareHistoryFactSheet>>();
+  let chars = 0, hits = 0, misses = 0, admitMisses = true;
+  return {
+    render(text: string, coveredTokens?: ReadonlySet<string>): string {
+      let prepared = cache.get(text);
+      if (prepared) {
+        hits++;
+        cache.delete(text); cache.set(text, prepared);
+      } else {
+        misses++;
+        prepared = prepareHistoryFactSheet(text, snapshot);
+        if (admitMisses && maxEntries > 0 && text.length <= maxChars) {
+          while (cache.size && (cache.size >= maxEntries || chars + text.length > maxChars)) {
+            const oldest = cache.keys().next().value!;
+            chars -= oldest.length; cache.delete(oldest);
+          }
+          cache.set(text, prepared); chars += text.length;
+        }
+      }
+      return prepared(coveredTokens);
+    },
+    // Emission is a second sequential pass. Misses there must not evict
+    // prepared gate results that later segments can still reuse.
+    beginEmission: () => { admitMisses = false; },
+    stats: () => ({ entries: cache.size, chars, hits, misses }),
+  };
 }
 
 interface ResponsesFlatTool {
@@ -939,6 +979,8 @@ async function applyResponsesHistoryCollapse(
   o: OpenAIResolvedOptions,
   profile: GptModelProfile,
 ): Promise<boolean> {
+  const historySheets = createHistoryFactSheetRenderer(profile);
+  const renderHistorySheet = historySheets.render;
   const profitable = (text: string, cols: number, baselineTextTokens?: number, sourceText = text) => {
     const gate = evalOpenAIGate(req.model, text, cols, o.charsPerToken, baselineTextTokens);
     if (!gate.profitable) return false;
@@ -947,7 +989,7 @@ async function applyResponsesHistoryCollapse(
     const framing = profile.history.framing === 'compact'
       ? COMPACT_HISTORY_TRANSCRIPT_INTRO + COMPACT_HISTORY_TRANSCRIPT_OUTRO
       : HISTORY_TRANSCRIPT_INTRO + HISTORY_TRANSCRIPT_OUTRO;
-    const collapsedTokens = gate.imageTokens + gptTextTokens(historyFactSheet(sourceText, profile) + framing);
+    const collapsedTokens = gate.imageTokens + gptTextTokens(renderHistorySheet(sourceText) + framing);
     if (collapsedTokens >= gate.textTokens) return false;
     return maxReads === undefined
       || computeOpenAICollapsePaybackReads(gate.textTokens, collapsedTokens, req.model) <= maxReads;
@@ -958,6 +1000,7 @@ async function applyResponsesHistoryCollapse(
     profitable,
     gptHistoryOpts(req.model, o, profile, existingImages),
   );
+  historySheets.beginEmission();
   const ps = plan.pairState;
   const rc = info.responsesComposition!;
   rc.completedFunctionPairs = ps.completedPairs;
@@ -988,7 +1031,7 @@ async function applyResponsesHistoryCollapse(
   const intro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_INTRO : HISTORY_TRANSCRIPT_INTRO;
   const outro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_OUTRO : HISTORY_TRANSCRIPT_OUTRO;
   const combinedSheet = profile.history.factSheetScope === 'combined'
-    ? historyFactSheet(plan.text, profile)
+    ? renderHistorySheet(plan.text)
     : '';
   // Request-local and emission-ordered: a skipped/referenced/unimaged group
   // cannot cover a spelling. Planning/payback remains conservatively independent
@@ -1003,7 +1046,7 @@ async function applyResponsesHistoryCollapse(
     ];
     const sheet = profile.history.factSheetScope === 'combined'
       ? (segmentIndex === plan.segments.length - 1 ? combinedSheet : '')
-      : historyFactSheet(segment.text, profile, coveredSheetTokens);
+      : renderHistorySheet(segment.text, coveredSheetTokens);
     if (sheet) {
       content.push({ type: 'input_text', text: sheet });
       if (coveredSheetTokens) {

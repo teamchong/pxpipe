@@ -99,6 +99,8 @@ export interface GptHistoryProfile {
 }
 
 export interface GptModelProfile {
+  /** Optional outbound image detail; shared by runtime and profile evaluations. */
+  imageDetail?: 'high' | 'original';
   /** How this model's provider bills the rendered images as input tokens. */
   vision: GptVisionCost;
   /** Cached-input list price ÷ uncached-input list price for this family.
@@ -608,6 +610,7 @@ function parseEnvProfiles(raw: string): Map<string, GptModelProfile> {
       : posInt(p.historyStripCols, base.historyStripCols ?? base.stripCols);
 
     out.set(key, {
+      imageDetail: p.imageDetail === 'high' || p.imageDetail === 'original' ? p.imageDetail : base.imageDetail,
       vision: isValidVision(p.vision) ? p.vision : base.vision,
       cacheReadRate: rate(p.cacheReadRate, base.cacheReadRate),
       cacheWriteRate: rate(p.cacheWriteRate, base.cacheWriteRate ?? 1),

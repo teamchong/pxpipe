@@ -28,7 +28,7 @@ source was fastest. Accuracy was tied; this pilot does not establish improved
 hex accuracy or predict whole-session dashboard savings. Its small sample and
 execution order do not support a general latency guarantee.
 
-The main N=15 result remains separate. Production defaults are unchanged;
+GPT-6 now defaults to `original`. The full-sized `high` baseline remains separate;
 `imageDetail` is now explicitly configurable through the shared model-profile
 registry, so eval and normal requests use the same setting when overridden.
 The JSONL codec remains an experimental representation, not a default transform.

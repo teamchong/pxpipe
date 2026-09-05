@@ -170,7 +170,11 @@ font. This tests rendered-content quality, not the complete proxy/agent pipeline
 
 | model | numbers at | arithmetic (N=100) | gist (N=98) | state (N=18) | never-stated (N=16) | dense hex (N=15) | profile provenance and receipts |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| `gpt-6-astra` low | Spleen 5×8, 152 cols; reflow; normal detail `high`; compact factsheet | 98/100 | 25/98 | 6/18 | **0/16** | 5/15 | **Low recall; not quality-validated.** Shared source-based v2 suite: [results and receipts](eval/model-quality/results/gpt-6-astra/QUALITY_RESULTS.md) |
+| `gpt-6-astra` low — `high` baseline | Spleen 5×8, 152 cols; reflow; measured detail `high`; compact factsheet | 98/100 | 25/98 | 6/18 | **0/16** | 5/15 | Shared source-based v2 baseline: [results and receipts](eval/model-quality/results/gpt-6-astra/QUALITY_RESULTS.md) |
+
+GPT-6 now defaults to `original` detail. The full-sized `high` baseline above is
+retained unchanged; the separately measured [N=2 matched pilot](eval/model-quality/pilots/HEX_RESULTS.md)
+compares both detail modes. The baseline scores are not `original` scores.
 
 Other models have **not** been rerun under this protocol; their prior scores
 remain below as historical evidence, not aligned comparison results. The old

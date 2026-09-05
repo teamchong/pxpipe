@@ -1,4 +1,8 @@
-# GPT-6 Astra — profile-aligned v2
+# GPT-6 Astra — profile-aligned v2, high-detail baseline
+
+These results retain the measured `high` configuration. GPT-6 now defaults to
+`original`; its separately measured N=2 pilot is in [the pilot results](../../pilots/HEX_RESULTS.md).
+The full-sized baseline scores below have not been relabeled as `original` scores.
 
 2026-09-05. Model `gpt-6-astra`, direct Responses transport, reasoning **low**.
 Runtime profile: Spleen **5×8**, **152 columns**, max height **1932px**,
@@ -15,7 +19,7 @@ monochrome AA, reflow enabled, compact native factsheet, normal image detail
 | never-stated guards | not rerun | **0/16 confabulated** | 16 |
 | dense hex association | not run | **5/15** | 15 |
 
-**The current GPT-6 rendering configuration has poor recall in this aligned
+**The measured high-detail GPT-6 configuration has poor recall in this aligned
 test. Do not use the old v1 scores to claim it is quality-validated.** Zero
 guard confabulations must be read alongside the low answerable recall, not as
 proof of strong comprehension. This is a rendered-content test, not a complete

@@ -634,6 +634,7 @@ export interface TransformInfo {
     instructions: number;
     systemDeveloper: number;
     userAssistant: number;
+    /** Legacy field names: include both function and custom tool items. */
     functionCalls: number;
     functionOutputs: number;
     reasoningEncrypted: number;

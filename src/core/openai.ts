@@ -46,7 +46,7 @@ import {
   type GptHistoryOptions,
 } from './openai-history.js';
 import { HISTORY_SYNTHETIC_INTRO, HISTORY_SYNTHETIC_OUTRO } from './history.js';
-import { factSheetText } from './factsheet.js';
+import { extractFactSheetTokens, factSheetText } from './factsheet.js';
 import { relocateOpenAIPins } from './pin.js';
 import { countTokens as o200kCountTokens } from 'gpt-tokenizer/encoding/o200k_base';
 
@@ -206,7 +206,7 @@ function responsesCacheBreakpoint(req: ResponsesRequest, profile: GptModelProfil
 }
 
 /** Profile-controlled native overflow is shared with rendered-content evals. */
-export function historyFactSheet(text: string, profile: GptModelProfile): string {
+export function historyFactSheet(text: string, profile: GptModelProfile, coveredTokens?: ReadonlySet<string>): string {
   const sheet = factSheetText(text, profile.factSheetFormat);
   if (profile.history.factSheetOverflow !== 'native-opaque') return sheet;
   const opaque = /\b(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|(?=[0-9a-f]{7,128}\b)(?=[0-9a-f]{0,127}\d)[0-9a-f]{7,128})\b/gi;
@@ -229,7 +229,11 @@ export function historyFactSheet(text: string, profile: GptModelProfile): string
     excerpts.set(source, lines);
     for (const id of identifiers) covered.add(id);
   }
-  if (excerpts.size === 0) return sheet;
+  // Exact spellings already sent in earlier archive groups need not be sent
+  // again. Keep local repetition counts, and never deduplicate opaque excerpts.
+  if (excerpts.size === 0) return coveredTokens?.size
+    ? factSheetText(text, profile.factSheetFormat, coveredTokens)
+    : sheet;
   const raw = [...excerpts].map(([source, lines]) => [source, ...lines].join('\n')).join('\n');
   const quoted = [...excerpts].map(([source, lines]) => ({ source, lines }));
   return factSheetText(text, profile.factSheetFormat, raw)
@@ -986,6 +990,11 @@ async function applyResponsesHistoryCollapse(
   const combinedSheet = profile.history.factSheetScope === 'combined'
     ? historyFactSheet(plan.text, profile)
     : '';
+  // Request-local and emission-ordered: a skipped/referenced/unimaged group
+  // cannot cover a spelling. Planning/payback remains conservatively independent
+  // of this final serialization optimization; appended groups keep old prefixes.
+  const coveredSheetTokens = profile.history.factSheetOverflow === 'native-opaque'
+    ? new Set<string>() : undefined;
   for (let segmentIndex = 0; segmentIndex < plan.segments.length; segmentIndex++) {
     const segment = plan.segments[segmentIndex]!;
     const content: ResponsesContentPart[] = [
@@ -994,8 +1003,13 @@ async function applyResponsesHistoryCollapse(
     ];
     const sheet = profile.history.factSheetScope === 'combined'
       ? (segmentIndex === plan.segments.length - 1 ? combinedSheet : '')
-      : historyFactSheet(segment.text, profile);
-    if (sheet) content.push({ type: 'input_text', text: sheet });
+      : historyFactSheet(segment.text, profile, coveredSheetTokens);
+    if (sheet) {
+      content.push({ type: 'input_text', text: sheet });
+      if (coveredSheetTokens) {
+        for (const token of extractFactSheetTokens(sheet)) coveredSheetTokens.add(token);
+      }
+    }
     content.push({ type: 'input_text', text: outro, ...responsesCacheBreakpoint(req, profile) });
     info.nativeInjectedTokens = (info.nativeInjectedTokens ?? 0)
       + gptTextTokens(intro + sheet + outro);

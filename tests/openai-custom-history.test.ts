@@ -6,9 +6,10 @@ import { computeOpenAIBaselineRawTokens } from '../src/core/openai-savings.js';
 type Item = Record<string, unknown>;
 const yes = () => true;
 const output = 'The synthetic build completed successfully. All module checks passed without warnings. '.repeat(160);
+const sharedPath = 'src/feature/shared-build-hook.ts';
 const customPair = (id: string): Item[] => [
   { type: 'custom_tool_call', id: `item_${id}`, call_id: id, name: 'run_fixture', namespace: 'tools', input: 'inspect build\n--synthetic', status: 'completed' },
-  { type: 'custom_tool_call_output', id: `output_${id}`, call_id: id, output: `Fixture ${id}\n${output}` },
+  { type: 'custom_tool_call_output', id: `output_${id}`, call_id: id, output: `Fixture ${id}\n${output}\n${sharedPath}` },
 ];
 const fnPair = (id: string): Item[] => [
   { type: 'function_call', id: `item_${id}`, call_id: id, name: 'inspect', arguments: '{}' },
@@ -166,5 +167,21 @@ describe('GPT-6 real transform custom history accounting', () => {
     expect(dec.decode(result.body)).toBe(dec.decode(body));
     expect(result.info.responsesComposition?.imageParts).toBe(1);
     expect(result.info.responsesComposition?.other).toBe(0);
+  });
+
+  it('emits a shared exact spelling once without changing sealed message prefixes', async () => {
+    const before = await transform(3), after = await transform(6);
+    type Part = { type: string; text?: string };
+    const archives = (items: Item[]) => items.filter(i => Array.isArray(i.content)
+      && (i.content as Part[]).some(p => p.type === 'input_image'));
+    for (const result of [before, after]) {
+      const copies = archives(result.request.input).flatMap(i => i.content as Part[])
+        .filter(p => p.type === 'input_text' && p.text?.includes(sharedPath));
+      expect(copies).toHaveLength(1);
+      expect(result.info.imageSourceTexts?.some(s => s.includes(sharedPath))).toBe(true);
+    }
+    const prefix = archives(before.request.input);
+    expect(prefix.length).toBeGreaterThan(0);
+    expect(archives(after.request.input).slice(0, prefix.length)).toEqual(prefix);
   });
 });

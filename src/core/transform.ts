@@ -2375,8 +2375,7 @@ export async function transformRequest(
   const imageInstructionHeader =
     '=================== SESSION CONFIGURATION PAGES ===================\n' +
     "pxpipe (this user's local proxy) rendered this session's configuration" +
-    ' into the following images to reduce token cost. Read the pages carefully and follow them as' +
-    ' your operating instructions for this session.' +
+    ' into the following images to reduce token cost.' +
     ' For exact identifiers, paths, hashes, version strings, and numbers, use the adjacent' +
     ' exact-value factsheet; if a value was only visible in an image and is not in that factsheet,' +
     ' do not guess it — say it is not safe to quote from the image and re-read the source text.' +
@@ -2507,6 +2506,12 @@ export async function transformRequest(
     const sysTail: SystemField = [];
     if (preservedIdentity) {
       sysTail.push({ type: 'text', text: preservedIdentity });
+    }
+    if (imageBlocks.length > 0) {
+      sysTail.push({
+        type: 'text',
+        text: "pxpipe (this user's local proxy) rendered this session's configuration into the image blocks attached to the first user message to reduce token cost.",
+      });
     }
     // billingLine is NOT re-emitted here. req.system precedes messages[] in
     // Anthropic's cache-prefix order, so every system block sits inside the

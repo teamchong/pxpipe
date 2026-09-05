@@ -554,7 +554,7 @@ function isGpt5Family(model?: string): boolean {
 
 /** Shared by normal outbound requests and profile-aligned evaluations. */
 export function openAIImageDetail(model?: string): 'original' | 'high' {
-  return isGpt5Family(model) ? 'original' : 'high';
+  return resolveGptProfile(model).imageDetail ?? (isGpt5Family(model) ? 'original' : 'high');
 }
 
 function openAIImagePart(img: RenderedImage, model?: string): OpenAIImagePart {

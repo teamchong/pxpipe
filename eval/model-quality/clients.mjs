@@ -10,6 +10,7 @@ export function inferenceSettings(model) {
   return { family, reasoning };
 }
 export async function callModel(args) {
+  if (!args || typeof args.model !== 'string' || !Array.isArray(args.content) || !Number.isInteger(args.maxOutputTokens) || args.maxOutputTokens <= 0 || !Number.isFinite(args.timeoutMs) || args.timeoutMs <= 0) throw new TypeError('Quality call requires model, content and positive output/timeout budgets');
   const { family, reasoning } = inferenceSettings(args.model);
   // Do not send a pre-rendered eval through pxpipe for a second transformation.
   if (family !== 'claude') {

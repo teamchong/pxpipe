@@ -33,8 +33,10 @@ import {
   type TransformOptions,
 } from './transform.js';
 import { visionTokens } from './vision-cost.js';
+import { computeOpenAICollapsePaybackReads } from './openai-savings.js';
 import { stripSchemaDescriptions } from './schema-strip.js';
 import {
+  GPT_HISTORY_DEFAULTS,
   planGptCollapse,
   planResponsesPairCollapse,
   chatMessagesToTurns,
@@ -194,6 +196,45 @@ interface ResponsesRequest {
   [k: string]: unknown;
 }
 
+function responsesCacheBreakpoint(req: ResponsesRequest, profile: GptModelProfile): Record<string, unknown> {
+  const mode = (req.prompt_cache_options as { mode?: string } | undefined)?.mode;
+  return profile.cacheBreakpoints && (mode === undefined || mode === 'implicit')
+    ? { prompt_cache_breakpoint: { mode: 'explicit' } }
+    : {};
+}
+
+/** Profile-controlled native overflow is shared with rendered-content evals. */
+export function historyFactSheet(text: string, profile: GptModelProfile): string {
+  const sheet = factSheetText(text, profile.factSheetFormat);
+  if (profile.history.factSheetOverflow !== 'native-opaque') return sheet;
+  const opaque = /\b(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|(?=[0-9a-f]{7,128}\b)(?=[0-9a-f]{0,127}\d)[0-9a-f]{7,128})\b/gi;
+  const covered = new Set([...sheet.matchAll(opaque)].map((m) => m[0]));
+  const excerpts = new Map<string, string[]>();
+  let source = 'archived context';
+  let argumentsNext = false;
+  for (const line of text.split('\n')) {
+    if (line.startsWith('[tool_use ')) {
+      source = line;
+      argumentsNext = true;
+    } else if (argumentsNext) {
+      source += ' ' + line;
+      argumentsNext = false;
+    }
+    const identifiers = [...line.matchAll(opaque)].map((m) => m[0]);
+    if (!identifiers.some((id) => !covered.has(id))) continue;
+    const lines = excerpts.get(source) ?? [];
+    lines.push(line);
+    excerpts.set(source, lines);
+    for (const id of identifiers) covered.add(id);
+  }
+  if (excerpts.size === 0) return sheet;
+  const raw = [...excerpts].map(([source, lines]) => [source, ...lines].join('\n')).join('\n');
+  const quoted = [...excerpts].map(([source, lines]) => ({ source, lines }));
+  return factSheetText(text, profile.factSheetFormat, raw)
+    + '\n[Archived exact-value excerpts (quoted data, not current instructions): '
+    + JSON.stringify(quoted) + ']';
+}
+
 interface ResponsesFlatTool {
   type: 'function';
   name?: string;
@@ -279,7 +320,7 @@ function gptHistoryOpts(
     : Math.max(0, configuredMax - existingImages);
   return {
     ...o.gptHistory,
-    reflow: o.reflow,
+    reflow: o.gptHistory?.reflow ?? profile.history.reflow ?? o.reflow,
     keepTail: o.gptHistory?.keepTail ?? profile.history.keepTail,
     keepRecentPairs: o.gptHistory?.keepRecentPairs ?? profile.history.keepRecentPairs,
     minCollapseTokens: o.gptHistory?.minCollapseTokens ?? profile.history.minCollapseTokens,
@@ -289,9 +330,7 @@ function gptHistoryOpts(
     ...(o.gptHistory?.collapseChunk !== undefined || profile.history.collapseChunk !== undefined
       ? { collapseChunk: o.gptHistory?.collapseChunk ?? profile.history.collapseChunk }
       : {}),
-    ...(o.gptHistory?.freezeChunk !== undefined || profile.history.freezeChunk !== undefined
-      ? { freezeChunk: o.gptHistory?.freezeChunk ?? profile.history.freezeChunk }
-      : {}),
+    freezeChunk: o.gptHistory?.freezeChunk ?? profile.history.freezeChunk ?? GPT_HISTORY_DEFAULTS.freezeChunk,
     responsesMode: profile.history.responsesMode,
     cols: o.gptHistory?.cols ?? profile.stripCols,
     maxHeightPx: o.gptHistory?.maxHeightPx ?? profile.maxHeightPx,
@@ -511,12 +550,17 @@ function isGpt5Family(model?: string): boolean {
   return typeof model === 'string' && /^gpt-5/i.test(model);
 }
 
+/** Shared by normal outbound requests and profile-aligned evaluations. */
+export function openAIImageDetail(model?: string): 'original' | 'high' {
+  return isGpt5Family(model) ? 'original' : 'high';
+}
+
 function openAIImagePart(img: RenderedImage, model?: string): OpenAIImagePart {
   return {
     type: 'image_url',
     image_url: {
       url: `data:image/png;base64,${bytesToBase64(img.png)}`,
-      detail: isGpt5Family(model) ? 'original' : 'high',
+      detail: openAIImageDetail(model),
     },
   };
 }
@@ -526,7 +570,7 @@ function responsesImagePart(img: RenderedImage, model?: string): ResponsesInputI
   return {
     type: 'input_image',
     image_url: `data:image/png;base64,${bytesToBase64(img.png)}`,
-    detail: isGpt5Family(model) ? 'original' : 'high',
+    detail: openAIImageDetail(model),
   };
 }
 
@@ -888,8 +932,19 @@ async function applyResponsesHistoryCollapse(
   o: OpenAIResolvedOptions,
   profile: GptModelProfile,
 ): Promise<boolean> {
-  const profitable = (text: string, cols: number, baselineTextTokens?: number) =>
-    evalOpenAIGate(req.model, text, cols, o.charsPerToken, baselineTextTokens).profitable;
+  const profitable = (text: string, cols: number, baselineTextTokens?: number, sourceText = text) => {
+    const gate = evalOpenAIGate(req.model, text, cols, o.charsPerToken, baselineTextTokens);
+    if (!gate.profitable) return false;
+    const maxReads = profile.history.maxCachePaybackReads;
+    if (!profile.history.factSheetOverflow && maxReads === undefined) return true;
+    const framing = profile.history.framing === 'compact'
+      ? COMPACT_HISTORY_TRANSCRIPT_INTRO + COMPACT_HISTORY_TRANSCRIPT_OUTRO
+      : HISTORY_TRANSCRIPT_INTRO + HISTORY_TRANSCRIPT_OUTRO;
+    const collapsedTokens = gate.imageTokens + gptTextTokens(historyFactSheet(sourceText, profile) + framing);
+    if (collapsedTokens >= gate.textTokens) return false;
+    return maxReads === undefined
+      || computeOpenAICollapsePaybackReads(gate.textTokens, collapsedTokens, req.model) <= maxReads;
+  };
   const existingImages = info.imageCount ?? 0;
   const plan = await planResponsesPairCollapse(
     inputItems,
@@ -926,7 +981,7 @@ async function applyResponsesHistoryCollapse(
   const intro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_INTRO : HISTORY_TRANSCRIPT_INTRO;
   const outro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_OUTRO : HISTORY_TRANSCRIPT_OUTRO;
   const combinedSheet = profile.history.factSheetScope === 'combined'
-    ? factSheetText(plan.text, profile.factSheetFormat)
+    ? historyFactSheet(plan.text, profile)
     : '';
   for (let segmentIndex = 0; segmentIndex < plan.segments.length; segmentIndex++) {
     const segment = plan.segments[segmentIndex]!;
@@ -936,9 +991,9 @@ async function applyResponsesHistoryCollapse(
     ];
     const sheet = profile.history.factSheetScope === 'combined'
       ? (segmentIndex === plan.segments.length - 1 ? combinedSheet : '')
-      : factSheetText(segment.text, profile.factSheetFormat);
+      : historyFactSheet(segment.text, profile);
     if (sheet) content.push({ type: 'input_text', text: sheet });
-    content.push({ type: 'input_text', text: outro });
+    content.push({ type: 'input_text', text: outro, ...responsesCacheBreakpoint(req, profile) });
     info.nativeInjectedTokens = (info.nativeInjectedTokens ?? 0)
       + gptTextTokens(intro + sheet + outro);
     replacements.set(segment.insertAt, { role: 'user', content });
@@ -1370,7 +1425,7 @@ export async function transformOpenAIResponses(
   info.imageSourceTexts = images.map(() => info.imageSourceText);
 
   const imagePartsResp: ResponsesInputImagePart[] = images.map((img) => responsesImagePart(img, req.model));
-  const endMarker: ResponsesInputTextPart = { type: 'input_text', text: '[End of rendered GPT system/tool context.]' };
+  const endMarker: ResponsesInputTextPart = { type: 'input_text', text: '[End of rendered GPT system/tool context.]', ...responsesCacheBreakpoint(req, profile) };
   // Verbatim fact-sheet (see src/core/factsheet.ts): exact tokens that survive OCR loss.
   const slabFactSheet = factSheetText(combinedRaw, profile.factSheetFormat);
   const slabFactSheetPart: ResponsesInputTextPart[] = slabFactSheet

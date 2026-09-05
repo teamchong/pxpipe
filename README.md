@@ -160,7 +160,26 @@ without running the proxy.
 
 ## Benchmark results and receipts
 
-### Model quality
+### Profile-aligned model quality
+
+All new scores use the [shared source-based suite](eval/model-quality/README.md).
+Each model uses its normal resolved profile (including supported overrides, or
+normal fallback when undefined), reflow, image detail, and native factsheet.
+N and scoring are shared; model-specific rendering is not replaced by a universal
+font. This tests rendered-content quality, not the complete proxy/agent pipeline.
+
+| model | numbers at | arithmetic (N=100) | gist (N=98) | state (N=18) | never-stated (N=16) | dense hex (N=15) | profile provenance and receipts |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `gpt-6-astra` low | Spleen 5×8, 152 cols; reflow; normal detail `high`; compact factsheet | 98/100 | 25/98 | 6/18 | **0/16** | 5/15 | **Low recall; not quality-validated.** Shared source-based v2 suite: [results and receipts](eval/model-quality/results/gpt-6-astra/QUALITY_RESULTS.md) |
+
+Other models have **not** been rerun under this protocol; their prior scores
+remain below as historical evidence, not aligned comparison results. The old
+GPT-6 v1 scores used different detail/history/hex settings and are superseded.
+
+<details>
+<summary>Historical evaluations — mixed fixtures, profiles and inference settings</summary>
+
+### Historical model quality
 
 This matrix shows coverage as well as scores. `—` means the model was not run
 on that test; it does not mean zero. Arithmetic uses novel random-number
@@ -176,6 +195,7 @@ numbers predate it).
 | `claude-fable-5-1` | Spleen 5×8, 312 cols (Fable 5 profile) | **100/100** | 95/98 | **18/18** | **0/16** | 6/15 | Fable 5 profile, no geometry of its own; 3 gist misses are image-arm negation flags answered UNKNOWN (0 confabs). Same-day Fable 5 control on the identical harness/PNGs reproduced 100/100 arithmetic and 30/30 tier-2 gist, so the gist/hex gap is the model, not the harness (hex control not rerun): [arithmetic](eval/sol-profile/), [dense hex](eval/verbatim-15/), [gist/state/guards](eval/gist-recall/) |
 | `google/gemini-3.6-flash`, `3.7-flash` | Spleen 5×8, 312 cols (shipped) | **100/100** | **98/98** | **18/18** | **0/16** | **14/15** | current shipped profile: [quality results](eval/gemini-profile/QUALITY_RESULTS.md) |
 | `claude-opus-5` | Spleen 5×8, 312 cols (shipped) | **100/100** | 94/98 | 17/18 | **0/16** | 2/15 | current profile: [arithmetic](eval/gsm8k/), [gist/state/guards](eval/gist-recall/), [dense hex](eval/verbatim-15/) |
+| `gpt-6-astra` low | Spleen 5×8, 152 cols (shipped); hex: shared legacy PNGs | 99/100 | **97/98** | **18/18** | **0/16** | 0/15 | current geometry + compact factsheet for arithmetic/gist; reasoning low; hex uses unchanged 908×328 pure-image fixtures: [quality results and receipts](eval/gpt6-profile/QUALITY_RESULTS.md) |
 | `gpt-5.6-sol` | Spleen 5×8, 152 cols; **ships 14px/84** | 98/100 | 83/98 | 17/18 | 4/16 | 0/15 | broad suite predates the shipped 14px profile; 14px pilot: 7/8 exact, 0 inventions, gist/guard pass: [pilot](eval/sol-profile/README.md) |
 | `claude-opus-4-8` | Spleen 5×8, 312 cols (historical) | 93/100 | 77/98 | **18/18** | **0/16** | 0/15 | historical profile: [arithmetic](eval/gsm8k/), [gist/state/guards](eval/gist-recall/), [dense hex](eval/needle-haystack/) |
 | `grok-4.5` | JetBrains Mono 14px, 84 cols (shipped) | **100/100** | **97/98** | 17/18 | **0/16** | 0/15 | native 14px/84 quality suite (live profile); [quality](eval/grok-density/QUALITY_RESULTS.md), [native-sweep](eval/grok-density/native-sweep/RESULTS.md) |
@@ -183,6 +203,8 @@ numbers predate it).
 | `moonshotai/kimi-k3` | Spleen 5×8, 152 cols (generic default) | 79/100 | 84/98 | 15/18 | 1/16 | 0/15 | generic GPT profile, no measured geometry of its own: [quality results](eval/sol-profile/KIMI_K3_QUALITY_RESULTS.md) |
 | `qwen-3.8` (`@cf/qwen/qwen3.8-27b`) | Spleen 5×8, 152 cols; **ships 14px/84** | 98/100 | 72/98 | 11/18 | **0/16** | 0/15 | broad suite predates the shipped 14px profile; 14px pilot: 8/8 exact, 0 inventions, 11/15 hex: [pilot & quality](eval/qwen-profile/QUALITY_RESULTS.md) |
 | `glm-5.3-flash` (`@cf/zai-org/glm-5.3-flash`) | Spleen 5×8, 152 cols (default fallback, nothing shipped) | 36/100 | 57/98 | 6/18 | **0/16** | 0/15 | 5×8 is illegible to GLM (0/15 hex); 14px pilot: 10/15 hex, all misses single-glyph confabs, guards 0/16: [pilot & quality](eval/glm-profile/QUALITY_RESULTS.md) |
+
+</details>
 
 ### Native-profile cost check
 

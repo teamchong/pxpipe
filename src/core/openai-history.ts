@@ -23,6 +23,7 @@
 
 import {
   renderTextToPngs,
+  measureContentCols,
   reflow,
 
   neutralizeSentinel,
@@ -47,6 +48,7 @@ export type GptProfitableFn = (
   text: string,
   cols: number,
   baselineTextTokens?: number,
+  sourceText?: string,
 ) => boolean;
 
 export interface GptHistoryOptions {
@@ -398,20 +400,7 @@ export async function planGptCollapse(
     const open = new Set<string>();
     for (let i = pp; i < rawEnd; i++) {
       if (i === pinIdx) {
-        // Force-seal the before-pin section (open is empty here by isClosedPrefix)
-        // and skip the pin so it is never imaged. If the remainder since the last
-        // seal is too small to be worth its own image, MERGE it into the previous
-        // before-section (a slightly oversized image) rather than emitting a sub-
-        // threshold one — imaging ~200 tokens costs more in vision tokens than it
-        // saves. (open is empty here, so extending the prior section can't orphan.)
-        if (secStart < i) {
-          const prev = sections[sections.length - 1];
-          if (acc < o.sectionTokens && prev && prev[1] === secStart) {
-            prev[1] = i; // extend previous before-section through the remainder
-          } else {
-            sections.push([secStart, i]);
-          }
-        }
+        if (secStart < i) sections.push([secStart, i]);
         secStart = i + 1;
         acc = 0;
         continue;
@@ -658,7 +647,7 @@ function responseReferencedIds(items: unknown[]): Set<string> {
 function classifyResponsesPairs(
   items: unknown[],
   keepRecentPairs: number,
-): { old: ResponsesCompletedRound[]; state: ResponsesPairState } {
+): { old: ResponsesCompletedRound[]; completed: ResponsesCompletedRound[]; state: ResponsesPairState } {
   const calls = new Map<string, number[]>();
   const outputs = new Map<string, number[]>();
   let missingIdItems = 0;
@@ -771,6 +760,7 @@ function classifyResponsesPairs(
   const imageableFunctionOutputTokens = old.reduce((n, round) => n + round.outputTokens, 0);
   return {
     old,
+    completed,
     state: {
       completedPairs,
       recentCompletedPairs: completedPairs - oldPairs,
@@ -797,9 +787,43 @@ function emptyResponsesPairPlan(state: ResponsesPairState): ResponsesPairCollaps
 }
 
 interface ResponsesMixedUnit {
+  eligible: boolean;
   indices: number[];
   text: string;
   baselineTokens: number;
+}
+
+function freezeResponsesRuns<T extends { indices: number[] }>(
+  runs: T[][],
+  items: unknown[],
+  opts: GptHistoryOptions,
+  tokensFor: (unit: T) => number,
+): T[][] {
+  if (opts.freezeChunk <= 0) return runs;
+  const sections: T[][] = [];
+  const target = Math.max(1, opts.sectionTokens);
+  for (const run of runs) {
+    let pending: T[] = [];
+    let tokens = 0;
+    const seal = () => {
+      if (pending.length > 0) sections.push(pending);
+      pending = [];
+      tokens = 0;
+    };
+    for (const unit of run) {
+      pending.push(unit);
+      tokens += tokensFor(unit);
+      if (tokens >= target) seal();
+    }
+    const last = run[run.length - 1];
+    if (!last) continue;
+    let nextIndex = last.indices[last.indices.length - 1]! + 1;
+    while (nextIndex < items.length && isContentlessMessage(items[nextIndex])) nextIndex++;
+    const next = items[nextIndex] as Record<string, unknown> | undefined;
+    if (next && next.type !== 'function_call' && next.type !== 'function_call_output'
+      && responseMessageText(next) === null) seal();
+  }
+  return sections;
 }
 
 /** Profile-gated broad Responses planner. Safe textual messages and complete old
@@ -808,12 +832,14 @@ interface ResponsesMixedUnit {
 async function planResponsesMixedCollapse(
   items: unknown[],
   old: ResponsesCompletedRound[],
+  completed: ResponsesCompletedRound[],
   state: ResponsesPairState,
   isProfitable: GptProfitableFn,
   o: GptHistoryOptions,
 ): Promise<ResponsesPairCollapsePlan> {
   const base = emptyResponsesPairPlan(state);
-  const oldByCall = new Map(old.map((round) => [round.startIndex, round]));
+  const oldStarts = new Set(old.map((round) => round.startIndex));
+  const oldByCall = new Map((o.freezeChunk > 0 ? completed : old).map((round) => [round.startIndex, round]));
   const messageIndices: number[] = [];
   const referencedIds = responseReferencedIds(items);
   let latestUserIndex = -1;
@@ -854,8 +880,9 @@ async function planResponsesMixedCollapse(
       .map((index) => items[index] as Record<string, unknown> | null)
       .map((item) => item?.id)
       .some((id) => typeof id === 'string' && referencedIds.has(id));
-    if (round && !roundReferenced) {
+    if (round && (o.freezeChunk > 0 || !roundReferenced)) {
       current.push({
+        eligible: oldStarts.has(round.startIndex) && !roundReferenced,
         indices: round.indices,
         text: round.text,
         baselineTokens: round.callTokens + round.outputTokens,
@@ -865,9 +892,11 @@ async function planResponsesMixedCollapse(
     }
     const item = items[i] as Record<string, unknown> | null;
     const referenced = !!item && typeof item.id === 'string' && referencedIds.has(item.id);
-    const text = protectedMessages.has(i) || referenced ? null : responseMessageTranscript(items[i], i);
+    const eligible = !protectedMessages.has(i) && !referenced;
+    const text = o.freezeChunk <= 0 && !eligible ? null : responseMessageTranscript(items[i], i);
     if (text) {
       current.push({
+        eligible,
         indices: [i],
         text,
         baselineTokens: gptCountTokens(responseMessageText(items[i])!.text),
@@ -889,7 +918,7 @@ async function planResponsesMixedCollapse(
   }
   flush();
 
-  const eligible = runs.flat();
+  const eligible = runs.flat().filter((unit) => unit.eligible);
   const allText = eligible.map((unit) => unit.text).join('\n\n');
   const allBaselineTokens = eligible.reduce((sum, unit) => sum + unit.baselineTokens, 0);
   if (eligible.length === 0) return { ...base, reason: 'no_closed_prefix' };
@@ -905,14 +934,17 @@ async function planResponsesMixedCollapse(
     const source = units.map((unit) => unit.text).join('\n\n');
     const safe = neutralizeSentinel(source);
     const renderedText = o.reflow ? reflow(safe) ?? safe : safe;
-    const images = await renderTextToPngs(renderedText, o.cols, o.style ?? DEFAULT_GPT_PROFILE.style, o.maxHeightPx);
-    return { source, renderedText, images };
+    const cols = o.reflow ? o.cols : measureContentCols(renderedText, o.cols, o.style?.markerScale, o.style?.font);
+    const images = await renderTextToPngs(renderedText, cols, o.style ?? DEFAULT_GPT_PROFILE.style, o.maxHeightPx);
+    return { source, renderedText, images, cols };
   };
 
   const segments: ResponsesPairCollapseSegment[] = [];
   let remainingImages = maxImages;
   let hitImageCap = false;
-  for (const run of runs) {
+  const frozenRuns = freezeResponsesRuns(runs, items, o, (unit) => unit.baselineTokens)
+    .filter((run) => run.every((unit) => unit.eligible));
+  for (const run of frozenRuns) {
     if (remainingImages === 0) { hitImageCap = true; break; }
     let low = 0;
     let high = run.length + 1;
@@ -930,7 +962,7 @@ async function planResponsesMixedCollapse(
     if (!best || low === 0) { hitImageCap = true; break; }
     const selected = run.slice(0, low);
     const selectedBaselineTokens = selected.reduce((sum, unit) => sum + unit.baselineTokens, 0);
-    if (!isProfitable(best.renderedText, o.cols, selectedBaselineTokens)) continue;
+    if (!isProfitable(best.renderedText, best.cols, selectedBaselineTokens, best.source)) continue;
     const selectedIndices = selected.flatMap((unit) => unit.indices).sort((a, b) => a - b);
     segments.push({
       insertAt: selectedIndices[0]!,
@@ -997,10 +1029,10 @@ export async function planResponsesPairCollapse(
   isProfitable: GptProfitableFn,
   opts: Partial<GptHistoryOptions> = {},
 ): Promise<ResponsesPairCollapsePlan> {
-  const o: GptHistoryOptions = { ...GPT_HISTORY_DEFAULTS, ...opts };
-  const { old, state } = classifyResponsesPairs(items, o.keepRecentPairs);
+  const o: GptHistoryOptions = { ...GPT_HISTORY_DEFAULTS, ...opts, freezeChunk: opts.freezeChunk ?? 0 };
+  const { old, completed, state } = classifyResponsesPairs(items, o.keepRecentPairs);
   if (o.responsesMode === 'mixed') {
-    return planResponsesMixedCollapse(items, old, state, isProfitable, o);
+    return planResponsesMixedCollapse(items, old, completed, state, isProfitable, o);
   }
   const base = emptyResponsesPairPlan(state);
   if (old.length === 0) return { ...base, reason: 'no_closed_prefix' };
@@ -1016,7 +1048,12 @@ export async function planResponsesPairCollapse(
   }
 
   const runs: ResponsesCompletedRound[][] = [];
-  for (const round of old) {
+  const referencedIds = responseReferencedIds(items);
+  const oldStarts = new Set(old.filter((round) => !round.indices.some((index) => {
+    const id = (items[index] as Record<string, unknown> | undefined)?.id;
+    return typeof id === 'string' && referencedIds.has(id);
+  })).map((round) => round.startIndex));
+  for (const round of o.freezeChunk > 0 ? completed : old) {
     const run = runs.at(-1);
     if (run && round.startIndex === run.at(-1)!.endIndex + 1) run.push(round);
     else runs.push([round]);
@@ -1026,16 +1063,19 @@ export async function planResponsesPairCollapse(
     const source = rounds.map((round) => round.text).join('\n\n');
     const safe = neutralizeSentinel(source);
     let renderedText = o.reflow ? reflow(safe) ?? safe : safe;
+    const cols = o.reflow ? o.cols : measureContentCols(renderedText, o.cols, o.style?.markerScale, o.style?.font);
     const images = await renderTextToPngs(
-      renderedText, o.cols, o.style ?? DEFAULT_GPT_PROFILE.style, o.maxHeightPx,
+      renderedText, cols, o.style ?? DEFAULT_GPT_PROFILE.style, o.maxHeightPx,
     );
-    return { source, renderedText, images };
+    return { source, renderedText, images, cols };
   };
 
   const segments: ResponsesPairCollapseSegment[] = [];
   let remainingImages = maxImages;
   let hitImageCap = false;
-  for (const run of runs) {
+  const frozenRuns = freezeResponsesRuns(runs, items, o, (round) => round.callTokens + round.outputTokens)
+    .filter((run) => run.every((round) => oldStarts.has(round.startIndex)));
+  for (const run of frozenRuns) {
     if (remainingImages === 0) { hitImageCap = true; break; }
 
     let low = 0;
@@ -1052,7 +1092,7 @@ export async function planResponsesPairCollapse(
       }
     }
     if (!best || low === 0) { hitImageCap = true; break; }
-    if (!isProfitable(best.renderedText, o.cols)) continue;
+    if (!isProfitable(best.renderedText, best.cols, undefined, best.source)) continue;
 
     const selected = run.slice(0, low);
     const selectedIndices = selected

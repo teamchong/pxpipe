@@ -57,15 +57,38 @@ normally — pxpipe compresses the *request* only, never the model's output.
 Recent turns stay text; the system prompt, tool docs, and older bulk history
 are imaged.
 
+### `pxpipe codex`
+
+Codex has a dedicated native Responses integration. Start the persistent PXPipe
+listener normally, then launch Codex through it:
+
+```bash
+pxpipe codex
+pxpipe codex --binary codex-ar
+```
+
+The launcher preserves Codex-owned ChatGPT authentication and `CODEX_HOME`,
+routes `/backend-api/codex/responses` through PXPipe, and leaves native
+`/responses/compact` traffic untouched. If the listener is unavailable it
+falls back to a direct Codex launch without rewriting the caller environment.
+
+Use `pxpipe codex --direct` to request the direct path explicitly.
+
+See [docs/CODEX_INTEGRATION.md](docs/CODEX_INTEGRATION.md) for the routing and
+authentication contract.
+
 ### `pxpipe warp`
 
 ```bash
-pxpipe warp -- claude          # also: cursor-agent, codex, or a shell alias
+pxpipe warp -- claude          # also: cursor-agent or a shell alias
 ```
 
 Same thing without `ANTHROPIC_BASE_URL`, so `/remote-control`, claude.ai
 connectors, and first-party gates keep working. Full instructions in the
 dashboard.
+
+For Codex, prefer the dedicated `pxpipe codex` launcher above rather than the
+Anthropic-oriented Warp path.
 
 `api.anthropic.com/v1/messages` is routed by default. Agents that reach their
 provider over some other base URL need a rule for it, and a rule that names a

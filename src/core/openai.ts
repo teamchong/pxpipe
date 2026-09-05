@@ -40,6 +40,8 @@ import {
   planGptCollapse,
   planResponsesPairCollapse,
   chatMessagesToTurns,
+  isResponsesToolCall,
+  isResponsesToolOutput,
   type GptCollapsePlan,
   type GptHistoryOptions,
 } from './openai-history.js';
@@ -636,10 +638,11 @@ function measureResponsesComposition(
       c.systemDeveloper += gptTextTokens(responsesContentText(o.content as ResponsesInputItem['content']));
     } else if (role === 'user' || role === 'assistant') {
       c.userAssistant += gptTextTokens(responsesContentText(o.content as ResponsesInputItem['content']));
-    } else if (type === 'function_call') {
+    } else if (isResponsesToolCall(o)) {
       c.functionCalls += gptTextTokens(JSON.stringify(o));
-    } else if (type === 'function_call_output') {
+    } else if (isResponsesToolOutput(o)) {
       c.functionOutputs += gptTextTokens(typeof o.output === 'string' ? o.output : JSON.stringify(o.output ?? ''));
+      c.imageParts += countImages(o.output);
     } else if (type === 'reasoning') {
       // Includes encrypted_content when present; this is often a large Codex-native bucket.
       c.reasoningEncrypted += gptTextTokens(JSON.stringify(o));

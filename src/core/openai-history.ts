@@ -143,7 +143,8 @@ export interface HistoryTurn {
 }
 
 export interface ResponsesPairState {
-  /** Strict adjacent call/output pairs found in the original request. */
+  /** Closed function/custom tool pairs found in the original request.
+   * Legacy Function-named counters below include both kinds. */
   completedPairs: number;
   /** Newest completed pairs deliberately retained as native Responses items. */
   recentCompletedPairs: number;
@@ -153,7 +154,8 @@ export interface ResponsesPairState {
   openCalls: number;
   /** Outputs without a unique preceding call, always native. */
   orphanOutputs: number;
-  /** Duplicate, reversed, or non-adjacent shapes that cannot be paired safely. */
+  /** Duplicate, reversed, non-adjacent, unfinished or non-text state that cannot
+   * be paired safely for imaging (not necessarily invalid wire protocol). */
   malformedItems: number;
   /** Original-request o200k bucket share belonging to eligible old pairs. */
   imageableFunctionCallTokens: number;
@@ -511,10 +513,11 @@ function gptCountTokens(text: string): number {
 
 function responseCallText(item: Record<string, unknown>): string {
   const name = typeof item.name === 'string' ? item.name : 'tool';
-  const args = typeof item.arguments === 'string'
-    ? item.arguments
-    : safeJson(item.arguments);
-  return `[tool_use ${name}]\n${args}`;
+  const qualifiedName = typeof item.namespace === 'string' && item.namespace && !name.startsWith(`${item.namespace}.`)
+    ? `${item.namespace}.${name}` : name;
+  const payload = item.type === 'custom_tool_call' ? item.input : item.arguments;
+  const args = typeof payload === 'string' ? payload : safeJson(payload);
+  return `[tool_use ${qualifiedName}]\n${args}`;
 }
 
 function responseOutputText(item: Record<string, unknown>): string {
@@ -547,6 +550,33 @@ interface ResponsesCompletedRound {
 function responseItemType(item: unknown): string {
   const o = item as Record<string, unknown> | null;
   return o && typeof o.type === 'string' ? o.type : '';
+}
+
+/** Shared with Responses accounting so custom tools do not disappear into Other. */
+export function isResponsesToolCall(item: unknown): boolean {
+  const type = responseItemType(item);
+  return type === 'function_call' || type === 'custom_tool_call';
+}
+
+export function isResponsesToolOutput(item: unknown): boolean {
+  const type = responseItemType(item);
+  return type === 'function_call_output' || type === 'custom_tool_call_output';
+}
+
+function isRenderableResponsesPair(call: Record<string, unknown>, output: Record<string, unknown>): boolean {
+  // A matching id alone is insufficient: cross-kind, partial and unknown state
+  // must remain native, even if an output happens to be present already.
+  if (output.type !== `${call.type}_output`) return false;
+  if (call.status !== undefined && call.status !== 'completed') return false;
+  if (output.status !== undefined && output.status !== 'completed') return false;
+  if (call.type !== 'custom_tool_call') return true;
+  if (typeof call.name !== 'string' || !call.name || typeof call.input !== 'string') return false;
+  if (call.namespace !== undefined && typeof call.namespace !== 'string') return false;
+  // Custom tools take raw text, NOT JSON arguments. Their outputs can also
+  // contain images/files; never flatten those into an image of their JSON/URL.
+  return typeof output.output === 'string'
+    || (Array.isArray(output.output) && output.output.every(part =>
+      part && typeof part === 'object' && part.type === 'input_text' && typeof part.text === 'string'));
 }
 
 function responseCallId(item: unknown): string {
@@ -652,11 +682,11 @@ function classifyResponsesPairs(
   const outputs = new Map<string, number[]>();
   let missingIdItems = 0;
   for (let i = 0; i < items.length; i++) {
-    const type = responseItemType(items[i]);
-    if (type !== 'function_call' && type !== 'function_call_output') continue;
+    const call = isResponsesToolCall(items[i]);
+    if (!call && !isResponsesToolOutput(items[i])) continue;
     const id = responseCallId(items[i]);
     if (!id) { missingIdItems++; continue; }
-    const map = type === 'function_call' ? calls : outputs;
+    const map = call ? calls : outputs;
     const at = map.get(id) ?? [];
     at.push(i);
     map.set(id, at);
@@ -675,6 +705,10 @@ function classifyResponsesPairs(
       const outputIndex = os[0]!;
       const call = items[callIndex] as Record<string, unknown>;
       const output = items[outputIndex] as Record<string, unknown>;
+      if (!isRenderableResponsesPair(call, output)) {
+        malformedItems += 2;
+        continue;
+      }
       pairByCallIndex.set(callIndex, {
         callIndex,
         outputIndex,
@@ -697,13 +731,13 @@ function classifyResponsesPairs(
   const completed: ResponsesCompletedRound[] = [];
   const acceptedCallIndices = new Set<number>();
   for (let i = 0; i < items.length;) {
-    if (responseItemType(items[i]) !== 'function_call' || !pairByCallIndex.has(i)) {
+    if (!isResponsesToolCall(items[i]) || !pairByCallIndex.has(i)) {
       i++;
       continue;
     }
     const calls: ResponsesCompletedPair[] = [];
     let j = i;
-    while (responseItemType(items[j]) === 'function_call' && pairByCallIndex.has(j)) {
+    while (isResponsesToolCall(items[j]) && pairByCallIndex.has(j)) {
       calls.push(pairByCallIndex.get(j)!);
       j++;
     }
@@ -711,7 +745,7 @@ function classifyResponsesPairs(
     const outputs: number[] = [];
     // Do not absorb an output belonging to orphan/other state into this round.
     while (
-      responseItemType(items[j]) === 'function_call_output'
+      isResponsesToolOutput(items[j])
       && roundOutputIndices.has(j)
     ) {
       outputs.push(j);
@@ -820,7 +854,7 @@ function freezeResponsesRuns<T extends { indices: number[] }>(
     let nextIndex = last.indices[last.indices.length - 1]! + 1;
     while (nextIndex < items.length && isContentlessMessage(items[nextIndex])) nextIndex++;
     const next = items[nextIndex] as Record<string, unknown> | undefined;
-    if (next && next.type !== 'function_call' && next.type !== 'function_call_output'
+    if (next && !isResponsesToolCall(next) && !isResponsesToolOutput(next)
       && responseMessageText(next) === null) seal();
   }
   return sections;
@@ -1054,6 +1088,9 @@ export async function planResponsesPairCollapse(
     return typeof id === 'string' && referencedIds.has(id);
   })).map((round) => round.startIndex));
   for (const round of o.freezeChunk > 0 ? completed : old) {
+    // In unfrozen mode a referenced round is a native barrier, not a reason
+    // to discard every otherwise-safe neighbor in the same contiguous run.
+    if (o.freezeChunk <= 0 && !oldStarts.has(round.startIndex)) continue;
     const run = runs.at(-1);
     if (run && round.startIndex === run.at(-1)!.endIndex + 1) run.push(round);
     else runs.push([round]);

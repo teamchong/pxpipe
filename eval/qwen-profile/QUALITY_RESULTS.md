@@ -1,3 +1,5 @@
+> **Historical, pre-v2 results.** These receipts have not been rerun under the [shared profile-aligned protocol](../model-quality/README.md). Settings and scores below describe the original run, not a new current-profile comparison. Standard profile-suite entrypoints now use the common runner.
+
 # Qwen 3.8 quality results
 
 Model: `workers-ai/@cf/qwen/qwen3.8-27b` (`qwen 3.8`) through Cloudflare Workers AI (via a local gateway).

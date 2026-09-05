@@ -276,11 +276,17 @@ export function factSheetTextFromEntries(
 /** One-line fact-sheet string for `text`, or `''` when nothing notable was found.
  *  Single path for slab, history, and tool results: page long text so early-turn
  *  ids are not dropped by MAX_SCAN. Short text is one page (same as before). */
-export function factSheetText(text: string, format: FactSheetFormat = 'full'): string {
+export function factSheetText(text: string, format: FactSheetFormat = 'full', coveredText?: string): string {
   if (!text) return '';
-  if (text.length <= MAX_SCAN) {
-    return factSheetTextFromEntries(extractFactSheetEntries(text), format);
-  }
-  const { kept } = extractFactSheetEntriesAllPages(text, FACTSHEET_PAGE_CHARS);
-  return factSheetTextFromEntries(kept, format);
+  const entries = text.length <= MAX_SCAN
+    ? extractFactSheetEntries(text)
+    : extractFactSheetEntriesAllPages(text, FACTSHEET_PAGE_CHARS).kept;
+  return factSheetTextFromEntries(
+    coveredText === undefined ? entries : entries.filter((entry) => {
+      if (!coveredText.includes(entry.token)) return true;
+      const first = text.indexOf(entry.token);
+      return text.indexOf(entry.token, first + entry.token.length) !== -1;
+    }),
+    format,
+  );
 }

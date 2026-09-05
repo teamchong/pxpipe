@@ -167,7 +167,26 @@ Not every vision encoder can read dense 5×8 bitmap glyphs. **Gemini 4 (`gemini-
 
 ## Benchmark results and receipts
 
-### Model quality
+### Profile-aligned model quality
+
+All new scores use the [shared source-based suite](eval/model-quality/README.md).
+Each model uses its normal resolved profile (including supported overrides, or
+normal fallback when undefined), reflow, image detail, and native factsheet.
+N and scoring are shared; model-specific rendering is not replaced by a universal
+font. This tests rendered-content quality, not the complete proxy/agent pipeline.
+
+| model | numbers at | arithmetic (N=100) | gist (N=98) | state (N=18) | never-stated (N=16) | dense hex (N=15) | profile provenance and receipts |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `gpt-6-astra` low | Spleen 5×8, 152 cols; reflow; normal detail `high`; compact factsheet | 98/100 | 25/98 | 6/18 | **0/16** | 5/15 | **Low recall; not quality-validated.** Shared source-based v2 suite: [results and receipts](eval/model-quality/results/gpt-6-astra/QUALITY_RESULTS.md) |
+
+Other models have **not** been rerun under this protocol; their prior scores
+remain below as historical evidence, not aligned comparison results. The old
+GPT-6 v1 scores used different detail/history/hex settings and are superseded.
+
+<details>
+<summary>Historical evaluations — mixed fixtures, profiles and inference settings</summary>
+
+### Historical model quality
 
 This matrix shows coverage as well as scores. `—` means the model was not run
 on that test; it does not mean zero. **Every `dense hex (N=15)` score is a pure-image read with NO factsheet** (12-char hex IDs looked up by `dur_ms` across 80-line JSON event-log PNGs). Arithmetic uses novel random-number
@@ -186,14 +205,17 @@ numbers predate it).
 | `claude-opus-5-5` (default, gist-only) | Spleen 5×8, 312 cols, +2px rows | **100/100** | 94/98 | 17/18 | **0/16** | 3/15 | spaced profile (Opus 5.5+); hex measured at dense geometry: [arithmetic](eval/sol-profile/), [gist/state/guards](eval/gist-recall/), [dense hex](eval/verbatim-15/) |
 | `claude-opus-5` (opt-in) | Spleen 5×8, 312 cols (shipped) | **100/100** | 94/98 | 17/18 | **0/16** | 2/15 | current profile: [arithmetic](eval/gsm8k/), [gist/state/guards](eval/gist-recall/), [dense hex](eval/verbatim-15/) |
 | `claude-sonnet-5-5` (opt-in, not recommended) | Spleen 5×8, 312 cols, +2px rows | **100/100** | 85/98 | 12/18 | **0/16** | 2/15 | spaced profile, opt-in via `PXPIPE_MODELS`; 6 state misses are wrong final values/counts, 7 gist misses answered UNKNOWN: [arithmetic](eval/sol-profile/), [gist/state/guards](eval/gist-recall/), [dense hex](eval/verbatim-15/) |
-| `grok-4.5` (opt-in) | JetBrains Mono 14px, 84 cols (shipped) | **100/100** | **97/98** | 17/18 | **0/16** | 0/15 | native 14px/84 quality suite (live profile); [quality](eval/grok-density/QUALITY_RESULTS.md), [native-sweep](eval/grok-density/native-sweep/RESULTS.md) |
-| `grok-4.6` high (opt-in) | JetBrains Mono 14px, 84 cols (shipped) | **100/100** | **97/98** | 17/18 | **0/16** | 0/15 | native 14px/84, reasoning high; [quality](eval/grok-profile/QUALITY_RESULTS.md) |
+| `grok-4.5` (opt-in) | JetBrains Mono 14px, 84 cols (shipped) | **100/100** | **97/98** | 17/18 | **0/16** | 0/15 | native 14px/84 quality suite (live profile): [quality](eval/grok-density/QUALITY_RESULTS.md), [native-sweep](eval/grok-density/native-sweep/RESULTS.md) |
+| `grok-4.6` high (opt-in) | JetBrains Mono 14px, 84 cols (shipped) | **100/100** | **97/98** | 17/18 | **0/16** | 0/15 | native 14px/84, reasoning high: [quality](eval/grok-profile/QUALITY_RESULTS.md) |
+| `gpt-6-astra` low | Spleen 5×8, 152 cols (shipped); hex: shared legacy PNGs | 99/100 | **97/98** | **18/18** | **0/16** | 0/15 | current geometry + compact factsheet for arithmetic/gist; reasoning low; hex uses unchanged 908×328 pure-image fixtures: [quality results and receipts](eval/gpt6-profile/QUALITY_RESULTS.md) |
 | `gpt-5.6-sol` (opt-in) | Spleen 5×8, 152 cols; **ships 14px/84** | 98/100 | 83/98 | 17/18 | 4/16 | 0/15 | broad suite predates the shipped 14px profile; 14px pilot: 7/8 exact, 0 inventions, gist/guard pass: [pilot](eval/sol-profile/README.md) |
 | `claude-opus-4-8` (historical) | Spleen 5×8, 312 cols (historical) | 93/100 | 77/98 | **18/18** | **0/16** | 0/15 | historical profile: [arithmetic](eval/gsm8k/), [gist/state/guards](eval/gist-recall/), [dense hex](eval/needle-haystack/) |
 | `moonshotai/kimi-k3` (unsupported) | Spleen 5×8, 152 cols (generic default) | 79/100 | 84/98 | 15/18 | 1/16 | 0/15 | generic GPT profile, no measured geometry of its own: [quality results](eval/sol-profile/KIMI_K3_QUALITY_RESULTS.md) |
 | `qwen-3.8` (`@cf/qwen/qwen3.8-27b`, opt-in) | Spleen 5×8, 152 cols; **ships 14px/84** | 98/100 | 72/98 | 11/18 | **0/16** | 0/15 | broad suite predates the shipped 14px profile; 14px pilot: 8/8 exact, 0 inventions, 11/15 hex: [pilot & quality](eval/qwen-profile/QUALITY_RESULTS.md) |
 | `glm-5.3-flash` (`@cf/zai-org/glm-5.3-flash`, unsupported) | Spleen 5×8, 152 cols (default fallback, nothing shipped) | 36/100 | 57/98 | 6/18 | **0/16** | 0/15 | 5×8 is illegible to GLM (0/15 hex); 14px pilot: 10/15 hex, all misses single-glyph confabs, guards 0/16: [pilot & quality](eval/glm-profile/QUALITY_RESULTS.md) |
 | `deepseek-v4.1-flash-1017` (`@cf/deepseek-ai/deepseek-v4.1-flash-1017`, unsupported) | JetBrains Mono 14px, 84 cols (pilot, nothing shipped) | **100/100** | **98/98** | **18/18** | **0/16** | 0/15 | 5×8 is illegible to DeepSeek V4.1 (0/15 hex); 14px pilot: 100/100 arith, 98/98 gist, 18/18 state, 0/16 guards, 8/15 hex: [pilot & quality](eval/deepseek-profile/QUALITY_RESULTS.md) |
+
+</details>
 
 ### Native-profile cost check
 

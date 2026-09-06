@@ -981,6 +981,10 @@ async function applyResponsesHistoryCollapse(
 ): Promise<boolean> {
   const historySheets = createHistoryFactSheetRenderer(profile);
   const renderHistorySheet = historySheets.render;
+  // Match emission's prefix-local deduplication. Only accepted sections cover
+  // spellings; rejected sections must not make a later replacement look cheaper.
+  const plannedSheetTokens = profile.history.factSheetOverflow === 'native-opaque'
+    && profile.history.factSheetScope === 'per-segment' ? new Set<string>() : undefined;
   const profitable = (text: string, cols: number, baselineTextTokens?: number, sourceText = text) => {
     const gate = evalOpenAIGate(req.model, text, cols, o.charsPerToken, baselineTextTokens);
     if (!gate.profitable) return false;
@@ -989,10 +993,15 @@ async function applyResponsesHistoryCollapse(
     const framing = profile.history.framing === 'compact'
       ? COMPACT_HISTORY_TRANSCRIPT_INTRO + COMPACT_HISTORY_TRANSCRIPT_OUTRO
       : HISTORY_TRANSCRIPT_INTRO + HISTORY_TRANSCRIPT_OUTRO;
-    const collapsedTokens = gate.imageTokens + gptTextTokens(renderHistorySheet(sourceText) + framing);
+    const sheet = renderHistorySheet(sourceText, plannedSheetTokens);
+    const collapsedTokens = gate.imageTokens + gptTextTokens(sheet + framing);
     if (collapsedTokens >= gate.textTokens) return false;
-    return maxReads === undefined
+    const accepted = maxReads === undefined
       || computeOpenAICollapsePaybackReads(gate.textTokens, collapsedTokens, req.model) <= maxReads;
+    if (accepted && plannedSheetTokens) {
+      for (const token of extractFactSheetTokens(sheet)) plannedSheetTokens.add(token);
+    }
+    return accepted;
   };
   const existingImages = info.imageCount ?? 0;
   const plan = await planResponsesPairCollapse(
@@ -1034,8 +1043,8 @@ async function applyResponsesHistoryCollapse(
     ? renderHistorySheet(plan.text)
     : '';
   // Request-local and emission-ordered: a skipped/referenced/unimaged group
-  // cannot cover a spelling. Planning/payback remains conservatively independent
-  // of this final serialization optimization; appended groups keep old prefixes.
+  // cannot cover a spelling. Use a fresh set to replay the same accepted-prefix
+  // coverage used by planning; appended groups keep old prefixes.
   const coveredSheetTokens = profile.history.factSheetOverflow === 'native-opaque'
     ? new Set<string>() : undefined;
   for (let segmentIndex = 0; segmentIndex < plan.segments.length; segmentIndex++) {

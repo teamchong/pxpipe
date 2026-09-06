@@ -433,22 +433,12 @@ function googleEff(args: {
   };
 }
 
-/** Cache-aware eff bundle for one GPT event. Shared by the live `update()`
- *  and `replay()` paths so both read identical per-row numbers. Pure: takes
- *  plain scalars (replay has no Usage/TransformInfo objects, only JSONL fields).
- *
- *  GPT differs from Anthropic on every axis: input_tokens already INCLUDES the
- *  cached subset (`cachedTokens`), there is no cache-create premium, the cached
- *  prefix reads at ~0.1×, and the baseline is the measured `baselineImagedTokens`
- *  (o200k text-token cost of the imaged content) vs the vision-token `imageTokens`
- *  pxpipe actually paid — not a count_tokens probe. No per-session warmth state:
- *  OpenAI caching is automatic/prefix-based and the discount is already folded
- *  into the cached-input rate. See src/core/openai-savings.ts. */
 function gptEff(args: {
   model: string | undefined;
   inputTokens: number;
   outputTokens: number;
   cachedTokens: number;
+  cacheWriteTokens: number;
   imageTokens: number;
   baselineImagedTokens: number;
   nativeInjectedTokens: number;
@@ -469,11 +459,11 @@ function gptEff(args: {
   // The transform measured what the imaged content would have cost as o200k
   // text; without it there is no counterfactual to credit.
   const haveBaseline = baselineImagedTokens > 0;
-  const actualInputEff = haveUsage ? computeOpenAIActualInputEff(inp, cached, model) : 0;
+  const actualInputEff = haveUsage ? computeOpenAIActualInputEff(inp, cached, model, args.cacheWriteTokens) : 0;
   const creditSaving = haveBaseline && haveUsage && compressed;
   const baselineInputEff = creditSaving
     ? computeOpenAIBaselineInputEff(
-        inp, cached, imageTokens, baselineImagedTokens, model, nativeInjectedTokens,
+        inp, cached, imageTokens, baselineImagedTokens, model, nativeInjectedTokens, args.cacheWriteTokens,
       )
     : actualInputEff;
   const outputEquiv = haveUsage ? out * openAIOutputRate(model) : 0;
@@ -711,14 +701,12 @@ export class DashboardState {
       // that an unknown cache discount was applied to the counterfactual.
       warmForRow = false;
     } else if (gpt) {
-      // GPT cost model: no count_tokens probe, no cache-create premium, no
-      // per-session warmth — the discount is automatic and folded into the
-      // cached-input rate. Baseline is the measured imaged-vs-text delta.
       const e = gptEff({
         model: ev.model,
         inputTokens: inp,
         outputTokens: out,
         cachedTokens: u?.cached_tokens ?? 0,
+        cacheWriteTokens: u?.cache_write_tokens ?? 0,
         imageTokens: info?.imageTokens ?? 0,
         baselineImagedTokens: info?.baselineImagedTokens ?? 0,
         nativeInjectedTokens: info?.nativeInjectedTokens ?? 0,
@@ -1101,6 +1089,7 @@ export class DashboardState {
           inputTokens: inp,
           outputTokens: out,
           cachedTokens: (t as { cached_tokens?: number }).cached_tokens ?? 0,
+          cacheWriteTokens: t.cache_write_tokens ?? 0,
           imageTokens: (t as { image_tokens?: number }).image_tokens ?? 0,
           baselineImagedTokens:
             (t as { baseline_imaged_tokens?: number }).baseline_imaged_tokens ?? 0,

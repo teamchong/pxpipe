@@ -881,6 +881,7 @@ function teeForUsage(
   res: Response,
   assumeResponsesSse = false,
   assumeResponsesJson = false,
+  retainStreamReceipt = false,
 ): {
   response: Response;
   usagePromise: Promise<Usage | undefined>;
@@ -956,6 +957,11 @@ function teeForUsage(
     const reader = forUs.getReader();
     const decoder = new TextDecoder();
     let buf = '';
+    let streamedMeasurement: OutputMeasurement | undefined;
+    const state: { usage: Usage | undefined; stopReason: string | undefined } = {
+      usage: undefined,
+      stopReason: undefined,
+    };
 
     try {
       // ChatGPT's /backend-api/codex/responses currently omits Content-Type.
@@ -969,10 +975,7 @@ function teeForUsage(
           toolUseChars: 0,
           redactedBlockCount: 0,
         };
-        const state: { usage: Usage | undefined; stopReason: string | undefined } = {
-          usage: undefined,
-          stopReason: undefined,
-        };
+        streamedMeasurement = m;
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
@@ -1037,7 +1040,13 @@ function teeForUsage(
         }
       }
     } catch {
-      /* tee released early (client abort) */
+      if (retainStreamReceipt) {
+        return {
+          usage: state.usage,
+          measurement: streamedMeasurement,
+          stopReason: state.stopReason ?? 'stream_error',
+        };
+      }
     }
     // Unknown content-type: drain to release the tee buffer.
     try {
@@ -2115,6 +2124,7 @@ let teed: Response;
           upstreamRes,
           isOpenAIResponsesWire && responsesStreaming,
           isOpenAIResponsesWire && !responsesStreaming,
+          isOpenAIChatWire || isOpenAIResponsesWire || bridgedGptMessages || bridgedChatMessages,
         ));
     } catch (e) {
       releaseInFlight();

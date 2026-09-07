@@ -96,7 +96,18 @@ interface SessionRecord {
    * that once had one, and then lost it, has provably free room to re-cut.
    */
   everCacheAlive?: boolean;
+  /**
+   * Consecutive 429s for this session, reset on any non-429 response. See
+   * {@link isRateLimitCircuitOpen}.
+   */
+  consecutive429: number;
 }
+
+/**
+ * Consecutive 429s after which a session stops being imaged. See
+ * {@link isRateLimitCircuitOpen}.
+ */
+const RATE_LIMIT_CIRCUIT_THRESHOLD = 3;
 
 const sessions = new Map<string, SessionRecord>();
 
@@ -107,7 +118,7 @@ function touch(key: string): SessionRecord {
     sessions.set(key, existing);
     return existing;
   }
-  const fresh: SessionRecord = { lastSeenMs: 0, freezeStep: 0, cacheDead: false };
+  const fresh: SessionRecord = { lastSeenMs: 0, freezeStep: 0, cacheDead: false, consecutive429: 0 };
   sessions.set(key, fresh);
   while (sessions.size > SESSIONS_MAX) {
     const oldest = sessions.keys().next().value;
@@ -249,6 +260,51 @@ export function responseLeftNoCache(status: number, errorBody?: string): boolean
   return false;
 }
 
+/**
+ * Feed a response's status back in for rate-limit tracking. Call once per
+ * response, alongside {@link noteCacheOutcome}.
+ *
+ * A 429 on a request whose bytes are unchanged from the last attempt (retried
+ * verbatim by the client) means imaging bought nothing: the provider never got
+ * far enough to populate a fresh prefix cache, the retry re-sends the same
+ * imaged bytes, and it fails the same way. Three in a row is past "unlucky
+ * timing" and into "this session cannot get a compressed request through
+ * right now" — see {@link isRateLimitCircuitOpen}.
+ *
+ * Any other status clears the counter: a single retry that gets through means
+ * whatever was throttling the account has room again.
+ */
+export function noteRateLimitOutcome(sessionKey: string | undefined, status: number): void {
+  if (!sessionKey) return;
+  // touch(), not a get-or-skip: unlike noteCacheOutcome (which only refines a
+  // record transformRequest is guaranteed to have created earlier in the same
+  // call), this is the sole writer for consecutive429 and must not silently
+  // no-op if some other response path reaches here first.
+  const rec = touch(sessionKey);
+  rec.consecutive429 = status === 429 ? rec.consecutive429 + 1 : 0;
+}
+
+/**
+ * Has this session hit {@link RATE_LIMIT_CIRCUIT_THRESHOLD} consecutive 429s?
+ * Callers use this to skip imaging and send plain text instead, so a session
+ * stuck behind a rate limit stops re-sending the same doomed imaged bytes and
+ * gets a chance to complete a request — which is also the only way its own
+ * prefix cache (see {@link noteCacheOutcome}) gets a chance to come back.
+ *
+ * Deliberately has no time-based reset: a session that tripped this is still
+ * the same session next request, and a fixed cooldown would either reopen too
+ * early (back to the same failure) or too late (stuck on text past the point
+ * the rate limit cleared) with no way to know which. Bounded instead by the
+ * session's own natural lifetime — 512 sessions tracked, oldest evicted first
+ * (see `SESSIONS_MAX`) — and by the fact that a session back under budget just
+ * needs one successful request of any kind to clear the counter.
+ */
+export function isRateLimitCircuitOpen(sessionKey: string | undefined): boolean {
+  if (!sessionKey) return false;
+  const rec = sessions.get(sessionKey);
+  return (rec?.consecutive429 ?? 0) >= RATE_LIMIT_CIRCUIT_THRESHOLD;
+}
+
 /** Test seam: drop all session state. */
 export function resetSessionState(): void {
   sessions.clear();
@@ -257,7 +313,7 @@ export function resetSessionState(): void {
 /** Test/telemetry seam: inspect a session without mutating its clock. */
 export function peekSessionState(
   sessionKey: string,
-): { lastSeenMs: number; freezeStep: number; cacheDead: boolean } | undefined {
+): { lastSeenMs: number; freezeStep: number; cacheDead: boolean; consecutive429: number } | undefined {
   const rec = sessions.get(sessionKey);
   return rec ? { ...rec } : undefined;
 }

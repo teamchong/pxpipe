@@ -8,6 +8,9 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createWarpRuntime } from './warp/index.js';
+import { CertificateAuthority } from './warp/ca.js';
+import { createWarpHandlers } from './warp/connect.js';
+import { parseRoute } from './warp/route.js';
 import { once } from 'node:events';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -1333,7 +1336,24 @@ async function main(): Promise<void> {
   };
   const handle = createProxy(config);
 
+  const defaultWarpRoutes = [
+    parseRoute(`api.anthropic.com/v1/messages*=http://127.0.0.1:${opts.port}`),
+  ];
+  const warpCa = CertificateAuthority.loadOrCreate(path.join(os.homedir(), '.pxpipe'));
+  const warpHandlers = createWarpHandlers({
+    routes: defaultWarpRoutes,
+    ca: warpCa,
+    onDivert: (host, path, target) => {
+      if (!process.stdout.isTTY) console.error(`[pxpipe] warp: ${host}${path} → ${target}`);
+    },
+  });
+
   const server = createServer((req, res) => {
+    // Forward proxy requests (absolute URL form: GET http://...)
+    if (req.url && (req.url.startsWith('http://') || req.url.startsWith('https://'))) {
+      warpHandlers.handleAbsoluteForm(req, res);
+      return;
+    }
     Promise.resolve()
       .then(async () => {
         // Local dashboard routes — handled BEFORE the proxy so they never hit
@@ -1368,6 +1388,8 @@ async function main(): Promise<void> {
       });
   });
 
+  server.on('connect', warpHandlers.handleConnect);
+
   // IPv6 literals need bracket notation to form a valid URL (http://[::1]:47821).
   const displayHost = opts.host.includes(':') ? `[${opts.host}]` : opts.host;
   const isLoopbackHost =
@@ -1376,6 +1398,7 @@ async function main(): Promise<void> {
     const routes = resolveUpstreams(config);
     console.log(`[pxpipe] anthropic upstream → ${routes.anthropic}`);
     console.log(`[pxpipe] openai upstream → ${routes.openai}`);
+    console.log(`[pxpipe] CONNECT proxy enabled → CA: ${warpCa.certPath}`);
     if (opts.cloudflareUpstream !== undefined) {
       console.log(
         `[pxpipe] cloudflare upstream → ${chatCompletionsUrl(opts.cloudflareUpstream)} ` +

@@ -134,6 +134,13 @@ describe('blocksToText', () => {
     expect(blocksToText('hello world')).toBe('hello world');
   });
 
+  it('tolerates non-array content (null/undefined) instead of throwing', () => {
+    // Untrusted bodies can send `content: null`; blocksToText must pass it
+    // through as empty like its sibling serializers, not 502 the request.
+    expect(blocksToText(null as unknown as string)).toBe('');
+    expect(blocksToText(undefined as unknown as string)).toBe('');
+  });
+
   it('joins text blocks with double newline', () => {
     expect(
       blocksToText([

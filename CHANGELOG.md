@@ -6,6 +6,20 @@ behavioral changes, patch = fixes).
 
 ## Unreleased
 
+### Added
+- Native Google `/v1/models/*` and `/v1beta/models/*` inference routes now
+  support rerouting with the client Google credentials preserved.
+- Cloud Code internal API route: `POST /v1internal:generateContent` and
+  `:streamGenerateContent` (Antigravity, Gemini CLI, Gemini Code Assist) are
+  now transformed like Google AI Studio requests. The body is a
+  `{ model, project, request: {...} }` envelope (`generateContentRequest` is
+  also accepted); the inner request is compressed and the envelope is kept
+  intact. Forwards to `https://cloudcode-pa.googleapis.com` by default,
+  override with `GOOGLE_UPSTREAM` (or `googleUpstream` in `ProxyConfig`). The
+  client's own OAuth bearer is forwarded; the Anthropic key is never injected
+  on this route. No upstream countTokens probe: the local profitability gate
+  decides.
+
 ### Changed
 - **Gemini is on by default for every version, and opt-out works again.** The
   built-in scope is now `PXPIPE_MODELS=claude-fable-5,gemini`; the `gemini`

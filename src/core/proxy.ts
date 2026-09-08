@@ -22,7 +22,12 @@ import {
   openAIChatToAnthropicResponse,
 } from './messages-chat-bridge.js';
 import { pinCommandResponse, pinCommandResponseOpenAI } from './pin.js';
-import { isGoogleInferencePath, parseGoogleModelFromPath, transformGoogleGenerateContent } from './google.js';
+import {
+  isGoogleInternalPath,
+  parseGoogleModelFromPath,
+  readGoogleInternalModel,
+  transformGoogleGenerateContent,
+} from './google.js';
 import { isGeminiModel } from './gemini-model-profiles.js';
 import { resolveGptProfile } from './gpt-model-profiles.js';
 
@@ -1407,17 +1412,18 @@ function resolveGoogleUpstream(
   passthroughUpstream: string,
   config: ProxyConfig,
 ): string {
-  if (config.provider === 'cloudflare-ai-gateway' || passthroughUpstream !== DEFAULT_UPSTREAM) {
+  if (config.provider === 'cloudflare-ai-gateway') {
     return passthroughUpstream;
   }
   if (config.googleUpstream) {
     return stripTrailingSlashes(config.googleUpstream.trim());
   }
+  if (passthroughUpstream !== DEFAULT_UPSTREAM) return passthroughUpstream;
   const host = extractHostname(req.headers.get('host'));
-  if (host === 'daily-cloudcode-pa.googleapis.com' || host === 'cloudcode-pa.googleapis.com' || pathname.startsWith('/v1internal:')) {
-    return host === 'cloudcode-pa.googleapis.com'
-      ? 'https://cloudcode-pa.googleapis.com'
-      : 'https://daily-cloudcode-pa.googleapis.com';
+  if (host === 'daily-cloudcode-pa.googleapis.com' || host === 'cloudcode-pa.googleapis.com' || isGoogleInternalPath(pathname)) {
+    return host === 'daily-cloudcode-pa.googleapis.com'
+      ? 'https://daily-cloudcode-pa.googleapis.com'
+      : 'https://cloudcode-pa.googleapis.com';
   }
   return 'https://generativelanguage.googleapis.com';
 }
@@ -1614,8 +1620,8 @@ let responseContentType: string | undefined;
     const googleModelFromPath = req.method === 'POST'
       ? parseGoogleModelFromPath(url.pathname)
       : null;
-    const isGoogleInference = req.method === 'POST' && isGoogleInferencePath(url.pathname);
-    const isGoogleRoute = googleModelFromPath !== null || isGoogleInference;
+    const isGoogleInternal = req.method === 'POST' && isGoogleInternalPath(url.pathname);
+    const isGoogleRoute = googleModelFromPath !== null || isGoogleInternal;
     const isGoogle = isGoogleRoute && !bypass;
     const isOpenAIPath = isCanonicalOpenAIPath(
       url.pathname,
@@ -1678,7 +1684,8 @@ let responseContentType: string | undefined;
         const transformOpts =
           typeof config.transform === 'function' ? config.transform() : config.transform;
         // Fail-closed: unreadable model → no compression, not a risky guess.
-        const model = googleModelFromPath ?? readModelField(bodyIn);
+        const model = googleModelFromPath
+          ?? (isGoogleInternal ? readGoogleInternalModel(bodyIn) : readModelField(bodyIn));
         if (isOpenAIResponses) responsesStreaming = readStreamField(bodyIn);
         requestModel = model ?? undefined;
         // A turn whose only content is `@pxpipe pin` / `@pxpipe unpin` is
@@ -1767,7 +1774,9 @@ let responseContentType: string | undefined;
               ? await transformOpenAIChatCompletions(bodyIn, effectiveOpts)
               : await transformOpenAIResponses(bodyIn, effectiveOpts);
         transformMs = Date.now() - tTransform;
-        if (isGoogle && r.info.compressed) {
+        // The Cloud Code internal API has no public countTokens shape worth
+        // probing; keep the local profitability decision there.
+        if (isGoogle && !isGoogleInternal && r.info.compressed) {
           const countHeaders = applyGatewayHeaders(filterHeaders(req.headers, STRIP_REQ_HEADERS));
           countHeaders.set('content-type', 'application/json');
           const countUrl = new URL(
@@ -1943,6 +1952,7 @@ let responseContentType: string | undefined;
       }
     } else if (isGoogleRoute) {
       // Inbound Google credential (Bearer or API key) is preserved; do not inject Anthropic keys.
+      if (isGoogleInternal) outHeaders.delete('x-api-key');
     } else if (!providerPrefixed || url.pathname.startsWith('/anthropic/')) {
       if (config.apiKey) outHeaders.set('x-api-key', config.apiKey);
       const bearer = resolveAuthToken(config);

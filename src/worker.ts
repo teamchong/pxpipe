@@ -25,6 +25,7 @@ export interface Env {
   /** Optional override — if set, replaces whatever x-api-key the client sent. */
   ANTHROPIC_API_KEY?: string;
   OPENAI_UPSTREAM?: string;
+  GOOGLE_UPSTREAM?: string;
   /** Optional override — if set, replaces whatever Authorization the client sent. */
   OPENAI_API_KEY?: string;
   OPENAI_MODELS?: string;
@@ -175,6 +176,7 @@ export default {
       upstream: env.ANTHROPIC_UPSTREAM ?? sharedUpstream ?? 'https://api.anthropic.com',
       apiKey: env.ANTHROPIC_API_KEY,
       openAIUpstream: env.OPENAI_UPSTREAM ?? sharedUpstream ?? 'https://api.openai.com',
+      googleUpstream: env.GOOGLE_UPSTREAM ?? sharedUpstream,
       openAIApiKey: env.OPENAI_API_KEY,
       cloudflareUpstream,
       cloudflareApiKey: cfToken,

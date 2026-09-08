@@ -92,8 +92,13 @@ const GROK_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
 ];
 
 const GEMINI_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
+  // `gemini` is the family base (default on): covers 3.6/3.7/3.8, Pro, 4, 5 and
+  // whatever ships next. The per-version chips are for narrowing scope after
+  // opting the family off.
+  { id: 'gemini', label: 'Gemini (all versions)' },
   { id: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash' },
   { id: 'gemini-3.7-flash', label: 'Gemini 3.7 Flash' },
+  { id: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash' },
 ];
 
 export function renderModelsFragment(
@@ -153,7 +158,7 @@ export function renderModelsFragment(
     `<div class="models">` +
     `<span class="models-label">Image Gemini models</span>` +
     geminiChips +
-    `<span class="hint">enabled by default · 100/100 vision reader</span>` +
+    `<span class="hint">on by default · toggle off to opt out · 100/100 vision reader</span>` +
     `</div>` +
     `<div class="models">` +
     `<span class="models-label">Image OpenAI Responses models</span>` +

@@ -50,11 +50,10 @@ export interface ProxyConfig {
   authToken?: string | (() => string | undefined);
   /** OpenAI API base for GPT chat completions, no trailing slash. */
   openAIUpstream?: string;
-  /** Cloud Code internal API base for `/v1internal:*generateContent` (Antigravity,
-   *  Gemini CLI), no trailing slash. Defaults to cloudcode-pa.googleapis.com. */
-  googleUpstream?: string;
   /** Override or supply an OpenAI API key. If unset, we forward Authorization. */
   openAIApiKey?: string;
+  /** Google API base for Gemini / CloudCode inference, no trailing slash. */
+  googleUpstream?: string;
   /** Cloudflare's OpenAI-compatible Chat Completions endpoint and bearer key. */
   cloudflareUpstream?: string;
   cloudflareApiKey?: string;
@@ -598,9 +597,10 @@ function processSseEvent(
   ) {
     m.toolUseChars += obj.delta.length;
   }
-  // Google AI Studio streaming chunks: usageMetadata object.
-  if (obj.usageMetadata && typeof obj.usageMetadata === 'object') {
-    const gUsage = normalizeUsage(obj.usageMetadata);
+  // Google AI Studio / CloudCode streaming chunks: usageMetadata object.
+  const usageObj = obj.usageMetadata ?? (obj.response as Record<string, unknown> | undefined)?.usageMetadata;
+  if (usageObj && typeof usageObj === 'object') {
+    const gUsage = normalizeUsage(usageObj);
     if (gUsage) state.usage = gUsage;
   }
   measureGoogleCandidates(obj, m, state);
@@ -799,8 +799,13 @@ function measureGoogleCandidates(
   m: OutputMeasurement,
   state?: { stopReason: string | undefined },
 ): boolean {
-  if (!Array.isArray(obj.candidates)) return false;
-  for (const rawCandidate of obj.candidates) {
+  const candidates = Array.isArray(obj.candidates)
+    ? obj.candidates
+    : (obj.response && typeof obj.response === 'object' && Array.isArray((obj.response as Record<string, unknown>).candidates))
+      ? (obj.response as Record<string, unknown>).candidates as unknown[]
+      : undefined;
+  if (!Array.isArray(candidates)) return false;
+  for (const rawCandidate of candidates) {
     const candidate = objectRecord(rawCandidate);
     if (!candidate) continue;
     if (state && typeof candidate.finishReason === 'string') state.stopReason = candidate.finishReason;
@@ -1018,7 +1023,11 @@ function teeForUsage(
           };
           const state: { stopReason: string | undefined } = { stopReason: undefined };
           for (const object of objects) {
-            const nextUsage = normalizeUsage(object.usage ?? object.usageMetadata);
+            const nextUsage = normalizeUsage(
+              object.usage
+                ?? object.usageMetadata
+                ?? (object.response as Record<string, unknown> | undefined)?.usageMetadata,
+            );
             if (nextUsage) usage = nextUsage;
             recognizedGoogle = measureGoogleCandidates(object, measurement, state) || recognizedGoogle;
           }
@@ -1062,7 +1071,6 @@ function teeForUsage(
 
 const DEFAULT_UPSTREAM = 'https://api.anthropic.com';
 const DEFAULT_OPENAI_UPSTREAM = 'https://api.openai.com';
-const DEFAULT_GOOGLE_INTERNAL_UPSTREAM = 'https://cloudcode-pa.googleapis.com';
 
 /** Headers we strip on the way out — they're hop-by-hop or proxy-injected. */
 const STRIP_REQ_HEADERS = new Set([
@@ -1282,7 +1290,10 @@ async function countGoogleTokensUpstream(
   model: string,
 ): Promise<number | null> {
   try {
-    const request = JSON.parse(new TextDecoder().decode(body)) as Record<string, unknown>;
+    const rawParsed = JSON.parse(new TextDecoder().decode(body)) as Record<string, unknown>;
+    const request = (rawParsed.request && typeof rawParsed.request === 'object' && !Array.isArray(rawParsed.request))
+      ? (rawParsed.request as Record<string, unknown>)
+      : rawParsed;
     const shapeBare = JSON.stringify(request);
     const shapeWrapped = JSON.stringify({ generateContentRequest: { ...request, model: `models/${model}` } });
     let host = '';
@@ -1376,6 +1387,47 @@ export function parseGatewayHeaders(spec: string | undefined): Record<string, st
   return out;
 }
 
+function extractHostname(hostHeader: string | null): string {
+  if (!hostHeader) return '';
+  const trimmed = hostHeader.trim().toLowerCase();
+  if (trimmed.startsWith('[')) {
+    const end = trimmed.indexOf(']');
+    return end !== -1 ? trimmed.slice(1, end) : trimmed;
+  }
+  const colon = trimmed.indexOf(':');
+  return colon !== -1 ? trimmed.slice(0, colon) : trimmed;
+}
+
+function stripTrailingSlashes(str: string): string {
+  let end = str.length;
+  while (end > 0 && str.charCodeAt(end - 1) === 47) {
+    end--;
+  }
+  return str.slice(0, end);
+}
+
+function resolveGoogleUpstream(
+  req: Request,
+  pathname: string,
+  passthroughUpstream: string,
+  config: ProxyConfig,
+): string {
+  if (config.provider === 'cloudflare-ai-gateway') {
+    return passthroughUpstream;
+  }
+  if (config.googleUpstream) {
+    return stripTrailingSlashes(config.googleUpstream.trim());
+  }
+  if (passthroughUpstream !== DEFAULT_UPSTREAM) return passthroughUpstream;
+  const host = extractHostname(req.headers.get('host'));
+  if (host === 'daily-cloudcode-pa.googleapis.com' || host === 'cloudcode-pa.googleapis.com' || isGoogleInternalPath(pathname)) {
+    return host === 'daily-cloudcode-pa.googleapis.com'
+      ? 'https://daily-cloudcode-pa.googleapis.com'
+      : 'https://cloudcode-pa.googleapis.com';
+  }
+  return 'https://generativelanguage.googleapis.com';
+}
+
 /** Build the proxy fetch handler. */
 export function createProxy(config: ProxyConfig = {}) {
   const modelRoutes = new Map<string, 'openai' | 'cloudflare'>();
@@ -1411,8 +1463,6 @@ export function createProxy(config: ProxyConfig = {}) {
   const passthroughUpstream = config.provider === 'cloudflare-ai-gateway'
     ? (config.gatewayBaseUrl ?? '').trim().replace(/\/+$/, '')
     : upstream;
-  const googleInternalUpstream = (config.googleUpstream ?? DEFAULT_GOOGLE_INTERNAL_UPSTREAM)
-    .trim().replace(/\/+$/, '');
   const gatewayHeaders = config.gatewayHeaders ?? {};
   const applyGatewayHeaders = (h: Headers): Headers => {
     for (const [k, v] of Object.entries(gatewayHeaders)) h.set(k, v);
@@ -1567,26 +1617,27 @@ let responseContentType: string | undefined;
     const isMessages = !bypass && isMessagesWire;
     const isOpenAIChat = !bypass && isOpenAIChatWire;
     const isOpenAIResponses = !bypass && isOpenAIResponsesWire;
-    const googleModel = req.method === 'POST'
+    const googleModelFromPath = req.method === 'POST'
       ? parseGoogleModelFromPath(url.pathname)
       : null;
     const isGoogleInternal = req.method === 'POST' && isGoogleInternalPath(url.pathname);
-    const isGoogleRoute = googleModel !== null || isGoogleInternal;
+    const isGoogleRoute = googleModelFromPath !== null || isGoogleInternal;
     const isGoogle = isGoogleRoute && !bypass;
     const isOpenAIPath = isCanonicalOpenAIPath(
       url.pathname,
       req.headers,
       config.openAIApiKey !== undefined,
     );
-    const upstreamBase = isGoogleInternal
-      ? googleInternalUpstream
-      : isGoogleRoute || providerPrefixed
+    const googleUpstream = resolveGoogleUpstream(req, url.pathname, passthroughUpstream, config);
+    const upstreamBase = isGoogleRoute
+      ? googleUpstream
+      : providerPrefixed
         ? passthroughUpstream
         : isOpenAIPath ? openAIUpstream : upstream;
 
     let bodyOut: BodyInit | null = null;
     let info: TransformInfo | undefined;
-    let requestModel: string | undefined = googleModel ?? undefined;
+    let requestModel: string | undefined = googleModelFromPath ?? undefined;
     let bridgedGptMessages = false;
     let bridgedChatMessages = false;
     let modelRouteForRequest: 'openai' | 'cloudflare' | undefined;
@@ -1633,7 +1684,7 @@ let responseContentType: string | undefined;
         const transformOpts =
           typeof config.transform === 'function' ? config.transform() : config.transform;
         // Fail-closed: unreadable model → no compression, not a risky guess.
-        const model = googleModel
+        const model = googleModelFromPath
           ?? (isGoogleInternal ? readGoogleInternalModel(bodyIn) : readModelField(bodyIn));
         if (isOpenAIResponses) responsesStreaming = readStreamField(bodyIn);
         requestModel = model ?? undefined;
@@ -1679,8 +1730,10 @@ let responseContentType: string | undefined;
         bridgedChatMessages = forceChat;
         const chatStamp = bridgedChatMessages ? routedModel : undefined;
         const effectiveModel = (bridgedGptMessages || bridgedChatMessages) ? routedModel : model;
+        // Gemini is in DEFAULT_MODEL_BASES as the family base `gemini`; the same
+        // allowlist gates it so PXPIPE_MODELS / the chip can opt out.
         const modelOk = isGoogle
-          ? isGeminiModel(model) && isPxpipeSupportedModel(model)
+          ? (isGeminiModel(model) && isPxpipeSupportedModel(model))
           : isMessages
             ? (messagesAnthropic && isPxpipeSupportedModel(model))
               || bridgedGptMessages
@@ -1727,7 +1780,7 @@ let responseContentType: string | undefined;
           const countHeaders = applyGatewayHeaders(filterHeaders(req.headers, STRIP_REQ_HEADERS));
           countHeaders.set('content-type', 'application/json');
           const countUrl = new URL(
-            passthroughUpstream + url.pathname.replace(
+            (isGoogleRoute ? googleUpstream : passthroughUpstream) + url.pathname.replace(
               /:(?:generateContent|streamGenerateContent)$/,
               ':countTokens',
             ),
@@ -1897,9 +1950,9 @@ let responseContentType: string | undefined;
         else if (decision.action === 'replace') outHeaders.set('authorization', `Bearer ${bridgeKey}`);
         // 'keep-inbound' leaves the header filterHeaders already copied.
       }
-    } else if (isGoogleInternal) {
-      // Cloud Code takes the client's own OAuth bearer; never an Anthropic key.
-      outHeaders.delete('x-api-key');
+    } else if (isGoogleRoute) {
+      // Inbound Google credential (Bearer or API key) is preserved; do not inject Anthropic keys.
+      if (isGoogleInternal) outHeaders.delete('x-api-key');
     } else if (!providerPrefixed || url.pathname.startsWith('/anthropic/')) {
       if (config.apiKey) outHeaders.set('x-api-key', config.apiKey);
       const bearer = resolveAuthToken(config);

@@ -125,8 +125,10 @@ without running the proxy.
 - **`claude-opus-5`:** weaker recall than Fable 5 (verbatim **2/15 vs 13/15**), good
   enough otherwise (100/100 arithmetic, 0/16 never-stated), **~4.7×** context before
   `/compact`. Suggested effort: **medium**. Details: [FINDINGS.md](FINDINGS.md).
-- **Model scope:** default `PXPIPE_MODELS=claude-fable-5,gemini-3.6-flash,gemini-3.7-flash`. Opus 5, Sol, GPT 5.5,
-  and **Grok** are opt-in only (dashboard chips or
+- **Model scope:** default `PXPIPE_MODELS=claude-fable-5,gemini`. The `gemini`
+  base covers every Gemini id (3.6/3.7/3.8 Flash, Pro, 4, 5, and future
+  versions); to opt Gemini out, drop `gemini` from `PXPIPE_MODELS` or click the
+  chip off. Opus 5, Sol, GPT 5.5, and **Grok** are opt-in only (dashboard chips or
   `PXPIPE_MODELS`). The exact Sol id still matters. Sibling variants such as
   `gpt-5.6-terra` do not
   inherit Sol's allowlist or render profile. `PXPIPE_MODELS=off` disables
@@ -171,6 +173,7 @@ numbers predate it).
 | model | numbers at | arithmetic (N=100) | gist (N=98) | state (N=18) | never-stated (N=16) | dense hex (N=15) | profile provenance and receipts |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
 | `claude-fable-5` | Spleen 5×8, 312 cols (shipped) | **100/100** | **98/98** | **18/18** | **0/16** | 13/15 | June 2026 production profiles: [arithmetic + hex](FINDINGS.md), [gist/state/guards](eval/gist-recall/) |
+| `claude-fable-5-1` | Spleen 5×8, 312 cols (Fable 5 profile) | **100/100** | 95/98 | **18/18** | **0/16** | 6/15 | Fable 5 profile, no geometry of its own; 3 gist misses are image-arm negation flags answered UNKNOWN (0 confabs). Same-day Fable 5 control on the identical harness/PNGs reproduced 100/100 arithmetic and 30/30 tier-2 gist, so the gist/hex gap is the model, not the harness (hex control not rerun): [arithmetic](eval/sol-profile/), [dense hex](eval/verbatim-15/), [gist/state/guards](eval/gist-recall/) |
 | `google/gemini-3.6-flash`, `3.7-flash` | Spleen 5×8, 312 cols (shipped) | **100/100** | **98/98** | **18/18** | **0/16** | **14/15** | current shipped profile: [quality results](eval/gemini-profile/QUALITY_RESULTS.md) |
 | `claude-opus-5` | Spleen 5×8, 312 cols (shipped) | **100/100** | 94/98 | 17/18 | **0/16** | 2/15 | current profile: [arithmetic](eval/gsm8k/), [gist/state/guards](eval/gist-recall/), [dense hex](eval/verbatim-15/) |
 | `gpt-5.6-sol` | Spleen 5×8, 152 cols; **ships 14px/84** | 98/100 | 83/98 | 17/18 | 4/16 | 0/15 | broad suite predates the shipped 14px profile; 14px pilot: 7/8 exact, 0 inventions, gist/guard pass: [pilot](eval/sol-profile/README.md) |

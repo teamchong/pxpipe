@@ -190,6 +190,23 @@ describe('provider-prefixed passthrough routing', () => {
     expect(cap.headers?.get('authorization')).toBe('Bearer local-token');
   });
 
+  it.each(['v1', 'v1beta'])('routes native Google %s requests with API credentials preserved', async (version) => {
+    const cap: { url?: string; headers?: Headers } = {};
+    stubFetch(cap);
+    const path = `/${version}/models/gemini-unknown:streamGenerateContent?alt=sse&key=test-google-key`;
+    await createProxy({ apiKey: 'anthropic-key', authToken: 'anthropic-token' })(
+      new Request(`http://localhost${path}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-goog-api-key': 'google-key', authorization: 'Bearer google-token' },
+        body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'hi' }] }] }),
+      }),
+    );
+    expect(cap.url).toBe(`https://generativelanguage.googleapis.com${path}`);
+    expect(cap.headers?.get('x-goog-api-key')).toBe('google-key');
+    expect(cap.headers?.get('authorization')).toBe('Bearer google-token');
+    expect(cap.headers?.get('x-api-key')).toBeNull();
+  });
+
   it('routes /v1internal:streamGenerateContent to the Cloud Code upstream with the client bearer', async () => {
     const cap: { url?: string; headers?: Headers } = {};
     stubFetch(cap);
@@ -198,7 +215,7 @@ describe('provider-prefixed passthrough routing', () => {
       project: 'p',
       request: { contents: [{ role: 'user', parts: [{ text: 'hi' }] }] },
     };
-    await createProxy({ upstream: 'http://gateway.test', apiKey: 'sk-anthropic-test' })(
+    await createProxy({ apiKey: 'sk-anthropic-test' })(
       new Request('http://localhost/v1internal:streamGenerateContent?alt=sse', {
         method: 'POST',
         headers: { 'content-type': 'application/json', authorization: 'Bearer oauth-token' },
@@ -209,7 +226,7 @@ describe('provider-prefixed passthrough routing', () => {
     expect(cap.headers?.get('authorization')).toBe('Bearer oauth-token');
     expect(cap.headers?.get('x-api-key')).toBeNull();
 
-    await createProxy({ googleUpstream: 'http://cloudcode.test/' })(
+    await createProxy({ upstream: 'http://other-provider.test', googleUpstream: 'http://cloudcode.test/' })(
       new Request('http://localhost/v1internal:generateContent', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },

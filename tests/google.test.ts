@@ -16,7 +16,7 @@ describe('parseGoogleModelFromPath', () => {
   it('extracts model name from Google AI Studio URL path', () => {
     expect(parseGoogleModelFromPath('/google-ai-studio/v1beta/models/gemini-3.6-flash:generateContent')).toBe('gemini-3.6-flash');
     expect(parseGoogleModelFromPath('/google-ai-studio/v1/models/gemini-3.6-flash:streamGenerateContent')).toBe('gemini-3.6-flash');
-    expect(parseGoogleModelFromPath('/v1beta/models/gemini-3.6-flash:streamGenerateContent')).toBeNull();
+    expect(parseGoogleModelFromPath('/v1beta/models/gemini-3.6-flash:streamGenerateContent')).toBe('gemini-3.6-flash');
     expect(parseGoogleModelFromPath('/foo/google-ai-studio/v1beta/models/gemini-3.6-flash:generateContent')).toBeNull();
     expect(parseGoogleModelFromPath('/google-ai-studio/v1beta/models/gemini-3.6-flash:countTokens')).toBeNull();
     expect(parseGoogleModelFromPath('/v1/messages')).toBeNull();
@@ -76,21 +76,40 @@ describe('Cloud Code internal route (Antigravity / Gemini CLI)', () => {
 });
 
 describe('transformGoogleGenerateContent', () => {
-  it('passes an unvalidated Gemini model through unchanged', async () => {
+  it('passes non-Gemini models through unchanged as unsupported_model', async () => {
     const raw = JSON.stringify({
       systemInstruction: { parts: [{ text: 'System instruction. '.repeat(300) }] },
       contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
     });
-    for (const unmeasuredModel of ['gemini-3.6-flash-preview', 'gemini-3.7-flash-preview', 'gemini-pro']) {
+    for (const nonGeminiModel of ['gemma-2-9b', 'text-embedding-004', 'imagen-3.0']) {
       const result = await transformGoogleGenerateContent(
         new TextEncoder().encode(raw),
-        unmeasuredModel,
+        nonGeminiModel,
         { compress: true },
       );
 
       expect(new TextDecoder().decode(result.body)).toBe(raw);
       expect(result.info.compressed).toBe(false);
       expect(result.info.reason).toBe('unsupported_model');
+    }
+  });
+
+  it('compresses forward-compatible Gemini models (gemini-4, gemini-5, gemini-pro)', async () => {
+    const sampleBody = {
+      systemInstruction: {
+        parts: [{ text: 'System instruction text for testing Google transformer. '.repeat(300) }],
+      },
+      contents: [{ role: 'user', parts: [{ text: 'User question' }] }],
+    };
+    const bodyBytes = new TextEncoder().encode(JSON.stringify(sampleBody));
+    for (const model of ['gemini-4-flash', 'gemini-5-pro', 'gemini-pro']) {
+      const result = await transformGoogleGenerateContent(bodyBytes, model, { compress: true });
+      expect(result.info.compressed).toBe(true);
+      expect(result.info.imageCount).toBeGreaterThan(0);
+      expect(result.info.imageTokens).toBe(result.info.imageDims?.reduce(
+        (sum, image) => sum + geminiVisionTokens(model, image.width, image.height),
+        0,
+      ));
     }
   });
 

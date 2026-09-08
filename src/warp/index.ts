@@ -46,7 +46,15 @@ export interface WarpRuntime {
  * keeps the agent's client-side gates satisfied.
  */
 function defaultRoutes(port: number): Route[] {
-  return [parseRoute(`api.anthropic.com/v1/messages*=http://127.0.0.1:${port}`)];
+  return [
+    parseRoute(`api.anthropic.com/v1/messages*=http://127.0.0.1:${port}`),
+    parseRoute(`daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent*=http://127.0.0.1:${port}`),
+    parseRoute(`daily-cloudcode-pa.googleapis.com/v1internal:generateContent*=http://127.0.0.1:${port}`),
+    parseRoute(`generativelanguage.googleapis.com/v1beta/models/*:streamGenerateContent*=http://127.0.0.1:${port}`),
+    parseRoute(`generativelanguage.googleapis.com/v1beta/models/*:generateContent*=http://127.0.0.1:${port}`),
+    parseRoute(`generativelanguage.googleapis.com/v1/models/*:streamGenerateContent*=http://127.0.0.1:${port}`),
+    parseRoute(`generativelanguage.googleapis.com/v1/models/*:generateContent*=http://127.0.0.1:${port}`),
+  ];
 }
 
 export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {

@@ -25,13 +25,22 @@ describe('Gemini Model Profiles & Identification', () => {
     expect(isGeminiModel('grok-4.5')).toBe(false);
   });
 
-  it('distinguishes family routing from the measured image profile', () => {
+  it('distinguishes validated profiles and supports forward-compatible future versions and Pro', () => {
     expect(hasGeminiMeasuredProfile('gemini-3.6-flash')).toBe(true);
     expect(hasGeminiMeasuredProfile('google/gemini-3.6-flash')).toBe(true);
     expect(hasGeminiMeasuredProfile('gemini-3.7-flash')).toBe(true);
     expect(hasGeminiMeasuredProfile('google/gemini-3.7-flash')).toBe(true);
     expect(hasGeminiMeasuredProfile('gemini-3.6-pro')).toBe(false);
     expect(hasGeminiMeasuredProfile('gemini-3.7-pro')).toBe(false);
+    expect(hasGeminiMeasuredProfile('gemini-3.8-flash')).toBe(true);
+    expect(hasGeminiMeasuredProfile('gemini-3.8-pro')).toBe(true);
+    expect(hasGeminiMeasuredProfile('gemini-3.9-flash')).toBe(true);
+    expect(hasGeminiMeasuredProfile('gemini-3.9-pro')).toBe(true);
+    expect(hasGeminiMeasuredProfile('gemini-4-flash')).toBe(true);
+    expect(hasGeminiMeasuredProfile('gemini-5-pro')).toBe(true);
+    expect(hasGeminiMeasuredProfile('gemini-pro')).toBe(true);
+    expect(hasGeminiMeasuredProfile('gpt-5.6-sol')).toBe(false);
+    expect(hasGeminiMeasuredProfile('claude-fable-5')).toBe(false);
   });
 
   it('resolves dedicated Gemini profile via resolveGeminiProfile and resolveGptProfile', () => {
@@ -55,6 +64,11 @@ describe('Gemini Model Profiles & Identification', () => {
     expect(prof3.stripCols).toBe(312);
     expect(prof3.maxHeightPx).toBe(728);
     expect(prof3.vision).toEqual(prof1.vision);
+
+    const prof4 = resolveGptProfile('gemini-4-flash');
+    expect(prof4.stripCols).toBe(312);
+    expect(prof4.maxHeightPx).toBe(728);
+    expect(prof4.vision).toEqual(prof1.vision);
   });
 
   it('uses the measured production-geometry image cost', () => {
@@ -63,15 +77,18 @@ describe('Gemini Model Profiles & Identification', () => {
     expect(geminiVisionTokens('gemini-3.6-flash', 1024, 1024)).toBe(1120);
     expect(geminiVisionTokens('gemini-3.6-flash', 768, 1932)).toBe(1120);
     expect(geminiVisionTokens('gemini-3.7-flash', 1568, 728)).toBe(1078);
+    expect(geminiVisionTokens('gemini-4-flash', 1568, 728)).toBe(1078);
+    expect(geminiVisionTokens('gemini-5-pro', 1568, 728)).toBe(1078);
 
     expect(visionTokensForModel('gemini-3.6-flash', 1568, 728)).toBe(1078);
     expect(visionTokensForModel('google/gemini-3.6-flash', 1568, 728)).toBe(1078);
     expect(visionTokensForModel('gemini-3.7-flash', 1568, 728)).toBe(1078);
     expect(visionTokensForModel('google/gemini-3.7-flash', 1568, 728)).toBe(1078);
+    expect(visionTokensForModel('gemini-4-flash', 1568, 728)).toBe(1078);
   });
 
   it('fails closed for unvalidated models and invalid dimensions', () => {
-    expect(() => geminiVisionTokens('gemini-3.5-flash', 1568, 728)).toThrow('Unsupported Gemini model');
+    expect(() => geminiVisionTokens('not-gemini', 1568, 728)).toThrow('Unsupported Gemini model');
     expect(() => geminiVisionTokens('gemini-3.6-flash', 0, 728)).toThrow('Invalid Gemini image dimensions');
   });
 });

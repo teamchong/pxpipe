@@ -50,7 +50,7 @@ function quoteMeta(s: string): string {
 function compilePattern(pattern: string): RegExp {
   const withPath = pattern.includes('/') ? pattern : `${pattern}/*`;
   const parts = withPath.toLowerCase().split('*').map(quoteMeta);
-  return new RegExp(`^${parts.join('.*')}$`);
+  return new RegExp(`^${parts.join('.*')}$`, 'i');
 }
 
 /**
@@ -94,7 +94,7 @@ export function parseRoute(spec: string): Route {
   const prefix = target.pathname === '/' ? '' : target.pathname.replace(/\/$/, '');
 
   const hostGlob = pattern.split('/')[0]!;
-  const hostRe = new RegExp(`^${hostGlob.toLowerCase().split('*').map(quoteMeta).join('.*')}$`);
+  const hostRe = new RegExp(`^${hostGlob.toLowerCase().split('*').map(quoteMeta).join('.*')}$`, 'i');
   const hasPort = /:\d/.test(hostGlob);
 
   return { pattern, re, hostRe, hasPort, target, prefix };

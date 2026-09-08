@@ -11,7 +11,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { DashboardState, dashboardPath, dashboardHostLabel } from '../src/dashboard.js';
-import { getAllowedModelBases, setAllowedModelBases } from '../src/core/applicability.js';
+import { getAllowedModelBases, isPxpipeSupportedModel, setAllowedModelBases } from '../src/core/applicability.js';
 import type { SessionsPaths } from '../src/sessions.js';
 import type { TrackEvent } from '../src/core/tracker.js';
 import type { StatsPayload, RecentPayload } from '../src/dashboard/types.js';
@@ -192,9 +192,12 @@ describe('serveFragment', () => {
       expect(off).not.toContain('<div class="models" style="display:none">');
       // PXPIPE_MODELS textbox mirrors the live scope as CSV.
       expect(off).toContain('name="list"');
-      expect(off).toContain('value="claude-fable-5,gemini-3.6-flash,gemini-3.7-flash"');
+      expect(off).toContain('value="claude-fable-5,gemini"');
       expect(off).toContain('GPT 5.6 Sol</button>');
       expect(off).toContain('GPT 5.5</button>');
+      // Family chip is lit by default; per-version chips exist for narrowing.
+      expect(off).toContain('Gemini (all versions) ✓</button>');
+      expect(off).toContain('Gemini 3.8 Flash</button>');
       // Sol remains available and ordered before GPT 5.5.
       expect(off.indexOf('GPT 5.6 Sol')).toBeLessThan(off.indexOf('GPT 5.5'));
       expect(getAllowedModelBases()).toContain('claude-fable-5');
@@ -210,7 +213,14 @@ describe('serveFragment', () => {
       expect(getAllowedModelBases()).toContain('gpt-5.5');
       expect(getAllowedModelBases()).toContain('gpt-5.6-sol');
       // Chip flips are reflected back into the textbox CSV.
-      expect(onBoth).toContain('value="claude-fable-5,gemini-3.6-flash,gemini-3.7-flash,gpt-5.6-sol,gpt-5.5"');
+      expect(onBoth).toContain('value="claude-fable-5,gemini,gpt-5.6-sol,gpt-5.5"');
+      // Opting the Gemini family off is a real opt-out: the chip unlights and
+      // the base leaves the scope.
+      dash.handleModelsToggle('gemini', false);
+      const geminiOff = await (await dash.serveFragment('models', url, 1234)).text();
+      expect(geminiOff).toContain('Gemini (all versions)</button>');
+      expect(getAllowedModelBases()).not.toContain('gemini');
+      expect(isPxpipeSupportedModel('gemini-4')).toBe(false);
     } finally {
       setAllowedModelBases(null);
       if (prev === undefined) delete process.env.PXPIPE_MODELS;
@@ -250,7 +260,7 @@ describe('serveFragment', () => {
       });
 
       persisting.handleModelsToggle('gpt-5.6-sol', true);
-      expect(saved.at(-1)).toEqual(['claude-fable-5', 'gemini-3.6-flash', 'gemini-3.7-flash', 'gpt-5.6-sol']);
+      expect(saved.at(-1)).toEqual(['claude-fable-5', 'gemini', 'gpt-5.6-sol']);
       persisting.handleModelsSet('claude-fable-5');
       expect(saved.at(-1)).toEqual(['claude-fable-5']);
       // Empty scope persists too (round-trips as 'off' on load).
@@ -674,7 +684,7 @@ describe('GPT savings split', () => {
 
 describe('Gemini savings split', () => {
   beforeEach(() => {
-    setAllowedModelBases(['gemini-3.6-flash']);
+    setAllowedModelBases(['gemini']);
   });
 
   it('shows measured token savings without applying Claude dollar pricing', async () => {
@@ -809,6 +819,28 @@ describe('Gemini savings split', () => {
     expect(recent.recent.at(-1)?.baseline_input).toBe(4100);
     expect(recent.recent.at(-1)?.actual_input).toBe(1200);
     expect(recent.recent.at(-1)?.session_saved_so_far_delta).toBe(2900);
+  });
+
+  it('counts forward-compatible Gemini models in enabled totals without warming-up zero counts', async () => {
+    dash.update({
+      method: 'POST',
+      path: '/google-ai-studio/v1beta/models/gemini-3.8-flash:generateContent',
+      model: 'gemini-3.8-flash',
+      accountingProvider: 'google',
+      status: 200,
+      durationMs: 100,
+      usage: { input_tokens: 150, output_tokens: 20 },
+      info: {
+        compressed: true,
+        baselineTokens: 500,
+        baselineProbeStatus: 'ok',
+        imageCount: 1,
+      },
+    } as never);
+
+    const stats = (await dash.serveStats().json()) as StatsPayload;
+    expect(stats.compressed_requests).toBe(1);
+    expect(stats.saved_input_tokens).toBe(350);
   });
 });
 

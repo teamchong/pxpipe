@@ -259,9 +259,8 @@ Environment:
                            (default https://api.anthropic.com)
   OPENAI_UPSTREAM         OpenAI API base; overrides PXPIPE_UPSTREAM
                            (default https://api.openai.com)
-  GOOGLE_UPSTREAM         Cloud Code API base for /v1internal:*generateContent
-                           (Antigravity, Gemini CLI); overrides PXPIPE_UPSTREAM
-                           (default https://cloudcode-pa.googleapis.com)
+  GOOGLE_UPSTREAM         Google inference API base; overrides PXPIPE_UPSTREAM
+                           (defaults to Generative Language or Cloud Code by route)
   OPENAI_API_KEY          optional OpenAI key override; otherwise forwarded
   OPENAI_MODELS           comma-separated exact model ids routed to OpenAI
                           Responses
@@ -273,7 +272,7 @@ Environment:
   PXPIPE_GATEWAY_BASE_URL gateway base URL (required with PXPIPE_PROVIDER)
   PXPIPE_GATEWAY_HEADERS  extra upstream headers: JSON object or k=v;k2=v2
   PXPIPE_MODELS           comma-separated model bases to image (Claude/Gemini/GPT/Grok);
-                          default claude-fable-5,gemini-3.6-flash,gemini-3.7-flash (Sol/Opus/GPT-5.5/Grok opt-in);
+                          default claude-fable-5,gemini (every Gemini; Sol/Opus/GPT-5.5/Grok opt-in);
                           off disables
   PXPIPE_CONFIG           JSON config path (default ~/.config/pxpipe/config.json)
                           supports {"models": [...]} or {"models": "off"}

@@ -67,7 +67,7 @@ export interface GoogleGenerateContentRequest {
   [key: string]: unknown;
 }
 
-const GOOGLE_ROUTE = /^\/google-ai-studio\/(?:v1|v1beta)\/models\/([^/:]+):(generateContent|streamGenerateContent)$/;
+const GOOGLE_ROUTE = /^(?:\/google-ai-studio)?\/(?:v1|v1beta)\/models\/([^/:]+):(generateContent|streamGenerateContent)$/;
 /** Cloud Code internal API (Antigravity, Gemini CLI, Gemini Code Assist):
  *  `POST /v1internal:streamGenerateContent` on cloudcode-pa.googleapis.com. The
  *  model is not in the path; it lives in the body next to a wrapped request. */
@@ -114,6 +114,10 @@ export function readGoogleInternalModel(bodyBytes: Uint8Array): string | null {
     if (typeof candidate === 'string' && candidate.length <= 200) return candidate;
   }
   return null;
+}
+
+export function isGoogleInferencePath(pathname: string): boolean {
+  return parseGoogleModelFromPath(pathname) !== null || isGoogleInternalPath(pathname);
 }
 
 const SYSTEM_POINTER =
@@ -964,7 +968,8 @@ export async function transformGoogleGenerateContent(
     info.droppedChars = (info.droppedChars ?? 0) + toolResultPlan.droppedChars;
   }
 
-  const transformedBytes = new TextEncoder().encode(JSON.stringify(transformedReq));
+  const outPayload = transformedReq;
+  const transformedBytes = new TextEncoder().encode(JSON.stringify(outPayload));
   return { body: transformedBytes, info };
 }
 
@@ -991,8 +996,9 @@ function withStampedThoughtSignatures(
     : normalizeGoogleTurnRoles(req.contents);
   const normalizedSignatures = normalizeGeminiThoughtSignatures(normalized);
   if (normalizedSignatures === req.contents && normalized === req.contents) return { body: bodyBytes, info };
+  const outObj = { ...req, contents: normalizedSignatures };
   return {
-    body: new TextEncoder().encode(JSON.stringify({ ...req, contents: normalizedSignatures })),
+    body: new TextEncoder().encode(JSON.stringify(outObj)),
     info,
   };
 }

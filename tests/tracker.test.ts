@@ -222,6 +222,31 @@ describe('toTrackEvent', () => {
     expect(emptyBucketMap.bucket_chars).toBeUndefined();
   });
 
+  it('surfaces serializedRequestBytes as req_bytes for the headroom KPI', () => {
+    // proxy.ts sets info.serializedRequestBytes to the exact byte length of the
+    // final serialized upstream body; the diagnostics-page headroom KPI needs it
+    // under the snake_case name req_bytes.
+    const out = toTrackEvent({
+      method: 'POST',
+      path: '/v1/messages',
+      status: 413,
+      durationMs: 5,
+      info: { compressed: true, origChars: 1, serializedRequestBytes: 123456 },
+    });
+    expect(out.req_bytes).toBe(123456);
+  });
+
+  it('omits req_bytes when serializedRequestBytes was never measured', () => {
+    const out = toTrackEvent({
+      method: 'POST',
+      path: '/v1/messages',
+      status: 200,
+      durationMs: 5,
+      info: { compressed: false, reason: 'compress=false', origChars: 0 },
+    });
+    expect(out.req_bytes).toBeUndefined();
+  });
+
   it('handles a minimal ProxyEvent (no info, no usage) without throwing', () => {
     const out = toTrackEvent({
       method: 'GET',

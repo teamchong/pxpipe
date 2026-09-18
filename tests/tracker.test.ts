@@ -157,8 +157,8 @@ describe('toTrackEvent', () => {
         cache_read_input_tokens: 0,
       },
     });
-    expect(out.cache_creation_5m_tokens).toBeUndefined();
-    expect(out.cache_creation_1h_tokens).toBeUndefined();
+    expect(out.cache_create_5m_tokens).toBeUndefined();
+    expect(out.cache_create_1h_tokens).toBeUndefined();
     expect(out.web_search_requests).toBeUndefined();
   });
 

@@ -79,6 +79,11 @@ if NO_MARKER:
     print(f"  !! {len(NO_MARKER)}/{2*N} arms had no ANSWER: marker and were scored "
           f"by last-number fallback -- these scores are not trustworthy on their own.")
 print(f"  delta             = {100*(ic-bc)/N:+.1f} pp")
+# Receipt: every pred/gold pair, so the score can be audited without rerunning.
+if os.environ.get('GSM_OUT'):
+    json.dump([dict(i=i, gold=g, text=b, image=im, text_ok=bok, image_ok=iok)
+               for i, (bok, iok, g, b, im) in enumerate(res)],
+              open(os.environ['GSM_OUT'], 'w'), indent=1)
 for i, (bok, iok, g, b, im) in enumerate(res):
     if bok and not iok:
         print(f"    image miss q{i}: gold={g} text={b} image={im}")

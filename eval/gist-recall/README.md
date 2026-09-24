@@ -75,5 +75,17 @@ python3 gen2.py && node render2.mjs && python3 run2.py && python3 grade2.py  # t
 python3 gen3.py && node render3.mjs && python3 run3.py && python3 grade3.py  # tier 3
 ```
 
+To score a different model at its own shipped geometry, re-render the three
+corpora first and set `MODEL` for the runners (each `run*.py` preflight-aborts
+if `work*/render.meta.json` was rendered for another model):
+
+```bash
+MODEL=claude-opus-5-5 node render_model.mjs            # work, work2, work3
+MODEL=claude-opus-5-5 python3 run.py  && python3 grade.py  work/results_claude-opus-5-5.jsonl
+MODEL=claude-opus-5-5 python3 run2.py && python3 grade2.py work2/results_claude-opus-5-5.jsonl
+MODEL=claude-opus-5-5 python3 run3.py && python3 grade3.py work3/results_claude-opus-5-5.jsonl
+```
+
 Needs the claude CLI on a plan with fable-5 access and a built `dist/`
-(`pnpm run build`). Raw model answers are in `work*/results.jsonl`.
+(`pnpm run build`). Raw model answers are in `work*/results.jsonl`
+(per-model runs write `work*/results_<model>.jsonl`).

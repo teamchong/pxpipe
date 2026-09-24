@@ -1,10 +1,81 @@
 # FINDINGS — pxpipe (text→PNG token compression)
 
 **Status:** ⚠️ **VERDICT REVERSED — see correction below.** Originally ruled "dead"; live measurement shows pxpipe is a working *lossy gist-compressor* saving ~68% on real (dense) Claude Code traffic, with a known verbatim-recall gap.
-**Date:** 2026-05-28 (original) · 2026-05-29 (correction) · 2026-06-09 (Fable 5 update) · 2026-06-10 (gist-recall A/B, SWE-bench pilot) · 2026-06-12 (field observation, n=1) · 2026-06-23 (reframe: correct baseline = /compact) · 2026-07-09 (GPT-5.6 Sol raw-recall pilot) · 2026-07-19 (K/H glyph-surgery model-level A/B)
-**Models tested:** `claude-opus-4-5` (original run), `claude-opus-4-8` (re-test after a model bump), `claude-fable-5` (2026-06-09), `gpt-5.6-sol` (2026-07-09 raw-image pilot), `claude-opus-5` (2026-07-20 default-scope evaluation)
+**Date:** 2026-05-28 (original) · 2026-05-29 (correction) · 2026-06-09 (Fable 5 update) · 2026-06-10 (gist-recall A/B, SWE-bench pilot) · 2026-06-12 (field observation, n=1) · 2026-06-23 (reframe: correct baseline = /compact) · 2026-07-09 (GPT-5.6 Sol raw-recall pilot) · 2026-07-19 (K/H glyph-surgery model-level A/B) · 2026-09-23 (Claude Opus 5.5 full suite)
+**Models tested:** `claude-opus-4-5` (original run), `claude-opus-4-8` (re-test after a model bump), `claude-fable-5` (2026-06-09), `gpt-5.6-sol` (2026-07-09 raw-image pilot), `claude-opus-5` (2026-07-20 default-scope evaluation), `claude-opus-5-5` (2026-09-23 full suite)
 **Model scope (current):** Fable 5, Gemini 3.6 Flash, and Gemini 3.7 Flash. Opus 5, Sol, GPT 5.5, and Grok remain explicit opt-ins.
 **Harnesses:** Claude/Opus/Fable: `eval/needle-haystack/` (older receipts preserved from `/tmp/needle_eval`); Sol: `eval/sol-profile/` (raw responses and receipts committed)
+
+---
+
+## Update (2026-09-23): `claude-opus-5-5` measured on the full suite
+
+**Verdict: stays on the legible 14px/172-col history profile and stays opt-in.
+On the one comparison at identical pixels (dense hex), Opus 5.5 reads better
+than Opus 5 (5/15 vs 2/15) and far worse than Fable 5 (13/15), so it does not
+earn Fable's dense geometry. At its own shipped profile it is at or near ceiling
+on arithmetic, gist, state, and the never-stated guard.**
+
+### Scores, side by side
+
+Same harnesses as the Fable 5.1 row (#272), but not the same pixels on every
+suite:
+
+- **Dense hex** reads the committed `eval/verbatim-15/` pages (Spleen 5x8,
+  312 cols), the same pages the Fable 5, Fable 5.1, and Opus 5 numbers came
+  from. This is the only model-vs-model comparison at identical pixels.
+- **Arithmetic, gist, state, never-stated** read renders at opus-5-5's shipped
+  profile (`CLAUDE_LEGIBLE_PROFILE`: `jetbrains-mono-14`, 172 cols, 1556x728 px
+  pages). The other three columns were read at Spleen 5x8, 312 cols, so a gap
+  on these rows mixes model and geometry.
+
+| suite | pixels | `claude-fable-5` | `claude-fable-5-1` | `claude-opus-5` | `claude-opus-5-5` |
+|---|---|---:|---:|---:|---:|
+| arithmetic, novel numbers (N=100) | each model's profile | 100/100 | 100/100 | 100/100 | **100/100** on text, pure image, and image+factsheet |
+| gist recall (N=98) | each model's profile | 98/98 | 95/98 | 94/98 | **97/98** |
+| state tracking (N=18) | each model's profile | 18/18 | 18/18 | 17/18 | **18/18** |
+| never-stated guard (N=16, lower is better) | each model's profile | 0/16 | 0/16 | 0/16 | **0/16** |
+| dense hex verbatim (N=15) | identical | 13/15 | 6/15 | 2/15 | **5/15** |
+
+Receipts: [`eval/sol-profile/model-claude-opus-5-5-novel-arithmetic-results.json`](eval/sol-profile/model-claude-opus-5-5-novel-arithmetic-results.json)
+(text, pure image, and image+factsheet arms with token counts, same runner as the
+Fable 5.1 row), [`eval/gsm8k/results_claude-opus-5-5_novel.json`](eval/gsm8k/results_claude-opus-5-5_novel.json)
+(independent 2-arm run, all 100 pred/gold pairs, agrees),
+[`eval/gist-recall/work*/results_claude-opus-5-5.jsonl`](eval/gist-recall/),
+[`eval/verbatim-15/results_claude-opus-5-5.jsonl`](eval/verbatim-15/results_claude-opus-5-5.jsonl)
+(gold, got, and hit for all 15 trials).
+
+### Reading the misses
+
+- **Gist 97/98.** The single miss is tier 2, session 0, the "which package was
+  chosen" decision probe. The model answered UNKNOWN. It did not pick the
+  praised-elsewhere distractor, so this is an abstain, not a wrong answer.
+- **Never-stated 0/16.** One tier-1 image answer is `UNKNOWN` followed by a note
+  claiming only 9 of the session's 10 pages were attached. All 10 PNGs exist
+  and all 10 paths are in the prompt, so the model stopped one page short. The
+  strict grader (`answer == "unknown"`) flags the note as a confab. It is scored
+  here as 0, the same call the `claude-fable-5-1` row made for its identical
+  case. Cause not investigated.
+- **Dense hex 5/15.** 5 exact, 4 near (1 or 2 glyph positions wrong), 6 wrong
+  row, 0 abstains. Opus 5.5 still guesses rather than declines when it cannot
+  resolve a glyph, which is why non-Fable Claude ids ship on the legible profile.
+
+### What changes
+
+Nothing in code. `resolveClaudeProfile('claude-opus-5-5')` already returns
+`CLAUDE_LEGIBLE_PROFILE`, the geometry the non-hex suites above were read at.
+Opus 5.5 is not in the default scope. The allowlist matches an entry and any
+`<entry>-*` id, so `PXPIPE_MODELS=claude-opus-5` and the dashboard's "Opus 5"
+chip also enable `claude-opus-5-5`. There is no separate Opus 5.5 chip.
+
+Capacity at that profile, measured by `scripts/gen-context-chart.ts` on
+2026-09-24: 5.3 chars per vision token, about 1.3× text in a 1M window. Fable's
+dense pages measure about 19, or 4.7×. Opus 5 resolves to the same profile, so
+the README's earlier ~4.7× for Opus 5 (measured before the Aug 2026 legible
+default) is corrected to ~1.3× in this change.
+
+Not measured: Opus 5.5 gist and arithmetic at Spleen 5x8, 312 cols. That run
+would isolate the model effect on the non-hex rows.
 
 ---
 

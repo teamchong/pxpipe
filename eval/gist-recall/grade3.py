@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-import json, re, collections
-res = [json.loads(l) for l in open('work3/results.jsonl')]
+import json, re, collections, sys
+res = [json.loads(l) for l in open(sys.argv[1] if len(sys.argv) > 1 else 'work3/results.jsonl')]
 def norm(s): return re.sub(r'\s+', ' ', s.strip().lower())
 def correct(p):
     a, g, t = norm(p['answer']), norm(p['gold']), p['type']

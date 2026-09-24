@@ -122,9 +122,10 @@ without running the proxy.
 <details>
 <summary><strong>Model support and rendering details</strong></summary>
 
-- **`claude-opus-5`:** weaker recall than Fable 5 (verbatim **2/15 vs 13/15**), good
-  enough otherwise (100/100 arithmetic, 0/16 never-stated), **~4.7×** context before
-  `/compact`. Suggested effort: **medium**. Details: [FINDINGS.md](FINDINGS.md).
+- **`claude-opus-5`:** weaker recall than Fable 5 (verbatim **2/15 vs 13/15**), so it
+  ships the legible 14px/172-col profile, which holds about **1.3×** text in context
+  (Fable's dense pages hold ~4.7×). Good enough otherwise (100/100 arithmetic, 0/16
+  never-stated). Suggested effort: **medium**. Details: [FINDINGS.md](FINDINGS.md).
 - **Model scope:** default `PXPIPE_MODELS=claude-fable-5,gemini`. The `gemini`
   base covers every Gemini id (3.6/3.7/3.8 Flash, Pro, 4, 5, and future
   versions); to opt Gemini out, drop `gemini` from `PXPIPE_MODELS` or click the
@@ -144,7 +145,8 @@ without running the proxy.
   `PXPIPE_GPT_HISTORY_MAX_IMAGES=48` after validating the provider's request cap.
 - **Per-model rendering:** opt-in `gpt-5.6-sol` and Grok use native 14px
   JetBrains Mono glyphs in a 9×16 cell, 84 columns, and a 764px full-width
-  strip; Claude keeps its 312-column, 1568×728 5×8 Spleen profile. These
+  strip; Fable keeps its 312-column, 1568×728 5×8 Spleen profile, and other
+  Claude ids (Opus 5, Opus 5.5) use 14px JetBrains Mono at 172 columns. These
   are selected by exact model id, including history pages and profitability
   math. Recognized IDs can ride in the bounded factsheet, and
   recent/open tool state stays native.
@@ -167,15 +169,16 @@ on that test; it does not mean zero. Arithmetic uses novel random-number
 problems. Gist, state, and never-stated probes share one corpus. Never-stated
 is confabulations, so lower is better. The **numbers at** column is the render
 geometry the row's scores were measured at; a model's shipped profile can
-differ (Sol and Qwen ship the measured 14px/84 geometry, but their broad-suite
-numbers predate it).
+differ (Sol and Qwen ship 14px/84 and Opus 5 ships 14px/172, but their
+broad-suite numbers predate those profiles).
 
 | model | numbers at | arithmetic (N=100) | gist (N=98) | state (N=18) | never-stated (N=16) | dense hex (N=15) | profile provenance and receipts |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
 | `claude-fable-5` | Spleen 5×8, 312 cols (shipped) | **100/100** | **98/98** | **18/18** | **0/16** | 13/15 | June 2026 production profiles: [arithmetic + hex](FINDINGS.md), [gist/state/guards](eval/gist-recall/) |
 | `claude-fable-5-1` | Spleen 5×8, 312 cols (Fable 5 profile) | **100/100** | 95/98 | **18/18** | **0/16** | 6/15 | Fable 5 profile, no geometry of its own; 3 gist misses are image-arm negation flags answered UNKNOWN (0 confabs). Same-day Fable 5 control on the identical harness/PNGs reproduced 100/100 arithmetic and 30/30 tier-2 gist, so the gist/hex gap is the model, not the harness (hex control not rerun): [arithmetic](eval/sol-profile/), [dense hex](eval/verbatim-15/), [gist/state/guards](eval/gist-recall/) |
 | `google/gemini-3.6-flash`, `3.7-flash` | Spleen 5×8, 312 cols (shipped) | **100/100** | **98/98** | **18/18** | **0/16** | **14/15** | current shipped profile: [quality results](eval/gemini-profile/QUALITY_RESULTS.md) |
-| `claude-opus-5` | Spleen 5×8, 312 cols (shipped) | **100/100** | 94/98 | 17/18 | **0/16** | 2/15 | current profile: [arithmetic](eval/gsm8k/), [gist/state/guards](eval/gist-recall/), [dense hex](eval/verbatim-15/) |
+| `claude-opus-5` | Spleen 5×8, 312 cols; **ships 14px/172** | **100/100** | 94/98 | 17/18 | **0/16** | 2/15 | broad suite predates the legible 14px/172 default (Aug 2026): [arithmetic](eval/gsm8k/), [gist/state/guards](eval/gist-recall/), [dense hex](eval/verbatim-15/) |
+| `claude-opus-5-5` | JetBrains Mono 14px, 172 cols (shipped legible profile); hex on the shared Spleen 312-col fixture | **100/100** | 97/98 | **18/18** | **0/16** | 5/15 | 2026-09-23, same harnesses as the Fable 5.1 row. Only dense hex shares that row's pixels; the other suites read the 14px profile opus-5-5 ships. The 1 gist miss is an UNKNOWN abstain; hex misses are 4 near (1 or 2 glyphs) and 6 wrong, 0 abstains. Opt-in: `PXPIPE_MODELS=claude-opus-5` (the Opus 5 chip) also covers it: [arithmetic](eval/sol-profile/) ([gsm8k](eval/gsm8k/) agrees), [gist/state/guards](eval/gist-recall/), [dense hex](eval/verbatim-15/results_claude-opus-5-5.jsonl), [findings](FINDINGS.md) |
 | `gpt-5.6-sol` | Spleen 5×8, 152 cols; **ships 14px/84** | 98/100 | 83/98 | 17/18 | 4/16 | 0/15 | broad suite predates the shipped 14px profile; 14px pilot: 7/8 exact, 0 inventions, gist/guard pass: [pilot](eval/sol-profile/README.md) |
 | `claude-opus-4-8` | Spleen 5×8, 312 cols (historical) | 93/100 | 77/98 | **18/18** | **0/16** | 0/15 | historical profile: [arithmetic](eval/gsm8k/), [gist/state/guards](eval/gist-recall/), [dense hex](eval/needle-haystack/) |
 | `grok-4.5` | JetBrains Mono 14px, 84 cols (shipped) | **100/100** | **97/98** | 17/18 | **0/16** | 0/15 | native 14px/84 quality suite (live profile); [quality](eval/grok-density/QUALITY_RESULTS.md), [native-sweep](eval/grok-density/native-sweep/RESULTS.md) |
@@ -230,7 +233,7 @@ chars/vision-token ÷ 4 (prose text baseline). Not a model-quality score.
 |---|---:|---:|---:|---:|---:|
 | **`claude-fable-5[1m]`** (default) | 1M | ~4.0M | **~18.9M** | ~18.9 c/vt (exact 28px patches) | **~4.7×** |
 | **`google/gemini-3.6-flash`** | 1M | ~4.0M | **~20.1M** | ~20.1 c/vt (1,078 tok/page) | **~5.0×** |
-| **`claude-opus-5`** | 1M | ~4.0M | **~18.9M** | ~18.9 c/vt (resolves to Fable 5’s geometry) | **~4.7×** |
+| **`claude-opus-5`**, `claude-opus-5-5` | 1M | ~4.0M | **~5.3M** | ~5.3 c/vt (legible 14px/172-col profile) | **~1.3×** |
 
 Regenerate: `npx tsx scripts/gen-context-chart.ts` · chart PNG
 [`docs/assets/context-window-chars.png`](docs/assets/context-window-chars.png).

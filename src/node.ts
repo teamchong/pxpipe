@@ -14,7 +14,9 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import { isIP } from 'node:net';
 import { spawnSync } from 'node:child_process';
-import { createProxy, parseGatewayHeaders, resolveUpstreams, type ProxyConfig } from './core/proxy.js';
+import { parseGatewayHeaders, resolveUpstreams, type ProxyConfig } from './core/proxy.js';
+import { createProviderRouter } from './core/provider-router.js';
+import { buildCodexProxyConfig } from './core/codex.js';
 import {
   chatCompletionsUrl,
 } from './core/messages-chat-bridge.js';
@@ -1331,7 +1333,19 @@ async function main(): Promise<void> {
       tracker.emit(toTrackEvent(e));
     },
   };
-  const handle = createProxy(config);
+  // Codex uses ChatGPT OAuth plus the Responses API. Give it an isolated route
+  // so ordinary OpenAI/API-key traffic keeps its configured upstream while the
+  // caller's own ChatGPT bearer remains untouched. Both bases point at
+  // chatgpt.com: `/backend-api/codex/responses` is transformed by core, while
+  // native `/responses/compact` and `/models` pass through byte-for-byte.
+  const handle = createProviderRouter({
+    defaultProxy: config,
+    providers: [{
+      id: 'codex',
+      protocol: 'openai',
+      proxy: buildCodexProxyConfig(config),
+    }],
+  });
 
   const server = createServer((req, res) => {
     Promise.resolve()

@@ -76,6 +76,47 @@ function stubFetch(capture: { url?: string; headers?: Headers }) {
   }) as typeof fetch;
 }
 
+describe('upstream that already ends with a provider segment', () => {
+  const BASE = 'http://harness.example.test/anthropic';
+  const send = (path: string) =>
+    createProxy({ upstream: BASE })(
+      new Request(`http://localhost${path}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'claude-fable-5', max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] }),
+      }),
+    );
+
+  it('does not double the segment for a prefixed path, and still appends an unprefixed one', async () => {
+    const cap: { url?: string } = {};
+    stubFetch(cap);
+    expect((await send('/anthropic/v1/messages')).status).toBe(200);
+    expect(cap.url).toBe(`${BASE}/v1/messages`);
+    expect((await send('/v1/messages')).status).toBe(200);
+    expect(cap.url).toBe(`${BASE}/v1/messages`);
+  });
+
+  it('probes count_tokens at the same deduped path as the forward', async () => {
+    const probed: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/count_tokens')) {
+        probed.push(url);
+        return new Response(JSON.stringify({ input_tokens: 1 }), {
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response(
+        JSON.stringify({ type: 'message', content: [], usage: { input_tokens: 1, output_tokens: 1 } }),
+        { headers: { 'content-type': 'application/json' } },
+      );
+    }) as typeof fetch;
+    expect((await send('/anthropic/v1/messages')).status).toBe(200);
+    expect(probed.length).toBeGreaterThan(0);
+    for (const url of probed) expect(url).toBe(`${BASE}/v1/messages/count_tokens`);
+  });
+});
+
 describe('gateway end-to-end routing (stubbed fetch)', () => {
   const proxy = () =>
     createProxy({

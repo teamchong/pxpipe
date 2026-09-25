@@ -261,3 +261,23 @@ export function peekSessionState(
   const rec = sessions.get(sessionKey);
   return rec ? { ...rec } : undefined;
 }
+
+/** Harness envelopes a client injects ahead of the user's own words. */
+const ENVELOPE_RE = /^<(system-notice|system-reminder)>[\s\S]*<\/\1>$/;
+
+/**
+ * Pick the text that identifies a conversation, from the text blocks of its
+ * opening user turn(s) in order (everything before the first assistant message).
+ *
+ * Blocks that are wholly a harness envelope are skipped: they are boilerplate
+ * the client injects into every session (omp opens each one with the same
+ * `<system-notice>` device inventory; Claude Code with the project's CLAUDE.md
+ * `<system-reminder>`), so keying on them merges every concurrent session into
+ * one record, and each session's cache outcomes then re-cut the others' history
+ * grids. The first non-envelope block is the user's own prompt. When every block
+ * is an envelope, the first one is still better than no key. Capped at 4 KiB.
+ */
+export function sessionAnchorText(texts: readonly string[]): string {
+  const anchor = texts.find((t) => t.trim() !== '' && !ENVELOPE_RE.test(t.trim())) ?? texts[0] ?? '';
+  return anchor.slice(0, 4096);
+}

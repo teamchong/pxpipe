@@ -17,6 +17,25 @@ behavioral changes, patch = fixes).
   allowlist is the only gate. Dashboard: one "Gemini (all versions)" chip plus
   per-version chips for narrowing.
 
+### Fixed
+- **Concurrent sessions no longer share one cache record.** `first_user_sha8`
+  hashed the first text block of the first user message, which for omp is the
+  same `<system-notice>` device inventory in every session (and for Claude Code
+  the project's CLAUDE.md `<system-reminder>`). Every session in the project
+  collapsed onto one key, so one session's `cache_create`/`cache_read` outcomes
+  and freeze step drove the others' history-grid decisions: pages re-cut and
+  re-keyed the image prefix as `cache_create`. The key now skips blocks that
+  are wholly a `<system-notice>`/`<system-reminder>` envelope and uses the
+  first prompt text before the first assistant turn. Dashboard session groups
+  and the Claude Code transcript map use the same rule; events logged before
+  the fix keep their old keys.
+- **Savings are measured again when the upstream ends in `/anthropic`.** The
+  baseline `count_tokens` probe appended the client's `/anthropic/v1/messages`
+  path to an `ANTHROPIC_UPSTREAM` that already ended in `/anthropic`, so it hit
+  `…/anthropic/anthropic/v1/messages/count_tokens` and got a 403. Every row
+  logged `baseline_probe_status: "failed"` and the dashboard reported 0% fewer
+  tokens. The probe now joins the path the same way the main forward does.
+
 ## 0.13.2 — 2026-08-18
 
 ### Added

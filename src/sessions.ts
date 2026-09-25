@@ -5,7 +5,8 @@
  * ## Why we group by first_user_sha8 (Path B)
  *
  * Every TrackEvent carries `first_user_sha8` (see src/core/tracker.ts), an
- * sha256 prefix of the conversation's first user message. Within a single
+ * sha256 prefix of the conversation's first prompt (harness envelopes skipped;
+ * see src/core/session-state.ts:sessionAnchorText). Within a single
  * Claude Code session that hash is stable across every turn; across two
  * different sessions it is virtually never the same. That makes it a
  * better-than-good-enough session key without coupling pxpipe to Claude
@@ -34,6 +35,7 @@ import {
   computeBaselineInputEffWithCacheTier,
   deriveBaselineWarmth,
 } from './core/baseline.js';
+import { sessionAnchorText } from './core/session-state.js';
 
 // ---- Types -----------------------------------------------------------------
 
@@ -525,10 +527,10 @@ export function claudeProjectsDir(): string {
 }
 
 /**
- * Compute the sha256 prefix the proxy uses for `first_user_sha8` (see
- * src/core/transform.ts:firstUserText + sha8). Crucially this must match
- * exactly — same 4 KiB cap, same first-8-hex-char prefix — or the map will
- * silently miss every entry.
+ * Compute the sha256 prefix the proxy uses for `first_user_sha8` from the
+ * anchor text (see src/core/session-state.ts:sessionAnchorText + sha8).
+ * Crucially this must match exactly — same 4 KiB cap, same first-8-hex-char
+ * prefix — or the map will silently miss every entry.
  */
 export function fingerprintFirstUser(text: string): string {
   const trimmed = text.slice(0, 4096);
@@ -536,9 +538,9 @@ export function fingerprintFirstUser(text: string): string {
   return hash.slice(0, 8);
 }
 
-/** Pull the first user message text out of a single Claude Code session
- *  JSONL file. Walks the file line by line and stops at the first row with
- *  `type === 'user'` that has parseable user content. */
+/** Pull the session anchor text out of a single Claude Code session JSONL
+ *  file: the text blocks of every user row before the first assistant row,
+ *  reduced by the same `sessionAnchorText` rule the proxy applies. */
 export async function readFirstUserFromClaudeSession(
   filePath: string,
 ): Promise<string | undefined> {
@@ -558,6 +560,7 @@ export async function readFirstUserFromClaudeSession(
     /* swallow — the iterator will end with no rows */
   });
   const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  const texts: string[] = [];
   try {
     for await (const line of rl) {
       if (!line.trim()) continue;
@@ -569,17 +572,16 @@ export async function readFirstUserFromClaudeSession(
       }
       if (!row || typeof row !== 'object') continue;
       const r = row as Record<string, unknown>;
+      if (r.type === 'assistant') break;
       if (r.type !== 'user') continue;
       const msg = r.message;
-      if (!msg || typeof msg !== 'object') {
-        // Older Claude Code format: content may live at the top level.
-        const content = r.content;
-        if (typeof content === 'string') return content;
-        return undefined;
-      }
-      const content = (msg as Record<string, unknown>).content;
-      if (typeof content === 'string') return content;
-      if (Array.isArray(content)) {
+      const content =
+        msg && typeof msg === 'object'
+          ? (msg as Record<string, unknown>).content
+          : r.content; // Older Claude Code format: content may live at the top level.
+      if (typeof content === 'string') {
+        texts.push(content);
+      } else if (Array.isArray(content)) {
         for (const block of content) {
           if (
             block &&
@@ -587,18 +589,18 @@ export async function readFirstUserFromClaudeSession(
             (block as Record<string, unknown>).type === 'text'
           ) {
             const t = (block as Record<string, unknown>).text;
-            if (typeof t === 'string') return t;
+            if (typeof t === 'string') texts.push(t);
           }
         }
       }
-      // Found a user row but couldn't read it — give up on this file so we
-      // don't accidentally hash a later message and produce a wrong mapping.
-      return undefined;
+      // First user row unreadable — give up on this file so we don't hash a
+      // later message and produce a wrong mapping.
+      if (texts.length === 0) return undefined;
     }
   } finally {
     stream.close();
   }
-  return undefined;
+  return texts.length > 0 ? sessionAnchorText(texts) : undefined;
 }
 
 /** Convert Claude Code's project directory encoding back to a path. The

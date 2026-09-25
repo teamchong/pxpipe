@@ -45,19 +45,17 @@ function bodyWithHistory(model: string): Uint8Array {
 }
 
 describe('per-content-class render geometry', () => {
-  it('ships legible history for misread-prone Claude models by default', () => {
-    // Measured: Opus 3/26 exact at dense geometry, 100/100 at 172 cols
-    // jetbrains-mono-14. Fable read 25/26 at dense, so it keeps the 5.28x
-    // geometry; non-Claude families are untouched by this PR.
-    const opus = resolveGptProfile('claude-opus-5');
-    expect(opus.stripCols).toBe(172);
-    expect(opus.style.font).toBe('jetbrains-mono-14');
-    expect(opus.historyStripCols).toBe(172);
-    expect(opus.historyStyle?.font).toBe('jetbrains-mono-14');
-
-    const sonnet = resolveGptProfile('claude-sonnet-4-5');
-    expect(sonnet.stripCols).toBe(172);
-    expect(sonnet.style.font).toBe('jetbrains-mono-14');
+  it('ships spaced 5x8 for non-Fable Claude models by default', () => {
+    // Measured: Opus 5.5 at spaced 5x8 (312 cols, +2px rows) read 93/98 gist,
+    // 0/16 confabulations. Fable keeps the bare dense cell (98/98).
+    for (const m of ['claude-opus-5', 'claude-opus-5-5', 'claude-sonnet-4-5']) {
+      const p = resolveGptProfile(m);
+      expect(p.stripCols, m).toBe(312);
+      expect(p.style.font, m).toBe('spleen-5x8');
+      expect(p.style.cellHBonus, m).toBe(2);
+      expect(p.historyStyle?.cellHBonus, m).toBe(2);
+    }
+    expect(resolveGptProfile('claude-fable-5').style.cellHBonus ?? 0).toBe(0);
     for (const m of ['claude-fable-5', 'gpt-5.6-sol', 'moonshotai/kimi-k3']) {
       const p = resolveGptProfile(m);
       expect(p.historyStripCols, `${m} must stay dense by default`).toBeUndefined();
@@ -95,9 +93,9 @@ describe('per-content-class render geometry', () => {
     expect(afterOpus.historyStripCols).toBe(100);
   });
 
-  it('renders history at the legible geometry by default, costing more image tokens for the same text', async () => {
+  it('renders history at the spaced geometry by default, never fewer pages for the same text', async () => {
     // No env override on either side: this pins the SHIPPED defaults.
-    // Fable keeps dense history; Opus gets legible out of the box.
+    // Fable keeps dense history; Opus gets spaced rows out of the box.
     const dense = await transformAnthropicMessages({
       body: bodyWithHistory('claude-fable-5'),
       model: 'claude-fable-5',
@@ -112,9 +110,8 @@ describe('per-content-class render geometry', () => {
     });
     expect(legible.applied, legible.reason).toBe(true);
 
-    // Same source text, larger glyphs: more pages. Legibility is bought with
-    // image tokens, and for misread-prone models the default buys it.
-    expect(legible.info.collapsedImages ?? 0).toBeGreaterThan(denseImages);
+    // Same source text, taller rows: at least as many pages.
+    expect(legible.info.collapsedImages ?? 0).toBeGreaterThanOrEqual(denseImages);
     expect(legible.info.collapsedChars).toBe(dense.info.collapsedChars);
   });
 

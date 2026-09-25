@@ -8,6 +8,7 @@ import {
   type SessionsPaths,
 } from '../src/sessions.js';
 import type { TrackEvent } from '../src/core/tracker.js';
+import { transformRequest } from '../src/core/transform.js';
 
 // ---- Test scaffolding ------------------------------------------------------
 
@@ -426,6 +427,29 @@ describe('Claude Code session map', () => {
     expect(ref!.sessionId).toBe('abc-123');
     expect(ref!.projectPath).toBe('/Users/me/code/pxpipe');
     expect(ref!.firstUserPreview).toContain('hello');
+  });
+
+  it('matches the proxy key when the transcript opens with a CLAUDE.md reminder', async () => {
+    const root = makeCCRoot();
+    const proj = path.join(root, '-Users-me-bar');
+    fs.mkdirSync(proj, { recursive: true });
+    const reminder = '<system-reminder>\n# claudeMd\nrules\n</system-reminder>';
+    const messages = [
+      { role: 'user', content: [{ type: 'text', text: reminder }, { type: 'text', text: 'ship it' }] },
+    ];
+    fs.writeFileSync(
+      path.join(proj, 'sess-r.jsonl'),
+      [
+        JSON.stringify({ type: 'user', message: messages[0] }),
+        JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: 'ok' } }),
+      ].join('\n') + '\n',
+    );
+    const { info } = await transformRequest(
+      new TextEncoder().encode(JSON.stringify({ model: 'claude', messages, system: 'x\n'.repeat(400) })),
+    );
+    const ref = (await claudeCodeMap(root)).get(info.firstUserSha8!);
+    expect(ref?.sessionId).toBe('sess-r');
+    expect(ref?.firstUserPreview).toContain('ship it');
   });
 
   it('parses content-array blocks (the modern Claude Code shape)', async () => {

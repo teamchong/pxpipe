@@ -84,40 +84,38 @@ export const CLAUDE_LEGACY_PROFILE: GptModelProfile = {
 };
 
 /**
- * Legible collapsed-history geometry, DEFAULT for every Claude model except
- * Fable. Measured (PR #170, 26-value exact-recall battery, ground truth
- * withheld): at the dense 312-col spleen-5x8 geometry Fable 5 read 25/26
- * exactly while Opus 5 read 3/26 with 10 SILENTLY wrong; at 172 cols
- * jetbrains-mono-14 Opus read 100/100. 172 cols at this font still fits
- * 1568x728, so nothing is downscaled. Cost on live transcript: dense is 5.28x
- * cheaper than text, legible 1.47x — still a saving, so misread-prone models
- * get legibility by default rather than behind a flag. Uses unified 14px
- * JetBrains Mono @ 172 cols across all page types (slabs, tools, and history).
+ * Spaced geometry, DEFAULT for every Claude model except Fable: the same
+ * 312-col spleen-5x8 cell with 2 px of extra row height.
+ *
+ * Opus 5.5 gist recall (eval/gist-recall, 98 answerable, image arm):
+ *
+ *   dense 5x8          84/98   2.31x cheaper than text
+ *   5x8 +2px rows      93/98   1.85x
+ *   jetbrains-mono-14  --      0.54-0.92x (costs MORE than text on this corpus)
+ *
+ * 0/16 confabulations at every geometry. Bare 5x8 glyphs are not the problem
+ * (sparse ids 99.9% per char); misses came from crowded rows. The 14px profile
+ * this replaces was legible but no longer saved tokens, so it was dropped.
  */
-export const CLAUDE_HISTORY_STRIP_COLS = 172;
-const CLAUDE_HISTORY_STYLE: GptRenderStyle = {
+const CLAUDE_SPACED_STYLE: GptRenderStyle = {
   ...BASE_STYLE,
-  font: 'jetbrains-mono-14',
+  cellHBonus: 2,
 };
 
-export const CLAUDE_LEGIBLE_PROFILE: GptModelProfile = {
+export const CLAUDE_SPACED_PROFILE: GptModelProfile = {
   ...CLAUDE_PROFILE,
-  stripCols: CLAUDE_HISTORY_STRIP_COLS,
-  style: { ...CLAUDE_HISTORY_STYLE },
-  historyStripCols: CLAUDE_HISTORY_STRIP_COLS,
-  historyStyle: { ...CLAUDE_HISTORY_STYLE },
+  style: { ...CLAUDE_SPACED_STYLE },
+  historyStyle: { ...CLAUDE_SPACED_STYLE },
 };
 
-export const CLAUDE_LEGACY_LEGIBLE_PROFILE: GptModelProfile = {
+export const CLAUDE_LEGACY_SPACED_PROFILE: GptModelProfile = {
   ...CLAUDE_LEGACY_PROFILE,
-  stripCols: CLAUDE_HISTORY_STRIP_COLS,
-  style: { ...CLAUDE_HISTORY_STYLE },
-  historyStripCols: CLAUDE_HISTORY_STRIP_COLS,
-  historyStyle: { ...CLAUDE_HISTORY_STYLE },
+  style: { ...CLAUDE_SPACED_STYLE },
+  historyStyle: { ...CLAUDE_SPACED_STYLE },
 };
 
-/** Fable is the only Claude family measured accurate at dense geometry, so it
- *  alone keeps the 5.28x dense rendering for history. */
+/** Fable is the only Claude family measured accurate at bare dense geometry
+ *  (98/98 gist), so it alone keeps the unspaced 5x8 cell. */
 export function isFableClaude(model: string): boolean {
   return model.toLowerCase().includes('fable');
 }
@@ -153,13 +151,11 @@ export function isPre47Claude(m: string): boolean {
 
 /** Pick the Claude profile for an id. Billing geometry is identical across
  *  opus/sonnet/haiku/fable; HISTORY geometry is not, because verbatim recall
- *  at dense geometry is a per-model property (see CLAUDE_LEGIBLE_PROFILE).
- *  Fable keeps dense history; every other Claude id gets legible history by
- *  default. Unmeasured families (sonnet/haiku) get legible too: a misread is
- *  silent, an extra 0.68x-of-text render cost is not. */
+ *  at dense geometry is a per-model property (see CLAUDE_SPACED_PROFILE).
+ *  Fable keeps bare dense; every other Claude id gets spaced rows. */
 export function resolveClaudeProfile(m: string): GptModelProfile {
   if (isFableClaude(m)) {
     return isPre47Claude(m) ? CLAUDE_LEGACY_PROFILE : CLAUDE_PROFILE;
   }
-  return isPre47Claude(m) ? CLAUDE_LEGACY_LEGIBLE_PROFILE : CLAUDE_LEGIBLE_PROFILE;
+  return isPre47Claude(m) ? CLAUDE_LEGACY_SPACED_PROFILE : CLAUDE_SPACED_PROFILE;
 }

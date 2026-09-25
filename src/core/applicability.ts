@@ -26,7 +26,9 @@ function baseModelId(model: string): string {
 /** Dashboard runtime override; null = fall back to PXPIPE_MODELS env / built-in default. In-memory only. */
 let runtimeModelBases: readonly string[] | null = null;
 
-/** Built-in default scope when PXPIPE_MODELS is unset: Fable 5, Gemini 3.6 Flash, and Gemini 3.7 Flash.
+/** Built-in default scope when PXPIPE_MODELS is unset: Fable 5, Opus 5.5, Gemini 3.6 Flash, and Gemini 3.7 Flash.
+ *  Opus 5.5 is on at the spaced 5x8 profile: 93/98 gist, 0/16 confabulations,
+ *  100/100 arithmetic (CLAUDE_SPACED_PROFILE).
  *  Everything else is opt-in via dashboard chips or PXPIPE_MODELS:
  *  - Opus 4.7/4.8 — worse at reading imaged content (FINDINGS.md 2026-06-16:
  *    Opus 4.8 ~2pp arithmetic, 6/15 dense-hex vs Fable 100/100).
@@ -49,7 +51,7 @@ let runtimeModelBases: readonly string[] | null = null;
  *  is the ordinary path — drop `gemini` from PXPIPE_MODELS or click the chip off —
  *  which only works because the Google gate in proxy.ts/dashboard.ts consults
  *  this list and nothing else. */
-export const DEFAULT_MODEL_BASES = ['claude-fable-5', 'gemini'];
+export const DEFAULT_MODEL_BASES = ['claude-fable-5', 'claude-opus-5-5', 'gemini'];
 
 function falsey(v: string): boolean {
   return /^(0|false|no|off|none)$/i.test(v.trim());

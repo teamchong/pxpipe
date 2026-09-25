@@ -67,16 +67,57 @@ export interface GoogleGenerateContentRequest {
   [key: string]: unknown;
 }
 
-const GOOGLE_ROUTE = /^\/google-ai-studio\/(?:v1|v1beta)\/models\/([^/:]+):(generateContent|streamGenerateContent)$/;
-const CLOUDCODE_PA_INFERENCE_ROUTE = /^\/v1internal:(?:generateContent|streamGenerateContent)$/;
+const GOOGLE_ROUTE = /^(?:\/google-ai-studio)?\/(?:v1|v1beta)\/models\/([^/:]+):(generateContent|streamGenerateContent)$/;
+/** Cloud Code internal API (Antigravity, Gemini CLI, Gemini Code Assist):
+ *  `POST /v1internal:streamGenerateContent` on cloudcode-pa.googleapis.com. The
+ *  model is not in the path; it lives in the body next to a wrapped request. */
+const GOOGLE_INTERNAL_ROUTE = /^(?:\/[a-z0-9][a-z0-9._-]*)?\/v1internal:(generateContent|streamGenerateContent)$/;
+
+/** Wrapper keys the Cloud Code API and countTokens use around a generateContent body. */
+const GOOGLE_WRAPPER_KEYS = ['request', 'generateContentRequest'] as const;
 
 export function parseGoogleModelFromPath(pathname: string): string | null {
   const match = GOOGLE_ROUTE.exec(pathname);
   return match && match[1] ? match[1] : null;
 }
 
+export function isGoogleInternalPath(pathname: string): boolean {
+  return GOOGLE_INTERNAL_ROUTE.test(pathname);
+}
+
+/** Unwrap a Cloud Code envelope: `{ model, project, request: {...} }`. Returns the
+ *  wrapper key and inner request, or null when the body is a bare request. */
+export function unwrapGoogleRequest(
+  body: Record<string, unknown>,
+): { key: string; inner: Record<string, unknown> } | null {
+  if (Array.isArray(body.contents)) return null;
+  for (const key of GOOGLE_WRAPPER_KEYS) {
+    const inner = body[key];
+    if (inner && typeof inner === 'object' && !Array.isArray(inner)) {
+      return { key, inner: inner as Record<string, unknown> };
+    }
+  }
+  return null;
+}
+
+/** Model id for an internal-route body: top-level `model`, else the wrapped one. */
+export function readGoogleInternalModel(bodyBytes: Uint8Array): string | null {
+  let body: Record<string, unknown> | null;
+  try {
+    body = record(JSON.parse(new TextDecoder().decode(bodyBytes)));
+  } catch {
+    return null;
+  }
+  if (!body) return null;
+  const wrapped = unwrapGoogleRequest(body);
+  for (const candidate of [body.model, wrapped?.inner.model]) {
+    if (typeof candidate === 'string' && candidate.length <= 200) return candidate;
+  }
+  return null;
+}
+
 export function isGoogleInferencePath(pathname: string): boolean {
-  return parseGoogleModelFromPath(pathname) !== null || CLOUDCODE_PA_INFERENCE_ROUTE.test(pathname);
+  return parseGoogleModelFromPath(pathname) !== null || isGoogleInternalPath(pathname);
 }
 
 const SYSTEM_POINTER =
@@ -660,22 +701,29 @@ export async function transformGoogleGenerateContent(
   if (!reqRecord) {
     return { body: bodyBytes, info: createDefaultInfo(modelName) };
   }
-  const isEnvelope = Boolean(
-    reqRecord.request
-    && typeof reqRecord.request === 'object'
-    && !Array.isArray(reqRecord.request),
-  );
-  const req = (isEnvelope ? reqRecord.request : reqRecord) as GoogleGenerateContentRequest;
+  const wrapped = unwrapGoogleRequest(reqRecord);
+  if (wrapped) {
+    // Cloud Code envelope: transform the inner request, put it back in place.
+    const innerBytes = new TextEncoder().encode(JSON.stringify(wrapped.inner));
+    const result = await transformGoogleGenerateContent(innerBytes, modelName, options);
+    if (result.body === innerBytes) return { body: bodyBytes, info: result.info };
+    const innerOut: unknown = JSON.parse(new TextDecoder().decode(result.body));
+    return {
+      body: new TextEncoder().encode(JSON.stringify({ ...reqRecord, [wrapped.key]: innerOut })),
+      info: result.info,
+    };
+  }
+  const req = reqRecord as GoogleGenerateContentRequest;
 
   const info = createDefaultInfo(modelName);
   const pinChars = relocateGooglePins(req);
   if (pinChars > 0) info.pinChars = pinChars;
   const pinBody = pinChars > 0
-    ? new TextEncoder().encode(JSON.stringify(isEnvelope ? { ...reqRecord, request: req } : req))
+    ? new TextEncoder().encode(JSON.stringify(req))
     : bodyBytes;
   if (options.compress === false) {
     info.reason = 'compression_disabled';
-    return withStampedThoughtSignatures(req, pinBody, info, isEnvelope ? reqRecord : undefined);
+    return withStampedThoughtSignatures(req, pinBody, info);
   }
 
   // Extract system instructions
@@ -817,7 +865,7 @@ export async function transformGoogleGenerateContent(
     } else if (!staticProfitable) {
       info.reason = 'not_profitable';
     }
-    return withStampedThoughtSignatures(req, pinBody, info, isEnvelope ? reqRecord : undefined);
+    return withStampedThoughtSignatures(req, pinBody, info);
   }
 
   if (hasStaticCompression) {
@@ -920,7 +968,7 @@ export async function transformGoogleGenerateContent(
     info.droppedChars = (info.droppedChars ?? 0) + toolResultPlan.droppedChars;
   }
 
-  const outPayload = isEnvelope ? { ...reqRecord, request: transformedReq } : transformedReq;
+  const outPayload = transformedReq;
   const transformedBytes = new TextEncoder().encode(JSON.stringify(outPayload));
   return { body: transformedBytes, info };
 }
@@ -941,7 +989,6 @@ function withStampedThoughtSignatures(
   req: GoogleGenerateContentRequest,
   bodyBytes: Uint8Array,
   info: TransformInfo,
-  envelopeRecord?: Record<string, unknown>,
 ): { body: Uint8Array; info: TransformInfo } {
   if (!Array.isArray(req.contents)) return { body: bodyBytes, info };
   const normalized = isNormalizedGoogleTurnRoles(req.contents)
@@ -949,9 +996,7 @@ function withStampedThoughtSignatures(
     : normalizeGoogleTurnRoles(req.contents);
   const normalizedSignatures = normalizeGeminiThoughtSignatures(normalized);
   if (normalizedSignatures === req.contents && normalized === req.contents) return { body: bodyBytes, info };
-  const outObj = envelopeRecord
-    ? { ...envelopeRecord, request: { ...req, contents: normalizedSignatures } }
-    : { ...req, contents: normalizedSignatures };
+  const outObj = { ...req, contents: normalizedSignatures };
   return {
     body: new TextEncoder().encode(JSON.stringify(outObj)),
     info,

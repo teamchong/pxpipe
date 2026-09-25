@@ -48,6 +48,7 @@ interface RuntimeConfig {
   host: string;
   upstream: string;
   openAIUpstream: string;
+  googleUpstream?: string;
   openAIApiKey?: string;
   /** Independent Cloudflare OpenAI-compatible endpoint. */
   cloudflareUpstream?: string;
@@ -178,6 +179,7 @@ function parseCli(argv: string[]): RuntimeConfig {
     host: process.env.HOST?.trim() || '127.0.0.1',
     upstream: process.env.ANTHROPIC_UPSTREAM ?? sharedUpstream ?? 'https://api.anthropic.com',
     openAIUpstream: process.env.OPENAI_UPSTREAM ?? sharedUpstream ?? 'https://api.openai.com',
+    googleUpstream: process.env.GOOGLE_UPSTREAM ?? sharedUpstream,
     openAIApiKey: process.env.OPENAI_API_KEY,
     cloudflareUpstream,
     cloudflareApiKey: cfToken,
@@ -257,6 +259,8 @@ Environment:
                            (default https://api.anthropic.com)
   OPENAI_UPSTREAM         OpenAI API base; overrides PXPIPE_UPSTREAM
                            (default https://api.openai.com)
+  GOOGLE_UPSTREAM         Google inference API base; overrides PXPIPE_UPSTREAM
+                           (defaults to Generative Language or Cloud Code by route)
   OPENAI_API_KEY          optional OpenAI key override; otherwise forwarded
   OPENAI_MODELS           comma-separated exact model ids routed to OpenAI
                           Responses
@@ -1210,6 +1214,7 @@ async function main(): Promise<void> {
     gatewayHeaders: opts.gatewayHeaders,
     upstream: opts.upstream,
     openAIUpstream: opts.openAIUpstream,
+    googleUpstream: opts.googleUpstream,
     openAIApiKey: opts.openAIApiKey,
     cloudflareUpstream: opts.cloudflareUpstream,
     cloudflareApiKey: opts.cloudflareApiKey,

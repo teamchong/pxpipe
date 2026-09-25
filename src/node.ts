@@ -54,7 +54,7 @@ interface RuntimeConfig {
   cloudflareApiKey?: string;
   openAIModels?: string[];
   cloudflareModels?: string[];
-  provider?: 'cloudflare-ai-gateway';
+  provider?: 'cloudflare-ai-gateway' | 'orcarouter';
   gatewayBaseUrl?: string;
   gatewayHeaders?: Record<string, string>;
   eventsFile: string;
@@ -210,9 +210,9 @@ function parseMaxRequestBytes(value: string | undefined): number | undefined {
   return bytes;
 }
 
-function parseProvider(v: string | undefined): 'cloudflare-ai-gateway' | undefined {
+function parseProvider(v: string | undefined): 'cloudflare-ai-gateway' | 'orcarouter' | undefined {
   if (v === undefined || v === '') return undefined;
-  if (v === 'cloudflare-ai-gateway') return v;
+  if (v === 'cloudflare-ai-gateway' || v === 'orcarouter') return v;
   console.error(`[pxpipe] unknown PXPIPE_PROVIDER: ${v}`);
   process.exit(2);
 }
@@ -263,9 +263,10 @@ Environment:
   CLOUDFLARE_MODELS       comma-separated exact model ids routed to Cloudflare
   CLOUDFLARE_ACCOUNT_ID   with CLOUDFLARE_API_TOKEN, zero-config Cloudflare
   CLOUDFLARE_API_TOKEN    Workers AI endpoint and bearer token
-  PXPIPE_PROVIDER         optional: 'cloudflare-ai-gateway' — route both API
-                          families through one gateway base URL
-  PXPIPE_GATEWAY_BASE_URL gateway base URL (required with PXPIPE_PROVIDER)
+  PXPIPE_PROVIDER         optional: 'cloudflare-ai-gateway' or 'orcarouter' — route
+                          both API families through one gateway base URL
+  PXPIPE_GATEWAY_BASE_URL gateway base URL (optional with PXPIPE_PROVIDER;
+                          orcarouter defaults to https://api.orcarouter.ai)
   PXPIPE_GATEWAY_HEADERS  extra upstream headers: JSON object or k=v;k2=v2
   PXPIPE_MODELS           comma-separated model bases to image (Claude/Gemini/GPT/Grok);
                           default claude-fable-5,gemini (every Gemini; Sol/Opus/GPT-5.5/Grok opt-in);

@@ -361,6 +361,10 @@ interface StreamState {
   usage?: JsonObject;
   // OpenAI tool_calls stream by their own `index`; map it to our block state.
   calls: Map<number, StreamCall>;
+  // Key of the most recently seen tool call, so index-less continuation
+  // fragments (providers that don't repeat `index`) append to the open call
+  // instead of opening a spurious new block.
+  lastToolKey?: number;
 }
 
 function chatStreamEvent(chunk: JsonObject, state: StreamState): string {
@@ -411,8 +415,20 @@ function chatStreamEvent(chunk: JsonObject, state: StreamState): string {
     for (const raw of delta.tool_calls) {
       const tc = object(raw);
       if (!tc) continue;
-      const key = typeof tc.index === 'number' ? tc.index : state.calls.size;
       const fn = object(tc.function) ?? {};
+      // Some OpenAI-compatible providers omit `index` on tool-call deltas.
+      // A new call is signaled by an id/name; an args-only fragment continues
+      // the most recent call. Keying index-less continuations by calls.size
+      // would split them into spurious new tool_use blocks.
+      let key: number;
+      if (typeof tc.index === 'number') {
+        key = tc.index;
+      } else if (typeof tc.id === 'string' || typeof fn.name === 'string' || state.calls.size === 0) {
+        key = state.calls.size; // opens a new call
+      } else {
+        key = state.lastToolKey ?? 0; // args-only continuation
+      }
+      state.lastToolKey = key;
       let call = state.calls.get(key);
       if (!call) {
         closeText();

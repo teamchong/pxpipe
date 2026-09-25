@@ -279,6 +279,10 @@ export function staleFreshnessHints(text: string): string {
  */
 export function blocksToText(content: string | ContentBlock[]): string {
   if (typeof content === 'string') return content;
+  // Untrusted bodies can carry a non-array content (e.g. `content: null`).
+  // Tolerate it like every sibling serializer/scanner here rather than letting
+  // `for...of` throw and 502 the whole request.
+  if (!Array.isArray(content)) return '';
   const parts: string[] = [];
   for (const blk of content) {
     if (!blk || typeof blk !== 'object') continue;

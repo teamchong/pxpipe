@@ -32,8 +32,8 @@ import {
 export const DEFAULT_EXPORT_MODEL = 'claude-sonnet-4-5';
 // Chars-per-token for the reporting estimate now lives in transform.ts as
 // REPORT_CHARS_PER_TOKEN (single source of truth for all token-estimate constants).
-/** Default column width (172 cols for default 14px legible model). */
-export const DEFAULT_EXPORT_COLS: number = 172;
+/** Default column width (312 cols, the spaced 5x8 Claude profile). */
+export const DEFAULT_EXPORT_COLS: number = 312;
 
 // ---------------------------------------------------------------------------
 // Glob matching (no external glob library — node:fs only per convention)

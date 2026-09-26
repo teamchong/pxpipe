@@ -1575,21 +1575,34 @@ describe('transform', () => {
     expect(a.info.systemSha8).toBe(b.info.systemSha8);
   });
 
-  it('computes firstUserSha8 from the first user message', async () => {
-    const body = new TextEncoder().encode(
-      JSON.stringify({
-        model: 'claude',
-        messages: [
-          { role: 'user', content: 'continue from HANDOFF?' },
-          { role: 'assistant', content: 'sure' },
-          { role: 'user', content: 'a totally different message' },
-        ],
-        system: 'claude.md\n'.repeat(400),
-      }),
-    );
-    const { info } = await transformRequest(body);
-    expect(info.firstUserSha8).toBeDefined();
-    expect(info.firstUserSha8).toMatch(/^[0-9a-f]{8}$/);
+  it('keys firstUserSha8 on the prompt, not on a shared harness envelope', async () => {
+    const notice = '<system-notice>\nxd:// device inventory changed.\n</system-notice>';
+    const key = async (messages: unknown[]) => {
+      const body = new TextEncoder().encode(
+        JSON.stringify({ model: 'claude', messages, system: 'claude.md\n'.repeat(400) }),
+      );
+      return (await transformRequest(body)).info.firstUserSha8;
+    };
+    // omp shape: the envelope is its own user message ahead of the prompt.
+    const a = await key([
+      { role: 'user', content: notice },
+      { role: 'user', content: 'review PR 293' },
+    ]);
+    const b = await key([
+      { role: 'user', content: notice },
+      { role: 'user', content: 'fix the flaky test' },
+    ]);
+    // Same session a turn later: key must not move.
+    const aLater = await key([
+      { role: 'user', content: [{ type: 'text', text: notice }, { type: 'text', text: 'review PR 293' }] },
+      { role: 'assistant', content: 'on it' },
+      { role: 'user', content: 'and run the tests' },
+    ]);
+    expect(a).toMatch(/^[0-9a-f]{8}$/);
+    expect(a).not.toBe(b);
+    expect(aLater).toBe(a);
+    // Nothing but envelopes: still keyed rather than dropped.
+    expect(await key([{ role: 'user', content: notice }])).toMatch(/^[0-9a-f]{8}$/);
   });
 
   it('renders identical input to byte-identical output (determinism = cacheability)', async () => {

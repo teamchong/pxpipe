@@ -51,7 +51,7 @@ import {
   ANTHROPIC_MAX_IMAGES,
   ANTHROPIC_HISTORY_IMAGE_BUDGET,
 } from './history.js';
-import { noteHistoryRequest, recordFreezeStep } from './session-state.js';
+import { noteHistoryRequest, recordFreezeStep, sessionAnchorText } from './session-state.js';
 import type { GptHistoryOptions } from './openai-history.js';
 import { CACHE_CREATE_RATE, CACHE_READ_RATE } from './baseline.js';
 import { visionTokens, type VisionPricing } from './vision-cost.js';
@@ -1351,23 +1351,24 @@ async function cachePrefixDigest(
 // appeared across the whole event log. Project instructions are now kept as
 // text structurally — see the <system-reminder> handling below.
 
-/** First user message text, capped at 4 KiB (stable thread id; hashing large pastes is wasteful). */
+/**
+ * Session identity text: the user's first prompt, skipping harness envelopes
+ * (see {@link sessionAnchorText}). Scans every user message before the first
+ * assistant turn, because a client may send its envelope as a message of its own.
+ */
 export function firstUserText(req: MessagesRequest): string {
-  const msgs = req.messages ?? [];
-  for (const m of msgs) {
-    if (m.role !== 'user') continue;
-    if (typeof m.content === 'string') return m.content.slice(0, 4096);
-    if (Array.isArray(m.content)) {
+  const texts: string[] = [];
+  for (const m of req.messages ?? []) {
+    if (m.role !== 'user') break;
+    if (typeof m.content === 'string') {
+      texts.push(m.content);
+    } else if (Array.isArray(m.content)) {
       for (const block of m.content) {
-        if (block && (block as any).type === 'text' && typeof (block as any).text === 'string') {
-          return ((block as any).text as string).slice(0, 4096);
-        }
+        if (block?.type === 'text' && typeof block.text === 'string') texts.push(block.text);
       }
     }
-    // First user message found but unreadable — return empty rather than fall through to next.
-    return '';
   }
-  return '';
+  return sessionAnchorText(texts);
 }
 
 /**

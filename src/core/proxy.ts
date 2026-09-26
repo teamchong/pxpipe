@@ -1117,6 +1117,14 @@ function isProviderPrefixedPath(pathname: string): boolean {
   return PASSTHROUGH_PREFIXES.some((prefix) => pathname.startsWith(prefix));
 }
 
+/** Append a provider-prefixed path without doubling the provider segment when
+ *  the base already ends with it: base `http://h/anthropic` plus
+ *  `/anthropic/v1/messages` is `http://h/anthropic/v1/messages`. */
+function joinProviderPath(base: string, path: string): string {
+  const segment = /^\/[^/?]+/.exec(path)?.[0];
+  return segment && base.endsWith(segment) ? base.slice(0, -segment.length) + path : base + path;
+}
+
 /** One optional gateway/provider segment, then an optional `/v1`, before the
  *  wire-shape suffix:
  *
@@ -1855,9 +1863,11 @@ let responseContentType: string | undefined;
             if (ctAuth) ctHeaders.set('authorization', `Bearer ${ctAuth}`);
             // Mirror the actual outbound request base+path: count_tokens lives at
             // `<messages-path>/count_tokens`, so provider-prefixed routes like
-            // `/anthropic/messages` probe `/anthropic/messages/count_tokens`.
-            const ctBase = providerPrefixed ? passthroughUpstream : upstream;
-            const ctUrl = ctBase + url.pathname + '/count_tokens';
+            // `/anthropic/messages` probe `/anthropic/messages/count_tokens`,
+            // joined like the main forward so a `…/anthropic` base isn't doubled.
+            const ctUrl = providerPrefixed
+              ? joinProviderPath(passthroughUpstream, url.pathname + '/count_tokens')
+              : upstream + url.pathname + '/count_tokens';
             baselinePromise = countTokensUpstream(ctUrl, ctBody, ctHeaders);
             // Null = no markers → cacheable=0 by definition, no probe needed.
             const ctCacheableBody = buildCacheablePrefixCountTokensBody(bodyIn);
@@ -1989,7 +1999,9 @@ let responseContentType: string | undefined;
         ? (routes.stripOpenAIV1 ? '/responses' : '/v1/responses')
         : isOpenAIPath && routes.stripOpenAIV1 ? path.replace(/^\/v1(?=\/)/, '') : path;
       const requestUpstreamBase = bridgedGptMessages ? openAIUpstream : upstreamBase;
-      upstreamUrl = requestUpstreamBase + outPath;
+      upstreamUrl = providerPrefixed && !bridgedGptMessages
+        ? joinProviderPath(requestUpstreamBase, outPath)
+        : requestUpstreamBase + outPath;
     }
     let releaseInFlight = (): void => {};
     if (reqBodySha256 && duplicateHoldMs > 0) {

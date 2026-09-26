@@ -138,7 +138,7 @@ describe('public library API', () => {
       expect(isPxpipeSupportedGptModel('grok-4.20')).toBe(false);
       expect(getAllowedModelBases()).not.toContain('grok-4.5');
       expect(getAllowedModelBases()).not.toContain('grok-4.6');
-      expect(getAllowedModelBases()).toEqual(['claude-fable-5', 'gemini']);
+      expect(getAllowedModelBases()).toEqual(['claude-fable-5', 'claude-opus-5-5', 'gemini']);
 
       process.env.PXPIPE_MODELS = 'claude-fable-5,gpt-5.6-sol,grok-4.6';
       expect(isPxpipeSupportedGptModel('grok-4.6')).toBe(true);

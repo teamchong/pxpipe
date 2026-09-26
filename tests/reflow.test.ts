@@ -23,7 +23,14 @@ import {
   dereflow,
   minifyForRender,
   expandTabsInLine,
+  padNewlineMarkers,
+  wrapLines,
+  measureContentCols,
+  renderTextToPngs,
+  renderCellHeight,
+  PAD_Y,
 } from '../src/core/render.js';
+import { countVisualRows } from '../src/core/transform.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -691,5 +698,79 @@ describe('reflow L0 contract – real corpus', () => {
 
     console.log(`[4xx-bodies] Checked ${textsChecked} text blocks.`);
     expect(violations).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Render-layer marker spacing
+//
+// The ↵ marker used to be laid out with no separating cell on either side, so
+// the value ending one source line fused with the identifier starting the next
+// (`00014↵L00003`) and line-trailing values were attributed to the following
+// line. The padding lives in the wrap layer, NOT in reflow(), so the L0
+// round-trip contract above is unaffected.
+// ---------------------------------------------------------------------------
+
+describe('↵ marker spacing at the render layer', () => {
+  const ledger = (i: number) => `L${String(i).padStart(5, '0')}  ledger entry ${i * 7}`;
+
+  it('reflow() still emits the bare sentinel (round-trip untouched)', () => {
+    const r = reflow('a\nb')!;
+    expect(r).toBe('a' + NL_SENTINEL + 'b');
+    expect(dereflow(r)).toBe('a\nb');
+  });
+
+  it('separates the marker from the text on both sides when laid out', () => {
+    const reflowed = reflow([ledger(2), ledger(3)].join('\n'))!;
+    const laidOut = wrapLines(reflowed, 312).join('');
+
+    // The failure mode: value and next identifier fused across the marker.
+    expect(laidOut).not.toContain('14' + NL_SENTINEL + 'L00003');
+    expect(laidOut).toContain(' ' + NL_SENTINEL + ' ');
+
+    // Every marker carries a blank cell on each side.
+    for (const [index] of [...laidOut].entries()) {
+      if (laidOut[index] !== NL_SENTINEL) continue;
+      expect(laidOut[index - 1]).toBe(' ');
+      expect(laidOut[index + 1]).toBe(' ');
+    }
+  });
+
+  it('padNewlineMarkers is pure and a no-op for marker-free text', () => {
+    const plain = 'no markers here';
+    expect(padNewlineMarkers(plain)).toBe(plain);
+    expect(padNewlineMarkers('a' + NL_SENTINEL + 'b')).toBe(
+      'a ' + NL_SENTINEL + ' b',
+    );
+  });
+
+  it('keeps the next line indentation intact', () => {
+    const reflowed = reflow('if (x) {\n    doThing();')!;
+    const laidOut = wrapLines(reflowed, 312).join('');
+    // One pad cell, then the four original indent cells.
+    expect(laidOut).toContain(NL_SENTINEL + '     doThing();');
+  });
+
+  it('measureContentCols charges the same width wrapLines lays out', () => {
+    const reflowed = reflow([ledger(2), ledger(3), ledger(4)].join('\n'))!;
+    const measured = measureContentCols(reflowed, 312);
+    const laidOut = wrapLines(reflowed, 312)[0]!.length;
+    expect(measured).toBe(laidOut);
+  });
+
+  it('renders and estimates the rows wrapLines lays out, across pages', async () => {
+    // Pages are rendered from rows wrapLines already padded; padding them again
+    // pushed marker rows past `cols` and added rows the gate estimate never saw.
+    const reflowed = reflow(Array.from({ length: 400 }, (_, i) => ledger(i)).join('\n'))!;
+    const cols = 84;
+    const rows = wrapLines(reflowed, cols).length;
+    const images = await renderTextToPngs(reflowed, cols);
+    expect(images.length).toBeGreaterThan(1);
+    const rendered = images.reduce(
+      (sum, img) => sum + (img.height - 2 * PAD_Y) / renderCellHeight({}),
+      0,
+    );
+    expect(rendered).toBe(rows);
+    expect(countVisualRows(reflowed, cols)).toBe(rows);
   });
 });

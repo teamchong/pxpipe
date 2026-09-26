@@ -155,6 +155,7 @@ export interface TrackEvent {
   cache_read_tokens?: number;
   /** OpenAI prompt-cache hits (subset of input_tokens), from input/prompt_tokens_details.cached_tokens. */
   cached_tokens?: number;
+  cache_write_tokens?: number;
   /** Cache_create split by tier — 1.25x (5-min) and 2x (1-hour) input rates.
    *  Their sum equals `cache_create_tokens` when both fields are present. */
   cache_create_5m_tokens?: number;
@@ -372,6 +373,7 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
       out.cache_read_tokens = u.cache_read_input_tokens;
     if (u.cached_tokens !== undefined)
       out.cached_tokens = u.cached_tokens;
+    if (u.cache_write_tokens !== undefined) out.cache_write_tokens = u.cache_write_tokens;
     // cache_creation splits cache_creation_input_tokens across 5-min (1.25x) and 1-hour (2x) tiers.
     if (u.cache_creation) {
       if (u.cache_creation.ephemeral_5m_input_tokens !== undefined)

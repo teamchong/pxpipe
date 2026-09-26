@@ -1,3 +1,5 @@
+> **Historical, pre-v2 results.** These receipts have not been rerun under the [shared profile-aligned protocol](../model-quality/README.md). Settings and scores below describe the original run, not a new current-profile comparison. Standard profile-suite entrypoints now use the common runner.
+
 # Gemini 3.6 Flash quality results
 
 Model: `google/gemini-3.6-flash` (`gemini-3.6-flash`) through the Google AI Studio bridge. These receipts use the shipped Spleen 5×8, 312-column, 728px profile and adjacent text factsheet.

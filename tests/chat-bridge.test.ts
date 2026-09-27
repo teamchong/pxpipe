@@ -489,6 +489,32 @@ describe('openAIChatStreamToAnthropic — SSE translation', () => {
     expect(text).toContain('event: error');
     expect(text).toContain('api_error');
   });
+
+  it('keeps index-less tool-call argument fragments in one tool_use block', async () => {
+    // Some OpenAI-compatible providers omit `index` on tool-call deltas and
+    // split arguments across chunks. A new call is signaled by id/name; the
+    // args-only continuation must append to the same block, not open a second.
+    const text = await collect([
+      'data: {"id":"chatcmpl-1","choices":[{"delta":{"tool_calls":[{"id":"call_1","function":{"name":"search","arguments":"{\\"q\\":"}}]}}]}\n\n',
+      'data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"\\"cats\\"}"}}]}}]}\n\n',
+      'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n',
+      'data: [DONE]\n\n',
+    ]);
+    const events = text.split('\n\n').filter(Boolean).map((block) => {
+      const line = block.split('\n').find((l) => l.startsWith('data: '))!;
+      return JSON.parse(line.slice(6)) as any;
+    });
+    const toolStarts = events.filter(
+      (e) => e.type === 'content_block_start' && e.content_block?.type === 'tool_use',
+    );
+    expect(toolStarts).toHaveLength(1); // one block, not split into two
+    expect(toolStarts[0].content_block.name).toBe('search');
+    const args = events
+      .filter((e) => e.type === 'content_block_delta' && e.delta?.type === 'input_json_delta')
+      .map((e) => e.delta.partial_json)
+      .join('');
+    expect(args).toBe('{"q":"cats"}'); // fragments concatenate to valid JSON
+  });
 });
 
 describe('anthropicMessagesToOpenAIChat — model override', () => {

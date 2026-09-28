@@ -6,9 +6,38 @@ behavioral changes, patch = fixes).
 
 ## Unreleased
 
+## 0.14.0 — 2026-09-28
+
+### Added
+- **Session state survives proxy restarts** (#295). The freeze step is a pin:
+  once a session's history is packed at a coarse grid it must never be
+  re-rendered finer, or every history chunk re-keys and the provider bills the
+  whole prefix as `cache_create`. The pin lived only in memory, so each restart
+  let the next collapse pick a finer step. The Node host now saves the
+  freeze-step floor and cache liveness to `~/.pxpipe/session-state.json` (mode
+  0600, written to a temp file and renamed, debounced 250 ms, flushed on
+  shutdown). `PXPIPE_SESSION_STATE=<path>` moves it and `0`/`off` turns it off.
+  Records idle more than 24 h and malformed records are dropped on load. Core
+  stays filesystem-free: hosts attach a store via
+  `configureSessionStateStore()`.
+- **`pxpipe warp` supports agy (Antigravity CLI)** (#271). Warp routes the
+  Cloud Code (`daily-cloudcode-pa.googleapis.com/v1internal:*`) and
+  `generativelanguage.googleapis.com` generate-content endpoints to the proxy.
+
 ### Changed
+- **Opus 5.5 is on by default, and every non-Fable Claude model uses the
+  spaced 5×8 profile** (#293). Opus 5.5 misread the bare 5×8 cell that Fable
+  reads cleanly (84/98 gist). Adding 2px of row height fixes it (93/98 gist,
+  0/16 confabulations, 100/100 arithmetic) and still costs about 1.9× less
+  than text. `CLAUDE_SPACED_PROFILE` (312 cols, `cellHBonus: 2`) replaces the
+  14px legible profile, which cost more than sending text and is removed.
+  `claude-opus-5-5` joins the default scope, and `DEFAULT_EXPORT_COLS` goes
+  from 172 to 312 to match. Exact 12-char hex recall stays weak (3/15, same as
+  the dense control), so exact ids still come from the factsheet or a
+  re-fetch.
 - **Gemini is on by default for every version, and opt-out works again.** The
-  built-in scope is now `PXPIPE_MODELS=claude-fable-5,gemini`; the `gemini`
+  built-in scope is now
+  `PXPIPE_MODELS=claude-fable-5,claude-opus-5-5,gemini`; the `gemini`
   family base matches `gemini-3.6-flash`, `gemini-4`, `gemini-pro`, and future
   ids through the ordinary prefix rule. The Google gate in the proxy and the
   dashboard totals previously admitted any measured Gemini model whenever the
@@ -16,6 +45,8 @@ behavioral changes, patch = fixes).
   dashboard chip) unable to turn Gemini off. That bypass is removed; the
   allowlist is the only gate. Dashboard: one "Gemini (all versions)" chip plus
   per-version chips for narrowing.
+- `gpt-tokenizer` 3.4 → 4.0 (major), used for o200k token counts on the
+  OpenAI and Google paths (#242).
 
 ### Fixed
 - **Concurrent sessions no longer share one cache record.** `first_user_sha8`
@@ -42,6 +73,20 @@ behavioral changes, patch = fixes).
   The probe got a 403, so every row logged `baseline_probe_status: "failed"`
   and the dashboard reported 0% fewer tokens. Both now drop the duplicated
   segment when the base already ends with it.
+- **`@pxpipe pin` works on the OpenAI and Google paths.** Pins were moved to
+  the tail only for Anthropic requests; OpenAI Chat/Responses and Gemini
+  requests now get the same relocation.
+- **`pxpipe warp -- claude` works on native Windows** (#294). It failed with
+  `spawn /bin/sh ENOENT`: `PATH` was split on `:`, `PATHEXT` was ignored, and
+  `C:\…` paths weren't recognised as paths, so every lookup fell through to a
+  `$SHELL -ic` fallback that defaults to `/bin/sh`. Resolution now handles
+  `PATH`/`PATHEXT` per platform (only `.com`/`.exe`, since `spawn()` can't run
+  `.cmd`/`.bat` without a shell) and skips the shell fallback when the shell
+  itself can't run.
+- **Google upstream selection only trusts known hosts** (#271). The `Host`
+  header is parsed and matched exactly against the Cloud Code hostnames before
+  routing, and trailing-slash stripping no longer uses a regex that could
+  backtrack on long input.
 
 ## 0.13.2 — 2026-08-18
 

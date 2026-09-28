@@ -22,16 +22,6 @@ This is what the model sees instead of text:
 tokens as this page. Real pipeline output; the model reads renders like this
 at 100/100 (see benchmarks).*
 
-![chart: characters a frontier context window holds, 2018–2026 — vendor text series including Grok 4.5; orange measured overlays are Fable 5 [1m] + pxpipe ~19.0M (4.8×) and Gemini 3.6 Flash + pxpipe ~21.3M (5.3×)](docs/assets/context-window-chars.png)
-
-*Eight years of context growth, in characters. Every text line tops out near
-~4M chars (a 1M-token window at ~4 chars/token); **Grok 4.5** is shown as a
-text-window point only (500K). The orange overlays are the **same 1M
-windows** read through pxpipe images — ~19.0M chars for Fable 5 (**4.8×**) and ~21.3M chars for Gemini 3.6 Flash (**5.3×** text capacity). Density is measured from a live render at
-generation time, not hand-typed: regenerate with
-`npx tsx scripts/gen-context-chart.ts`
-([source](scripts/gen-context-chart.ts)).*
-
 ## Demo
 
 **Fable 5 (the default, 100/100 reader) — plain left, pxpipe right:**
@@ -261,9 +251,6 @@ chars/vision-token ÷ 4 (prose text baseline). Not a model-quality score.
 | **`claude-fable-5[1m]`** (default) | 1M | ~4.0M | **~18.9M** | ~18.9 c/vt (exact 28px patches) | **~4.7×** |
 | **`google/gemini-3.6-flash`** | 1M | ~4.0M | **~20.1M** | ~20.1 c/vt (1,078 tok/page) | **~5.0×** |
 | **`claude-opus-5`** | 1M | ~4.0M | **~18.9M** | ~18.9 c/vt (resolves to Fable 5’s geometry) | **~4.7×** |
-
-Regenerate: `npx tsx scripts/gen-context-chart.ts` · chart PNG
-[`docs/assets/context-window-chars.png`](docs/assets/context-window-chars.png).
 
 The older GSM8K result is omitted because its training-data contamination can
 hide image misreads; the linked arithmetic evaluations use novel numbers.

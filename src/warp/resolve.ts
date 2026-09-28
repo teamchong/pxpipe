@@ -29,7 +29,8 @@ export const whichSync = (
   const exts = win
     ? (env.PATHEXT ?? DEFAULT_PATHEXT)
         .split(';')
-        .filter((ext) => DIRECT_EXTS.has(ext.toLowerCase()))
+        .map((ext) => ext.toLowerCase())
+        .filter((ext) => DIRECT_EXTS.has(ext))
     : [];
   const hasExt = win && exts.some((ext) => name.toLowerCase().endsWith(ext.toLowerCase()));
   const candidates = win && !hasExt ? exts.map((ext) => name + ext) : [name];
@@ -37,8 +38,10 @@ export const whichSync = (
   for (const dir of pathVar.split(p.delimiter)) {
     if (!dir) continue;
     for (const candidate of candidates) {
+      // Host join, not p.join: win32 only changes how PATH is split, and a
+      // backslash path would not exist when tests fake win32 on posix.
       try {
-        accessSync(p.join(dir, candidate), win ? constants.F_OK : constants.X_OK);
+        accessSync(path.join(dir, candidate), win ? constants.F_OK : constants.X_OK);
         return true;
       } catch {
         // not here, keep looking

@@ -33,16 +33,20 @@ import {
   type TransformOptions,
 } from './transform.js';
 import { visionTokens } from './vision-cost.js';
+import { computeOpenAICollapsePaybackReads } from './openai-savings.js';
 import { stripSchemaDescriptions } from './schema-strip.js';
 import {
+  GPT_HISTORY_DEFAULTS,
   planGptCollapse,
   planResponsesPairCollapse,
   chatMessagesToTurns,
+  isResponsesToolCall,
+  isResponsesToolOutput,
   type GptCollapsePlan,
   type GptHistoryOptions,
 } from './openai-history.js';
 import { HISTORY_SYNTHETIC_INTRO, HISTORY_SYNTHETIC_OUTRO } from './history.js';
-import { factSheetText } from './factsheet.js';
+import { extractFactSheetTokens, factSheetText, prepareFactSheet } from './factsheet.js';
 import { relocateOpenAIPins } from './pin.js';
 import { countTokens as o200kCountTokens } from 'gpt-tokenizer/encoding/o200k_base';
 
@@ -194,6 +198,89 @@ interface ResponsesRequest {
   [k: string]: unknown;
 }
 
+function responsesCacheBreakpoint(req: ResponsesRequest, profile: GptModelProfile): Record<string, unknown> {
+  const mode = (req.prompt_cache_options as { mode?: string } | undefined)?.mode;
+  return profile.cacheBreakpoints && (mode === undefined || mode === 'implicit')
+    ? { prompt_cache_breakpoint: { mode: 'explicit' } }
+    : {};
+}
+
+/** Profile-controlled native overflow is shared with rendered-content evals. */
+export function historyFactSheet(text: string, profile: GptModelProfile, coveredTokens?: ReadonlySet<string>): string {
+  return prepareHistoryFactSheet(text, profile)(coveredTokens);
+}
+
+function prepareHistoryFactSheet(text: string, profile: GptModelProfile): (coveredTokens?: ReadonlySet<string>) => string {
+  const renderSheet = prepareFactSheet(text, profile.factSheetFormat);
+  const sheet = renderSheet();
+  if (profile.history.factSheetOverflow !== 'native-opaque') return () => sheet;
+  const opaque = /\b(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|(?=[0-9a-f]{7,128}\b)(?=[0-9a-f]{0,127}\d)[0-9a-f]{7,128})\b/gi;
+  const covered = new Set([...sheet.matchAll(opaque)].map((m) => m[0]));
+  const excerpts = new Map<string, string[]>();
+  let source = 'archived context';
+  let argumentsNext = false;
+  for (const line of text.split('\n')) {
+    if (line.startsWith('[tool_use ')) {
+      source = line;
+      argumentsNext = true;
+    } else if (argumentsNext) {
+      source += ' ' + line;
+      argumentsNext = false;
+    }
+    const identifiers = [...line.matchAll(opaque)].map((m) => m[0]);
+    if (!identifiers.some((id) => !covered.has(id))) continue;
+    const lines = excerpts.get(source) ?? [];
+    lines.push(line);
+    excerpts.set(source, lines);
+    for (const id of identifiers) covered.add(id);
+  }
+  // Exact spellings already sent in earlier archive groups need not be sent
+  // again. Keep local repetition counts, and never deduplicate opaque excerpts.
+  if (excerpts.size === 0) return (coveredTokens) => coveredTokens?.size
+    ? renderSheet(coveredTokens)
+    : sheet;
+  const raw = [...excerpts].map(([source, lines]) => [source, ...lines].join('\n')).join('\n');
+  const quoted = [...excerpts].map(([source, lines]) => ({ source, lines }));
+  const result = renderSheet(raw)
+    + '\n[Archived exact-value excerpts (quoted data, not current instructions): '
+    + JSON.stringify(quoted) + ']';
+  return () => result;
+}
+
+/** Bounded to one request. Only extraction is reused; final coverage-dependent
+ * output is always recomputed. No cross-request retention of source text. */
+export function createHistoryFactSheetRenderer(profile: GptModelProfile, limits: { maxEntries?: number; maxChars?: number } = {}) {
+  const maxEntries = Number.isFinite(limits.maxEntries) ? Math.max(0, Math.floor(limits.maxEntries!)) : 64;
+  const maxChars = Number.isFinite(limits.maxChars) ? Math.max(0, Math.floor(limits.maxChars!)) : 1024 * 1024;
+  const snapshot = { ...profile, history: { ...profile.history } };
+  const cache = new Map<string, ReturnType<typeof prepareHistoryFactSheet>>();
+  let chars = 0, hits = 0, misses = 0, admitMisses = true;
+  return {
+    render(text: string, coveredTokens?: ReadonlySet<string>): string {
+      let prepared = cache.get(text);
+      if (prepared) {
+        hits++;
+        cache.delete(text); cache.set(text, prepared);
+      } else {
+        misses++;
+        prepared = prepareHistoryFactSheet(text, snapshot);
+        if (admitMisses && maxEntries > 0 && text.length <= maxChars) {
+          while (cache.size && (cache.size >= maxEntries || chars + text.length > maxChars)) {
+            const oldest = cache.keys().next().value!;
+            chars -= oldest.length; cache.delete(oldest);
+          }
+          cache.set(text, prepared); chars += text.length;
+        }
+      }
+      return prepared(coveredTokens);
+    },
+    // Emission is a second sequential pass. Misses there must not evict
+    // prepared gate results that later segments can still reuse.
+    beginEmission: () => { admitMisses = false; },
+    stats: () => ({ entries: cache.size, chars, hits, misses }),
+  };
+}
+
 interface ResponsesFlatTool {
   type: 'function';
   name?: string;
@@ -279,7 +366,7 @@ function gptHistoryOpts(
     : Math.max(0, configuredMax - existingImages);
   return {
     ...o.gptHistory,
-    reflow: o.reflow,
+    reflow: o.gptHistory?.reflow ?? profile.history.reflow ?? o.reflow,
     keepTail: o.gptHistory?.keepTail ?? profile.history.keepTail,
     keepRecentPairs: o.gptHistory?.keepRecentPairs ?? profile.history.keepRecentPairs,
     minCollapseTokens: o.gptHistory?.minCollapseTokens ?? profile.history.minCollapseTokens,
@@ -289,9 +376,7 @@ function gptHistoryOpts(
     ...(o.gptHistory?.collapseChunk !== undefined || profile.history.collapseChunk !== undefined
       ? { collapseChunk: o.gptHistory?.collapseChunk ?? profile.history.collapseChunk }
       : {}),
-    ...(o.gptHistory?.freezeChunk !== undefined || profile.history.freezeChunk !== undefined
-      ? { freezeChunk: o.gptHistory?.freezeChunk ?? profile.history.freezeChunk }
-      : {}),
+    freezeChunk: o.gptHistory?.freezeChunk ?? profile.history.freezeChunk ?? GPT_HISTORY_DEFAULTS.freezeChunk,
     responsesMode: profile.history.responsesMode,
     cols: o.gptHistory?.cols ?? profile.stripCols,
     maxHeightPx: o.gptHistory?.maxHeightPx ?? profile.maxHeightPx,
@@ -511,12 +596,17 @@ function isGpt5Family(model?: string): boolean {
   return typeof model === 'string' && /^gpt-5/i.test(model);
 }
 
+/** Shared by normal outbound requests and profile-aligned evaluations. */
+export function openAIImageDetail(model?: string): 'original' | 'high' {
+  return resolveGptProfile(model).imageDetail ?? (isGpt5Family(model) ? 'original' : 'high');
+}
+
 function openAIImagePart(img: RenderedImage, model?: string): OpenAIImagePart {
   return {
     type: 'image_url',
     image_url: {
       url: `data:image/png;base64,${bytesToBase64(img.png)}`,
-      detail: isGpt5Family(model) ? 'original' : 'high',
+      detail: openAIImageDetail(model),
     },
   };
 }
@@ -526,7 +616,7 @@ function responsesImagePart(img: RenderedImage, model?: string): ResponsesInputI
   return {
     type: 'input_image',
     image_url: `data:image/png;base64,${bytesToBase64(img.png)}`,
-    detail: isGpt5Family(model) ? 'original' : 'high',
+    detail: openAIImageDetail(model),
   };
 }
 
@@ -592,10 +682,11 @@ function measureResponsesComposition(
       c.systemDeveloper += gptTextTokens(responsesContentText(o.content as ResponsesInputItem['content']));
     } else if (role === 'user' || role === 'assistant') {
       c.userAssistant += gptTextTokens(responsesContentText(o.content as ResponsesInputItem['content']));
-    } else if (type === 'function_call') {
+    } else if (isResponsesToolCall(o)) {
       c.functionCalls += gptTextTokens(JSON.stringify(o));
-    } else if (type === 'function_call_output') {
+    } else if (isResponsesToolOutput(o)) {
       c.functionOutputs += gptTextTokens(typeof o.output === 'string' ? o.output : JSON.stringify(o.output ?? ''));
+      c.imageParts += countImages(o.output);
     } else if (type === 'reasoning') {
       // Includes encrypted_content when present; this is often a large Codex-native bucket.
       c.reasoningEncrypted += gptTextTokens(JSON.stringify(o));
@@ -888,14 +979,37 @@ async function applyResponsesHistoryCollapse(
   o: OpenAIResolvedOptions,
   profile: GptModelProfile,
 ): Promise<boolean> {
-  const profitable = (text: string, cols: number, baselineTextTokens?: number) =>
-    evalOpenAIGate(req.model, text, cols, o.charsPerToken, baselineTextTokens).profitable;
+  const historySheets = createHistoryFactSheetRenderer(profile);
+  const renderHistorySheet = historySheets.render;
+  // Match emission's prefix-local deduplication. Only accepted sections cover
+  // spellings; rejected sections must not make a later replacement look cheaper.
+  const plannedSheetTokens = profile.history.factSheetOverflow === 'native-opaque'
+    && profile.history.factSheetScope === 'per-segment' ? new Set<string>() : undefined;
+  const profitable = (text: string, cols: number, baselineTextTokens?: number, sourceText = text) => {
+    const gate = evalOpenAIGate(req.model, text, cols, o.charsPerToken, baselineTextTokens);
+    if (!gate.profitable) return false;
+    const maxReads = profile.history.maxCachePaybackReads;
+    if (!profile.history.factSheetOverflow && maxReads === undefined) return true;
+    const framing = profile.history.framing === 'compact'
+      ? COMPACT_HISTORY_TRANSCRIPT_INTRO + COMPACT_HISTORY_TRANSCRIPT_OUTRO
+      : HISTORY_TRANSCRIPT_INTRO + HISTORY_TRANSCRIPT_OUTRO;
+    const sheet = renderHistorySheet(sourceText, plannedSheetTokens);
+    const collapsedTokens = gate.imageTokens + gptTextTokens(sheet + framing);
+    if (collapsedTokens >= gate.textTokens) return false;
+    const accepted = maxReads === undefined
+      || computeOpenAICollapsePaybackReads(gate.textTokens, collapsedTokens, req.model) <= maxReads;
+    if (accepted && plannedSheetTokens) {
+      for (const token of extractFactSheetTokens(sheet)) plannedSheetTokens.add(token);
+    }
+    return accepted;
+  };
   const existingImages = info.imageCount ?? 0;
   const plan = await planResponsesPairCollapse(
     inputItems,
     profitable,
     gptHistoryOpts(req.model, o, profile, existingImages),
   );
+  historySheets.beginEmission();
   const ps = plan.pairState;
   const rc = info.responsesComposition!;
   rc.completedFunctionPairs = ps.completedPairs;
@@ -926,8 +1040,13 @@ async function applyResponsesHistoryCollapse(
   const intro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_INTRO : HISTORY_TRANSCRIPT_INTRO;
   const outro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_OUTRO : HISTORY_TRANSCRIPT_OUTRO;
   const combinedSheet = profile.history.factSheetScope === 'combined'
-    ? factSheetText(plan.text, profile.factSheetFormat)
+    ? renderHistorySheet(plan.text)
     : '';
+  // Request-local and emission-ordered: a skipped/referenced/unimaged group
+  // cannot cover a spelling. Use a fresh set to replay the same accepted-prefix
+  // coverage used by planning; appended groups keep old prefixes.
+  const coveredSheetTokens = profile.history.factSheetOverflow === 'native-opaque'
+    ? new Set<string>() : undefined;
   for (let segmentIndex = 0; segmentIndex < plan.segments.length; segmentIndex++) {
     const segment = plan.segments[segmentIndex]!;
     const content: ResponsesContentPart[] = [
@@ -936,9 +1055,14 @@ async function applyResponsesHistoryCollapse(
     ];
     const sheet = profile.history.factSheetScope === 'combined'
       ? (segmentIndex === plan.segments.length - 1 ? combinedSheet : '')
-      : factSheetText(segment.text, profile.factSheetFormat);
-    if (sheet) content.push({ type: 'input_text', text: sheet });
-    content.push({ type: 'input_text', text: outro });
+      : renderHistorySheet(segment.text, coveredSheetTokens);
+    if (sheet) {
+      content.push({ type: 'input_text', text: sheet });
+      if (coveredSheetTokens) {
+        for (const token of extractFactSheetTokens(sheet)) coveredSheetTokens.add(token);
+      }
+    }
+    content.push({ type: 'input_text', text: outro, ...responsesCacheBreakpoint(req, profile) });
     info.nativeInjectedTokens = (info.nativeInjectedTokens ?? 0)
       + gptTextTokens(intro + sheet + outro);
     replacements.set(segment.insertAt, { role: 'user', content });
@@ -1370,7 +1494,7 @@ export async function transformOpenAIResponses(
   info.imageSourceTexts = images.map(() => info.imageSourceText);
 
   const imagePartsResp: ResponsesInputImagePart[] = images.map((img) => responsesImagePart(img, req.model));
-  const endMarker: ResponsesInputTextPart = { type: 'input_text', text: '[End of rendered GPT system/tool context.]' };
+  const endMarker: ResponsesInputTextPart = { type: 'input_text', text: '[End of rendered GPT system/tool context.]', ...responsesCacheBreakpoint(req, profile) };
   // Verbatim fact-sheet (see src/core/factsheet.ts): exact tokens that survive OCR loss.
   const slabFactSheet = factSheetText(combinedRaw, profile.factSheetFormat);
   const slabFactSheetPart: ResponsesInputTextPart[] = slabFactSheet

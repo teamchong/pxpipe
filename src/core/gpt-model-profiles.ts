@@ -87,6 +87,9 @@ export interface GptHistoryProfile {
   /** Chat-completions only: freeze imaged chunks on this turn grid.
    *  Undefined keeps the planner default (10). Native-14px sets 1. */
   freezeChunk?: number;
+  reflow?: boolean;
+  factSheetOverflow?: 'native-opaque';
+  maxCachePaybackReads?: number;
   /** Responses items eligible for history images. */
   responsesMode: 'pairs' | 'mixed';
   /** Native text bracketing each history image group. */
@@ -96,11 +99,15 @@ export interface GptHistoryProfile {
 }
 
 export interface GptModelProfile {
+  /** Optional outbound image detail; shared by runtime and profile evaluations. */
+  imageDetail?: 'high' | 'original';
   /** How this model's provider bills the rendered images as input tokens. */
   vision: GptVisionCost;
   /** Cached-input list price ÷ uncached-input list price for this family.
    *  Savings reporting reads this instead of re-classifying the model id. */
   cacheReadRate: number;
+  cacheWriteRate?: number;
+  cacheBreakpoints?: boolean;
   /** Output list price ÷ uncached-input list price for this family. */
   outputRate: number;
   /** Max portrait-strip width in columns. Combined with `style`, this must stay
@@ -198,6 +205,8 @@ export const DEFAULT_GPT_PROFILE: GptModelProfile = {
 };
 
 const GPT56_SOL_PROFILE: GptModelProfile = {
+  cacheWriteRate: 1.25,
+  cacheBreakpoints: true,
   // GPT-5.6 original detail bills the submitted 32px patches without a patch cap.
   vision: { regime: 'patch', multiplier: 1 },
   ...GPT5_PRICING,
@@ -223,6 +232,39 @@ const GPT56_SOL_PROFILE: GptModelProfile = {
     font: 'jetbrains-mono-14',
     cellWBonus: 0,
     cellHBonus: 0,
+  },
+};
+
+const GPT6_PROFILE: GptModelProfile = {
+  ...DEFAULT_GPT_PROFILE,
+  imageDetail: 'original',
+  vision: { regime: 'patch', multiplier: 1.2 },
+  stripCols: 152,
+  cacheReadRate: 0.1,
+  cacheWriteRate: 1.25,
+  cacheBreakpoints: true,
+  outputRate: 5,
+  exactStaticBaseline: true,
+  factSheetFormat: 'compact',
+  history: {
+    ...BASE_HISTORY,
+    maxImages: 200,
+    keepTail: 1,
+    keepRecentPairs: 1,
+    minCollapseTokens: 0,
+    minCollapsePrefix: 1,
+    collapseChunk: 1,
+    freezeChunk: 1,
+    reflow: true,
+    factSheetOverflow: 'native-opaque',
+    maxCachePaybackReads: 10,
+    responsesMode: 'mixed',
+    framing: 'compact',
+    factSheetScope: 'per-segment',
+  },
+  style: {
+    ...BASE_STYLE,
+    font: 'spleen-5x8',
   },
 };
 
@@ -265,6 +307,10 @@ const miniNanoProfile = (
  *   mini/nano -> patch (nano 2.46 / mini 1.62, cap 1536), BEFORE 5.x flagship.
  */
 const BUILTIN_RULES: ProfileRule[] = [
+  {
+    test: (m) => /^gpt-6(?:[.-]|$)/.test(m),
+    profile: GPT6_PROFILE,
+  },
   // nano patch models: ceil(patches * 2.46), cap 1536
   {
     test: (m) => isMiniNanoPatch(m) && /nano/.test(m) && /^gpt-5/.test(m),
@@ -544,6 +590,11 @@ function parseEnvProfiles(raw: string): Map<string, GptModelProfile> {
       freezeChunk: historyIn?.freezeChunk === undefined
         ? baseHistory.freezeChunk
         : nonNegativeInt(historyIn.freezeChunk, baseHistory.freezeChunk ?? 10),
+      reflow: typeof historyIn?.reflow === 'boolean' ? historyIn.reflow : baseHistory.reflow,
+      factSheetOverflow: historyIn?.factSheetOverflow === 'native-opaque' ? historyIn.factSheetOverflow : baseHistory.factSheetOverflow,
+      maxCachePaybackReads: historyIn?.maxCachePaybackReads === undefined
+        ? baseHistory.maxCachePaybackReads
+        : nonNegativeInt(historyIn.maxCachePaybackReads, baseHistory.maxCachePaybackReads ?? 10),
       responsesMode: responsesMode(historyIn?.responsesMode, baseHistory.responsesMode),
       framing: historyFraming(historyIn?.framing, baseHistory.framing),
       factSheetScope: factSheetScope(historyIn?.factSheetScope, baseHistory.factSheetScope),
@@ -560,8 +611,11 @@ function parseEnvProfiles(raw: string): Map<string, GptModelProfile> {
       : posInt(p.historyStripCols, base.historyStripCols ?? base.stripCols);
 
     out.set(key, {
+      imageDetail: p.imageDetail === 'high' || p.imageDetail === 'original' ? p.imageDetail : base.imageDetail,
       vision: isValidVision(p.vision) ? p.vision : base.vision,
       cacheReadRate: rate(p.cacheReadRate, base.cacheReadRate),
+      cacheWriteRate: rate(p.cacheWriteRate, base.cacheWriteRate ?? 1),
+      cacheBreakpoints: base.cacheBreakpoints,
       outputRate: rate(p.outputRate, base.outputRate),
       stripCols: posInt(p.stripCols, base.stripCols),
       maxHeightPx: posInt(p.maxHeightPx, base.maxHeightPx),

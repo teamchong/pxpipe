@@ -81,6 +81,9 @@ async function startNode(extraEnv: Record<string, string> = {}): Promise<{
       HOST: '127.0.0.1',
       PXPIPE_LOG: eventsFile,
       PXPIPE_CONFIG: configFile,
+      // Session state persists to ~/.pxpipe/session-state.json by default; keep
+      // test children off the developer's real file.
+      PXPIPE_SESSION_STATE: 'off',
       PXPIPE_MODELS: 'claude-fable-5',
       ANTHROPIC_UPSTREAM: `http://127.0.0.1:${upstreamPort}`,
       ...extraEnv,

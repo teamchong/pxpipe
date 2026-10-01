@@ -525,6 +525,28 @@ function isEscapeExempt(cp: number): boolean {
   return false;
 }
 
+/** Blank cells reserved on EACH side of the ↵ marker when it is laid out.
+ *  Without them the marker carries no separation at all, so the value ending one
+ *  source line and the identifier starting the next fuse into a single visual
+ *  token (`00014↵L00003`) — a reader that transcribes the image perfectly still
+ *  attributes line-trailing values to the FOLLOWING line. One cell per side makes
+ *  the strongest boundary in the source separate at least as strongly as an
+ *  intra-line word gap. */
+export const NL_SENTINEL_PAD_CELLS = 1;
+
+/** Surround every ↵ with blank cells so it reads as its own token. Pure
+ *  string→string, applied at the same layer as tab expansion and atlas-miss
+ *  escaping (wrapLines + measureContentCols), so wrap math and canvas
+ *  measurement stay consistent. Runs on the render copy only: `reflow` still
+ *  emits the bare sentinel, so the reflow/dereflow round-trip is untouched.
+ *  Fast path allocates nothing for text with no markers (every non-reflowed
+ *  render). */
+export function padNewlineMarkers(line: string): string {
+  if (line.indexOf(NL_SENTINEL) < 0) return line; // fast path
+  const pad = ' '.repeat(NL_SENTINEL_PAD_CELLS);
+  return line.split(NL_SENTINEL).join(pad + NL_SENTINEL + pad);
+}
+
 /** Replace atlas-missing codepoints with `[U+HEX]` (uppercase hex — e.g.
  *  🔥 → `[U+1F525]`). Lossless for non-exempt misses (hex → codepoint) and
  *  idempotent: the escape spells only atlas-present chars, so a second pass is
@@ -612,7 +634,11 @@ export function measureContentCols(
   let start = 0;
   for (let i = 0; i <= text.length; i++) {
     if (i === text.length || text[i] === '\n') {
-      const w = measureLineCols(escapeMissingGlyphs(expandTabsInLine(text.slice(start, i))), markerScale, font);
+      const w = measureLineCols(
+        escapeMissingGlyphs(padNewlineMarkers(expandTabsInLine(text.slice(start, i)))),
+        markerScale,
+        font,
+      );
       if (w > widest) widest = w;
       if (widest >= cap) return cap;
       start = i + 1;
@@ -626,11 +652,15 @@ export function wrapLines(
   cols: number,
   markerScale: number = 1,
   font: RenderFont = DEFAULT_RENDER_FONT,
+  padMarkers: boolean = true,
 ): string[] {
   const out: string[] = [];
   const minified = minifyForRender(text);
   for (const rawWithTabs of minified.split('\n')) {
-    const raw = escapeMissingGlyphs(expandTabsInLine(rawWithTabs));
+    // Unlike tab expansion and escaping, marker padding is not idempotent, so rows
+    // that already went through here are re-wrapped with `padMarkers = false`.
+    const expanded = expandTabsInLine(rawWithTabs);
+    const raw = escapeMissingGlyphs(padMarkers ? padNewlineMarkers(expanded) : expanded);
     if (raw.length === 0) {
       out.push('');
       continue;
@@ -883,6 +913,9 @@ export async function renderChunkToPng(
   style: RenderStyle = {},
   maxHeightPx: number = MAX_HEIGHT_PX,
   slotText?: string,
+  /** `text` is rows already laid out by wrapLines (renderTextToPngs pages), so
+   *  its ↵ markers are padded already and must not be padded again. */
+  prewrapped: boolean = false,
 ): Promise<RenderedImage> {
   const useAA = style.aa === true;
   const selected = atlasSet(style.font);
@@ -891,13 +924,13 @@ export async function renderChunkToPng(
   const markerScale = Math.max(1, Math.floor(style.markerScale ?? 1));
   const cellH = renderCellHeight(style);
   const cellW = renderCellWidth(style);
-  const lines = wrapLines(text, cols, markerScale, style.font);
+  const lines = wrapLines(text, cols, markerScale, style.font, !prewrapped);
   // Slot string carries role attribution by position. It is width-identical to
   // `text`, so wrapLines splits it into the exact same rows — fitSlotLines[r] aligns
   // codepoint-for-codepoint with fitLines[r]. Only built when coloring is on.
   const slotLines: string[] | null =
     style.colorByRole === true && slotText !== undefined
-      ? wrapLines(slotText, cols, markerScale, style.font)
+      ? wrapLines(slotText, cols, markerScale, style.font, !prewrapped)
       : null;
 
   const maxLines = Math.max(1, Math.floor((maxHeightPx - 2 * PAD_Y) / cellH));
@@ -1369,7 +1402,7 @@ async function renderTextToPngsUncached(
       ? slotLines.slice(slotCursor, slotCursor + page.length).join('\n')
       : undefined;
     slotCursor += page.length;
-    images.push(await renderChunkToPng(chunk, cols, style, maxHeightPx, slotChunk));
+    images.push(await renderChunkToPng(chunk, cols, style, maxHeightPx, slotChunk, true));
   }
   return images;
 }

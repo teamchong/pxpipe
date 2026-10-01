@@ -21,6 +21,7 @@ import {
   shrinkColsToContent,
   MAX_HEIGHT_PX,
   NL_SENTINEL,
+  NL_SENTINEL_PAD_CELLS,
   neutralizeSentinel,
   PAD_X,
   PAD_Y,
@@ -1518,18 +1519,25 @@ function lineRows(line: string, cols: number): number {
  *  (see wrapLines in render.ts: "never forces a row break"), so packing many
  *  original newlines into one soft-wrapped stream must NOT inflate the row
  *  count. Treating ↵ as a break overstated image pages ~6× on reflowed
- *  history and flipped profitable collapses to not_profitable. */
+ *  history and flipped profitable collapses to not_profitable.
+ *
+ *  Each ↵ is laid out with NL_SENTINEL_PAD_CELLS blank cells on either side
+ *  (padNewlineMarkers in render.ts), so it counts as that many extra cells. */
 export function countVisualRows(text: string, cols: number): number {
+  const sentinel = NL_SENTINEL.charCodeAt(0);
   let rows = 0;
   let lineStart = 0;
+  let padCells = 0;
   const len = text.length;
   for (let i = 0; i <= len; i++) {
     const cc = i < len ? text.charCodeAt(i) : -1;
+    if (cc === sentinel) padCells += 2 * NL_SENTINEL_PAD_CELLS;
     if (i === len || cc === 10 /* \n */) {
-      const lineLen = i - lineStart;
+      const lineLen = i - lineStart + padCells;
       // Empty line (consecutive \n) still costs one visual row.
       rows += lineLen === 0 ? 1 : Math.ceil(lineLen / Math.max(1, cols));
       lineStart = i + 1;
+      padCells = 0;
     }
   }
   return rows;

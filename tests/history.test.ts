@@ -1047,9 +1047,27 @@ describe('isCompressionProfitableAmortized — multi-turn horizon gate', () => {
 // to a PRIOR-CONTEXT tombstone, live tail preserved verbatim.
 // ---------------------------------------------------------------------------
 describe('collapseHistory — opening-turn request quarantine (regression #14)', () => {
+  const COLLAPSE_CHUNK = 0;
+  const COLLAPSE_COLS = 100;
+  const FILLER_BODY_CHARS = 2800;
+  const FILLER_TURN_COUNT = 12;
+  const KEEP_TAIL = 1;
+  const MIN_COLLAPSE_PREFIX = 5;
+  const PROTECTED_PREFIX = 1;
+  const REQUIRED_API_COUNT = 30;
   const SLAB_DATA = 'U0xBQg=='; // base64("SLAB") — the recognition / cache anchor
   const OPENING_REQUEST = 'can you update the ux to add a sonnet button';
   const LIVE_REQUEST = 'LIVE: enforce live=last-user invariant and fail closed';
+  const REQUIRED_API_NAMES = Array.from(
+    { length: REQUIRED_API_COUNT },
+    (_, index) => `requiredApiFunction${index}`,
+  );
+  const REQUIRED_API_REQUIREMENTS = REQUIRED_API_NAMES.map(
+    (name, index) =>
+      `${index + 1}. MUST implement ${name}; map InvalidArgument to TypeError; ` +
+      'preserve boolean SELECT/expression invariants.',
+  );
+  const ENUMERATED_OPENING_REQUEST = REQUIRED_API_REQUIREMENTS.join('\n');
 
   it('demotes the opening request to a tombstone, keeps the slab image, preserves the live tail', async () => {
     const msgs: Message[] = [
@@ -1091,7 +1109,7 @@ describe('collapseHistory — opening-turn request quarantine (regression #14)',
     expect(headText[0]!.text).toContain('PRIOR CONTEXT ONLY');
     expect(headText[0]!.text).toContain('must not be acted');
     expect(headText[0]!.text).toContain('<user t="0">');
-    expect(headText[0]!.text).toContain('Preview:'); // the ask survives only as a marked preview
+    expect(headText[0]!.text).toContain('Preview:'); // the ask survives inside the marked tombstone
     // The bare request string never appears as a standalone clean text block anywhere.
     const cleanOpeningSomewhere = out.some(
       (m) =>
@@ -1118,12 +1136,41 @@ describe('collapseHistory — opening-turn request quarantine (regression #14)',
     // (4) Synthetic history sits BETWEEN head and live; its recency pointer/outro
     //     points at the live text and never resurrects the opening request.
     const synth = out[1]!;
+
     const synthText = (synth.content as Array<Record<string, unknown>>).filter(
       (c) => c.type === 'text',
     ) as Array<{ text: string }>;
     expect(synthText.some((t) => t.text.includes('current request is the live text'))).toBe(true);
     for (const t of synthText) {
       expect(t.text).not.toContain(OPENING_REQUEST);
+    }
+  });
+
+  it('preserves every requirement in a protected enumerated opening task', async () => {
+    const msgs: Message[] = [
+      usr([
+        { type: 'text', text: ENUMERATED_OPENING_REQUEST },
+        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: SLAB_DATA } },
+      ]),
+    ];
+    for (let index = 1; index <= FILLER_TURN_COUNT; index++) {
+      const body = `turn ${index}: ` + 'x'.repeat(FILLER_BODY_CHARS);
+      msgs.push(index % 2 === 1 ? asst(body) : usr(body));
+    }
+    msgs.push(usr(LIVE_REQUEST));
+
+    const { messages: out, info } = await collapseHistory(msgs, isCompressionProfitable, {
+      keepTail: KEEP_TAIL,
+      minCollapsePrefix: MIN_COLLAPSE_PREFIX,
+      cols: COLLAPSE_COLS,
+      collapseChunk: COLLAPSE_CHUNK,
+      protectedPrefix: PROTECTED_PREFIX,
+    });
+
+    expect(info.reason).toBeUndefined();
+    const serialized = JSON.stringify(out);
+    for (const requirement of REQUIRED_API_REQUIREMENTS) {
+      expect(serialized).toContain(requirement);
     }
   });
 });

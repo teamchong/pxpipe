@@ -1710,6 +1710,7 @@ export type DashboardRoute =
   | { kind: 'stats' } // /proxy-stats — legacy live counter
   | { kind: 'recent' } // /proxy-recent — legacy ring buffer
   | { kind: 'png' } // /proxy-latest-png
+  | { kind: 'build-info' } // /build-info, /api/build-info, /v1/build-info
   | { kind: 'api-sessions' } // /api/sessions.json
   | { kind: 'api-stats' } // /api/stats.json
   | { kind: 'current-session' } // /api/current-session.json
@@ -1723,6 +1724,11 @@ export function dashboardPath(pathname: string): DashboardRoute | null {
   if (pathname === '/proxy-stats') return { kind: 'stats' };
   if (pathname === '/proxy-recent') return { kind: 'recent' };
   if (pathname === '/proxy-latest-png') return { kind: 'png' };
+  if (
+    pathname === '/build-info' ||
+    pathname === '/api/build-info' ||
+    pathname === '/v1/build-info'
+  ) return { kind: 'build-info' };
   if (pathname === '/api/sessions.json') return { kind: 'api-sessions' };
   if (pathname === '/api/stats.json') return { kind: 'api-stats' };
   if (pathname === '/api/current-session.json') return { kind: 'current-session' };

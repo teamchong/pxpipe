@@ -42,6 +42,7 @@ import {
   type DashboardRoute,
 } from './dashboard.js';
 import { runStats } from './stats.js';
+import { getBuildProvenance } from './core/build-provenance.js';
 
 /** Runtime config. The core transform tuning comes from DEFAULTS in
  *  transform.ts; startup knobs cover deployment plus emergency GPT scope
@@ -208,6 +209,10 @@ function parseCli(argv: string[]): RuntimeConfig {
       printVersion();
       process.exit(0);
     }
+    if (a === '--build-info' || a === '--provenance') {
+      printBuildInfo();
+      process.exit(0);
+    }
     if (a.startsWith('-')) {
       console.error(`[pxpipe] unknown option: ${a}`);
       console.error(`[pxpipe] this build accepts no flags; run \`pxpipe --help\` for env vars`);
@@ -300,6 +305,7 @@ For after-the-fact analysis without the server running, use pxpipe stats.
 Flags:
   -h, --help              show this help
       --version           show version
+      --build-info        show immutable build provenance JSON
 
 Environment:
   PORT                    listen port (default 47821)
@@ -362,6 +368,10 @@ declare const __PXPIPE_VERSION__: string | undefined;
 function printVersion(): void {
   const injected = typeof __PXPIPE_VERSION__ === 'string' ? __PXPIPE_VERSION__ : undefined;
   console.log(injected ?? process.env.npm_package_version ?? 'unknown');
+}
+
+function printBuildInfo(): void {
+  console.log(JSON.stringify(getBuildProvenance(), null, 2));
 }
 
 // ---- node:http <-> Web Request/Response bridge ---------------------------
@@ -578,6 +588,18 @@ async function dispatchDashboard(
     case 'recent':
       if (method !== 'GET') return undefined;
       return dashboard.serveRecent();
+    case 'build-info': {
+      if (method !== 'GET' && method !== 'HEAD') return undefined;
+      return new Response(
+        method === 'HEAD' ? null : JSON.stringify(getBuildProvenance(), null, 2),
+        {
+          headers: {
+            'content-type': 'application/json; charset=utf-8',
+            'cache-control': 'no-store',
+          },
+        },
+      );
+    }
     case 'png': {
       if (method !== 'GET') return undefined;
       const idRaw = url.searchParams.get('id');
@@ -1459,6 +1481,12 @@ async function main(): Promise<void> {
 
   server.listen(opts.port, opts.host, () => {
     console.log(`[pxpipe] listening on http://${displayHost}:${opts.port}`);
+    const provenance = getBuildProvenance();
+    console.log(
+      `[pxpipe] build source → ${provenance.source_sha}` +
+        `${provenance.dirty ? ' (dirty)' : ''} [${provenance.source_ref}]`,
+    );
+    console.log(`[pxpipe] build entry sha256 → ${provenance.entry_sha256}`);
     if (!isLoopbackHost) {
       console.warn(
         `[pxpipe] bound to ${opts.host}; proxy API is reachable off-host, ` +

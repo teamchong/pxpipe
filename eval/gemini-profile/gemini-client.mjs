@@ -180,7 +180,8 @@ export async function callGeminiRequest({
     .replace(/^google\//, '')
     .replace(/[^a-zA-Z0-9._-]+/g, '');
   const origin = gatewayOrigin();
-  const isDirect = origin.includes('googleapis.com');
+  const hostname = new URL(origin).hostname.toLowerCase();
+  const isDirect = hostname === 'googleapis.com' || hostname.endsWith('.googleapis.com');
   const url = isDirect
     ? `${origin}/v1beta/models/${cleanModel}:generateContent`
     : `${origin}/google-ai-studio/v1beta/models/${cleanModel}:generateContent`;

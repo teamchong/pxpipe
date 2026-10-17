@@ -8,6 +8,8 @@ import {
   resolveGeminiProfile,
   geminiVisionTokens,
   GEMINI_3_6_FLASH_PROFILE,
+  GEMINI_4_ARGON_PROFILE,
+  GEMINI_4_PROFILE,
 } from '../src/core/gemini-model-profiles.js';
 import { visionTokensForModel } from '../src/core/openai.js';
 import { resolveGptProfile } from '../src/core/gpt-model-profiles.js';
@@ -18,6 +20,7 @@ describe('Gemini Model Profiles & Identification', () => {
     expect(isGeminiModel('gemini-3.7-flash')).toBe(true);
     expect(isGeminiModel('google/gemini-3.6-flash')).toBe(true);
     expect(isGeminiModel('google/gemini-3.7-flash')).toBe(true);
+    expect(isGeminiModel('gemini-4-argon')).toBe(true);
     expect(isGeminiModel('GEMINI-PRO')).toBe(true);
     expect(isGeminiModel('google/gemini-3.6-pro')).toBe(true);
     expect(isGeminiModel('gpt-5.6-sol')).toBe(false);
@@ -37,6 +40,7 @@ describe('Gemini Model Profiles & Identification', () => {
     expect(hasGeminiMeasuredProfile('gemini-3.9-flash')).toBe(true);
     expect(hasGeminiMeasuredProfile('gemini-3.9-pro')).toBe(true);
     expect(hasGeminiMeasuredProfile('gemini-4-flash')).toBe(true);
+    expect(hasGeminiMeasuredProfile('gemini-4-argon')).toBe(true);
     expect(hasGeminiMeasuredProfile('gemini-5-pro')).toBe(true);
     expect(hasGeminiMeasuredProfile('gemini-pro')).toBe(true);
     expect(hasGeminiMeasuredProfile('gpt-5.6-sol')).toBe(false);
@@ -69,6 +73,18 @@ describe('Gemini Model Profiles & Identification', () => {
     expect(prof4.stripCols).toBe(312);
     expect(prof4.maxHeightPx).toBe(728);
     expect(prof4.vision).toEqual(prof1.vision);
+
+    const prof5 = resolveGeminiProfile('gemini-4-argon');
+    expect(prof5).toBe(GEMINI_4_PROFILE);
+
+    const prof6 = resolveGeminiProfile('gemini-4');
+    expect(prof6).toBe(GEMINI_4_PROFILE);
+
+    const prof7 = resolveGeminiProfile('gemini-4-custom');
+    expect(prof7).toBe(GEMINI_4_PROFILE);
+
+    const profDefault = resolveGeminiProfile();
+    expect(profDefault).toBe(GEMINI_4_PROFILE);
   });
 
   it('uses the measured production-geometry image cost', () => {

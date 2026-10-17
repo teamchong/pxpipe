@@ -101,6 +101,7 @@ const GEMINI_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
   { id: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash' },
   { id: 'gemini-3.7-flash', label: 'Gemini 3.7 Flash' },
   { id: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash' },
+  { id: 'gemini-4', label: 'Gemini 4' },
 ];
 
 export function renderModelsFragment(

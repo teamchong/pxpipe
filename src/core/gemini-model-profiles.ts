@@ -66,6 +66,15 @@ export const GEMINI_3_1_FLASH_PROFILE: GptModelProfile = {
   style: { ...GEMINI_3_6_FLASH_PROFILE.style },
 };
 
+export const GEMINI_4_PROFILE: GptModelProfile = {
+  ...GEMINI_3_6_FLASH_PROFILE,
+  vision: { ...GEMINI_3_6_FLASH_PROFILE.vision },
+  history: { ...GEMINI_3_6_FLASH_PROFILE.history },
+  style: { ...GEMINI_3_6_FLASH_PROFILE.style },
+};
+
+export const GEMINI_4_ARGON_PROFILE: GptModelProfile = GEMINI_4_PROFILE;
+
 const GEMINI_MEASURED_PROFILES: Readonly<Record<string, GptModelProfile>> = {
   'gemini-3.6-flash': GEMINI_3_6_FLASH_PROFILE,
   'gemini-3.7-flash': GEMINI_3_7_FLASH_PROFILE,
@@ -75,6 +84,13 @@ const GEMINI_MEASURED_PROFILES: Readonly<Record<string, GptModelProfile>> = {
   'gemini-3.8-flash-low': GEMINI_3_8_FLASH_PROFILE,
   'gemini-3.1-flash': GEMINI_3_1_FLASH_PROFILE,
   'gemini-3.1-flash-lite': GEMINI_3_1_FLASH_PROFILE,
+  'gemini-4': GEMINI_4_PROFILE,
+  'gemini-4-flash': GEMINI_4_PROFILE,
+  'gemini-4-pro': GEMINI_4_PROFILE,
+  'gemini-4-argon': GEMINI_4_PROFILE,
+  'gemini-4-argon-high': GEMINI_4_PROFILE,
+  'gemini-4-argon-medium': GEMINI_4_PROFILE,
+  'gemini-4-argon-low': GEMINI_4_PROFILE,
 };
 
 function normalizeGeminiId(model: string | null | undefined): string {
@@ -107,10 +123,12 @@ export function hasGeminiMeasuredProfile(model: string | null | undefined): bool
 
 export function resolveGeminiProfile(model?: string | null): GptModelProfile {
   if (model) {
-    const prof = GEMINI_MEASURED_PROFILES[normalizeGeminiId(model)];
+    const id = normalizeGeminiId(model);
+    const prof = GEMINI_MEASURED_PROFILES[id];
     if (prof) return prof;
+    if (id.startsWith('gemini-4')) return GEMINI_4_PROFILE;
   }
-  return GEMINI_3_8_FLASH_PROFILE;
+  return GEMINI_4_PROFILE;
 }
 
 /** Gemini image tokens for any supported Gemini model using the validated

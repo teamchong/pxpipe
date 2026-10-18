@@ -8,6 +8,7 @@ import {
   resolveGeminiProfile,
   geminiVisionTokens,
   GEMINI_PROFILE,
+  GEMINI_LEGACY_PROFILE,
   GEMINI_3_6_FLASH_PROFILE,
 } from '../src/core/gemini-model-profiles.js';
 import { visionTokensForModel } from '../src/core/openai.js';
@@ -48,17 +49,17 @@ describe('Gemini Model Profiles & Identification', () => {
 
   it('resolves dedicated Gemini profile via resolveGeminiProfile and resolveGptProfile', () => {
     const prof1 = resolveGeminiProfile('gemini-3.6-flash');
-    expect(prof1).toBe(GEMINI_PROFILE);
-    expect(GEMINI_3_6_FLASH_PROFILE).toBe(GEMINI_PROFILE);
+    expect(prof1).toBe(GEMINI_LEGACY_PROFILE);
+    expect(GEMINI_3_6_FLASH_PROFILE).toBe(GEMINI_LEGACY_PROFILE);
     expect(prof1.stripCols).toBe(312);
     expect(prof1.maxHeightPx).toBe(728);
+    expect(prof1.history.maxImages).toBe(32);
     expect(prof1.vision).toEqual({
       regime: 'flat',
       tokens: 1120,
       exact: { widthPx: 1568, heightPx: 728, tokens: 1078 },
     });
     expect(prof1.style.font).toBe('spleen-5x8');
-
     const prof2 = resolveGptProfile('google/gemini-3.6-flash');
     expect(prof2.stripCols).toBe(312);
     expect(prof2.maxHeightPx).toBe(728);
@@ -74,9 +75,13 @@ describe('Gemini Model Profiles & Identification', () => {
     expect(prof4.maxHeightPx).toBe(728);
     expect(prof4.vision).toEqual(prof1.vision);
 
-    expect(resolveGeminiProfile('gemini-4-argon')).toBe(GEMINI_PROFILE);
+    const profArgon = resolveGeminiProfile('gemini-4-argon');
+    expect(profArgon).toBe(GEMINI_PROFILE);
+    expect(profArgon.history.maxImages).toBe(96);
+    expect(profArgon.history.responsesMode).toBe('mixed');
     expect(resolveGeminiProfile('gemini-4')).toBe(GEMINI_PROFILE);
     expect(resolveGeminiProfile('gemini-4-custom')).toBe(GEMINI_PROFILE);
+    expect(resolveGeminiProfile('gemini-3.9-flash')).toBe(GEMINI_LEGACY_PROFILE);
     expect(resolveGeminiProfile()).toBe(GEMINI_PROFILE);
   });
 

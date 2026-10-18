@@ -1427,9 +1427,6 @@ function resolveGoogleUpstream(
       ? 'https://cloudcode-pa.googleapis.com'
       : 'https://daily-cloudcode-pa.googleapis.com';
   }
-  if (host === 'gateway.opencode.cloudflare.dev') {
-    return 'https://gateway.opencode.cloudflare.dev';
-  }
   if (host === 'generativelanguage.googleapis.com') {
     return 'https://generativelanguage.googleapis.com';
   }

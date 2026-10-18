@@ -54,10 +54,6 @@ function defaultRoutes(port: number): Route[] {
     parseRoute(`generativelanguage.googleapis.com/v1beta/models/*:generateContent*=http://127.0.0.1:${port}`),
     parseRoute(`generativelanguage.googleapis.com/v1/models/*:streamGenerateContent*=http://127.0.0.1:${port}`),
     parseRoute(`generativelanguage.googleapis.com/v1/models/*:generateContent*=http://127.0.0.1:${port}`),
-    parseRoute(`gateway.opencode.cloudflare.dev/google-ai-studio/v1beta/models/*:streamGenerateContent*=http://127.0.0.1:${port}`),
-    parseRoute(`gateway.opencode.cloudflare.dev/google-ai-studio/v1beta/models/*:generateContent*=http://127.0.0.1:${port}`),
-    parseRoute(`gateway.opencode.cloudflare.dev/google-ai-studio/v1/models/*:streamGenerateContent*=http://127.0.0.1:${port}`),
-    parseRoute(`gateway.opencode.cloudflare.dev/google-ai-studio/v1/models/*:generateContent*=http://127.0.0.1:${port}`),
   ];
 }
 

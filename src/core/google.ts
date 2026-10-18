@@ -7,6 +7,7 @@
 
 import { countTokens as o200kCountTokens } from 'gpt-tokenizer/encoding/o200k_base';
 import {
+  READABLE_CHARS_PER_IMAGE,
   neutralizeSentinel,
   reflow,
   renderTextToPngs,
@@ -272,13 +273,31 @@ function rewriteGoogleTools(tools: unknown[] | undefined): GoogleToolRewrite {
   };
 }
 
+const SIMPLE_RESPONSE_KEYS = new Set(['name', 'output', 'content', 'result', 'error']);
+
+function extractGoogleFunctionResponseText(response: unknown): string {
+  const rec = record(response);
+  if (rec) {
+    const keys = Object.keys(rec);
+    if (keys.length > 0 && keys.every((k) => SIMPLE_RESPONSE_KEYS.has(k))) {
+      const parts: string[] = [];
+      for (const k of ['content', 'output', 'result', 'error'] as const) {
+        const v = rec[k];
+        if (typeof v === 'string' && v.length > 0) parts.push(v);
+      }
+      if (parts.length > 0) return compactSlabWhitespace(parts.join('\n'));
+    }
+  }
+  return safeJson(response ?? {});
+}
+
 function googlePartText(part: GooglePart): string {
   if (typeof part.text === 'string') return part.text;
   if (part.functionCall) {
     return `[tool_use ${part.functionCall.name ?? 'tool'}]\n${safeJson(part.functionCall.args ?? {})}`;
   }
   if (part.functionResponse) {
-    return `[tool_result ${part.functionResponse.name ?? 'tool'}]\n${safeJson(part.functionResponse.response ?? {})}`;
+    return `[tool_result ${part.functionResponse.name ?? 'tool'}]\n${extractGoogleFunctionResponseText(part.functionResponse.response)}`;
   }
   return '';
 }
@@ -288,38 +307,56 @@ function googleHistoryUnit(content: GoogleContent, index: number): GoogleHistory
     return { index, text: '', baselineTokens: 0, source: content, opens: [], closes: [], opaque: true };
   }
   const text: string[] = [];
+  const rawTexts: string[] = [];
   const opens: string[] = [];
   const closes: string[] = [];
   let opaque = false;
   for (const rawPart of content.parts) {
     const part = record(rawPart) as GooglePart | null;
     if (!part) { opaque = true; continue; }
+    if (part.thought === true) {
+      if (typeof part.text === 'string' && part.text) rawTexts.push(part.text);
+      continue;
+    }
     if (typeof part.text === 'string') {
       text.push(part.text);
+      rawTexts.push(part.text);
       continue;
     }
     if (part.functionCall) {
       const name = typeof part.functionCall.name === 'string' ? part.functionCall.name : 'tool';
       opens.push(name);
-      text.push(googlePartText(part));
+      const serialized = googlePartText(part);
+      text.push(serialized);
+      rawTexts.push(safeJson(part.functionCall));
       continue;
     }
     if (part.functionResponse) {
       const name = typeof part.functionResponse.name === 'string' ? part.functionResponse.name : 'tool';
       closes.push(name);
-      text.push(googlePartText(part));
+      const serialized = googlePartText(part);
+      text.push(serialized);
+      rawTexts.push(safeJson(part.functionResponse.response ?? {}));
       continue;
     }
-    // Thought signatures, images, server tool state, and unknown parts must stay native.
+    if (part.inlineData) {
+      text.push('[image]');
+      continue;
+    }
+    if (readGeminiThoughtSignature(part) !== undefined) {
+      continue;
+    }
+    // Server tool state and unknown parts must stay native.
     opaque = true;
   }
   const role = content.role === 'model' ? 'assistant' : 'user';
   const body = text.filter(Boolean).join('\n\n');
+  const rawBody = rawTexts.filter(Boolean).join('\n\n');
   const transcript = body ? `<${role} t="${index}">\n${body}\n</${role}>` : '';
   return {
     index,
     text: transcript,
-    baselineTokens: googleTextTokens(body),
+    baselineTokens: Math.max(googleTextTokens(body), googleTextTokens(rawBody)),
     source: content,
     opens,
     closes,
@@ -375,9 +412,12 @@ async function compressGoogleToolResults(
       const part = record(rawPart) as GooglePart | null;
       const response = part?.functionResponse;
       const responseBody = record(response?.response);
-      const raw = typeof responseBody?.content === 'string' ? responseBody.content : '';
+      const textKey = (['content', 'output', 'result', 'error'] as const).find(
+        (k) => typeof responseBody?.[k] === 'string' && (responseBody[k] as string).length >= minChars,
+      );
+      const raw = textKey ? (responseBody![textKey] as string) : '';
       if (
-        !part || !response || !responseBody || raw.length < minChars ||
+        !part || !response || !responseBody || !textKey || raw.length < minChars ||
         (Array.isArray(response.parts) && response.parts.length > 0)
       ) {
         rewrittenParts.push(rawPart);
@@ -422,7 +462,7 @@ async function compressGoogleToolResults(
         ...part,
         functionResponse: {
           ...response,
-          response: { ...responseBody, content: pointer },
+          response: { ...responseBody, [textKey]: pointer },
           parts: images.map(imagePart),
         },
       });
@@ -514,15 +554,26 @@ async function planGoogleHistory(
   const admitted: GoogleHistoryUnit[] = [];
   const images: RenderedImage[] = [];
   const imageSources: string[] = [];
-  const chunkSize = 8;
+  const minChunkTurns = 8;
   let cursor = 0;
   while (cursor < selected.length && images.length < profile.history.maxImages) {
     const remaining = profile.history.maxImages - images.length;
-    let candidateEnd = googleClosedBoundary(
-      selected,
-      cursor,
-      Math.min(selected.length, cursor + chunkSize),
-    ) + 1;
+    let targetEnd = Math.min(selected.length, cursor + minChunkTurns);
+    let accruedChars = 0;
+    for (let i = cursor; i < selected.length; i++) {
+      accruedChars += selected[i]!.text.length + 2;
+      if (i + 1 >= cursor + minChunkTurns && accruedChars >= READABLE_CHARS_PER_IMAGE) {
+        const closed = googleClosedBoundary(selected, cursor, i + 1) + 1;
+        if (closed > cursor) {
+          targetEnd = closed;
+          break;
+        }
+      }
+      if (i === selected.length - 1) {
+        targetEnd = selected.length;
+      }
+    }
+    let candidateEnd = googleClosedBoundary(selected, cursor, targetEnd) + 1;
     let accepted = false;
     while (candidateEnd > cursor) {
       const chunk = selected.slice(cursor, candidateEnd);

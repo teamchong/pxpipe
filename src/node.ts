@@ -54,6 +54,7 @@ interface RuntimeConfig {
   upstream: string;
   openAIUpstream: string;
   openAIApiKey?: string;
+  googleUpstream?: string;
   /** Independent Cloudflare OpenAI-compatible endpoint. */
   cloudflareUpstream?: string;
   cloudflareApiKey?: string;
@@ -232,6 +233,7 @@ function parseCli(argv: string[]): RuntimeConfig {
     upstream: process.env.ANTHROPIC_UPSTREAM ?? sharedUpstream ?? 'https://api.anthropic.com',
     openAIUpstream: process.env.OPENAI_UPSTREAM ?? sharedUpstream ?? 'https://api.openai.com',
     openAIApiKey: process.env.OPENAI_API_KEY,
+    googleUpstream: process.env.GOOGLE_UPSTREAM,
     cloudflareUpstream,
     cloudflareApiKey: cfToken,
     openAIModels: parseModels(process.env.OPENAI_MODELS),
@@ -1276,6 +1278,7 @@ async function main(): Promise<void> {
     upstream: opts.upstream,
     openAIUpstream: opts.openAIUpstream,
     openAIApiKey: opts.openAIApiKey,
+    googleUpstream: opts.googleUpstream,
     cloudflareUpstream: opts.cloudflareUpstream,
     cloudflareApiKey: opts.cloudflareApiKey,
     openAIModels: opts.openAIModels,

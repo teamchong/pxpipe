@@ -170,4 +170,33 @@ describe('Antigravity CloudCode PA inference routing', () => {
     await proxy(req);
     expect(capturedUrl).toBe('https://mock-google-gateway.internal/v1internal:streamGenerateContent?alt=sse');
   });
+
+  it('routes warped gateway.opencode.cloudflare.dev Google requests even when ANTHROPIC_UPSTREAM is set', async () => {
+    let capturedUrl: string | undefined;
+    let capturedHeaders: Headers | undefined;
+    globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      capturedUrl = input.toString();
+      capturedHeaders = init?.headers as Headers;
+      return new Response('data: {}\n\n', { status: 200, headers: { 'content-type': 'text/event-stream' } });
+    };
+
+    const proxy = createProxy({
+      upstream: 'http://127.0.0.1:49449/anthropic',
+      openAIUpstream: 'http://127.0.0.1:49449',
+    });
+    const req = new Request('http://127.0.0.1:47821/google-ai-studio/v1beta/models/gemini-4-argon:streamGenerateContent?alt=sse', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'host': 'gateway.opencode.cloudflare.dev:443',
+        'cf-access-token': 'cf-test-jwt',
+      },
+      body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'hi' }] }] }),
+    });
+
+    const res = await proxy(req);
+    expect(res.status).toBe(200);
+    expect(capturedUrl).toBe('https://gateway.opencode.cloudflare.dev/google-ai-studio/v1beta/models/gemini-4-argon:streamGenerateContent?alt=sse');
+    expect(capturedHeaders?.get('cf-access-token')).toBe('cf-test-jwt');
+  });
 });

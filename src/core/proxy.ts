@@ -1415,17 +1415,26 @@ function resolveGoogleUpstream(
   passthroughUpstream: string,
   config: ProxyConfig,
 ): string {
-  if (config.provider === 'cloudflare-ai-gateway' || passthroughUpstream !== DEFAULT_UPSTREAM) {
-    return passthroughUpstream;
-  }
   if (config.googleUpstream) {
     return stripTrailingSlashes(config.googleUpstream.trim());
+  }
+  if (config.provider === 'cloudflare-ai-gateway') {
+    return passthroughUpstream;
   }
   const host = extractHostname(req.headers.get('host'));
   if (host === 'daily-cloudcode-pa.googleapis.com' || host === 'cloudcode-pa.googleapis.com' || pathname.startsWith('/v1internal:')) {
     return host === 'cloudcode-pa.googleapis.com'
       ? 'https://cloudcode-pa.googleapis.com'
       : 'https://daily-cloudcode-pa.googleapis.com';
+  }
+  if (host === 'gateway.opencode.cloudflare.dev') {
+    return 'https://gateway.opencode.cloudflare.dev';
+  }
+  if (host === 'generativelanguage.googleapis.com') {
+    return 'https://generativelanguage.googleapis.com';
+  }
+  if (passthroughUpstream !== DEFAULT_UPSTREAM && !passthroughUpstream.endsWith('/anthropic')) {
+    return passthroughUpstream;
   }
   return 'https://generativelanguage.googleapis.com';
 }

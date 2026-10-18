@@ -181,8 +181,8 @@ describe('Antigravity CloudCode PA inference routing', () => {
     };
 
     const proxy = createProxy({
-      upstream: 'http://127.0.0.1:49449/anthropic',
-      openAIUpstream: 'http://127.0.0.1:49449',
+      upstream: 'https://mock-anthropic-gateway.internal',
+      openAIUpstream: 'https://mock-openai-gateway.internal',
       googleUpstream: 'https://mock-google-gateway.internal',
     });
     const req = new Request('http://127.0.0.1:47821/google-ai-studio/v1beta/models/gemini-4-argon:streamGenerateContent?alt=sse', {

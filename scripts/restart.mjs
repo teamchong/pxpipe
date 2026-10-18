@@ -115,7 +115,7 @@ export function resolveTarget(env = process.env) {
 // the proxy is normally launched with a *relative* entry path, so the real
 // Windows command line reads `"C:\…\node.exe" bin/cli.js` with no leading
 // separator at all.
-const PROXY_COMMAND_RE = /\bnode(\.exe)?\b.*[\s"'\\/]bin[\\/]cli\.js\b/i;
+const PROXY_COMMAND_RE = /\bnode(\.exe)?\b.*[\s"'\\/]bin[\\/]cli\.js["']?\s*$/i;
 
 export function matchesProxyCommand(commandLine) {
   return typeof commandLine === 'string' && PROXY_COMMAND_RE.test(commandLine);

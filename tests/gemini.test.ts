@@ -7,9 +7,8 @@ import {
   hasGeminiMeasuredProfile,
   resolveGeminiProfile,
   geminiVisionTokens,
+  GEMINI_PROFILE,
   GEMINI_3_6_FLASH_PROFILE,
-  GEMINI_4_ARGON_PROFILE,
-  GEMINI_4_PROFILE,
 } from '../src/core/gemini-model-profiles.js';
 import { visionTokensForModel } from '../src/core/openai.js';
 import { resolveGptProfile } from '../src/core/gpt-model-profiles.js';
@@ -49,7 +48,8 @@ describe('Gemini Model Profiles & Identification', () => {
 
   it('resolves dedicated Gemini profile via resolveGeminiProfile and resolveGptProfile', () => {
     const prof1 = resolveGeminiProfile('gemini-3.6-flash');
-    expect(prof1).toBe(GEMINI_3_6_FLASH_PROFILE);
+    expect(prof1).toBe(GEMINI_PROFILE);
+    expect(GEMINI_3_6_FLASH_PROFILE).toBe(GEMINI_PROFILE);
     expect(prof1.stripCols).toBe(312);
     expect(prof1.maxHeightPx).toBe(728);
     expect(prof1.vision).toEqual({
@@ -74,17 +74,10 @@ describe('Gemini Model Profiles & Identification', () => {
     expect(prof4.maxHeightPx).toBe(728);
     expect(prof4.vision).toEqual(prof1.vision);
 
-    const prof5 = resolveGeminiProfile('gemini-4-argon');
-    expect(prof5).toBe(GEMINI_4_PROFILE);
-
-    const prof6 = resolveGeminiProfile('gemini-4');
-    expect(prof6).toBe(GEMINI_4_PROFILE);
-
-    const prof7 = resolveGeminiProfile('gemini-4-custom');
-    expect(prof7).toBe(GEMINI_4_PROFILE);
-
-    const profDefault = resolveGeminiProfile();
-    expect(profDefault).toBe(GEMINI_4_PROFILE);
+    expect(resolveGeminiProfile('gemini-4-argon')).toBe(GEMINI_PROFILE);
+    expect(resolveGeminiProfile('gemini-4')).toBe(GEMINI_PROFILE);
+    expect(resolveGeminiProfile('gemini-4-custom')).toBe(GEMINI_PROFILE);
+    expect(resolveGeminiProfile()).toBe(GEMINI_PROFILE);
   });
 
   it('uses the measured production-geometry image cost', () => {

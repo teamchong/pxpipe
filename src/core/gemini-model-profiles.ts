@@ -6,9 +6,11 @@ import { BASE_PRICING } from './profile-base.js';
 import { visionTokens } from './vision-cost.js';
 import type { GptModelProfile } from './gpt-model-profiles.js';
 
-/** Dedicated profile for the validated Gemini 3.6 Flash model. The production
- *  1568×728 geometry measured 1,078 image tokens. */
-export const GEMINI_3_6_FLASH_PROFILE: GptModelProfile = {
+/** Validated Gemini profile (3.x Flash and 4+). The production 1568×728
+ *  geometry (312×90 at 5×8) maps to 49×22 = 1,078 ViT patches at an exact
+ *  32 px/patch horizontal stride; larger or denser canvases are resampled into
+ *  the same ~1,078–1,110 patch budget and lose dense hex legibility. */
+export const GEMINI_PROFILE: GptModelProfile = {
   // Flat per-image charge. Live usage measured the exact production canvas at
   // 1,078 IMAGE tokens; other measured shapes ranged up to 1,113 and Google's
   // Gemini 3 docs publish an approximate 1,120-token default/high image budget,
@@ -43,54 +45,24 @@ export const GEMINI_3_6_FLASH_PROFILE: GptModelProfile = {
   },
 };
 
-/** Dedicated profile for Gemini 3.7 Flash. Reuses the measured 3.6 Flash
- *  image geometry (1568×728 @ 1,078 tokens) and shared pricing structure. */
-export const GEMINI_3_7_FLASH_PROFILE: GptModelProfile = {
-  ...GEMINI_3_6_FLASH_PROFILE,
-  vision: { ...GEMINI_3_6_FLASH_PROFILE.vision },
-  history: { ...GEMINI_3_6_FLASH_PROFILE.history },
-  style: { ...GEMINI_3_6_FLASH_PROFILE.style },
-};
-
-export const GEMINI_3_8_FLASH_PROFILE: GptModelProfile = {
-  ...GEMINI_3_6_FLASH_PROFILE,
-  vision: { ...GEMINI_3_6_FLASH_PROFILE.vision },
-  history: { ...GEMINI_3_6_FLASH_PROFILE.history },
-  style: { ...GEMINI_3_6_FLASH_PROFILE.style },
-};
-
-export const GEMINI_3_1_FLASH_PROFILE: GptModelProfile = {
-  ...GEMINI_3_6_FLASH_PROFILE,
-  vision: { ...GEMINI_3_6_FLASH_PROFILE.vision },
-  history: { ...GEMINI_3_6_FLASH_PROFILE.history },
-  style: { ...GEMINI_3_6_FLASH_PROFILE.style },
-};
-
-export const GEMINI_4_PROFILE: GptModelProfile = {
-  ...GEMINI_3_6_FLASH_PROFILE,
-  vision: { ...GEMINI_3_6_FLASH_PROFILE.vision },
-  history: { ...GEMINI_3_6_FLASH_PROFILE.history },
-  style: { ...GEMINI_3_6_FLASH_PROFILE.style },
-};
-
-export const GEMINI_4_ARGON_PROFILE: GptModelProfile = GEMINI_4_PROFILE;
+export const GEMINI_3_6_FLASH_PROFILE: GptModelProfile = GEMINI_PROFILE;
 
 const GEMINI_MEASURED_PROFILES: Readonly<Record<string, GptModelProfile>> = {
-  'gemini-3.6-flash': GEMINI_3_6_FLASH_PROFILE,
-  'gemini-3.7-flash': GEMINI_3_7_FLASH_PROFILE,
-  'gemini-3.8-flash': GEMINI_3_8_FLASH_PROFILE,
-  'gemini-3.8-flash-high': GEMINI_3_8_FLASH_PROFILE,
-  'gemini-3.8-flash-medium': GEMINI_3_8_FLASH_PROFILE,
-  'gemini-3.8-flash-low': GEMINI_3_8_FLASH_PROFILE,
-  'gemini-3.1-flash': GEMINI_3_1_FLASH_PROFILE,
-  'gemini-3.1-flash-lite': GEMINI_3_1_FLASH_PROFILE,
-  'gemini-4': GEMINI_4_PROFILE,
-  'gemini-4-flash': GEMINI_4_PROFILE,
-  'gemini-4-pro': GEMINI_4_PROFILE,
-  'gemini-4-argon': GEMINI_4_PROFILE,
-  'gemini-4-argon-high': GEMINI_4_PROFILE,
-  'gemini-4-argon-medium': GEMINI_4_PROFILE,
-  'gemini-4-argon-low': GEMINI_4_PROFILE,
+  'gemini-3.6-flash': GEMINI_PROFILE,
+  'gemini-3.7-flash': GEMINI_PROFILE,
+  'gemini-3.8-flash': GEMINI_PROFILE,
+  'gemini-3.8-flash-high': GEMINI_PROFILE,
+  'gemini-3.8-flash-medium': GEMINI_PROFILE,
+  'gemini-3.8-flash-low': GEMINI_PROFILE,
+  'gemini-3.1-flash': GEMINI_PROFILE,
+  'gemini-3.1-flash-lite': GEMINI_PROFILE,
+  'gemini-4': GEMINI_PROFILE,
+  'gemini-4-flash': GEMINI_PROFILE,
+  'gemini-4-pro': GEMINI_PROFILE,
+  'gemini-4-argon': GEMINI_PROFILE,
+  'gemini-4-argon-high': GEMINI_PROFILE,
+  'gemini-4-argon-medium': GEMINI_PROFILE,
+  'gemini-4-argon-low': GEMINI_PROFILE,
 };
 
 function normalizeGeminiId(model: string | null | undefined): string {
@@ -123,12 +95,10 @@ export function hasGeminiMeasuredProfile(model: string | null | undefined): bool
 
 export function resolveGeminiProfile(model?: string | null): GptModelProfile {
   if (model) {
-    const id = normalizeGeminiId(model);
-    const prof = GEMINI_MEASURED_PROFILES[id];
+    const prof = GEMINI_MEASURED_PROFILES[normalizeGeminiId(model)];
     if (prof) return prof;
-    if (id.startsWith('gemini-4')) return GEMINI_4_PROFILE;
   }
-  return GEMINI_4_PROFILE;
+  return GEMINI_PROFILE;
 }
 
 /** Gemini image tokens for any supported Gemini model using the validated

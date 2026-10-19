@@ -996,6 +996,14 @@ export async function transformOpenAIChatCompletions(
     info.reason = 'parse_error: messages must be an array';
     return { body, info };
   }
+  // The element itself is read unguarded from here down (`m.role` just below,
+  // then contentText/setTextContent/history collapse), so a non-object element
+  // threw out of the transform and the proxy answered 502 for a body the
+  // upstream would have rejected with its own 400. Same bail-out as above.
+  if (req.messages.some((m) => !m || typeof m !== 'object')) {
+    info.reason = 'invalid_messages';
+    return { body, info };
+  }
   const pinChars = relocateOpenAIPins(req);
   if (pinChars > 0) info.pinChars = pinChars;
   const pinBody = pinChars > 0
@@ -1214,6 +1222,12 @@ export async function transformOpenAIResponses(
     inputItems = req.input as Array<ResponsesInputItem | Record<string, unknown>>;
   } else {
     info.reason = 'parse_error: input must be a string or array';
+    return { body: pinBody, info };
+  }
+  // As on the chat path: every stage below reads `.role` / `.content` off each
+  // item, so a non-object item threw out of the transform and became a 502.
+  if (inputItems.some((item) => !item || typeof item !== 'object')) {
+    info.reason = 'invalid_input';
     return { body: pinBody, info };
   }
 

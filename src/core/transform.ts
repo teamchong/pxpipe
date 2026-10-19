@@ -2401,6 +2401,17 @@ export async function transformRequest(
     return { body, info };
   }
 
+  // Every stage below — image pricing, pin folding, history collapse — reads
+  // `m.content` or `m.role` off each element, so a non-object element throws a
+  // TypeError out of transformRequest and the proxy answers 502 for a body the
+  // upstream API would have rejected with its own 400. Bail to the untouched
+  // bytes instead, exactly as parse_error above does: the body is forwarded as
+  // the client sent it and the real error comes back from the real API.
+  if (Array.isArray(req.messages) && req.messages.some((m) => !m || typeof m !== 'object')) {
+    info.reason = 'invalid_messages';
+    return { body, info };
+  }
+
   // Price the caller's OWN images before we rewrite anything: they occupy the
   // same wire cap we are about to spend from. Counted once, here, because every
   // later path (slab, tool_results, history) rewrites content in place.

@@ -42,6 +42,9 @@ export interface TrackEvent {
    *  messages that already carried images, so we rendered more than we sent. */
   wire_images?: number;
   image_bytes?: number;
+  /** Exact UTF-8 byte length of the final serialized upstream request body. Feeds the
+   *  diagnostics-page headroom KPI (distance to the model's serialized-request limit). */
+  req_bytes?: number;
   /** Total pixel area across all rendered images; pairs with cache_create_tokens for px/token regression. */
   image_pixels?: number;
   /** Provider-estimated vision tokens billed for rendered images. */
@@ -258,6 +261,7 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
       out.wire_images = info.wireImages;
     }
     if (info.imageBytes !== undefined) out.image_bytes = info.imageBytes;
+    if (info.serializedRequestBytes !== undefined) out.req_bytes = info.serializedRequestBytes;
     if (info.imagePixels !== undefined && info.imagePixels > 0) {
       out.image_pixels = info.imagePixels;
     }

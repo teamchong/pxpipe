@@ -189,6 +189,7 @@ numbers predate it).
 | `moonshotai/kimi-k3` | Spleen 5×8, 152 cols (generic default) | 79/100 | 84/98 | 15/18 | 1/16 | 0/15 | generic GPT profile, no measured geometry of its own: [quality results](eval/sol-profile/KIMI_K3_QUALITY_RESULTS.md) |
 | `qwen-3.8` (`@cf/qwen/qwen3.8-27b`) | Spleen 5×8, 152 cols; **ships 14px/84** | 98/100 | 72/98 | 11/18 | **0/16** | 0/15 | broad suite predates the shipped 14px profile; 14px pilot: 8/8 exact, 0 inventions, 11/15 hex: [pilot & quality](eval/qwen-profile/QUALITY_RESULTS.md) |
 | `glm-5.3-flash` (`@cf/zai-org/glm-5.3-flash`) | Spleen 5×8, 152 cols (default fallback, nothing shipped) | 36/100 | 57/98 | 6/18 | **0/16** | 0/15 | 5×8 is illegible to GLM (0/15 hex); 14px pilot: 10/15 hex, all misses single-glyph confabs, guards 0/16: [pilot & quality](eval/glm-profile/QUALITY_RESULTS.md) |
+| `deepseek-v4.1-flash-1017` (`@cf/deepseek-ai/deepseek-v4.1-flash-1017`) | JetBrains Mono 14px, 84 cols (pilot, nothing shipped) | **100/100** | **98/98** | **18/18** | **0/16** | 0/15 | 5×8 is illegible to DeepSeek V4.1 (0/15 hex); 14px pilot: 100/100 arith, 98/98 gist, 18/18 state, 0/16 guards, 8/15 hex: [pilot & quality](eval/deepseek-profile/QUALITY_RESULTS.md) |
 
 ### Native-profile cost check
 

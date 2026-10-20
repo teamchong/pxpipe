@@ -37,6 +37,7 @@ import {
   computeActualInputEffWithCacheTier,
   computeBaselineInputEffWithCacheTier,
   deriveBaselineWarmth,
+  type BaselineWarmthPrev,
 } from './core/baseline.js';
 import {
   computeOpenAIActualInputEff,
@@ -507,13 +508,13 @@ export class DashboardState {
    *  ever carried a `firstUserSha8` (e.g. a cold start with only passthrough
    *  hits that the upstream probe never tagged). */
   private currentSessionId: string | null = null;
-  /** Per-session prior prefix size for the cache-aware TEXT baseline. Warm/cold
-   *  comes only from the server-observed cache_read on the actual request; this
-   *  map is used only after cr>0 to split the text counterfactual into reused vs
-   *  grown prefix tokens. Reconstructed identically in replay() from persisted
-   *  timestamps, so live and restored numbers agree. Capped with sessions. */
-  private baselineWarmth: Map<string, { ts: number; cacheable: number; prefixSha?: string }> = new Map();
-  /** Max age for reusing a prior prefix size after cr>0 has proved warmth. */
+  /** Per-session prior row for the cache-aware TEXT baseline. A fresh
+   *  same-prefix prior makes the text path warm (see deriveBaselineWarmth) and
+   *  sizes its reused vs grown prefix tokens. Reconstructed identically in
+   *  replay() from persisted timestamps, so live and restored numbers agree.
+   *  Capped with sessions. */
+  private baselineWarmth: Map<string, BaselineWarmthPrev> = new Map();
+  /** Max age of a prior row that can still make the text path warm. */
   private static readonly CACHE_TTL_SEC = 300;
   /** Hard cap on `sessions` Map entries. Keeps memory bounded in
    *  long-running deployments. 50 sessions × ~13 numeric fields each is
@@ -767,16 +768,14 @@ export class DashboardState {
       // actually compressed AND we have a usable probe.
       creditSaving = haveBaseline && haveUsage && compressed;
 
-      // Cache-aware, server-observed baseline. INVARIANT: pxpipe is credited ONLY
-      // for the text it imaged away — NEVER for caching. The imagined text path
-      // gets the same observed cache state as the actual request: cr>0 means warm
-      // for both, cr===0 means cold for both. No wall-clock-only inference.
+      // Cache-aware baseline. INVARIANT: pxpipe is credited ONLY for the text it
+      // imaged away — NEVER for caching. The imagined text path is warm when
+      // cr>0, or when a same-prefix prior completed within the TTL (text would
+      // have read its own cache even if pxpipe's image busted the real one).
       // Uncompressed rows fall back to actualInputEff → zero savings.
       const cacheable = info?.baselineCacheableTokens ?? 0;
-      // If cr>0 proved warmth, a completed prior with the same prefix refines the
-      // reused/grown split for the text baseline. Use request start for that
-      // lookup; an overlapping request that had not completed could not provide a
-      // prior prefix size for this in-flight request.
+      // Use request start for the prior lookup; an overlapping request that had
+      // not completed could not have warmed the text cache for this one.
       const sidNow = info?.firstUserSha8;
       const prefixShaNow = info?.systemSha8;
       const completionSec = Date.now() / 1000;
@@ -785,8 +784,8 @@ export class DashboardState {
         typeof sidNow === 'string' && sidNow.length > 0
           ? this.baselineWarmth.get(sidNow)
           : undefined;
-      // Warmth itself is cr-only; prior state only estimates the warm split.
       // Centralised in deriveBaselineWarmth so update()/replay()/sessions can't drift.
+      const toolsShaNow = info?.cachePrefixToolsSha8;
       const { warm, prevCacheable } = deriveBaselineWarmth(
         warmthPrev,
         requestStartSec,
@@ -794,6 +793,8 @@ export class DashboardState {
         cr,
         DashboardState.CACHE_TTL_SEC,
         prefixShaNow,
+        toolsShaNow,
+        { pxPrefixSha: info?.cachePrefixSha8, model: ev.model },
       );
       baselineInputEff = creditSaving
         ? computeBaselineInputEffWithCacheTier(
@@ -808,13 +809,16 @@ export class DashboardState {
             cc5m,
           )
         : actualInputEff;
-      // Record this completed turn's prefix size for future cr>0 split estimates.
+      // Record this completed turn's prefix for later warmth/split decisions.
       // Carry the prior cacheable when this row has no probe.
       if (typeof sidNow === 'string' && sidNow.length > 0 && haveUsage) {
         this.baselineWarmth.set(sidNow, {
           ts: completionSec,
           cacheable: cacheable > 0 ? cacheable : (warmthPrev?.cacheable ?? 0),
           prefixSha: prefixShaNow ?? warmthPrev?.prefixSha,
+          toolsSha: toolsShaNow ?? warmthPrev?.toolsSha,
+          pxPrefixSha: info?.cachePrefixSha8 ?? warmthPrev?.pxPrefixSha,
+          model: ev.model ?? warmthPrev?.model,
         });
         if (this.baselineWarmth.size > DashboardState.SESSION_CAP) {
           const firstKey = this.baselineWarmth.keys().next().value;
@@ -1136,16 +1140,15 @@ export class DashboardState {
         // compressed rows. Uncompressed/passthrough rows fall back to the
         // actual cost so they show zero saved (no fabricated savings).
         creditSaving = haveBaseline && haveUsage && compressed;
-        // Warm/cold is reconstructed from server-observed cr only. Persisted
-        // completion ts + duration_ms are used only to find a prior prefix size
-        // for the reused/grown split after cr>0 has proved warmth.
+        // Warmth is reconstructed from persisted completion ts + duration_ms
+        // exactly as update() saw it live.
         const sidR = (t as { first_user_sha8?: string }).first_user_sha8;
         const prefixShaR = (t as { system_sha8?: string }).system_sha8;
         const completionSecR = Date.parse(t.ts) / 1000;
         const requestStartSecR = completionSecR - Math.max(0, t.duration_ms || 0) / 1000;
         const warmthPrevR =
           typeof sidR === 'string' && sidR.length > 0 ? this.baselineWarmth.get(sidR) : undefined;
-        // Same cr-only warmth as update(); prior state only refines the split.
+        const toolsShaR = (t as { cache_prefix_tools_sha8?: string }).cache_prefix_tools_sha8;
         const { warm: warmR, prevCacheable: prevCacheableR } = deriveBaselineWarmth(
           warmthPrevR,
           requestStartSecR,
@@ -1153,6 +1156,8 @@ export class DashboardState {
           cr,
           DashboardState.CACHE_TTL_SEC,
           prefixShaR,
+          toolsShaR,
+          { pxPrefixSha: t.cache_prefix_sha8, model: t.model },
         );
         baselineInputEff = creditSaving
           ? computeBaselineInputEffWithCacheTier(
@@ -1172,6 +1177,9 @@ export class DashboardState {
             ts: completionSecR,
             cacheable: cacheable > 0 ? cacheable : (warmthPrevR?.cacheable ?? 0),
             prefixSha: prefixShaR ?? warmthPrevR?.prefixSha,
+            toolsSha: toolsShaR ?? warmthPrevR?.toolsSha,
+            pxPrefixSha: t.cache_prefix_sha8 ?? warmthPrevR?.pxPrefixSha,
+            model: t.model ?? warmthPrevR?.model,
           });
           if (this.baselineWarmth.size > DashboardState.SESSION_CAP) {
             const firstKey = this.baselineWarmth.keys().next().value;
@@ -1182,7 +1190,7 @@ export class DashboardState {
         rawBaseline = baseline ?? 0;
         baselineForRow = baseline ?? 0;
         cacheReadForRow = cr;
-        warmForRow = warmR; // server-observed cache read
+        warmForRow = warmR;
       }
       // Rebuild the Context Map breakdown so old rows keep their "Saved" value
       // and "Details" link after a restart. The PNG ring is in-memory and gone,

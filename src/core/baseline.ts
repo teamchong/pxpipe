@@ -29,9 +29,9 @@ function cacheCreateRate(cc: number, cc5m?: number, cc1h?: number): number {
   ) / splitTotal;
 }
 
-/** Anthropic prompt-cache TTL (seconds). Kept for callers that display provider
- *  docs, but savings math does not use TTL to infer a hypothetical text-cache
- *  hit: text is considered warm only when the actual request reports cr > 0. */
+/** Anthropic prompt-cache TTL (seconds). A same-prefix prior that completed
+ *  within this window makes the text counterfactual warm even when the actual
+ *  request reports cr === 0 (see deriveBaselineWarmth). */
 export const CACHE_TTL_SEC = 300;
 
 /** This session's previous usage-bearing turn, used only for warm split sizing. */
@@ -43,34 +43,40 @@ export interface BaselineWarmthPrev {
   /** Hash of the image-bound/static text prefix. If it changes, do not reuse the
    *  prior prefix size for this row's text reused/grown split. */
   prefixSha?: string;
+  /** cache_prefix_tools_sha8 of that turn. A changed tool list busts the text
+   *  prefix too; missing on either side is treated as unknown (don't care). */
+  toolsSha?: string;
+  /** cache_prefix_sha8 pxpipe actually sent (post-transform). */
+  pxPrefixSha?: string;
+  /** Model of that turn; prompt cache does not cross models. */
+  model?: string;
 }
 
 /**
  * Decide whether the TEXT counterfactual's prefix was warm this turn.
  *
- * Strict accounting rule: the imagined text path gets the same observed cache
- * state as the real image path. `cr > 0` is server proof that the request read a
- * warm prefix, so the text baseline is warm too. `cr === 0` means the actual
- * request did not read cache, so the text baseline is priced cold too. We do not
- * use wall-clock TTL to claim that text would have been warm while images were
- * cold; that would be an unobservable counterfactual and can create negative
- * rows from cache assumptions rather than token savings.
+ * The text path is warm when either:
+ *  - this session has a prior row that completed less than `ttlSec` before
+ *    this request started, with the same `system_sha8` (both known) and the
+ *    same tools hash (or either unknown). The text request would have read
+ *    that prefix from cache even if the image path missed — pxpipe busting its
+ *    own cache is a real cost of pxpipe, not something text would have paid;
+ *  - or the actual request reports `cr > 0`, which is server proof of a warm read.
  *
- * When cr proves warmth, a completed same-prefix prior is used only to estimate
- * how much of the text prefix was reused vs grown. If none is available, assume
- * full reuse of this turn's cacheable prefix; this is conservative for savings.
+ * Otherwise the text baseline is priced cold. When warm, reused =
+ * min(prevCacheable, cacheable); without a usable prior, cr-only warmth assumes
+ * full reuse of this turn's cacheable prefix, which is conservative for savings.
  *
  * @param prev       this session's previous usage-bearing turn, or undefined.
  * @param nowSec     request-start wall-clock seconds, used only to reject prior
  *                   rows that had not completed before this request was sent.
  * @param cacheable  this turn's cacheable-prefix tokens (the full-reuse credit
  *                   when warm only via cr, since cr proves a read but not the split).
- * @param cr         observed cache-read tokens this turn; the only warm/cold signal.
- * @param ttlSec     legacy parameter; no longer decides warm/cold. It only
- *                   bounds whether a prior prefix size is used for reused/grown
- *                   splitting after cr > 0 has already proved warmth.
- * @param prefixSha  stable-prefix fingerprint for the text counterfactual. A
- *                   prior prefix size is reused only when this matches.
+ * @param cr         observed cache-read tokens this turn.
+ * @param ttlSec     how recently a prior must have completed to count as fresh.
+ * @param prefixSha  system_sha8 of this row. Must match the prior's for a
+ *                   cr === 0 row to be warm.
+ * @param toolsSha   cache_prefix_tools_sha8 of this row; a mismatch keeps the row cold.
  */
 export function deriveBaselineWarmth(
   prev: BaselineWarmthPrev | undefined,
@@ -79,6 +85,8 @@ export function deriveBaselineWarmth(
   cr: number,
   ttlSec: number = CACHE_TTL_SEC,
   prefixSha?: string,
+  toolsSha?: string,
+  opts?: { pxPrefixSha?: string; model?: string },
 ): { warm: boolean; prevCacheable: number } {
   const age = prev !== undefined ? nowSec - prev.ts : Number.POSITIVE_INFINITY;
   const samePrefix = prev === undefined
@@ -86,10 +94,40 @@ export function deriveBaselineWarmth(
     || prefixSha === undefined
     || prev.prefixSha === prefixSha;
   // cr is the only warm/cold signal. A prior only refines the warm split.
-  if (!(cr > 0)) return { warm: false, prevCacheable: 0 };
-  // Fresh prior: use its real prefix size for the reused/grown split. Without
-  // one, cr proves warmth but not the split, so assume full reuse.
-  const freshPrior = prev !== undefined && age >= 0 && age < ttlSec && samePrefix;
+  const fresh = prev !== undefined && age >= 0 && age < ttlSec;
+  const sameTools = prev === undefined
+    || prev.toolsSha === undefined
+    || toolsSha === undefined
+    || prev.toolsSha === toolsSha;
+  // A same-prefix prior that completed inside the TTL means the TEXT request
+  // would have found its own prefix cached, even when the image path missed
+  // (cr === 0 because pxpipe re-rendered and busted its own cache). Requires a
+  // positive system match — an unknown system hash can't vouch for the prefix.
+  const provenSystem = prev !== undefined
+    && prev.prefixSha !== undefined
+    && prefixSha !== undefined
+    && prev.prefixSha === prefixSha;
+  if (!(cr > 0)) {
+    // Self-bust exception: only when pxpipe PROVABLY changed what it sent.
+    //  - prompt cache is per model: a model switch means text would miss too;
+    //  - the outgoing cache_prefix_sha8 must differ from the prior's. If pxpipe
+    //    sent the same prefix and still got cr === 0, the server evicted it and
+    //    text would have missed as well — not pxpipe's fault, not text's gain.
+    const sameModel = prev?.model !== undefined
+      && opts?.model !== undefined
+      && prev.model === opts.model;
+    const pxpipeBusted = prev?.pxPrefixSha !== undefined
+      && opts?.pxPrefixSha !== undefined
+      && prev.pxPrefixSha !== opts.pxPrefixSha;
+    if (fresh && provenSystem && sameTools && sameModel && pxpipeBusted) {
+      return { warm: true, prevCacheable: prev!.cacheable };
+    }
+    return { warm: false, prevCacheable: 0 };
+  }
+  // cr proves warmth. A fresh same-prefix prior gives the real reused/grown
+  // split; without one, assume full reuse (conservative for savings).
+  // (Unchanged from 0.15.0: tools hash does not gate the split.)
+  const freshPrior = fresh && samePrefix;
   return { warm: true, prevCacheable: freshPrior ? prev!.cacheable : cacheable };
 }
 

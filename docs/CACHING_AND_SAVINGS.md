@@ -84,9 +84,9 @@ This is separate from dashboard savings. The gate decides whether to transform. 
 The cache discount is provider behavior, not pxpipe savings. To avoid counting cache as savings, both sides use the same observed cache state:
 
 - If the actual request has `cr > 0`, the imagined text baseline is priced warm too.
-- If the actual request has `cr === 0`, the imagined text baseline is priced cold too.
+- If the actual request has `cr === 0`, the imagined text baseline is still priced warm when a same-session prior proves the text prefix would have been cached: that prior completed less than `CACHE_TTL_SEC` (300 s) before this request started, its `system_sha8` matches this row's, and its `cache_prefix_tools_sha8` matches this row's (or either side has none). Without such a prior, the text baseline is priced cold too.
 
-pxpipe does not infer a warm text baseline from wall-clock TTL alone. The text request does not actually exist, so cache warmth for that counterfactual is based only on the real request's server-reported cache read.
+pxpipe does not infer a warm text baseline from wall-clock TTL alone. A request whose image path missed the cache (`cr === 0`) after a fresh same-prefix prior is pxpipe busting its own image cache. The text request would have read its unchanged prefix, so that miss is a real cost of pxpipe, not a saving. A changed system or tools hash means the text request would have missed too, so those rows stay cold.
 
 For each `/v1/messages` request, pxpipe records three measurements:
 
@@ -107,13 +107,13 @@ cacheable = min(baseline_cacheable_tokens, baseline_tokens)
 coldTail  = baseline_tokens - cacheable
 ```
 
-If the actual request is cold (`cr === 0`):
+If the text baseline is cold (`cr === 0` and no fresh same-prefix prior):
 
 ```text
 baseline_eff = cacheable * observed_write_rate + coldTail
 ```
 
-If the actual request is warm (`cr > 0`):
+If the text baseline is warm (`cr > 0`, or a fresh same-prefix prior):
 
 ```text
 reused = min(prevCacheable, cacheable)
@@ -122,7 +122,7 @@ grown  = cacheable - reused
 baseline_eff = reused * 0.10 + grown * observed_write_rate + coldTail
 ```
 
-`observed_write_rate` is the request's server-reported mix of 5-minute writes at `1.25x` and 1-hour writes at `2x`. If the API omits the tier split, pxpipe falls back to `1.25x` for backward compatibility. `prevCacheable` is used only after `cr > 0` proves a warm read. It refines how much of the text baseline was reused vs newly grown. If there is no completed same-session prior with the same static-prefix hash, pxpipe assumes full reuse for the text baseline: `prevCacheable = cacheable`. That is conservative for savings because it makes the text baseline cheaper.
+`observed_write_rate` is the request's server-reported mix of 5-minute writes at `1.25x` and 1-hour writes at `2x`. If the API omits the tier split, pxpipe falls back to `1.25x` for backward compatibility. When `cr > 0` proves a warm read, `prevCacheable` refines how much of the text baseline was reused vs newly grown. If there is no completed same-session prior with the same static-prefix hash, pxpipe assumes full reuse for the text baseline: `prevCacheable = cacheable`. When `cr === 0` and the warmth comes from a fresh prior, `reused = min(prevCacheable, cacheable)` uses that prior's real size. That is conservative for savings because it makes the text baseline cheaper.
 
 Replay uses request start time (`ts - duration_ms`) to avoid overlapping requests refining each other's `prevCacheable` split before the earlier request had completed.
 

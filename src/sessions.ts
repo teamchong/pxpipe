@@ -34,6 +34,7 @@ import {
   computeActualInputEffWithCacheTier,
   computeBaselineInputEffWithCacheTier,
   deriveBaselineWarmth,
+  type BaselineWarmthPrev,
 } from './core/baseline.js';
 import { sessionAnchorText } from './core/session-state.js';
 
@@ -138,11 +139,11 @@ export async function aggregateSessions(
 ): Promise<AggregateResult> {
   const sessions = new Map<string, SessionSummary>();
   const sidecarsBySession = new Map<string, Set<string>>();
-  // Per-session prior prefix sizes for the cache-aware text counterfactual.
-  // Warm/cold comes only from server-observed cache_read; this map only refines
-  // reused/grown splitting after cr>0 has proved warmth. Kept out of
-  // SessionSummary so it never leaks into the /api/sessions.json shape.
-  const warmth = new Map<string, { ts: number; cacheable: number; prefixSha?: string }>();
+  // Per-session prior rows for the cache-aware text counterfactual: a fresh
+  // same-prefix prior makes the text path warm, and sizes the reused/grown
+  // split. Kept out of SessionSummary so it never leaks into the
+  // /api/sessions.json shape.
+  const warmth = new Map<string, BaselineWarmthPrev>();
   const CACHE_TTL_SEC = 300;
 
   // Stat sidecar sizes once up front. Looking up size per event would be
@@ -176,8 +177,8 @@ export async function aggregateSessions(
     if (s.project === undefined && ev.cwd) s.project = ev.cwd;
     // Real per-session savings, cache-aware. See src/core/baseline.ts for the
     // full derivation: pxpipe is credited only for token reduction, never for
-    // caching. The imagined text baseline gets the SAME observed cache state as
-    // the actual request: cr>0 means warm for both, cr===0 means cold for both.
+    // caching. The imagined text baseline is warm when cr>0, or when a
+    // same-prefix prior completed within the TTL (see deriveBaselineWarmth).
     // Events missing either probe stay out of the rollup — no estimation.
     const inp = ev.input_tokens ?? 0;
     const cc = ev.cache_create_tokens ?? 0;
@@ -198,8 +199,6 @@ export async function aggregateSessions(
       const completionSec = Date.parse(ev.ts) / 1000;
       const requestStartSec = completionSec - Math.max(0, ev.duration_ms || 0) / 1000;
       const prev = warmth.get(id);
-      // Warmth is cr-only; a completed same-prefix prior only refines the
-      // reused/grown split after cr>0 has proved warmth.
       const { warm, prevCacheable } = deriveBaselineWarmth(
         prev,
         requestStartSec,
@@ -207,6 +206,8 @@ export async function aggregateSessions(
         cr,
         CACHE_TTL_SEC,
         prefixSha,
+        ev.cache_prefix_tools_sha8,
+        { pxPrefixSha: ev.cache_prefix_sha8, model: ev.model },
       );
       const baselineEff = computeBaselineInputEffWithCacheTier(
         baseline,
@@ -224,7 +225,7 @@ export async function aggregateSessions(
       s.tokensSavedEst += Math.round(tokensSaved);
       s.charsSaved += Math.round(tokensSaved * 4);
     }
-    // Record this completed row's prefix size for future cr>0 split estimates.
+    // Record this completed row's prefix for later warmth/split decisions.
     // Carry prior cacheable when this row had no probe.
     if (haveUsage) {
       const completionSec = Date.parse(ev.ts) / 1000;
@@ -235,6 +236,9 @@ export async function aggregateSessions(
         ts: completionSec,
         cacheable: cacheable > 0 ? cacheable : (prev?.cacheable ?? 0),
         prefixSha: prefixSha ?? prev?.prefixSha,
+        toolsSha: ev.cache_prefix_tools_sha8 ?? prev?.toolsSha,
+        pxPrefixSha: ev.cache_prefix_sha8 ?? prev?.pxPrefixSha,
+        model: ev.model ?? prev?.model,
       });
     }
     if (typeof ev.cache_read_tokens === 'number') {

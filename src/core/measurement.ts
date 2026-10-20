@@ -46,7 +46,7 @@ export function buildBaselineCountTokensBody(bytes: BytesLike): Uint8Array | nul
       if (COUNT_TOKENS_FIELDS.has(k)) out[k] = obj[k];
     }
     if (typeof out.model !== 'string' || !Array.isArray(out.messages)) return null;
-    return new TextEncoder().encode(JSON.stringify(out));
+    return new TextEncoder().encode(JSON.stringify(prependSyntheticToolUses(out)));
   } catch {
     return null;
   }
@@ -103,6 +103,53 @@ function appendSyntheticToolResults(
     })),
   };
   return { ...truncated, messages: [...messages, syntheticUserMsg] };
+}
+
+
+/** Return tool_result ids with no EARLIER matching tool_use. A server-side thread
+ *  continue (`thread:{type:"continue"}`) sends only the delta, which usually opens
+ *  with the tool_result whose tool_use lives in the server-held thread; count_tokens
+ *  rejects that body with 400, so the baseline probe used to fail on every such turn. */
+function findOrphanToolResultIds(messages: unknown[]): string[] {
+  const seen = new Set<string>();
+  const orphans: string[] = [];
+  for (const msg of messages) {
+    if (!msg || typeof msg !== 'object') continue;
+    const content = (msg as { content?: unknown }).content;
+    if (!Array.isArray(content)) continue;
+    for (const blk of content) {
+      if (!blk || typeof blk !== 'object') continue;
+      const t = (blk as { type?: unknown }).type;
+      if (t === 'tool_use') {
+        const id = (blk as { id?: unknown }).id;
+        if (typeof id === 'string') seen.add(id);
+      } else if (t === 'tool_result') {
+        const id = (blk as { tool_use_id?: unknown }).tool_use_id;
+        if (typeof id === 'string' && !seen.has(id) && !orphans.includes(id)) orphans.push(id);
+      }
+    }
+  }
+  return orphans;
+}
+
+/** Prepend a minimal user turn + assistant tool_use turn pairing every orphan
+ *  tool_result, so a thread-delta body is countable. Measurement-only: this body
+ *  goes to count_tokens, never to /v1/messages. Adds a few dozen tokens of overhead. */
+export function prependSyntheticToolUses(
+  body: Record<string, unknown>,
+): Record<string, unknown> {
+  const messages = body.messages;
+  if (!Array.isArray(messages)) return body;
+  const orphanIds = findOrphanToolResultIds(messages);
+  if (orphanIds.length === 0) return body;
+  const prefix = [
+    { role: 'user', content: 'x' },
+    {
+      role: 'assistant',
+      content: orphanIds.map((id) => ({ type: 'tool_use', id, name: 'x', input: {} })),
+    },
+  ];
+  return { ...body, messages: [...prefix, ...messages] };
 }
 
 
@@ -182,7 +229,7 @@ export function buildCacheablePrefixCountTokensBody(bytes: BytesLike): Uint8Arra
   }
 
   if (truncated == null) return null;
-  truncated = appendSyntheticToolResults(truncated);
+  truncated = prependSyntheticToolUses(appendSyntheticToolResults(truncated));
   const out: Record<string, unknown> = {};
   for (const k of Object.keys(truncated)) {
     if (COUNT_TOKENS_FIELDS.has(k)) out[k] = truncated[k];

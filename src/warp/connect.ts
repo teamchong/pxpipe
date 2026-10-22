@@ -274,9 +274,19 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
       res.end('pxpipe warp: unsupported scheme');
       return;
     }
+    // A pattern that names a port is matched against "host:port", and the
+    // CONNECT path always supplies one via authority(host, port) — but
+    // URL.host omits a DEFAULT port, so `api.anthropic.com:443/v1/*` matched
+    // a CONNECT and then silently missed the very same request in absolute
+    // form. Put the implied port back so both paths hand matchRoute the same
+    // authority. target.host already brackets an IPv6 literal and already
+    // carries a non-default port, so it only ever needs the default appended.
+    const hostPort = target.port
+      ? target.host
+      : `${target.host}:${target.protocol === 'https:' ? 443 : 80}`;
     // target.origin, not a rebuilt https:// URL: scheme and non-default port
     // are part of where this request was actually going.
-    forward(req, res, target.host, target.pathname + target.search, target.origin);
+    forward(req, res, hostPort, target.pathname + target.search, target.origin);
   };
 
   return { handleConnect, handleAbsoluteForm };

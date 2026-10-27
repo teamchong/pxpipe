@@ -18,7 +18,10 @@
  *
  * Run just this file:  pnpm vitest run tests/image-byte-budget.test.ts
  */
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import {
+  collapseHistory,
+} from '../src/core/history.js';
 import {
   countNativeImageBytes,
   imageByteHeadroom,
@@ -144,6 +147,110 @@ describe('a group that does not fit keeps its text', () => {
       { maxImageBytes: limit },
     );
     expect(wireImageBytes(dec(out).messages)).toBeLessThanOrEqual(limit);
+  });
+});
+
+describe('history is trimmed before its configured geometry is degraded (#216)', () => {
+  // History uses a model-specific readable profile on purpose: a misread prior
+  // turn compounds. When the full collapse is too heavy, keep the oldest chunks
+  // in that profile and leave the rest as text instead of swapping geometry.
+  const TURNS = 100;
+  const REP = 50;
+  const IMAGED_SLAB_CHARS = 12_000; // above minCompressChars -> slab is imaged (site: transformRequest inline)
+  const TINY_SLAB_CHARS = 50; // below minCompressChars -> slab stays text (site: runHistoryCollapseAndFinalize)
+  const HUGE_BUDGET = 100 * 1024 * 1024; // never binds; used only to measure the render size
+  const MODEL = 'claude-opus-5';
+  const BUDGET_DIVISOR = 2;
+  const NO_IMAGE_BUDGET = 1;
+  const OVER_CAP_USER_TEXT_CHARS = 2_000;
+
+  beforeEach(() => {
+    resetSessionState();
+    process.env.PXPIPE_MODELS = MODEL;
+  });
+  afterEach(() => {
+    delete process.env.PXPIPE_MODELS;
+  });
+
+  /** A long collapsible history behind a slab of the given size. */
+  function longHistory(model: string, slabChars: number): Uint8Array {
+    const bulk =
+      'commit a1b2c3d4e5f6 sha 9f8e7d6c ts 2026-07-04T14:50:50Z ratio 0.734 $30.99 Tampa-0 stock 120 reorder 40. ';
+    const messages: unknown[] = [];
+    for (let i = 0; i < TURNS; i++) {
+      messages.push({
+        role: i % 2 === 0 ? 'user' : 'assistant',
+        content: [{ type: 'text', text: bulk.repeat(REP) + ` turn ${i}` }],
+      });
+    }
+    messages.push({ role: 'user', content: [{ type: 'text', text: 'continue' }] });
+    return enc({
+      model,
+      max_tokens: 1024,
+      system: [{ type: 'text', text: 'S'.repeat(slabChars), cache_control: { type: 'ephemeral' } }],
+      messages,
+    });
+  }
+
+  async function render(slabChars: number, maxImageBytes: number) {
+    resetSessionState();
+    return transformRequest(longHistory(MODEL, slabChars), { model: MODEL, maxImageBytes });
+  }
+
+  // Both admission sites share the bug; exercise each. Site 2 is the inline path
+  // in transformRequest (slab imaged); site 1 is runHistoryCollapseAndFinalize
+  // (slab below the gate, history still collapses — the "tiny system, huge
+  // messages" shape).
+  for (const [siteLabel, slabChars] of [
+    ['imaged-slab path', IMAGED_SLAB_CHARS],
+    ['text-slab path', TINY_SLAB_CHARS],
+  ] as const) {
+    it(`keeps a byte-fitted prefix at the configured history geometry (${siteLabel})`, async () => {
+      const full = (await render(slabChars, HUGE_BUDGET)).info;
+      expect(full.historyReason, 'fixture must collapse at configured geometry').toBe('collapsed');
+      const budget = Math.floor(full.imageBytes / BUDGET_DIVISOR);
+      const { info } = await render(slabChars, budget);
+
+      expect(info.historyReason).toBe('collapsed');
+      expect(info.historyBudgetTrimmed).toBe(true);
+      expect(info.collapsedTurns).toBeGreaterThan(0);
+      expect(info.collapsedTurns).toBeLessThan(full.collapsedTurns ?? 0);
+      expect(info.imageByteSkips ?? 0).toBe(0);
+      expect(info.imageBytes).toBeLessThanOrEqual(budget);
+      expect(info.outgoingTextChars).toBeGreaterThan(full.outgoingTextChars ?? 0);
+
+      const historyImages = (info.imagePngs ?? []).slice(-(info.collapsedImages ?? 0));
+      const fullHistoryImages = (full.imagePngs ?? []).slice(-(full.collapsedImages ?? 0));
+      expect(historyImages).toEqual(fullHistoryImages.slice(0, historyImages.length));
+    });
+  }
+
+  it('keeps text when even the oldest history chunk cannot fit', async () => {
+    const { info } = await render(TINY_SLAB_CHARS, NO_IMAGE_BUDGET);
+    expect(info.historyReason).toBe('image_bytes');
+    expect(info.imageByteSkips ?? 0).toBeGreaterThan(0);
+    expect(info.collapsedTurns ?? 0).toBe(0);
+  });
+
+  it('admits a marked user-only chunk when its image fits', async () => {
+    const markedUser = {
+      role: 'user',
+      content: [{
+        type: 'text',
+        text: 'u'.repeat(OVER_CAP_USER_TEXT_CHARS),
+        cache_control: { type: 'ephemeral' },
+      }],
+    } as unknown as Message;
+    const messages = [markedUser, { role: 'assistant', content: 'answer' }] as Message[];
+    const { info } = await collapseHistory(messages, () => true, {
+      keepTail: 0,
+      minCollapsePrefix: 1,
+      collapseChunk: 0,
+      imageByteBudget: HUGE_BUDGET,
+    });
+
+    expect(info.collapsedTurns).toBe(messages.length);
+    expect(info.collapsedImages).toBeGreaterThan(0);
   });
 });
 

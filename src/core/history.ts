@@ -88,6 +88,9 @@ export interface HistoryCollapseOptions {
    *  the estimate fits; if even a single chunk cannot fit, the collapse range is
    *  trimmed from the tail and the remainder stays live text. 0 = unlimited. */
   imageBudget: number;
+  /** Remaining request-wide decoded PNG byte budget. Whole oldest chunks are
+   *  retained until the next chunk would cross it. */
+  imageByteBudget: number;
   /** Fill-optimal repack. When true the freeze step is raised until the grid costs
    *  at most one page more than a perfectly packed render — trading the append-only
    *  cache freeze for ~2× fewer image tokens. Only correct when the upstream prefix
@@ -125,6 +128,7 @@ export const HISTORY_DEFAULTS: HistoryCollapseOptions = {
   // one image holds, and DENSE_CONTENT_CHARS_PER_IMAGE is only true at 312 cols.
   pageChars: maxCharsPerImage(100),
   imageBudget: ANTHROPIC_HISTORY_IMAGE_BUDGET,
+  imageByteBudget: Number.POSITIVE_INFINITY,
   packFill: false,
   minFreezeStep: 0,
 };
@@ -160,7 +164,8 @@ export interface HistoryCollapseInfo {
     | 'no_closed_prefix'
     | 'not_profitable'
     | 'render_empty'
-    | 'over_budget';
+    | 'over_budget'
+    | 'over_byte_budget';
   /** Freeze step actually used (messages per chunk). Larger than `o.freezeChunk`
    *  when the image budget or fill-repack forced chunks to merge. The caller pins
    *  it per session (`minFreezeStep`) so the coarser grid never falls back — a
@@ -796,6 +801,7 @@ export async function collapseHistory(
   // candidate grids off per-message serialized lengths: one pass here replaces
   // re-serializing the transcript once per candidate step.
   const budget = o.imageBudget > 0 ? o.imageBudget : Infinity;
+  const byteBudget = Math.max(0, o.imageByteBudget);
   const pageChars = Math.max(1, o.pageChars);
   const msgLen: number[] = [];
   // Over-cap user prompts are imaged too (userTurnBlocks), batched per chunk. They
@@ -839,7 +845,7 @@ export async function collapseHistory(
   }
 
   // Exclude slab messages (protectedPrefix) from serialization.
-  const text = messagesToHistoryText(messages, collapseLen, protectedPrefix);
+  let text = messagesToHistoryText(messages, collapseLen, protectedPrefix);
   if (!text || text.length === 0) {
     info.reason = 'render_empty';
     return { messages, info };
@@ -917,13 +923,6 @@ export async function collapseHistory(
   ends.add(collapseLen);
   const sortedEnds = [...ends].filter((e) => e > protectedPrefix && e <= collapseLen).sort((a, b) => a - b);
 
-  // Carry-over anchor end: the largest FULLY grid-aligned chunk boundary strictly
-  // before collapseLen. That chunk's bytes are frozen across window advances, unlike
-  // the newest partial chunk — so it's the stable place to pin the cache breakpoint (#11).
-  let carryOverEnd = -1;
-  for (let e = protectedPrefix + step; e < collapseLen; e += step) carryOverEnd = e;
-  let carryOverOrdinal = -1;
-
   const blocks: ContentBlock[] = [];
   let imageCount = 0;
   const countImage = (img: RenderedImage) => {
@@ -937,6 +936,32 @@ export async function collapseHistory(
       info.droppedCodepoints.set(cp, (info.droppedCodepoints.get(cp) ?? 0) + n);
     }
   };
+  const chunkCheckpoint = () => ({
+    blocks: blocks.length,
+    imageCount,
+    imageBytes: info.collapsedImageBytes,
+    imagePixels: info.collapsedImagePixels,
+    pngs: info.collapsedPngs.length,
+    dims: info.collapsedImageDims.length,
+    droppedChars: info.droppedChars,
+    droppedCodepoints: new Map(info.droppedCodepoints),
+  });
+  let byteBudgetReached = false;
+  const admitChunk = (from: number, before: ReturnType<typeof chunkCheckpoint>): boolean => {
+    if (info.collapsedImageBytes <= byteBudget) return true;
+    blocks.length = before.blocks;
+    imageCount = before.imageCount;
+    info.collapsedImageBytes = before.imageBytes;
+    info.collapsedImagePixels = before.imagePixels;
+    info.collapsedPngs.length = before.pngs;
+    info.collapsedImageDims.length = before.dims;
+    info.droppedChars = before.droppedChars;
+    info.droppedCodepoints = before.droppedCodepoints;
+    collapseLen = from;
+    byteBudgetReached = true;
+    return false;
+  };
+  const lastImageOrdinalByEnd = new Map<number, number>();
   let chunkStart = protectedPrefix;
   for (const chunkEnd of sortedEnds) {
     // messagesToHistorySegments already omits the user's typed words; userTurnBlocks
@@ -944,10 +969,13 @@ export async function collapseHistory(
     const seg = messagesToHistorySegments(messages, chunkEnd, chunkStart);
     const userFrom = chunkStart;
     chunkStart = chunkEnd;
+    const before = chunkCheckpoint();
     if (!seg.text || seg.text.length === 0) {
       // Transcript empty (e.g. the chunk was nothing but user prompts) — the
       // prompts themselves still belong in the output.
       blocks.push(...(await userTurnBlocks(messages, userFrom, chunkEnd, countImage)));
+      if (!admitChunk(userFrom, before)) break;
+      lastImageOrdinalByEnd.set(chunkEnd, imageCount - 1);
       continue;
     }
     // Reflow the text and its parallel slot string in lockstep so role attribution
@@ -1001,18 +1029,28 @@ export async function collapseHistory(
       blocks.push(block);
       countImage(img);
     }
-    // The carry-over chunk's LAST image is the newest byte-stable history image.
-    // Record its ordinal so the relocator pins the cache breakpoint here instead of
-    // on the still-growing newest chunk, which busts every window advance (#11).
-    if (chunkEnd === carryOverEnd) carryOverOrdinal = imageCount - 1;
     // This chunk's user prompts, as text, immediately after the image they were
     // pulled out of — attribution stays local and the ordering matches the render.
     blocks.push(...(await userTurnBlocks(messages, userFrom, chunkEnd, countImage)));
+    if (!admitChunk(userFrom, before)) break;
+    lastImageOrdinalByEnd.set(chunkEnd, imageCount - 1);
+  }
+  if (byteBudgetReached && collapseLen - protectedPrefix < o.minCollapsePrefix) {
+    info.reason = 'over_byte_budget';
+    return { messages, info };
+  }
+  if (byteBudgetReached) {
+    info.budgetTrimmed = true;
+    text = messagesToHistoryText(messages, collapseLen, protectedPrefix);
   }
   if (imageCount === 0) {
     info.reason = 'render_empty';
     return { messages, info };
   }
+  // Pin the newest fully grid-aligned accepted chunk, never the still-growing tail.
+  let carryOverEnd = -1;
+  for (let e = protectedPrefix + step; e < collapseLen; e += step) carryOverEnd = e;
+  const carryOverOrdinal = lastImageOrdinalByEnd.get(carryOverEnd) ?? -1;
   const latestUserPointer = latestCollapsedUserPointer(messages, collapseLen, protectedPrefix);
   const historyFactSheet = factSheetText(text);
   const syntheticContent: ContentBlock[] = [

@@ -52,6 +52,7 @@ import {
   ANTHROPIC_MAX_IMAGES,
   ANTHROPIC_HISTORY_IMAGE_BUDGET,
 } from './history.js';
+import type { HistoryCollapseInfo } from './history.js';
 import { noteHistoryRequest, recordFreezeStep, sessionAnchorText } from './session-state.js';
 import type { GptHistoryOptions } from './openai-history.js';
 import { CACHE_CREATE_RATE, CACHE_READ_RATE } from './baseline.js';
@@ -1948,6 +1949,19 @@ function historyGridTuning(
   return { imageBudget, packFill: session.cold, minFreezeStep: session.minFreezeStep };
 }
 
+function recordHistoryCollapseFailure(
+  info: TransformInfo,
+  reason: HistoryCollapseInfo['reason'],
+): void {
+  if (reason === 'over_byte_budget') {
+    bumpPassthrough(info, 'image_budget');
+    info.imageByteSkips = (info.imageByteSkips ?? 0) + 1;
+    info.historyReason = 'image_bytes';
+  } else if (reason) {
+    info.historyReason = reason;
+  }
+}
+
 /**
  * Step 5b: image eligible tool_result content across ALL user messages, in place.
  * Returns true when any block was rewritten. Shared by the main path and the
@@ -2269,6 +2283,7 @@ async function runHistoryCollapseAndFinalize(
         maxHeightPx: historyGeometry.maxHeightPx,
         pageChars: historyGeometry.maxChars,
         imageBudget: tuning.imageBudget,
+        imageByteBudget: imageByteHeadroom(info, o.maxImageBytes),
         packFill: tuning.packFill,
         minFreezeStep: tuning.minFreezeStep,
       },
@@ -2277,12 +2292,9 @@ async function runHistoryCollapseAndFinalize(
     if (histInfo.freezeStep !== undefined) info.historyFreezeStep = histInfo.freezeStep;
     if (histInfo.budgetTrimmed) info.historyBudgetTrimmed = true;
     if (tuning.packFill) info.historyPackFill = true;
-    // Atomic admission by weight. The collapse is one semantic group: applying
-    // it means every collapsed message becomes pages, so a group that does not
-    // fit the byte budget is not applied at all and the original text stands.
-    // Rendering it first and discarding it costs CPU, which is the cheap half of
-    // the trade: the alternative is estimating PNG size from character counts and
-    // being wrong on the request that mattered.
+    // Safety net: collapseHistory admits only whole oldest chunks within the
+    // exact decoded-byte headroom. Keep this check at the system boundary so a
+    // future renderer-accounting regression cannot overfill the request.
     if (
       histInfo.collapsedTurns > 0 &&
       histInfo.collapsedImageBytes > imageByteHeadroom(info, o.maxImageBytes)
@@ -2312,8 +2324,8 @@ async function runHistoryCollapseAndFinalize(
       info.historyImageSha = await historyImageSha8(newMessages);
       bumpBucket(info, 'history', histInfo.collapsedChars);
       collapsedFlag = true;
-    } else if (histInfo.reason) {
-      info.historyReason = histInfo.reason;
+    } else {
+      recordHistoryCollapseFailure(info, histInfo.reason);
     }
   }
   // tool_results are imaged on their own merits, not only when the slab is: a
@@ -2874,6 +2886,7 @@ export async function transformRequest(
         maxHeightPx: historyGeometry.maxHeightPx,
         pageChars: historyGeometry.maxChars,
         imageBudget: tuning.imageBudget,
+        imageByteBudget: imageByteHeadroom(info, o.maxImageBytes),
         packFill: tuning.packFill,
         minFreezeStep: tuning.minFreezeStep,
       },
@@ -2882,12 +2895,9 @@ export async function transformRequest(
     if (histInfo.freezeStep !== undefined) info.historyFreezeStep = histInfo.freezeStep;
     if (histInfo.budgetTrimmed) info.historyBudgetTrimmed = true;
     if (tuning.packFill) info.historyPackFill = true;
-    // Atomic admission by weight. The collapse is one semantic group: applying
-    // it means every collapsed message becomes pages, so a group that does not
-    // fit the byte budget is not applied at all and the original text stands.
-    // Rendering it first and discarding it costs CPU, which is the cheap half of
-    // the trade: the alternative is estimating PNG size from character counts and
-    // being wrong on the request that mattered.
+    // Safety net: collapseHistory admits only whole oldest chunks within the
+    // exact decoded-byte headroom. Keep this check at the system boundary so a
+    // future renderer-accounting regression cannot overfill the request.
     if (
       histInfo.collapsedTurns > 0 &&
       histInfo.collapsedImageBytes > imageByteHeadroom(info, o.maxImageBytes)
@@ -2929,8 +2939,8 @@ export async function transformRequest(
       if (histInfo.carryOverImageOrdinal !== undefined) {
         relocateAnchorToHistoryImage(req.messages, histInfo.carryOverImageOrdinal);
       }
-    } else if (histInfo.reason) {
-      info.historyReason = histInfo.reason;
+    } else {
+      recordHistoryCollapseFailure(info, histInfo.reason);
     }
   }
 

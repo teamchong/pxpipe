@@ -80,7 +80,7 @@ const PINNED_REQUEST_HEADER =
 const PINNED_REQUEST_FOOTER =
   '\n===== END CURRENT USER REQUEST =====\n';
 
-function pinnedRequestBlock(text: string): string {
+export function pinnedRequestBlock(text: string): string {
   return PINNED_REQUEST_HEADER + text + PINNED_REQUEST_FOOTER;
 }
 
@@ -88,7 +88,7 @@ function pinnedRequestBlock(text: string): string {
 // echoes it verbatim (capped) and points at the in-history text block; otherwise it
 // falls back to "the live request is the trailing user message" (interactive shape,
 // where the latest user turn is already native text in the kept tail).
-function buildLiveRequestGuard(pinText?: string): string {
+export function buildLiveRequestGuard(pinText?: string): string {
   if (pinText !== undefined) {
     const echo = pinText.length > 600 ? pinText.slice(0, 600) + '…' : pinText;
     return (

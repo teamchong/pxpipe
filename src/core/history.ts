@@ -400,7 +400,7 @@ export function messagesToHistorySegments(
   return { text: textOut.join('\n\n'), slotText: slotOut.join('\n\n') };
 }
 
-function compactPreview(text: string): string {
+export function compactPreview(text: string): string {
   const compact = text.replace(/\s+/g, ' ').trim();
   if (compact.length <= LATEST_COLLAPSED_USER_PREVIEW_CHARS) return compact;
   return compact.slice(0, LATEST_COLLAPSED_USER_PREVIEW_CHARS).trimEnd() + '...';
@@ -415,7 +415,7 @@ const LATEST_COLLAPSED_USER_VERBATIM_CHARS = 4000;
 const VERBATIM_HEAD_CHARS = 2600;
 const VERBATIM_TAIL_CHARS = 1400;
 
-function verbatimTaskText(text: string): string {
+export function verbatimTaskText(text: string): string {
   const t = text.trim();
   if (t.length <= LATEST_COLLAPSED_USER_VERBATIM_CHARS) return t;
   const elided = t.length - VERBATIM_HEAD_CHARS - VERBATIM_TAIL_CHARS;

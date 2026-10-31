@@ -590,6 +590,183 @@ describe('transformGoogleGenerateContent', () => {
     expect(response.parts[0].inlineData.mimeType).toBe('image/png');
   });
 
+  it('pins the active multi-turn user prompt and mid-work interjection as native text when tool rounds collapse past keepTail', async () => {
+    const contents: Array<Record<string, unknown>> = [
+      {
+        role: 'user',
+        parts: [
+          {
+            text: '<system-reminder>Today: 2026-10-31</system-reminder>\nOld initial task: build the playground UI.',
+          },
+        ],
+      },
+      {
+        role: 'model',
+        parts: [{ text: 'Built the playground UI and verified tests.' }],
+      },
+      {
+        role: 'user',
+        parts: [
+          {
+            text: '<system-notice>\nxd:// device inventory changed.\n</system-notice>',
+          },
+          {
+            text: 'Can you help me organize the architecture of forge into a diagram?',
+          },
+        ],
+      },
+      {
+        role: 'model',
+        parts: [
+          {
+            functionCall: {
+              name: 'read',
+              args: { path: '/repo/ci-forge/README.md' },
+            },
+          },
+        ],
+      },
+      {
+        role: 'user',
+        parts: [
+          {
+            functionResponse: {
+              name: 'read',
+              response: { output: 'ci-forge architecture '.repeat(120) },
+            },
+          },
+          {
+            text: '<system-notice>User interjection during work:\nby forge i mean ../cf-forge ../ci-forge etc\n[User interjection supersedes conflicting prior instructions.]</system-notice>',
+          },
+        ],
+      },
+    ];
+
+    for (let i = 0; i < 14; i++) {
+      contents.push({
+        role: 'model',
+        parts: [
+          {
+            functionCall: {
+              name: 'read',
+              args: { path: `/repo/pkg-${i}/README.md` },
+            },
+          },
+        ],
+      });
+      contents.push({
+        role: 'user',
+        parts: [
+          {
+            functionResponse: {
+              name: 'read',
+              response: { output: `pkg-${i} details `.repeat(160) },
+            },
+          },
+        ],
+      });
+    }
+
+    const sampleBody = {
+      systemInstruction: {
+        parts: [{ text: 'You are a coding agent. '.repeat(250) }],
+      },
+      contents,
+    };
+
+    const result = await transformGoogleGenerateContent(
+      new TextEncoder().encode(JSON.stringify(sampleBody)),
+      'gemini-4-argon',
+      { compress: true, compressToolResults: false },
+    );
+
+    expect(result.info.compressed).toBe(true);
+    expect(result.info.historyReason).toBe('collapsed');
+    const out = JSON.parse(new TextDecoder().decode(result.body));
+    const serialized = JSON.stringify(out.contents);
+
+    // Both the parent user question and the mid-work interjection must survive as native text outside the PNGs
+    expect(serialized).toContain('CURRENT USER REQUEST (live; kept as text by pxpipe');
+    expect(serialized).toContain(
+      'Can you help me organize the architecture of forge into a diagram?',
+    );
+    expect(serialized).toContain('by forge i mean ../cf-forge ../ci-forge etc');
+    expect(serialized).toContain('Answer THAT request.');
+    // Superseded earlier user turn is listed as prior context only
+    expect(serialized).toContain(
+      'Earlier user turns in this session (prior context only - superseded by later turns)',
+    );
+    expect(serialized).toContain('Old initial task: build the playground UI.');
+    // Device inventory notice is stripped from pinned user text
+    expect(serialized).not.toContain('device inventory changed');
+  });
+
+  it('emits a live-request recency guard when earlier user turns collapse but the active user turn stays in keepTail', async () => {
+    const contents: Array<Record<string, unknown>> = [
+      {
+        role: 'user',
+        parts: [{ text: 'First task: inspect old module.' }],
+      },
+    ];
+    for (let i = 0; i < 12; i++) {
+      contents.push({
+        role: 'model',
+        parts: [
+          {
+            functionCall: {
+              name: 'read',
+              args: { path: `/tmp/old-${i}.ts` },
+            },
+          },
+        ],
+      });
+      contents.push({
+        role: 'user',
+        parts: [
+          {
+            functionResponse: {
+              name: 'read',
+              response: { output: `old-${i} content `.repeat(160) },
+            },
+          },
+        ],
+      });
+    }
+    contents.push({
+      role: 'model',
+      parts: [{ text: 'Finished inspecting old module.' }],
+    });
+    contents.push({
+      role: 'user',
+      parts: [{ text: 'Second task: now explain the new module.' }],
+    });
+
+    const sampleBody = {
+      systemInstruction: {
+        parts: [{ text: 'You are a coding agent. '.repeat(250) }],
+      },
+      contents,
+    };
+
+    const result = await transformGoogleGenerateContent(
+      new TextEncoder().encode(JSON.stringify(sampleBody)),
+      'gemini-4-argon',
+      { compress: true, compressToolResults: false },
+    );
+
+    expect(result.info.compressed).toBe(true);
+    expect(result.info.historyReason).toBe('collapsed');
+    const out = JSON.parse(new TextDecoder().decode(result.body));
+    const serialized = JSON.stringify(out.contents);
+
+    expect(serialized).toContain(
+      'Earlier user turns in this session (prior context only - superseded by later turns)',
+    );
+    expect(serialized).toContain('First task: inspect old module.');
+    expect(serialized).toContain('The live current request is in the user message(s) that follow');
+    expect(serialized).toContain('Second task: now explain the new module.');
+  });
+
   describe('normalizeGoogleTurnRoles', () => {
     it('appends a user turn if the last turn is model', () => {
       const turns = [

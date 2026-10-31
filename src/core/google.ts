@@ -21,16 +21,18 @@ import {
   prepareImagedRenderText,
   droppedCodepointsTop,
   schemaAnnotationLines,
+  buildLiveRequestGuard,
   CHAT_HEADER,
   HISTORY_TRANSCRIPT_INTRO,
   HISTORY_TRANSCRIPT_OUTRO,
   COMPACT_HISTORY_TRANSCRIPT_INTRO,
   COMPACT_HISTORY_TRANSCRIPT_OUTRO,
+  pinnedRequestBlock,
 } from './openai.js';
 import { factSheetText } from './factsheet.js';
 import { stripSchemaDescriptions } from './schema-strip.js';
 import { relocateGooglePins } from './pin.js';
-
+import { compactPreview, verbatimTaskText } from './history.js';
 export interface GooglePart {
   text?: string;
   inlineData?: {
@@ -102,6 +104,8 @@ interface GoogleToolRewrite {
 interface GoogleHistoryUnit {
   index: number;
   text: string;
+  userText?: string;
+  userInterjection?: boolean;
   baselineTokens: number;
   source: GoogleContent;
   opens: string[];
@@ -116,6 +120,7 @@ interface GoogleHistoryPlan {
   imageSources: string[];
   text: string;
   factSheet: string;
+  pinnedUserText?: string;
   baselineTokens: number;
   nativeTokens: number;
   collapsedTurns: number;
@@ -290,6 +295,79 @@ function extractGoogleFunctionResponseText(response: unknown): string {
   }
   return safeJson(response ?? {});
 }
+const GOOGLE_REMINDER_OPEN = '<system-reminder>';
+const GOOGLE_REMINDER_CLOSE = '</system-reminder>';
+const GOOGLE_NOTICE_OPEN = '<system-notice>';
+const GOOGLE_NOTICE_CLOSE = '</system-notice>';
+const USER_INTERJECTION_HEADER_RE = /^User interjection during work[^\n]*\n?/i;
+const USER_INTERJECTION_FOOTER_RE =
+  /\n?\[User interjection supersedes conflicting prior instructions\.[^\]]*\]\s*$/i;
+
+/**
+ * Extract human-authored prompt text from a Gemini user turn's text parts.
+ * Strips `<system-reminder>` envelopes and non-interjection `<system-notice>`
+ * blocks (e.g. device-inventory updates), while unwrapping mid-work user
+ * interjections (`<system-notice>User interjection during work...</system-notice>`)
+ * so they remain recognized as part of the active user request.
+ */
+function extractGoogleUserPrompt(
+  parts: readonly string[],
+): { text: string; isInterjection: boolean } | undefined {
+  if (parts.length === 0) return undefined;
+  const cleanedParts: string[] = [];
+  let isInterjection = false;
+
+  for (const raw of parts) {
+    let withoutReminders = '';
+    let at = 0;
+    for (;;) {
+      const open = raw.indexOf(GOOGLE_REMINDER_OPEN, at);
+      if (open < 0) break;
+      const close = raw.indexOf(
+        GOOGLE_REMINDER_CLOSE,
+        open + GOOGLE_REMINDER_OPEN.length,
+      );
+      if (close < 0) break;
+      withoutReminders += raw.slice(at, open);
+      at = close + GOOGLE_REMINDER_CLOSE.length;
+    }
+    withoutReminders += raw.slice(at);
+
+    let out = '';
+    let cursor = 0;
+    for (;;) {
+      const open = withoutReminders.indexOf(GOOGLE_NOTICE_OPEN, cursor);
+      if (open < 0) break;
+      const close = withoutReminders.indexOf(
+        GOOGLE_NOTICE_CLOSE,
+        open + GOOGLE_NOTICE_OPEN.length,
+      );
+      if (close < 0) break;
+      out += withoutReminders.slice(cursor, open);
+      const inner = withoutReminders
+        .slice(open + GOOGLE_NOTICE_OPEN.length, close)
+        .trim();
+      if (USER_INTERJECTION_HEADER_RE.test(inner)) {
+        isInterjection = true;
+        const unwrapped = inner
+          .replace(USER_INTERJECTION_HEADER_RE, '')
+          .replace(USER_INTERJECTION_FOOTER_RE, '')
+          .trim();
+        if (unwrapped) {
+          out += (out && !out.endsWith('\n') ? '\n' : '') + unwrapped + '\n';
+        }
+      }
+      cursor = close + GOOGLE_NOTICE_CLOSE.length;
+    }
+    out += withoutReminders.slice(cursor);
+
+    const trimmed = out.trim();
+    if (trimmed) cleanedParts.push(trimmed);
+  }
+
+  if (cleanedParts.length === 0) return undefined;
+  return { text: cleanedParts.join('\n\n'), isInterjection };
+}
 
 function googlePartText(part: GooglePart): string {
   if (typeof part.text === 'string') return part.text;
@@ -308,6 +386,7 @@ function googleHistoryUnit(content: GoogleContent, index: number): GoogleHistory
   }
   const text: string[] = [];
   const rawTexts: string[] = [];
+  const userTextParts: string[] = [];
   const opens: string[] = [];
   const closes: string[] = [];
   let opaque = false;
@@ -321,6 +400,7 @@ function googleHistoryUnit(content: GoogleContent, index: number): GoogleHistory
     if (typeof part.text === 'string') {
       text.push(part.text);
       rawTexts.push(part.text);
+      if (content.role !== 'model') userTextParts.push(part.text);
       continue;
     }
     if (part.functionCall) {
@@ -353,9 +433,17 @@ function googleHistoryUnit(content: GoogleContent, index: number): GoogleHistory
   const body = text.filter(Boolean).join('\n\n');
   const rawBody = rawTexts.filter(Boolean).join('\n\n');
   const transcript = body ? `<${role} t="${index}">\n${body}\n</${role}>` : '';
+  const userPrompt =
+    content.role !== 'model' ? extractGoogleUserPrompt(userTextParts) : undefined;
   return {
     index,
     text: transcript,
+    ...(userPrompt
+      ? {
+          userText: userPrompt.text,
+          userInterjection: userPrompt.isInterjection || closes.length > 0,
+        }
+      : {}),
     baselineTokens: Math.max(googleTextTokens(body), googleTextTokens(rawBody)),
     source: content,
     opens,
@@ -536,9 +624,8 @@ async function planGoogleHistory(
   // keep turn 0 native so the prompt stays visible outside the image. In multi-turn
   // chat, the active user turn is already in the kept tail, so collapse from turn 0.
   const userTurns: number[] = [];
-  for (let i = 0; i < contents.length; i++) {
-    const c = contents[i];
-    if (c?.role === 'user' && Array.isArray(c.parts) && c.parts.some((p) => p && typeof p.text === 'string' && p.text.trim())) {
+  for (let i = 0; i < units.length; i++) {
+    if (units[i]?.userText !== undefined) {
       userTurns.push(i);
     }
   }
@@ -611,8 +698,72 @@ async function planGoogleHistory(
   const compactFraming = profile.history.framing === 'compact';
   const intro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_INTRO : HISTORY_TRANSCRIPT_INTRO;
   const outro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_OUTRO : HISTORY_TRANSCRIPT_OUTRO;
+  const endExclusive = start + admitted.length;
+
+  // Identify the active user request: the latest human user turn, plus any
+  // preceding user turn(s) that were not yet answered by a completed assistant
+  // prose turn (no tool calls) or that the latest user turn interjected into
+  // mid-work.
+  const activeUserIndices: number[] = [];
+  if (userTurns.length > 0) {
+    const lastUserIdx = userTurns[userTurns.length - 1]!;
+    activeUserIndices.push(lastUserIdx);
+    let needParentPrompt = units[lastUserIdx]!.userInterjection === true;
+    for (let i = lastUserIdx - 1; i >= 0; i--) {
+      const u = units[i]!;
+      if (u.userText !== undefined) {
+        activeUserIndices.unshift(i);
+        needParentPrompt = u.userInterjection === true;
+        continue;
+      }
+      if (!needParentPrompt && u.source.role === 'model') {
+        break;
+      }
+    }
+  }
+  const activeUserSet = new Set(activeUserIndices);
+
+  const collapsedUserIndices = userTurns.filter(
+    (i) => i >= start && i < endExclusive,
+  );
+  const collapsedActiveIndices = collapsedUserIndices.filter((i) =>
+    activeUserSet.has(i),
+  );
+  const collapsedPriorIndices = collapsedUserIndices.filter(
+    (i) => !activeUserSet.has(i),
+  );
+
+  let pinnedUserText: string | undefined;
+  if (collapsedUserIndices.length > 0) {
+    const blocks: string[] = [];
+    if (collapsedPriorIndices.length > 0) {
+      const recentPrior = collapsedPriorIndices.slice(-6);
+      const priorLines = recentPrior.map(
+        (i) => `<user t="${i}">${compactPreview(units[i]!.userText!)}</user>`,
+      );
+      blocks.push(
+        `[Earlier user turns in this session (prior context only - superseded by later turns):\n${priorLines.join('\n')}]`,
+      );
+    }
+    if (collapsedActiveIndices.length > 0) {
+      const activeVerbatim = activeUserIndices
+        .map(
+          (i) => `<user t="${i}">\n${verbatimTaskText(units[i]!.userText!)}\n</user>`,
+        )
+        .join('\n\n');
+      const activeSummary = activeUserIndices
+        .map((i) => `<user t="${i}"> ${compactPreview(units[i]!.userText!)} </user>`)
+        .join(' ');
+      blocks.push(pinnedRequestBlock(activeVerbatim).trim());
+      blocks.push(buildLiveRequestGuard(activeSummary));
+    } else {
+      blocks.push(buildLiveRequestGuard(undefined));
+    }
+    pinnedUserText = blocks.join('\n\n');
+  }
+
   const nativeTokens = googleTextTokens(
-    intro + factSheet + outro,
+    [intro, factSheet, outro, pinnedUserText].filter(Boolean).join('\n\n'),
   );
   if (imageTokens + nativeTokens >= baselineTokens) return null;
   const droppedCodepoints = new Map<number, number>();
@@ -625,11 +776,12 @@ async function planGoogleHistory(
   }
   return {
     start,
-    endExclusive: start + admitted.length,
+    endExclusive,
     images,
     imageSources,
     text,
     factSheet,
+    ...(pinnedUserText ? { pinnedUserText } : {}),
     baselineTokens,
     nativeTokens,
     collapsedTurns: admitted.length,
@@ -837,6 +989,9 @@ export async function transformGoogleGenerateContent(
     ];
     if (historyPlan.factSheet) historyParts.push({ text: historyPlan.factSheet });
     historyParts.push({ text: outro });
+    if (historyPlan.pinnedUserText) {
+      historyParts.push({ text: historyPlan.pinnedUserText });
+    }
     if (historyPlan.start > 0 && contents[historyPlan.start - 1]?.role === 'user') {
       // Keep Gemini's alternating role shape: append the synthetic prior-context
       // parts to the preceding live user turn rather than emitting user→user.

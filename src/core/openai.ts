@@ -592,13 +592,10 @@ function rewriteFlatToolsForGpt(tools: unknown[] | undefined): {
   return { tools: changed ? rewritten : tools, docs: docs.join('\n\n') };
 }
 
-function isGpt5Family(model?: string): boolean {
-  return typeof model === 'string' && /^gpt-5/i.test(model);
-}
-
 /** Shared by normal outbound requests and profile-aligned evaluations. */
 export function openAIImageDetail(model?: string): 'original' | 'high' {
-  return resolveGptProfile(model).imageDetail ?? (isGpt5Family(model) ? 'original' : 'high');
+  const isGpt5Family = typeof model === 'string' && /^gpt-5/i.test(model);
+  return resolveGptProfile(model).imageDetail ?? (isGpt5Family ? 'original' : 'high');
 }
 
 function openAIImagePart(img: RenderedImage, model?: string): OpenAIImagePart {

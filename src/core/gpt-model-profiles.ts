@@ -207,7 +207,7 @@ export const DEFAULT_GPT_PROFILE: GptModelProfile = {
 const GPT56_SOL_PROFILE: GptModelProfile = {
   cacheWriteRate: 1.25,
   cacheBreakpoints: true,
-  // GPT-5.6 original detail bills the submitted 32px patches without a patch cap.
+  // GPT-5.6 / GPT-6.1 Sol original detail bills the submitted 32px patches without a patch cap.
   vision: { regime: 'patch', multiplier: 1 },
   ...GPT5_PRICING,
   // Sol pins an exact static slab, so the gate compares against the measured
@@ -307,6 +307,15 @@ const miniNanoProfile = (
  *   mini/nano -> patch (nano 2.46 / mini 1.62, cap 1536), BEFORE 5.x flagship.
  */
 const BUILTIN_RULES: ProfileRule[] = [
+  // Exact Sol variant observed on production traffic. Do not match bare 5.6/6.1
+  // or sibling variants (for example gpt-5.6-terra): model-specific visual
+  // tuning must not leak across variants merely because they share a version
+  // number. Evaluated before the generic gpt-6 family rule so gpt-6.1-sol
+  // inherits Sol's native 14px profile rather than GPT6_PROFILE's 5x8 Spleen.
+  {
+    test: (m) => /^gpt-(?:5\.6|6\.1)-sol(?:-|$)/.test(m),
+    profile: GPT56_SOL_PROFILE,
+  },
   {
     test: (m) => /^gpt-6(?:[.-]|$)/.test(m),
     profile: GPT6_PROFILE,
@@ -330,13 +339,6 @@ const BUILTIN_RULES: ProfileRule[] = [
   {
     test: isMiniNanoPatch,
     profile: miniNanoProfile(1.62, BASE_PRICING),
-  },
-  // Exact Sol variant observed on production traffic. Do not match bare 5.6 or
-  // sibling variants (for example gpt-5.6-terra): model-specific visual tuning
-  // must not leak across variants merely because they share a version number.
-  {
-    test: (m) => m === 'gpt-5.6-sol' || m.startsWith('gpt-5.6-sol-'),
-    profile: GPT56_SOL_PROFILE,
   },
   // 5.x flagship (gpt-5.4/5.5/…, no -mini/-nano): patch, multiplier 1, detail:original cap
   {
@@ -554,7 +556,10 @@ function parseEnvProfiles(raw: string): Map<string, GptModelProfile> {
     // An exact override key may be a prefix of the real model id. Resolve the
     // known family explicitly so `{"gpt-5.6-sol":{...}}` inherits Sol's font
     // and geometry even when a suffixed runtime id is expected.
-    const base = key === 'gpt-5.6-sol' ? GPT56_SOL_PROFILE : resolveBuiltin(key);
+    const base =
+      key === 'gpt-5.6-sol' || key === 'gpt-6.1-sol'
+        ? GPT56_SOL_PROFILE
+        : resolveBuiltin(key);
     const p = v as Partial<GptModelProfile>;
     const styleIn = (p as { style?: GptRenderStyle }).style;
     const historyIn = (p as { history?: Partial<GptHistoryProfile> }).history;

@@ -9,6 +9,7 @@ describe('profile-controlled outbound image detail', () => {
     delete process.env.PXPIPE_GPT_PROFILES;
     expect(openAIImageDetail('gpt-6-astra')).toBe('original');
     expect(openAIImageDetail('gpt-5.6-sol')).toBe('original');
+    expect(openAIImageDetail('gpt-6.1-sol')).toBe('high');
     expect(openAIImageDetail('unknown-model')).toBe('high');
   });
   it.each(['high', 'original'] as const)('uses a valid %s profile override', imageDetail => {

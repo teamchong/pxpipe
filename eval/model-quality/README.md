@@ -47,7 +47,7 @@ profile-aligned README table.
 - Select history-specific style/width where defined for history fixtures.
   Apply profile-controlled history reflow and the normal reflow default.
 - Use the runtime's exported **`openAIImageDetail`** decision, rather than
-  hardcoding `original`. GPT-6 currently uses **`high`** in normal requests.
+  hardcoding `original`. GPT-6 now defaults to **`original`** in normal requests; GPT-5.x defaults to **`original`** and other OpenAI models default to **`high`**.
 - Use the runtime's **`prepareImagedRenderText`** for content and
   **`historyFactSheet`** for history, including native-opaque overflow when the
   profile requests it. Ordinary content uses `factSheetText` with the resolved

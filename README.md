@@ -144,14 +144,16 @@ Not every vision encoder can read dense 5×8 bitmap glyphs. **Gemini 4 (`gemini-
   coverage can be changed (defensive cap 100) with
   `PXPIPE_GPT_HISTORY_MAX_IMAGES=48` after validating the provider's request cap.
 - **`claude-opus-5-5` & `claude-opus-5`:** `claude-opus-5-5` is on by default at spaced 5×8 (+2px row height, ~25% more image tokens than Fable's layout, still ~50%+ live savings). Good for gist/reasoning (94/98 gist, 100/100 arithmetic, 0/16 never-stated), weak on dense verbatim hex (3/15 on Opus 5.5, 2/15 on Opus 5); agents must re-fetch exact IDs via tools. Details: [FINDINGS.md](FINDINGS.md).
-- **Per-model rendering:** Gemini 4 (`GEMINI_PROFILE`) uses 312-column, 1568×728 5×8 Spleen with 96 max history pages, `mixed` history grouping, and a compact factsheet; Gemini 3.x uses the same 5×8 canvas with a 32-page cap. Claude uses 312-column 5×8 Spleen (dense for Fable, +2px row spacing for Opus/Sonnet). Opt-in `gpt-5.6-sol` and Grok use native 14px JetBrains Mono glyphs in a 9×16 cell, 84 columns, and a 764px full-width strip.
-  [Sol receipts](eval/sol-profile/QUALITY_RESULTS.md) and
+- **Per-model rendering:** Gemini 4 (`GEMINI_PROFILE`) uses 312-column, 1568×728 5×8 Spleen with 96 max history pages, `mixed` history grouping, and a compact factsheet; Gemini 3.x uses the same 5×8 canvas with a 32-page cap. Claude uses 312-column 5×8 Spleen (dense for Fable, +2px row spacing for Opus/Sonnet). Opt-in `gpt-5.6-sol` / `gpt-6.1-sol` and Grok use native 14px JetBrains Mono glyphs in a 9×16 cell, 84 columns, and a 764px full-width strip.
+  [GPT-6.1 Sol receipts](eval/model-quality/results/gpt-6.1-sol/QUALITY_RESULTS.md),
+  [GPT-5.6 Sol receipts](eval/sol-profile/QUALITY_RESULTS.md), and
   [profile evidence](docs/MODEL_RENDER_PROFILES.md).
-- **Grok 4.5 / 4.6 (opt-in):** native 14px / 84 cols / maxH 512 (100/100 arith, 97/98 gist).
-  Off by default (dense hex still 0/15). History uses mixed collapse so Codex
+- **Grok 4.5 / 4.6 / 4.7 (opt-in):** native 14px / 84 cols / maxH 512 (Grok 4.7: 100/100
+  arith, 98/98 gist, 18/18 state, 0/16 never-stated, 14/15 hex; Grok 4.5/4.6: 100/100 arith, 97/98 gist, 0/15 pure-image hex).
+  Off by default. History uses mixed collapse so Codex
   assistant messages between tool rounds still image. Enable with
-  `PXPIPE_MODELS=claude-fable-5,grok-4.6` or the dashboard chip.
-  [eval/grok-density/QUALITY_RESULTS.md](eval/grok-density/QUALITY_RESULTS.md).
+  `PXPIPE_MODELS=claude-fable-5,grok-4.7` (or `grok-4.6`) or the dashboard chip.
+  [Grok 4.7 receipts](eval/model-quality/results/grok-4.7/QUALITY_RESULTS.md), [eval/grok-density/QUALITY_RESULTS.md](eval/grok-density/QUALITY_RESULTS.md).
 
 </details>
 
@@ -167,16 +169,14 @@ font. This tests rendered-content quality, not the complete proxy/agent pipeline
 
 | model | numbers at | arithmetic (N=100) | gist (N=98) | state (N=18) | never-stated (N=16) | dense hex (N=15) | profile provenance and receipts |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| `gpt-6-astra` low — `high` baseline | Spleen 5×8, 152 cols; reflow; measured detail `high`; compact factsheet | 98/100 | 25/98 | 6/18 | **0/16** | 5/15 | Shared source-based v2 baseline: [results and receipts](eval/model-quality/results/gpt-6-astra/QUALITY_RESULTS.md) |
+| `gpt-6.1-sol` low | JetBrains Mono 14px, 84 cols, maxH 1954; reflow; detail `high`; full factsheet | **100/100** | **96/98** | **18/18** | **0/16** | **15/15** | Shared source-based v2: [results and receipts](eval/model-quality/results/gpt-6.1-sol/QUALITY_RESULTS.md) |
+| `grok-4.7` high | JetBrains Mono 14px, 84 cols, maxH 512; reflow; compact factsheet | **100/100** | **98/98** | **18/18** | **0/16** | **14/15** | Shared source-based v2: [results and receipts](eval/model-quality/results/grok-4.7/QUALITY_RESULTS.md) |
+| `gpt-6-astra` low | Spleen 5×8, 152 cols; reflow; detail `original`; compact factsheet | 97/100 | 26/98 | 7/18 | **0/16** | 2/15 | Shared source-based v2 (`original` detail; `high` baseline 98/100 arith, 25/98 gist, 6/18 state, 0/16 guards, 5/15 hex): [results and receipts](eval/model-quality/results/gpt-6-astra/QUALITY_RESULTS.md) |
 
-GPT-6 now defaults to `original` detail. The full-sized `high` baseline above is
-retained unchanged; the separately measured [N=2 matched pilot](eval/model-quality/pilots/HEX_RESULTS.md)
-compares both detail modes. The baseline scores are not `original` scores.
-
+GPT-6 now defaults to `original` detail (`openAIImageDetail`); the separately measured [N=2 matched pilot](eval/model-quality/pilots/HEX_RESULTS.md) compares `original` and `high` detail modes on `gpt-6-astra`.
 Other models have **not** been rerun under this protocol; their prior scores
 remain below as historical evidence, not aligned comparison results. The old
 GPT-6 v1 scores used different detail/history/hex settings and are superseded.
-
 <details>
 <summary>Historical evaluations — mixed fixtures, profiles and inference settings</summary>
 

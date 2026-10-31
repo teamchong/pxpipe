@@ -10,9 +10,21 @@ import { openAIImageDetail, historyFactSheet } from '../../dist/core/openai.js';
 import { summarize } from './summarize.mjs';
 
 test('built modules are fresh before paid evaluation', () => assertBuildFresh());
-for (const model of ['gpt-6-astra', 'gpt-5.6-sol', 'grok-4.6', 'google/gemini-3.6-flash',
-  'google/gemini-3.8-flash', 'claude-fable-5', 'claude-opus-5',
-  'workers-ai/@cf/qwen/qwen3.8-27b', '@cf/zai-org/glm-5.3-flash', 'unknown-model']) {
+
+for (const model of [
+  'gpt-6-astra',
+  'gpt-5.6-sol',
+  'gpt-6.1-sol',
+  'grok-4.6',
+  'grok-4.7',
+  'gemini-3.6-flash',
+  'gemini-3.8-flash',
+  'claude-fable-5',
+  'claude-opus-5',
+  'workers-ai/@cf/qwen/qwen3.8-27b',
+  '@cf/zai-org/glm-5.3-flash',
+  'unknown-model',
+]) {
   test(`${model}: eval uses the runtime profile and exact renderer bytes`, async () => {
     const p = resolveGptProfile(model);
     const source = 'The selected package is immer.\nACTIVE_PORT=8431\nThe exact id is ab91cd45ef67.';

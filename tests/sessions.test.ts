@@ -506,18 +506,22 @@ describe('Claude Code session map', () => {
     expect(ref!.firstUserPreview).toContain('hello');
   });
 
-  it('matches the proxy key when the transcript opens with a CLAUDE.md reminder', async () => {
+  it('matches the proxy key when the transcript opens with reminders and slash commands', async () => {
     const root = makeCCRoot();
     const proj = path.join(root, '-Users-me-bar');
     fs.mkdirSync(proj, { recursive: true });
     const reminder = '<system-reminder>\n# claudeMd\nrules\n</system-reminder>';
+    const command = '<command-name>/effort</command-name>\n<command-message>effort</command-message>\n<command-args></command-args>';
     const messages = [
+      { role: 'user', content: [{ type: 'text', text: '<local-command-caveat>local</local-command-caveat>' }] },
+      { role: 'user', content: [{ type: 'text', text: command }] },
+      { role: 'user', content: [{ type: 'text', text: '<local-command-stdout>high</local-command-stdout>' }] },
       { role: 'user', content: [{ type: 'text', text: reminder }, { type: 'text', text: 'ship it' }] },
     ];
     fs.writeFileSync(
       path.join(proj, 'sess-r.jsonl'),
       [
-        JSON.stringify({ type: 'user', message: messages[0] }),
+        ...messages.map((message) => JSON.stringify({ type: 'user', message })),
         JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: 'ok' } }),
       ].join('\n') + '\n',
     );

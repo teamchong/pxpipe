@@ -326,8 +326,9 @@ describe('serveFragment', () => {
     expect(html).toContain('Original Responses composition');
     expect(html).toContain('Reasoning / encrypted items');
     expect(html).toContain('Native tool JSON');
-    expect(html).toContain('Function outputs eligible in old closed pairs');
-    expect(html).toContain('Function outputs actually imaged this request');
+    expect(html).toContain('Tool calls (function + custom)');
+    expect(html).toContain('Tool outputs eligible in old closed pairs');
+    expect(html).toContain('Tool outputs actually imaged this request');
     expect(html).toContain('Completed tool pairs');
     expect(html).toContain('Open calls kept native');
     expect(html).toContain('56.0k tok');

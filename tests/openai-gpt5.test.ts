@@ -31,18 +31,27 @@ describe('isPxpipeSupportedGptModel', () => {
     expect(isPxpipeSupportedGptModel('gpt-5.6-terra')).toBe(false);
     expect(isPxpipeSupportedGptModel('gpt-5-mini')).toBe(false);
     expect(isPxpipeSupportedGptModel('gpt-5.6-nano')).toBe(false);
+    expect(isPxpipeSupportedGptModel('gpt-5.6-sol-codex')).toBe(false);
     expect(isPxpipeSupportedGptModel('gpt-5.6-sol[1m]')).toBe(false);
-    expect(isPxpipeSupportedGptModel('gpt-5.6-sol-codex[1m]')).toBe(false);
+    expect(isPxpipeSupportedGptModel('gpt-6.1-sol')).toBe(false);
+    expect(isPxpipeSupportedGptModel('gpt-6.1-sol-codex')).toBe(false);
+    expect(isPxpipeSupportedGptModel('gpt-6.1-sol[1m]')).toBe(false);
   });
 
   it('enables only exact Sol ids and suffix aliases when explicitly opted in', () => {
-    process.env.PXPIPE_MODELS = 'gpt-5.6-sol';
+    process.env.PXPIPE_MODELS = 'gpt-5.6-sol,gpt-6.1-sol';
     expect(isPxpipeSupportedGptModel('gpt-5.6-sol')).toBe(true);
-    expect(isPxpipeSupportedGptModel('gpt-5.6-sol[1m]')).toBe(true);
     expect(isPxpipeSupportedGptModel('gpt-5.6-sol-codex')).toBe(true);
+    expect(isPxpipeSupportedGptModel('gpt-5.6-sol[1m]')).toBe(true);
     expect(isPxpipeSupportedGptModel('gpt-5.6-sol-codex[1m]')).toBe(true);
+    expect(isPxpipeSupportedGptModel('gpt-6.1-sol')).toBe(true);
+    expect(isPxpipeSupportedGptModel('gpt-6.1-sol-codex')).toBe(true);
+    expect(isPxpipeSupportedGptModel('gpt-6.1-sol[1m]')).toBe(true);
+    expect(isPxpipeSupportedGptModel('gpt-6.1-sol-codex[1m]')).toBe(true);
     expect(isPxpipeSupportedGptModel('gpt-5.6')).toBe(false);
     expect(isPxpipeSupportedGptModel('gpt-5.6-terra')).toBe(false);
+    expect(isPxpipeSupportedGptModel('gpt-6.1')).toBe(false);
+    expect(isPxpipeSupportedGptModel('gpt-6.1-terra')).toBe(false);
   });
 
   it('rejects non-GPT-5 models', () => {
@@ -1098,6 +1107,10 @@ describe('resolveGptProfile (GPT-5.6 Sol)', () => {
       'gpt-5.6-sol-codex',
       'gpt-5.6-sol-codex[1m]',
       'gpt-5.6-sol-2026-07-09',
+      'gpt-6.1-sol',
+      'gpt-6.1-sol[1m]',
+      'gpt-6.1-sol-codex',
+      'gpt-6.1-sol-codex[1m]',
     ]) {
       const sol = resolveGptProfile(model);
       expect(sol.maxHeightPx, model).toBe(1954);

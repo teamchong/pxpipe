@@ -17,8 +17,8 @@ still forwards to the passthrough upstream.
 | model rule | default | cell | columns | max height | evidence |
 |---|:---:|---|---:|---:|---|
 | `claude-*` / `anthropic-*` | yes | JetBrains Mono 14px, 9×16 | 172 | 728 px | established Claude suites; Fable keeps dense (Spleen 5×8, 312 cols) |
-| `gpt-5.6-sol*` | opt-in | JetBrains Mono 14px, 9×16 | 84 | 1954 px | 7/8 exact, 0 inventions, gist and guard pass |
-| `grok-*` | opt-in | JetBrains Mono 14px, 9×16 | 84 | 512 px | 100/100 arith, 97/98 gist, 17/18 state; hex 0/15 |
+| `gpt-5.6-sol*` / `gpt-6.1-sol*` | opt-in | JetBrains Mono 14px, 9×16 | 84 | 1954 px | `gpt-6.1-sol`: 100/100 arith, 96/98 gist, 18/18 state, 0/16 guards, 15/15 hex (5×8 control: 20/98 gist, 9/18 state, 3/15 hex); `gpt-5.6-sol` pilot: 7/8 exact, 0 inventions |
+| `grok-*` | opt-in | JetBrains Mono 14px, 9×16 | 84 | 512 px | `grok-4.7`: 100/100 arith, 98/98 gist, 18/18 state, 0/16 guards, 14/15 hex (5×8 control: 85/100 arith, 14/98 gist, 5/18 state, 0/15 hex); `grok-4.5`/`4.6`: 100/100 arith, 97/98 gist, 17/18 state |
 | other GPT/o-series | opt-in | Spleen 5×8 | 152 | 1932 px | conservative fallback |
 
 Every production path adds IDS rows to the image and an adjacent text factsheet
@@ -44,12 +44,9 @@ match Claude. Enable them explicitly with `PXPIPE_MODELS`, for example:
 ```bash
 PXPIPE_MODELS=claude-fable-5,gpt-5.6-sol
 ```
+`gpt-5.6-terra`, `gpt-6.1-terra`, and other non-Sol siblings do not inherit the Sol profile or allowlist.
 
-`gpt-5.6-terra` and other siblings do not inherit the Sol profile or allowlist.
-
-Evidence: [Sol results](../eval/sol-profile/RESULTS.md),
-[Grok results](../eval/grok-density/QUALITY_RESULTS.md).
-
+Evidence: [GPT-6.1 Sol 14px results](../eval/model-quality/results/gpt-6.1-sol/QUALITY_RESULTS.md) ([5×8 control](../eval/model-quality/results/gpt-6.1-sol-5x8/QUALITY_RESULTS.md)), [Sol pilot results](../eval/sol-profile/RESULTS.md), [Grok 4.7 14px results](../eval/model-quality/results/grok-4.7/QUALITY_RESULTS.md) ([5×8 control](../eval/model-quality/results/grok-4.7-5x8/QUALITY_RESULTS.md)), [Grok 4.5/4.6 results](../eval/grok-density/QUALITY_RESULTS.md).
 ## Overrides
 
 `PXPIPE_GPT_PROFILES` is a JSON map from model-id prefix to a partial profile.

@@ -15,7 +15,7 @@ vision regime (`mpix`, 1000 tokens/MP).
 | never-stated guards | not run | **0/16 confabulated** | 16 |
 | dense hex association | not run | **14/15** | 15 |
 
-`grok-4.7` uses the shipped Grok native 14px profile (JetBrains Mono 14px, 84 columns, max height 512px, reflow enabled, compact native factsheet) and scored **100/100** arithmetic, **98/98** gist, **18/18** state, **0/16** guard confabulations, and **14/15** dense hex association (with the compact factsheet active, compared to 0/15 on the pure-image legacy hex stress test without factsheet). It remains opt-in (`PXPIPE_MODELS=claude-fable-5,grok-4.7` or dashboard chip) alongside Grok 4.5 / 4.6.
+`grok-4.7` uses the shipped Grok native 14px profile (JetBrains Mono 14px, 84 columns, max height 512px, reflow enabled, compact native factsheet) and scored **100/100** arithmetic, **98/98** gist, **18/18** state, **0/16** guard confabulations, and **14/15** dense hex association (with the compact factsheet active, compared to 0/15 on the pure-image legacy hex stress test without factsheet). A matched [Spleen 5×8 / 152-column override control](../grok-4.7-5x8/QUALITY_RESULTS.md) dropped to **85/100** arithmetic, **14/98** gist (61 `UNKNOWN`), **5/18** state, **0/16** guards, and **0/15** hex, confirming that Grok 4.7 still requires the native 14px profile. It remains opt-in (`PXPIPE_MODELS=claude-fable-5,grok-4.7` or dashboard chip) alongside Grok 4.5 / 4.6.
 
 ## Receipts and actual cost
 

@@ -15,7 +15,7 @@ detail **`high`**.
 | never-stated guards | not run | **0/16 confabulated** | 16 |
 | dense hex association | not run | **15/15** | 15 |
 
-`gpt-6.1-sol` resolves to `GPT56_SOL_PROFILE` (native 14px JetBrains Mono at 84 columns, 1954px height, `detail: high`, full native factsheet) and scored **100/100** arithmetic, **96/98** gist, **18/18** state, **0/16** guard confabulations, and **15/15** dense hex association (with the full factsheet active, as in normal runtime requests). Of the 98 answerable gist probes, 96 were answered accurately and 0 were answered UNKNOWN. It remains opt-in (`PXPIPE_MODELS=claude-fable-5,gpt-6.1-sol`) because native 14px is a legibility/quality profile rather than a universal warm-cache cost win.
+`gpt-6.1-sol` resolves to `GPT56_SOL_PROFILE` (native 14px JetBrains Mono at 84 columns, 1954px height, `detail: high`, full native factsheet) and scored **100/100** arithmetic, **96/98** gist, **18/18** state, **0/16** guard confabulations, and **15/15** dense hex association (with the full factsheet active, as in normal runtime requests). Of the 98 answerable gist probes, 96 were answered accurately and 0 were answered UNKNOWN. A matched [Spleen 5×8 / 152-column override control](../gpt-6.1-sol-5x8/QUALITY_RESULTS.md) dropped to **100/100** arithmetic, **20/98** gist (68 `UNKNOWN`), **9/18** state, **0/16** guards, and **3/15** hex, confirming that 14px is required for legibility. It remains opt-in (`PXPIPE_MODELS=claude-fable-5,gpt-6.1-sol`) because native 14px is a legibility/quality profile rather than a universal warm-cache cost win.
 
 ## Receipts and actual cost
 

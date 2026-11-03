@@ -22,6 +22,7 @@ import {
   openAIChatToAnthropicResponse,
 } from './messages-chat-bridge.js';
 import { pinCommandResponse, pinCommandResponseOpenAI } from './pin.js';
+import { withClientToolRoundShape } from './client-tool-round.js';
 import { isGoogleInferencePath, parseGoogleModelFromPath, transformGoogleGenerateContent } from './google.js';
 import { isGeminiModel } from './gemini-model-profiles.js';
 import { resolveGptProfile } from './gpt-model-profiles.js';
@@ -1187,6 +1188,13 @@ const API_KEY_BEARER_RE = /^Bearer\s+sk-/i;
 /** Three base64url segments whose first decodes to a JSON header (`eyJ…`). */
 const JWT_BEARER_RE = /^Bearer\s+eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$/;
 
+// Re-exported so existing imports from './proxy.js' keep working.
+export {
+  parseTrustAdjacentToolRounds,
+  resolveTrustAdjacentToolRoundsEnv,
+  withClientToolRoundShape,
+} from './client-tool-round.js';
+
 export function classifyInboundCredential(headers: Headers): InboundCredential {
   const authorization = headers.get('authorization') ?? '';
   if (ANTHROPIC_BEARER_RE.test(authorization)) return 'anthropic-bearer';
@@ -1698,8 +1706,10 @@ let responseContentType: string | undefined;
       }
       const bodyIn = bounded.bytes;
       try {
-        const transformOpts =
-          typeof config.transform === 'function' ? config.transform() : config.transform;
+        const transformOpts = withClientToolRoundShape(
+          typeof config.transform === 'function' ? config.transform() : config.transform,
+          req.headers,
+        );
         // Fail-closed: unreadable model → no compression, not a risky guess.
         const model = googleModelFromPath ?? readModelField(bodyIn);
         if (isOpenAIResponses) responsesStreaming = readStreamField(bodyIn);

@@ -14,7 +14,13 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import { isIP } from 'node:net';
 import { spawnSync } from 'node:child_process';
-import { createProxy, parseGatewayHeaders, resolveUpstreams, type ProxyConfig } from './core/proxy.js';
+import {
+  createProxy,
+  parseGatewayHeaders,
+  resolveTrustAdjacentToolRoundsEnv,
+  resolveUpstreams,
+  type ProxyConfig,
+} from './core/proxy.js';
 import {
   chatCompletionsUrl,
 } from './core/messages-chat-bridge.js';
@@ -341,6 +347,9 @@ Environment:
                           chunks are byte-identical across turns, so
                           re-rendering them is wasted CPU; 0 disables the cache.
                           Live counters at /proxy-stats under render_cache.
+  PXPIPE_TRUST_ADJACENT_TOOL_ROUNDS  1 = let history collapse split adjacent
+                          tool call/result pairs for every client; 0 = never.
+                          Unset: on only for Claude Code (claude-cli/ UA + x-app: cli).
   PXPIPE_DEBUG_CAPTURE_4XX  debug: set to 1 to persist full 4xx request and
                           upstream error bodies (prompts + any secrets in
                           context) to disk. Off by default.
@@ -1181,6 +1190,10 @@ async function main(): Promise<void> {
   }
   // A/B harness passthrough switch (see the `transform` callback below).
   const forcePassthrough = /^(1|true|yes|on)$/i.test(process.env.PXPIPE_DISABLE ?? '');
+  // Unset → per-request client-header detection; 1/0 forces it for every client.
+  const trustAdjacent = resolveTrustAdjacentToolRoundsEnv(process.env.PXPIPE_TRUST_ADJACENT_TOOL_ROUNDS);
+  const trustAdjacentToolRounds = trustAdjacent.value;
+  if (trustAdjacent.warning) console.warn(trustAdjacent.warning);
   if (forcePassthrough) {
     console.log('[pxpipe] PXPIPE_DISABLE set — passthrough mode (compress=false), still logging usage + baselines');
   }
@@ -1298,7 +1311,9 @@ async function main(): Promise<void> {
       // (The dashboard kill switch does the same thing at runtime.)
       if (forcePassthrough || !dashboard.getCompressionEnabled()) return { compress: false };
       // Active path: use DEFAULTS in transform.ts for break-even gating.
-      return {};
+      return trustAdjacentToolRounds === undefined
+        ? {}
+        : { separateAdjacentToolPairs: trustAdjacentToolRounds };
     },
     onRequest: async (e) => {
       // Feed the dashboard BEFORE tracker.emit — toTrackEvent strips

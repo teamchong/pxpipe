@@ -99,6 +99,10 @@ export interface HistoryCollapseOptions {
    *  re-render re-keys the whole history. Rounded UP to a power-of-two multiple of
    *  `freezeChunk` so chunk boundaries stay a subset of the base grid. Default 0. */
   minFreezeStep: number;
+  /** Treat each closed assistant-tool/user-result pair as its own tool round.
+   *  Safe only for clients that send a parallel batch as one assistant message
+   *  (Claude Code). See {@link findClosedPrefixBoundary}. Default false. */
+  separateAdjacentToolPairs: boolean;
 }
 
 /** Images Anthropic accepts per request. Exceeding it fails the WHOLE request with
@@ -127,6 +131,7 @@ export const HISTORY_DEFAULTS: HistoryCollapseOptions = {
   imageBudget: ANTHROPIC_HISTORY_IMAGE_BUDGET,
   packFill: false,
   minFreezeStep: 0,
+  separateAdjacentToolPairs: false,
 };
 
 /** Per-request telemetry surfaced back to TransformInfo. */
@@ -183,16 +188,34 @@ export interface HistoryCollapseInfo {
  * assistant-tool/user-result pairs are treated as one tool round: some Anthropic
  * clients serialize a parallel batch that way, so the apparently-closed gap
  * between two pairs is not a safe collapse boundary.
+ *
+ * Pass `separateAdjacentToolPairs = true` for clients known to send a parallel
+ * batch as ONE assistant message (Claude Code). Each closed pair is then a valid
+ * boundary on its own; otherwise a pure tool loop with no text-only assistant
+ * turn never closes and the history can never collapse.
  */
 export function findClosedPrefixBoundary(
   messages: Message[],
   cutoffExclusive: number,
+  separateAdjacentToolPairs = false,
 ): number {
   if (cutoffExclusive <= 0) return -1;
   const openSet = new Set<string>();
   let lastClosed = -1;
   let inToolRound = false;
   const limit = Math.min(cutoffExclusive, messages.length);
+  // A prefix ending on an assistant tool_use message always leaves that call's
+  // tool_result live, which upstream rejects with 400. openSet alone cannot
+  // catch it when the tool_use id is not a string (it never enters openSet), so
+  // every boundary assignment goes through this guard, in both modes.
+  const closeAt = (j: number): void => {
+    const m = messages[j];
+    const opensToolUse =
+      m?.role === 'assistant' &&
+      Array.isArray(m.content) &&
+      m.content.some((blk) => !!blk && (blk as ToolUseBlock).type === 'tool_use');
+    if (!opensToolUse) lastClosed = j;
+  };
   for (let i = 0; i < limit; i++) {
     const msg = messages[i]!;
 
@@ -209,7 +232,7 @@ export function findClosedPrefixBoundary(
     // B-call/B-result. Do not expose the gap between those adjacent pairs as a
     // collapse boundary.
     if (inToolRound && openSet.size === 0 && assistantToolUses.length === 0) {
-      lastClosed = i - 1;
+      closeAt(i - 1);
       inToolRound = false;
     }
 
@@ -218,7 +241,7 @@ export function findClosedPrefixBoundary(
       continue;
     }
     if (msg.role === 'assistant') {
-      if (assistantToolUses.length > 0) inToolRound = true;
+      if (assistantToolUses.length > 0 && !separateAdjacentToolPairs) inToolRound = true;
       for (const blk of assistantToolUses) {
         const id = blk.id;
         if (typeof id === 'string') openSet.add(id);
@@ -231,7 +254,7 @@ export function findClosedPrefixBoundary(
         }
       }
     }
-    if (openSet.size === 0 && !inToolRound) lastClosed = i;
+    if (openSet.size === 0 && !inToolRound) closeAt(i);
   }
 
   // The end of a closed round is safe only if the actual next message does not
@@ -245,7 +268,7 @@ export function findClosedPrefixBoundary(
       next.content.some(
         (blk) => !!blk && (blk as ToolUseBlock).type === 'tool_use',
       );
-    if (!nextContinuesRound) lastClosed = limit - 1;
+    if (!nextContinuesRound) closeAt(limit - 1);
   }
   return lastClosed;
 }
@@ -777,7 +800,7 @@ export async function collapseHistory(
           ),
         )
       : rawCutoff;
-  const boundary = findClosedPrefixBoundary(messages, cutoff);
+  const boundary = findClosedPrefixBoundary(messages, cutoff, o.separateAdjacentToolPairs);
   if (boundary < 0) {
     info.reason = 'no_closed_prefix';
     return { messages, info };
@@ -828,7 +851,8 @@ export async function collapseHistory(
       acc += msgLen[k]! + userImgLen[k]!;
       k++;
     }
-    const trimmedLen = findClosedPrefixBoundary(messages, protectedPrefix + k) + 1;
+    const trimmedLen = findClosedPrefixBoundary(
+      messages, protectedPrefix + k, o.separateAdjacentToolPairs) + 1;
     if (trimmedLen - protectedPrefix < o.minCollapsePrefix) {
       info.reason = 'over_budget';
       return { messages, info };

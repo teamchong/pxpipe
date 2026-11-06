@@ -94,6 +94,8 @@ function forwardHeaders(headers: IncomingHttpHeaders): Record<string, string | s
 }
 
 function pipeSockets(a: Socket, b: Socket): void {
+  a.setNoDelay?.(true);
+  b.setNoDelay?.(true);
   a.pipe(b);
   b.pipe(a);
   const destroy = () => {
@@ -130,6 +132,8 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
     // absolute form must not be re-originated as `https://host:443`.
     origin: string,
   ) => {
+    req.socket?.setNoDelay?.(true);
+    res.socket?.setNoDelay?.(true);
     const path = requestUri.split('?')[0] ?? '/';
     const route = matchRoute(routes, hostPort, path);
 
@@ -152,11 +156,14 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
       setHost: false,
       agent: target.protocol === 'https:' ? httpsAgent : httpAgent,
     });
+    outbound.setNoDelay?.(true);
 
     let upstreamRes: IncomingMessage | undefined;
     outbound.on('response', (upstream) => {
       upstreamRes = upstream;
+      upstream.socket?.setNoDelay?.(true);
       res.writeHead(upstream.statusCode ?? 502, forwardHeaders(upstream.headers));
+      res.flushHeaders?.();
       // Streamed, never buffered: /v1/messages is SSE and must arrive token by
       // token or the agent appears to hang until the response completes.
       upstream.pipe(res);
@@ -231,6 +238,7 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
   mitmServer.on('clientError', (_err, socket) => socket.destroy());
 
   const handleConnect = (req: IncomingMessage, clientSocket: Socket, head: Buffer): void => {
+    clientSocket.setNoDelay?.(true);
     if (!isLoopbackAddress(req.socket.remoteAddress)) {
       clientSocket.end('HTTP/1.1 403 Forbidden\r\n\r\n');
       return;

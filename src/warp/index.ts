@@ -85,8 +85,8 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
   // The kernel picks it, nothing else needs to know it, so there is nothing to
   // collide with a pxpipe already running.
   const proxy = createServer(handlers.handleAbsoluteForm);
+  proxy.on('connection', (socket) => socket.setNoDelay(true));
   proxy.on('connect', handlers.handleConnect);
-
   /**
    * Does the user's interactive shell consider this word an alias? Both zsh
    * ("cc is an alias for ...") and bash ("cc is aliased to ...") answer through

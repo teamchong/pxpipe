@@ -471,6 +471,8 @@ async function writeWebResponse(res: Response, out: ServerResponse): Promise<voi
     out.end();
     return;
   }
+  out.socket?.setNoDelay?.(true);
+  out.flushHeaders();
   const reader = res.body.getReader();
   let finished = false;
   const cancelBody = () => {
@@ -1402,6 +1404,7 @@ async function main(): Promise<void> {
   const handle = createProxy(config);
 
   const server = createServer((req, res) => {
+    req.socket?.setNoDelay?.(true);
     Promise.resolve()
       .then(async () => {
         // Local dashboard routes — handled BEFORE the proxy so they never hit
@@ -1435,7 +1438,7 @@ async function main(): Promise<void> {
         if (!res.writableEnded) res.end();
       });
   });
-
+  server.on('connection', (socket) => socket.setNoDelay(true));
   // IPv6 literals need bracket notation to form a valid URL (http://[::1]:47821).
   const displayHost = opts.host.includes(':') ? `[${opts.host}]` : opts.host;
   const isLoopbackHost =

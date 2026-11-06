@@ -177,4 +177,57 @@ describe('upstream stall handling', () => {
       restore();
     }
   });
+
+  it('passes paused streams through untouched by default and records idle timeout errors when opted in', async () => {
+    const encoder = new TextEncoder();
+    let releaseSecondChunk: (() => void) | undefined;
+    const restore = mockUpstream(
+      () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(
+                encoder.encode('data: {"type":"response.output_text.delta","delta":"thought..."}\n\n'),
+              );
+              releaseSecondChunk = () => {
+                controller.enqueue(
+                  encoder.encode('data: {"type":"response.output_text.delta","delta":"tool_call"}\n\n'),
+                );
+                controller.close();
+              };
+            },
+          }),
+          { headers: { 'content-type': 'text/event-stream' } },
+        ),
+    );
+    try {
+      // Default proxy has no headers/idle timeout: stream passes through as-is.
+      const defaultProxy = createProxy({
+        openAIUpstream: 'http://mock',
+        transform: { compress: false },
+      });
+      const passRes = await defaultProxy(request());
+      releaseSecondChunk?.();
+      const passText = await new Response(passRes.body).text();
+      expect(passText).toContain('thought...');
+      expect(passText).toContain('tool_call');
+
+      // Opt-in idle timeout records upstream_timeout in ProxyEvent.error.
+      const { promise: eventPromise, resolve: resolveEvent } = Promise.withResolvers<{ error?: string }>();
+      const timedProxy = createProxy({
+        openAIUpstream: 'http://mock',
+        transform: { compress: false },
+        upstreamIdleTimeoutMs: 40,
+        onRequest(ev) {
+          resolveEvent(ev);
+        },
+      });
+      const timedRes = await timedProxy(request());
+      await expect(new Response(timedRes.body).text()).rejects.toThrow('upstream stalled');
+      const ev = await eventPromise;
+      expect(ev.error).toBe('upstream_timeout: no upstream bytes for 40ms');
+    } finally {
+      restore();
+    }
+  });
 });

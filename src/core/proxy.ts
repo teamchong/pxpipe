@@ -66,10 +66,10 @@ export interface ProxyConfig {
   captureErrorReqBody?: boolean;
   /** Abort the upstream request if response headers have not arrived within this
    *  many ms. Cleared once headers land, so long generations are unaffected.
-   *  0 disables. */
+   *  0 (default) disables so upstream and client control timeouts. */
   upstreamHeadersTimeoutMs?: number;
-  /** Abort the upstream response if no bytes arrive for this many ms. This is the
-   *  stall guard: a wedged connection can otherwise be held open forever. 0 disables. */
+  /** Abort the upstream response if no bytes arrive for this many ms.
+   *  0 (default) disables so buffered tool-call streams pass through as-is. */
   upstreamIdleTimeoutMs?: number;
   /** How long an in-flight request may reject an identical retry before the dedupe
    *  fails open. Prevents one stalled request from permanently 409-ing its retries.
@@ -135,10 +135,9 @@ export interface ProxyEvent {
 /** Max chars of 4xx error body captured on ProxyEvent — enough for Anthropic's full error JSON. */
 const ERROR_BODY_MAX = 2048;
 
-/** Headers should arrive well inside this; generous enough for slow reasoning starts. */
-const DEFAULT_UPSTREAM_HEADERS_TIMEOUT_MS = 300_000;
-/** No bytes for this long means the connection is wedged, not slow. */
-const DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS = 120_000;
+/** Disabled by default (0): upstream and client control request/stream timeouts. */
+const DEFAULT_UPSTREAM_HEADERS_TIMEOUT_MS = 0;
+const DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS = 0;
 /** Past this, an in-flight entry is treated as stale and a retry is let through. */
 const DEFAULT_DUPLICATE_HOLD_MS = 60_000;
 /**
@@ -200,7 +199,7 @@ function withIdleTimeout(
         // same wait the headers budget covers. Real traffic has taken >120s just to
         // return headers (max 146s over 41k requests), so charging the mid-stream idle
         // budget here would abort healthy slow starts.
-        arm(firstChunkMs);
+        arm(firstChunkMs > 0 ? firstChunkMs : ms);
       },
       transform(chunk, controller) {
         // Bytes have flowed: from here a long silence means wedged, not slow.
@@ -2174,7 +2173,7 @@ let teed: Response;
       fire(
         upstreamRes.status,
         info,
-        undefined,
+        timeoutKind === 'idle' ? `upstream_timeout: no upstream bytes for ${idleTimeoutMs}ms` : undefined,
         firstByteMs,
         usage,
         config.captureErrorReqBody ? errorBody : undefined,

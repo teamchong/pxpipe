@@ -230,4 +230,55 @@ describe('upstream stall handling', () => {
       restore();
     }
   });
+
+  it('preserves partial measurement and stream_error when a Gemini SSE stream aborts mid-response', async () => {
+    const encoder = new TextEncoder();
+    let abortStream: (() => void) | undefined;
+    const restore = mockUpstream(
+      () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(
+                encoder.encode(
+                  'data: {"candidates":[{"content":{"role":"model","parts":[{"text":"thinking chunk","thought":true}]}}]}\n\n',
+                ),
+              );
+              abortStream = () => controller.error(new Error('upstream connection reset'));
+            },
+          }),
+          { headers: { 'content-type': 'text/event-stream' } },
+        ),
+    );
+    try {
+      const { promise: eventPromise, resolve: resolveEvent } = Promise.withResolvers<{
+        stopReason?: string;
+        measurement?: { thinkingChars: number };
+      }>();
+      const proxy = createProxy({
+        googleUpstream: 'http://mock',
+        transform: { compress: false },
+        onRequest(ev) {
+          resolveEvent(ev);
+        },
+      });
+      const res = await proxy(
+        new Request('http://localhost/google-ai-studio/v1beta/models/gemini-4-argon:streamGenerateContent?alt=sse', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'hi' }] }] }),
+        }),
+      );
+      const reader = res.body!.getReader();
+      const first = await reader.read();
+      expect(new TextDecoder().decode(first.value)).toContain('thinking chunk');
+      abortStream?.();
+      await expect(reader.read()).rejects.toThrow('upstream connection reset');
+      const ev = await eventPromise;
+      expect(ev.stopReason).toBe('stream_error');
+      expect(ev.measurement?.thinkingChars).toBe(14);
+    } finally {
+      restore();
+    }
+  });
 });

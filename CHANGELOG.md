@@ -6,6 +6,11 @@ behavioral changes, patch = fixes).
 
 ## Unreleased
 
+### Fixed
+- When configured history geometry overflows the image-byte budget on a long
+  session, retain the oldest whole history chunks that fit and leave the
+  remainder as live text instead of abandoning the entire collapse (#216).
+
 ## 0.15.1 — 2026-10-25
 
 ### Added

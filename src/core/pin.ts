@@ -907,7 +907,14 @@ export function relocateOpenAIPins(req: OpenAIPinRequest): number {
   }
 
   if (stringInput) {
-    req.input = `${req.input as string}\n\n${pinText}`;
+    // Strip here too: a pin is MOVED, not copied. The loop above only reaches
+    // `items`, which is undefined for a bare string `input`, so the command line
+    // stayed in the prose and went upstream alongside the relocated block — and
+    // transformOpenAIResponses wraps this exact string back into `req.input`
+    // verbatim, so nothing downstream removes it. The two array shapes both
+    // strip, via stripOpenAIContent above.
+    const kept = stripLines(req.input as string);
+    req.input = kept.trim() ? `${kept}\n\n${pinText}` : pinText;
   } else if (target) {
     if (typeof target.content === 'string') {
       target.content = `${target.content}\n\n${pinText}`;

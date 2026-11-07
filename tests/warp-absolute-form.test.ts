@@ -35,7 +35,8 @@
  *   - Off-host callers are still refused (the loopback guard is untouched).
  */
 
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import { createServer, type IncomingMessage, request as httpRequest, type ServerResponse } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { describe, expect, it } from 'vitest';
 
 import type { CertificateAuthority } from '../src/warp/ca.js';
@@ -147,5 +148,58 @@ describe('absolute-form authority carries the implied default port', () => {
     );
     expect(status).toBe(403);
     expect(diverts).toHaveLength(0);
+  });
+
+  it('destroys the downstream response immediately when upstream aborts mid-stream', async () => {
+    let abortUpstream: (() => void) | undefined;
+    const upstreamServer = createServer((_req, out) => {
+      out.writeHead(200, { 'content-type': 'text/event-stream' });
+      out.flushHeaders();
+      out.write('data: {"type":"thinking_delta","delta":"hi"}\n\n');
+      abortUpstream = () => out.destroy(new Error('upstream terminated'));
+    });
+    const upstreamListening = Promise.withResolvers<void>();
+    upstreamServer.listen(0, '127.0.0.1', upstreamListening.resolve);
+    await upstreamListening.promise;
+    const upstreamPort = (upstreamServer.address() as AddressInfo).port;
+
+    const { handleAbsoluteForm } = createWarpHandlers({
+      routes: [parseRoute(`api.anthropic.com/v1/*=http://127.0.0.1:${upstreamPort}`)],
+      ca: CA,
+    });
+    const warpServer = createServer(handleAbsoluteForm);
+    const warpListening = Promise.withResolvers<void>();
+    warpServer.listen(0, '127.0.0.1', warpListening.resolve);
+    await warpListening.promise;
+    const warpPort = (warpServer.address() as AddressInfo).port;
+
+    try {
+      const responseReady = Promise.withResolvers<IncomingMessage>();
+      const clientReq = httpRequest(
+        {
+          host: '127.0.0.1',
+          port: warpPort,
+          method: 'POST',
+          path: 'http://api.anthropic.com/v1/messages',
+          headers: { host: 'api.anthropic.com', 'content-type': 'application/json' },
+        },
+        responseReady.resolve,
+      );
+      clientReq.end('{}');
+      const res = await responseReady.promise;
+      const firstChunk = Promise.withResolvers<Buffer>();
+      res.once('data', firstChunk.resolve);
+      expect((await firstChunk.promise).toString('utf8')).toContain('thinking_delta');
+
+      const closedPrematurely = Promise.withResolvers<boolean>();
+      res.on('error', () => closedPrematurely.resolve(!res.complete));
+      res.on('close', () => closedPrematurely.resolve(!res.complete));
+      res.resume();
+      abortUpstream?.();
+      expect(await closedPrematurely.promise).toBe(true);
+    } finally {
+      warpServer.close();
+      upstreamServer.close();
+    }
   });
 });

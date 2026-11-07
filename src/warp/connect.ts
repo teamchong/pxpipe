@@ -159,9 +159,19 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
     outbound.setNoDelay?.(true);
 
     let upstreamRes: IncomingMessage | undefined;
+    const abortDownstream = (err?: Error): void => {
+      if (!res.writableEnded && !res.destroyed) {
+        res.destroy(err);
+      }
+    };
     outbound.on('response', (upstream) => {
       upstreamRes = upstream;
       upstream.socket?.setNoDelay?.(true);
+      upstream.on('error', abortDownstream);
+      upstream.on('aborted', () => abortDownstream());
+      upstream.on('close', () => {
+        if (!upstream.complete) abortDownstream();
+      });
       res.writeHead(upstream.statusCode ?? 502, forwardHeaders(upstream.headers));
       res.flushHeaders?.();
       // Streamed, never buffered: /v1/messages is SSE and must arrive token by
@@ -172,7 +182,11 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
       // Our own teardown below surfaces here as ECONNRESET; the client is
       // already gone, so writing a 502 into it would throw.
       if (res.writableEnded || res.destroyed) return;
-      if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' });
+      if (res.headersSent) {
+        res.destroy(err);
+        return;
+      }
+      res.writeHead(502, { 'content-type': 'text/plain' });
       res.end(`pxpipe warp: upstream error: ${err.message}`);
     });
     // An SSE completion only ends when the model stops. If the agent is killed

@@ -68,6 +68,31 @@ than 404, confirming the routes exist); the actual model reply was not
 exercised end to end, so treat the routing as reachable but unverified, same
 disclaimer as everything past Kimi K3 above.
 
+### UberLLM (OpenAI- and Anthropic-compatible)
+
+> Community-contributed example. Not tested or endorsed by pxpipe; any
+> OpenAI-compatible provider works the same way.
+
+[UberLLM](https://uberllm.dev) serves the OpenAI Responses API and the
+Anthropic Messages API on one host with one key, so it goes through the
+existing `OPENAI_UPSTREAM` / `OPENAI_MODELS` route (no separate flag):
+
+```bash
+OPENAI_UPSTREAM=https://api.uberllm.dev \
+OPENAI_API_KEY=your-uberllm-key \
+OPENAI_MODELS=deepseek/deepseek-v4.1-flash \
+npx pxpipe-proxy
+```
+
+Because it also speaks the Messages API, setting
+`ANTHROPIC_UPSTREAM=https://api.uberllm.dev` keeps Claude models on the default
+Anthropic route; Claude Code then sends the same key as its
+`ANTHROPIC_AUTH_TOKEN`, which pxpipe forwards. Swap `OPENAI_MODELS` for any id
+from `https://api.uberllm.dev/v1/models`. A short text request returned a reply
+through both routes (`createProxy` handler, 2026-11-10); image-compressed
+sessions and `count_tokens` savings were not measured, so treat this route as
+unprofiled, same as Novita above.
+
 ## Connect Claude Code
 
 ```bash

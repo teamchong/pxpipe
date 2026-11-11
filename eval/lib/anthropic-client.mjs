@@ -73,6 +73,9 @@ const PYTHON = process.env.CCI_PYTHON || 'python3';
  */
 function modelAlias(model) {
   const m = (model ?? '').toLowerCase();
+  // Fable has no CLI alias, and its versions are separate eval rows: collapsing
+  // them to 'sonnet' measures the wrong model.
+  if (m.startsWith('claude-fable-')) return m;
   if (m.includes('opus'))  return 'opus';
   if (m.includes('haiku')) return 'haiku';
   return 'sonnet';
@@ -164,7 +167,9 @@ async function callClaudeCli(body, model) {
     '--model', model,
     '--output-format', 'json',
   ];
-  if (imageCount > 0) args.push('--allowedTools', 'Read');
+  // Always pass an allowlist, text arm included: without one cci.py falls back
+  // to bypass mode, which CLI 2.1.321 gates behind a consent dialog.
+  args.push('--allowedTools', 'Read');
 
   // Transport choice. cci.py drives the interactive TUI through a pty, which
   // pexpect only provides on POSIX — on Windows `pexpect.spawn` does not exist at

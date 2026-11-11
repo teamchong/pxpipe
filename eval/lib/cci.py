@@ -226,12 +226,15 @@ def main():
         sys.stderr.write("cci: no prompt (positional arg or stdin)\n")
         sys.exit(2)
 
-    args = ["--setting-sources", "project", "--strict-mcp-config",
-            "--dangerously-skip-permissions"]
+    args = ["--setting-sources", "project", "--strict-mcp-config"]
     if model:
         args += ["--model", model]
     if allowed:
+        # An explicit allowlist needs no bypass mode. CLI 2.1.321 gates bypass
+        # behind a consent dialog this shim never answers ("never reached ready").
         args += ["--allowedTools", allowed]
+    else:
+        args += ["--dangerously-skip-permissions"]
 
     env = dict(os.environ)
     env["TERM"] = "xterm-256color"

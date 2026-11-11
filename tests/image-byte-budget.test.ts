@@ -59,6 +59,20 @@ function withSlab(messages: Message[], slabChars = 60_000) {
   });
 }
 
+/**
+ * Decoded bytes of the imaged slab alone. Measured, not hard-coded: PNG deflate
+ * goes through CompressionStream, whose output differs across Node versions
+ * (12,683 bytes on Node 24, 16,439 on Node 26).
+ */
+async function slabBytes(): Promise<number> {
+  resetSessionState();
+  const { info } = await transformRequest(withSlab([{ role: 'user', content: 'go' }]), {
+    maxImageBytes: 100_000_000,
+  });
+  resetSessionState();
+  return info.imageBytes;
+}
+
 /** Total decoded image bytes actually on the wire, at both nesting levels. */
 function wireImageBytes(msgs: any[]): number {
   let total = 0;
@@ -122,13 +136,13 @@ describe('a group that does not fit keeps its text', () => {
   });
 
   it('keeps a tool_result as text when its pages do not fit', async () => {
-    // Measured on this fixture: the slab renders to 16,439 bytes and the
-    // tool_result group to about 7,677 more. A budget between the two admits the
-    // slab and leaves the tool group without room, which is the case worth
-    // pinning: partial admission is what must not happen.
+    // The tool_result group renders to several thousand bytes on top of the
+    // slab. A budget just above the slab admits it and leaves the tool group
+    // without room, which is the case worth pinning: partial admission is what
+    // must not happen.
     const { body: out, info } = await transformRequest(
       withSlab([{ role: 'user', content: 'go' }, toolResult('t1')]),
-      { maxImageBytes: 18_000 },
+      { maxImageBytes: (await slabBytes()) + 1_500 },
     );
     expect(info.imageCount ?? 0).toBeGreaterThan(0); // the slab was admitted
     expect(info.toolResultImgs ?? 0).toBe(0); // the tool group was not
@@ -138,7 +152,7 @@ describe('a group that does not fit keeps its text', () => {
   });
 
   it('stays within the budget it was given', async () => {
-    const limit = 18_000;
+    const limit = (await slabBytes()) + 1_500;
     const { body: out } = await transformRequest(
       withSlab([{ role: 'user', content: 'go' }, toolResult('t1'), toolResult('t2')]),
       { maxImageBytes: limit },
@@ -173,7 +187,7 @@ describe('telemetry distinguishes the two ceilings', () => {
   it('reports a byte skip, not a count skip, when weight is what ran out', async () => {
     const { info } = await transformRequest(
       withSlab([{ role: 'user', content: 'go' }, toolResult('t1')]),
-      { maxImageBytes: 18_000 },
+      { maxImageBytes: (await slabBytes()) + 1_500 },
     );
     // Five images is far under the 100-image cap, so nothing here is a count
     // problem. The two ceilings need different fixes and must not be conflated.
@@ -182,10 +196,11 @@ describe('telemetry distinguishes the two ceilings', () => {
   });
 
   it('warns before the next turn walks into the wall', async () => {
+    const slab = await slabBytes();
     const { info } = await transformRequest(withSlab([{ role: 'user', content: 'go' }]), {
-      // The slab measures 16,439 bytes, so an 18,000-byte budget admits it at
-      // about 91% full: nothing is dropped this turn, and the next one will be.
-      maxImageBytes: 18_000,
+      // A budget the slab fills to about 95%: nothing is dropped this turn, and
+      // the next one will be.
+      maxImageBytes: Math.ceil(slab / 0.95),
     });
     expect(info.imageCount ?? 0).toBeGreaterThan(0);
     expect(info.imageBytesNearLimit).toBe(true);

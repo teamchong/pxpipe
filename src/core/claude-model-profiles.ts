@@ -84,8 +84,8 @@ export const CLAUDE_LEGACY_PROFILE: GptModelProfile = {
 };
 
 /**
- * Spaced geometry, DEFAULT for every Claude model except Fable: the same
- * 312-col spleen-5x8 cell with 2 px of extra row height.
+ * Spaced geometry, DEFAULT for every Claude model except the original Fable 5:
+ * the same 312-col spleen-5x8 cell with 2 px of extra row height.
  *
  * Opus 5.5 gist recall (eval/gist-recall, 98 answerable, image arm):
  *
@@ -114,10 +114,20 @@ export const CLAUDE_LEGACY_SPACED_PROFILE: GptModelProfile = {
   historyStyle: { ...CLAUDE_SPACED_STYLE },
 };
 
-/** Fable is the only Claude family measured accurate at bare dense geometry
- *  (98/98 gist), so it alone keeps the unspaced 5x8 cell. */
-export function isFableClaude(model: string): boolean {
-  return model.toLowerCase().includes('fable');
+/**
+ * True only for the original Fable 5, the one Claude release measured accurate
+ * at bare dense geometry. Its point releases are not: dense hex
+ * (eval/verbatim-15, N=15, same needles) on claude-fable-5-2 reads
+ *
+ *   dense 5x8       7/15
+ *   5x8 +2px rows  13/15   (what Fable 5 scores unspaced)
+ *
+ * so 5.1+ and any unrecognised Fable get spaced rows. `\d{1,2}(?!\d)` keeps a
+ * trailing date stamp (`claude-fable-5-20260601`) from reading as a minor.
+ */
+export function isBareDenseFable(model: string): boolean {
+  const v = /fable-(\d+)(?:-(\d{1,2})(?!\d))?/.exec(model.toLowerCase());
+  return v !== null && Number(v[1]) === 5 && Number(v[2] ?? '0') === 0;
 }
 
 /** Every id that must be priced and rendered as Claude. */
@@ -152,9 +162,9 @@ export function isPre47Claude(m: string): boolean {
 /** Pick the Claude profile for an id. Billing geometry is identical across
  *  opus/sonnet/haiku/fable; HISTORY geometry is not, because verbatim recall
  *  at dense geometry is a per-model property (see CLAUDE_SPACED_PROFILE).
- *  Fable keeps bare dense; every other Claude id gets spaced rows. */
+ *  Fable 5 keeps bare dense; every other Claude id gets spaced rows. */
 export function resolveClaudeProfile(m: string): GptModelProfile {
-  if (isFableClaude(m)) {
+  if (isBareDenseFable(m)) {
     return isPre47Claude(m) ? CLAUDE_LEGACY_PROFILE : CLAUDE_PROFILE;
   }
   return isPre47Claude(m) ? CLAUDE_LEGACY_SPACED_PROFILE : CLAUDE_SPACED_PROFILE;

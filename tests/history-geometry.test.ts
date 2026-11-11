@@ -47,15 +47,18 @@ function bodyWithHistory(model: string): Uint8Array {
 describe('per-content-class render geometry', () => {
   it('ships spaced 5x8 for non-Fable Claude models by default', () => {
     // Measured: Opus 5.5 at spaced 5x8 (312 cols, +2px rows) read 93/98 gist,
-    // 0/16 confabulations. Fable keeps the bare dense cell (98/98).
-    for (const m of ['claude-opus-5', 'claude-opus-5-5', 'claude-sonnet-4-5']) {
+    // 0/16 confabulations. Fable 5 keeps the bare dense cell (98/98); its point
+    // releases do not (5.2 dense hex: 7/15 bare, 13/15 spaced).
+    for (const m of ['claude-opus-5', 'claude-opus-5-5', 'claude-sonnet-4-5', 'claude-fable-5-1', 'claude-fable-5-2', 'anthropic/claude-fable-5-2']) {
       const p = resolveGptProfile(m);
       expect(p.stripCols, m).toBe(312);
       expect(p.style.font, m).toBe('spleen-5x8');
       expect(p.style.cellHBonus, m).toBe(2);
       expect(p.historyStyle?.cellHBonus, m).toBe(2);
     }
-    expect(resolveGptProfile('claude-fable-5').style.cellHBonus ?? 0).toBe(0);
+    for (const m of ['claude-fable-5', 'claude-fable-5[1m]', 'claude-fable-5-20260601']) {
+      expect(resolveGptProfile(m).style.cellHBonus ?? 0, m).toBe(0);
+    }
     for (const m of ['claude-fable-5', 'gpt-5.6-sol', 'moonshotai/kimi-k3']) {
       const p = resolveGptProfile(m);
       expect(p.historyStripCols, `${m} must stay dense by default`).toBeUndefined();

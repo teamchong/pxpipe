@@ -12,8 +12,9 @@ before it leaves your machine. On the original June 2026 **`claude-fable-5`**
 runs, that landed as a **~59–70% lower end-to-end bill** (10/10 SWE-bench Lite,
 14/19 SWE-bench Pro, 13/15 dense hex). Since then, **Gemini 4 (`gemini-4-argon`)**
 reached **15/15** on pure-image dense hex (with no factsheet in the benchmark), while later
-Claude releases (`claude-fable-5-1`, `claude-fable-5-2`, `claude-opus-5-5`, `claude-sonnet-5-5`,
-`claude-haiku-5-5`) regressed sharply on dense pixel reading (0/15–7/15 hex; see
+Claude releases (`claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`) regressed sharply
+on dense pixel reading (0/15–3/15 hex; `claude-fable-5-1` and `claude-fable-5-2` recover to
+11/15–14/15 with +2px row spacing; see
 [The honest part](#the-honest-part)). Durable token savings are measured
 per-request against a free `count_tokens` counterfactual in
 `~/.pxpipe/events.jsonl`.
@@ -48,8 +49,8 @@ On original `claude-fable-5`, pxpipe counts an exact token **10/10** across 39 i
 (matches `grep` line-for-line), gets the multi-step ledger arithmetic right,
 and ends the session at **$6.06** with context to spare (73.5k/1M) vs
 **$42.21** at 96% full. Note: these headline Claude numbers are from **`claude-fable-5`**,
-*not* `claude-fable-5-1`, `claude-fable-5-2`, `claude-opus-5-5`, `claude-sonnet-5-5`, or `claude-haiku-5-5`
-(which regressed to 0/15–7/15 on dense pixel reading). One caveat visible in the clip: the pxpipe arm
+*not* `claude-opus-5-5`, `claude-sonnet-5-5`, or `claude-haiku-5-5`
+(which regressed to 0/15–3/15 on dense pixel reading). One caveat visible in the clip: the pxpipe arm
 needed a nudge to match the requested one-line output format.
 
 ## Try it (30 seconds)
@@ -117,14 +118,14 @@ without running the proxy.
 
 ## The honest part
 
-Not every vision encoder can read dense 5×8 bitmap glyphs. **Gemini 4 (`gemini-4-argon`) is the first model to score 15/15 on pure-image dense hex alongside 100/100 pure-image arithmetic, 98/98 gist recall, 18/18 state tracking, and 0/16 confabulations.** By contrast, every post-Fable-5 Claude release (`claude-fable-5-1`, `claude-opus-5`, `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`) regressed sharply on dense pixel reading (0/15 to 6/15 on exact hex).
+Not every vision encoder can read dense 5×8 bitmap glyphs. **Gemini 4 (`gemini-4-argon`) is the first model to score 15/15 on pure-image dense hex alongside 100/100 pure-image arithmetic, 98/98 gist recall, 18/18 state tracking, and 0/16 confabulations.** By contrast, every post-Fable-5 Claude release (`claude-opus-5`, `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`) regressed sharply on dense pixel reading (0/15 to 3/15 on exact hex). `claude-fable-5-1` and `claude-fable-5-2` read 6/15 and 7/15 on the unspaced cell and 14/15 and 13/15 with +2px row spacing, which is now their default.
 
 | tier | models | dense hex (pure image, N=15) | gist (N=98) | arithmetic (N=100) | runtime status & guidance |
 | --- | --- | ---: | ---: | ---: | --- |
 | **Tier 1 — Full-fidelity readers** | `gemini-4-argon` (`gemini-4*`) | **15/15** | **98/98** | **100/100** | **On by default.** First model to hit 15/15 hex and 100/100 arithmetic on pure images; 96-page history cap + compact factsheet. |
 | **Tier 1 — Full-fidelity readers** | `google/gemini-3.6-flash`, `3.7-flash`, `3.8-flash` | **14/15** | **98/98** | **100/100** | **On by default** (compact factsheet). ~5.0–5.3× text capacity. |
 | **Tier 1 — Full-fidelity readers** | `claude-fable-5` (original June 2026) | **13/15** | **98/98** | **100/100** | **On by default.** SWE-bench Lite 10/10, SWE-bench Pro 14/19. |
-| **Tier 2 — Gist & agentic history only** (not byte-exact on dense logs/JSON) | `claude-opus-5-5` (default), `claude-fable-5-1` / `claude-fable-5-2` (default, matched by `claude-fable-5`), `claude-opus-5` (opt-in), `grok-4.5` / `grok-4.6` (opt-in), `gpt-5.6-sol` (opt-in) | 0/15–7/15 | 83/98–**98/98** | 98/100–**100/100** | **Do not use for tool-less document/log extraction.** Safe only in live agent sessions where recent turns stay text and the agent has tools (`Read`/`Grep`) to re-fetch exact IDs/numbers. |
+| **Tier 2 — Gist & agentic history only** (not byte-exact on dense logs/JSON) | `claude-opus-5-5` (default), `claude-fable-5-1` / `claude-fable-5-2` (default, spaced profile), `claude-opus-5` (opt-in), `grok-4.5` / `grok-4.6` (opt-in), `gpt-5.6-sol` (opt-in) | 0/15–14/15 | 83/98–**98/98** | 98/100–**100/100** | **Do not use for tool-less document/log extraction.** Safe only in live agent sessions where recent turns stay text and the agent has tools (`Read`/`Grep`) to re-fetch exact IDs/numbers. |
 | **Unsupported — Do not image** | `claude-haiku-5-5` (`claude-haiku-*`), `claude-sonnet-5-5`, `claude-opus-4-8`, `gpt-6.1-sol`, `grok-4.7`, `gpt-6-astra`, `kimi-k3`, `glm-5.3-flash`, `deepseek-v4.1-flash-1017` | 0/15–2/15 | 14/98–98/98 | 36/100–100/100 | **Not in default scope** (or loses money after cache discount). Weak readers guess plausible wrong numbers/IDs or misbind factsheet tokens when tools are disabled. |
 
 - **Independent 6-document benchmark (`TokenSave` / `johnisking` corpus — English/Korean/Japanese prose, JS code, 60-record JSON, 230-line log):** That benchmark tested only `claude-haiku-5-5`, `claude-sonnet-5-5`, `claude-opus-5-5`, and `claude-fable-5-1` with `--tools ""`, where `images only` scored **3/60 to 14/60** on planted hex IDs, **6/60 to 29/60** on planted numbers, **0/80** on unplanted log/JSON IDs, and **3/10** on Korean prose numbers (`94392` misread as `9392`). Running the exact same 6-document, 80-item benchmark on **`gemini-4-argon` pure images (no factsheet)** scores **28/30 (93.3%)** on planted hex IDs (**10/10** on English + Code, **10/10** on Korean `prose_ko` including `94392` exact, **5/5** on Japanese hex), **27/30 (90.0%)** on planted numbers, and **13/20** on unplanted JSON/log items (including **4/5** on unplanted 230-line log `req=` IDs where all four Claude models scored 0/20).
@@ -182,8 +183,8 @@ numbers predate it).
 | `gemini-4-argon` (default) | Spleen 5×8, 312 cols (shipped) | **100/100** | **98/98** | **18/18** | **0/16** | **15/15** | shipped Gemini 4 profile; 100/100 pure-image arithmetic & 15/15 pure-image hex: [quality results](eval/gemini-profile/QUALITY_RESULTS.md) |
 | `google/gemini-3.6-flash`, `3.7-flash`, `3.8-flash` (default) | Spleen 5×8, 312 cols (shipped) | **100/100** | **98/98** | **18/18** | **0/16** | **14/15** | current shipped Gemini 3.x profile: [quality results](eval/gemini-profile/QUALITY_RESULTS.md) |
 | `claude-fable-5` (default) | Spleen 5×8, 312 cols (shipped) | **100/100** | **98/98** | **18/18** | **0/16** | 13/15 | June 2026 production profiles: [arithmetic + hex](FINDINGS.md), [gist/state/guards](eval/gist-recall/) |
-| `claude-fable-5-1` | Spleen 5×8, 312 cols (Fable 5 profile) | **100/100** | 95/98 | **18/18** | **0/16** | 6/15 | model regression vs `claude-fable-5` (6/15 vs 13/15 hex on identical PNGs); 3 gist misses are image-arm negation flags answered UNKNOWN (0 confabs): [arithmetic](eval/sol-profile/), [dense hex](eval/verbatim-15/), [gist/state/guards](eval/gist-recall/) |
-| `claude-fable-5-2` | Spleen 5×8, 312 cols (Fable 5 profile) | **100/100** | **98/98** | **18/18** | **0/16** | 7/15 | gist back to `claude-fable-5` level (no image-arm negation misses); hex still regressed (7/15, 5/15 on a second run; several misses are explicit "too small to read" refusals, not silent wrong ids): [arithmetic](eval/model-quality/), [dense hex](eval/verbatim-15/), [gist/state/guards](eval/gist-recall/) |
+| `claude-fable-5-1` (default) | Spleen 5×8, 312 cols, +2px rows | **100/100** | **98/98** | **18/18** | **0/16** | **14/15** | spaced profile; was 6/15 hex and 95/98 gist on the unspaced Fable 5 cell. Arithmetic measured unspaced, not rerun: [arithmetic](eval/sol-profile/), [dense hex](eval/verbatim-15/), [gist/state/guards](eval/gist-recall/) |
+| `claude-fable-5-2` (default) | Spleen 5×8, 312 cols, +2px rows | **100/100** | **98/98** | **18/18** | **0/16** | 13/15 | spaced profile; 13/15 and 11/15 over two hex runs, was 7/15 and 5/15 on the unspaced Fable 5 cell. Arithmetic measured unspaced, not rerun: [arithmetic](eval/model-quality/), [dense hex](eval/verbatim-15/), [gist/state/guards](eval/gist-recall/) |
 | `claude-opus-5-5` (default, gist-only) | Spleen 5×8, 312 cols, +2px rows | **100/100** | 94/98 | 17/18 | **0/16** | 3/15 | spaced profile (Opus 5.5+); hex measured at dense geometry: [arithmetic](eval/sol-profile/), [gist/state/guards](eval/gist-recall/), [dense hex](eval/verbatim-15/) |
 | `claude-opus-5` (opt-in) | Spleen 5×8, 312 cols (shipped) | **100/100** | 94/98 | 17/18 | **0/16** | 2/15 | current profile: [arithmetic](eval/gsm8k/), [gist/state/guards](eval/gist-recall/), [dense hex](eval/verbatim-15/) |
 | `claude-sonnet-5-5` (opt-in, not recommended) | Spleen 5×8, 312 cols, +2px rows | **100/100** | 85/98 | 12/18 | **0/16** | 2/15 | spaced profile, opt-in via `PXPIPE_MODELS`; 6 state misses are wrong final values/counts, 7 gist misses answered UNKNOWN: [arithmetic](eval/sol-profile/), [gist/state/guards](eval/gist-recall/), [dense hex](eval/verbatim-15/) |
@@ -434,7 +435,8 @@ their own collapsed history as image pages while they worked.
 Current as of October 2026. Exact recall at 5×8 density is bottlenecked by the
 model's vision encoder, not just font tweaks: repainting `K` reduced Fable 5's
 H/K confusion from 47.2% to 18.7% ([FINDINGS.md](FINDINGS.md), 2026-07-19),
-while later Claude releases (`claude-fable-5-1` at 6/15, `claude-fable-5-2` at 7/15, `claude-opus-5-5` at
+while later Claude releases (`claude-fable-5-1` at 6/15, `claude-fable-5-2` at 7/15 on the same cell,
+14/15 and 13/15 with +2px rows; `claude-opus-5-5` at
 3/15, `claude-sonnet-5-5` at 2/15) regressed relative to June 2026
 `claude-fable-5` (13/15). Conversely, **Gemini 4 (`gemini-4-argon`)** cleared the
 5×8 resolution tripwire at **15/15** pure-image dense hex, **100/100**

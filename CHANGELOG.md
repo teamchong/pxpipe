@@ -6,6 +6,22 @@ behavioral changes, patch = fixes).
 
 ## Unreleased
 
+## 0.16.0 — 2026-11-11
+
+### Added
+- **Experimental GPT-6 profile for Codex, with aligned quality evals** (#273). Includes per-profile image detail overrides (GPT-6 selects `original` detail by default) and benchmarks for GPT 6.1 Sol, Grok 4.7, and GPT-6 Astra.
+- **`claude-fable-5-2` evaluation** (#351). Arithmetic 100/100, gist 98/98, state 18/18, 0/16 confabulations.
+
+### Changed
+- **`claude-fable-5-1` and `claude-fable-5-2` render on the spaced profile (Spleen 5×8, +2px rows)** (#351). Only the original `claude-fable-5` reads the bare 5×8 cell. Dense hex, pure image (N=15): 5.1 `6/15 → 14/15`, 5.2 `7/15, 5/15 → 13/15, 11/15`. Gist stays 98/98 with 0/16 confabulations on both. Spaced pages cost more image tokens per page.
+- **Upstream streams pass through without default proxy timeouts** (#347). `upstreamHeadersTimeoutMs` and `upstreamIdleTimeoutMs` default to `0`. Google `streamGenerateContent` buffers a whole `functionCall.args` object before emitting a chunk, so a legitimate long tool call looked idle and was cut. Clients and gateways already own these timeouts.
+
+### Fixed
+- **Mid-stream upstream aborts close the downstream response and keep a `stream_error` receipt** (#349). An upstream SSE abort after headers emitted `aborted`/`close` rather than `error`, so `pxpipe warp` left the client socket open until the client's stall watchdog fired.
+- **Response headers flush immediately and proxy sockets set `TCP_NODELAY`** (#348). Headers were held until the first body chunk and small SSE frames were coalesced by Nagle across local hops.
+- **Gemini: the active user prompt and mid-work interjections stay pinned across history collapse** (#341).
+- **Responses: completed custom-tool history compresses as context grows; native factsheets are deduplicated within a request and priced correctly in the collapse gate** (#273).
+
 ## 0.15.1 — 2026-10-25
 
 ### Added

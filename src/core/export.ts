@@ -204,7 +204,14 @@ export function parseExportArgv(
     } else if (a === '--out') {
       i++;
       const val = argv[i];
-      if (val === undefined) return { kind: 'error', message: '--out requires a value' };
+      // Reject a flag-shaped value, as --include/--exclude/--diff above do. Without
+      // it, a forgotten value swallows the NEXT flag: `--out --json x.ts` set out to
+      // "--json", mkdirSync'd a directory of that name, and dropped --json silently,
+      // so a scripted caller got human-readable output and no error. `--out=-dir`
+      // remains the way to pass a value that really does start with a dash.
+      if (val === undefined || val.startsWith('-')) {
+        return { kind: 'error', message: '--out requires a value' };
+      }
       out = val;
     } else if (a.startsWith('--out=')) {
       const v = a.slice('--out='.length);
@@ -213,7 +220,12 @@ export function parseExportArgv(
     } else if (a === '--model') {
       i++;
       const val = argv[i];
-      if (val === undefined) return { kind: 'error', message: '--model requires a value' };
+      // Same as --out: a swallowed flag here is worse than a bad path, because an
+      // unknown model silently resolves to the fallback profile, so the export is
+      // rendered and priced for a model the user never asked for.
+      if (val === undefined || val.startsWith('-')) {
+        return { kind: 'error', message: '--model requires a value' };
+      }
       model = val;
     } else if (a.startsWith('--model=')) {
       const v = a.slice('--model='.length);

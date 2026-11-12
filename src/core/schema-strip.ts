@@ -38,17 +38,32 @@ const SCHEMA_COMPOSITION_KEYS = new Set(['oneOf', 'anyOf', 'allOf']);
 
 /** JSON Schema keys whose values are named-subschema objects.
  *  IMPORTANT: the *keys* inside these objects are user property names, not
- *  annotation keywords — we recurse into the values only. */
+ *  annotation keywords — we recurse into the values only.
+ *  Every container whose keys are property names MUST be listed here. The
+ *  fallback at the bottom of the walk recurses into an unknown key's object
+ *  value as if it were a schema node, so a missing container has its keys read
+ *  as annotations: `dependentSchemas: {description: {...}}` lost the whole
+ *  subschema and left `dependentSchemas: {}` behind. That is the same mistake
+ *  as stripping a property named `description`, one level up. */
 const SCHEMA_NAMED_SUBSCHEMA_KEYS = new Set([
   'properties',
   'patternProperties',
   'definitions',
   '$defs',
+  'dependentSchemas',  // 2019-09+
+  'dependencies',      // draft-07; value is a subschema OR an array of names
+  'dependentRequired', // 2019-09+; values are arrays of names, nothing to strip
 ]);
 
-/** JSON Schema keys whose value is a single subschema. */
+/** JSON Schema keys whose value is a single subschema, or an array of them.
+ *  An array-valued container must be listed here even though the fallback
+ *  recurses into unknown object values: that recursion returns an array
+ *  unchanged (arrays are handled by their parent), so annotations inside
+ *  `prefixItems` — the 2020-12 spelling of the tuple form this module already
+ *  handles as `items: [...]` — survived the strip and shipped at text rates. */
 const SCHEMA_SINGLE_SUBSCHEMA_KEYS = new Set([
   'items',
+  'prefixItems', // 2020-12 tuple form
   'additionalProperties',
   'not',
   'contains',

@@ -29,7 +29,9 @@ Change only `QUALITY_MODEL` to evaluate another model. Claude, Gemini, Grok,
 Qwen, GLM, Kimi, and other Responses models use their existing transport clients;
 rendering and scoring are shared. Direct endpoints must be configured for the
 selected client; the pxpipe port is rejected. Kimi requires an explicit direct
-`KIMI_QUALITY_BASE_URL`. No model's paid suite is triggered by testing another.
+`KIMI_QUALITY_BASE_URL`. Set `AGY_CLI=1` (and optional `AGY_EFFORT`) to run
+Gemini models through the local `agy -p` CLI harness instead of direct HTTP.
+No model's paid suite is triggered by testing another.
 
 The Sol/Grok/Gemini/Qwen/GLM `novel-arithmetic.mjs`, `gist-recall.mjs`, and
 `verbatim-hex.mjs` entrypoints now delegate here. Their legacy model/live env

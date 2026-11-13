@@ -1,7 +1,9 @@
-// Google AI Studio / CloudCode PA eval client through the local Cloudflare AI Gateway,
-// direct Google AI Studio, or Antigravity CloudCode PA.
-import { existsSync, readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+// Google AI Studio / CloudCode PA / Antigravity CLI (`agy -p`) eval client
+// through the local Cloudflare AI Gateway, direct Google AI Studio,
+// Antigravity CloudCode PA, or the local `agy` CLI subprocess (`AGY_CLI=1`).
+import { spawn } from 'node:child_process';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 function gatewayOrigin() {
@@ -252,6 +254,188 @@ export async function callGeminiRequest({
   }
 }
 
+export function buildAgyEnv(baseEnv = process.env) {
+  const env = { ...baseEnv };
+  for (const key of Object.keys(env)) {
+    if (
+      /^(HTTP_PROXY|HTTPS_PROXY|NO_PROXY|NODE_EXTRA_CA_CERTS|SSL_CERT_FILE|CURL_CA_BUNDLE|REQUESTS_CA_BUNDLE|PXPIPE|ANTIGRAVITY_|OPENAI_BASE_URL|GEMINI_BASE_URL|ANTHROPIC_BASE_URL)/i.test(
+        key,
+      )
+    ) {
+      delete env[key];
+    }
+  }
+  return env;
+}
+
+export function agyUsageToMetadata(u) {
+  if (!u || typeof u !== 'object') return null;
+  const input = Number(u.input_tokens || 0);
+  const cached = Number(u.cache_read_tokens || 0);
+  const thoughts = Number(u.thinking_tokens || 0);
+  const output = Number(u.output_tokens || 0);
+  return {
+    promptTokenCount: input + cached,
+    candidatesTokenCount: Math.max(0, output - thoughts),
+    thoughtsTokenCount: thoughts,
+    cachedContentTokenCount: cached,
+  };
+}
+
+export function parseAgyOutput(stdout) {
+  const trimmed = stdout.trim();
+  let parsed;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    const lines = trimmed.split(/\r?\n/).reverse();
+    const jsonLine = lines.find((line) => line.trim().startsWith('{'));
+    if (!jsonLine) {
+      throw new Error(`agy CLI returned non-JSON output: ${trimmed.slice(0, 400)}`);
+    }
+    parsed = JSON.parse(jsonLine);
+  }
+  if (parsed?.status !== 'SUCCESS' || typeof parsed?.response !== 'string') {
+    throw new Error(`agy CLI error: ${JSON.stringify(parsed).slice(0, 400)}`);
+  }
+  const usage = agyUsageToMetadata(parsed.usage);
+  if (!usage) {
+    throw new Error(`agy CLI missing usage metadata: ${JSON.stringify(parsed).slice(0, 400)}`);
+  }
+  return { text: parsed.response.trim(), usage };
+}
+
+function resolveAgyBin() {
+  if (process.env.AGY_BIN) return process.env.AGY_BIN;
+  const sep = process.platform === 'win32' ? ';' : ':';
+  const exts = process.platform === 'win32' ? ['.cmd', '.exe', ''] : [''];
+  for (const dir of (process.env.PATH ?? '').split(sep)) {
+    if (!dir) continue;
+    for (const ext of exts) {
+      const candidate = join(dir, `agy${ext}`);
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+  const local = join(homedir(), '.local', 'bin', 'agy');
+  if (existsSync(local)) return local;
+  throw new Error('agy binary not found. Set AGY_BIN to its full path.');
+}
+
+async function runAgyOnce({ agyBin, args, cwd, env, timeoutMs }) {
+  const started = Date.now();
+  const stdout = await new Promise((resolveP, rejectP) => {
+    const child = spawn(agyBin, args, {
+      cwd,
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let out = '';
+    let err = '';
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill('SIGTERM');
+      rejectP(new Error(`agy CLI timed out after ${timeoutMs}ms`));
+    }, timeoutMs + 10000);
+    child.stdout.on('data', (chunk) => {
+      out += chunk;
+    });
+    child.stderr.on('data', (chunk) => {
+      err += chunk;
+    });
+    child.on('error', (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      rejectP(error);
+    });
+    child.on('close', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code === 0) resolveP(out);
+      else rejectP(new Error(`agy CLI exited ${code}: ${(err || out).slice(0, 400)}`));
+    });
+  });
+  const parsed = parseAgyOutput(stdout);
+  return { ...parsed, ms: Date.now() - started };
+}
+
+async function callAgyCli({
+  model = 'gemini-3.6-flash',
+  content,
+  timeoutMs = 120000,
+  retries = 5,
+}) {
+  const workDir = mkdtempSync(join(tmpdir(), 'pxpipe-agy-eval-'));
+  try {
+    const contentParts = [];
+    let imageCount = 0;
+    for (const part of content) {
+      if (part.type === 'input_text') {
+        contentParts.push(part.text);
+      } else if (part.type === 'input_image' && typeof part.image_url === 'string') {
+        const match = /^data:([^;]+);base64,(.+)$/.exec(part.image_url);
+        if (!match) throw new Error('Gemini eval requires base64 data images');
+        imageCount += 1;
+        const imgPath = join(workDir, `eval-img-${imageCount}.png`);
+        writeFileSync(imgPath, Buffer.from(match[2], 'base64'));
+        contentParts.push(`[IMAGE #${imageCount} - file: ${imgPath}]`);
+      } else {
+        throw new Error(`unsupported Gemini content part: ${part.type}`);
+      }
+    }
+    const parts = [];
+    if (imageCount > 0) {
+      parts.push(
+        `There ${imageCount === 1 ? 'is 1 image' : `are ${imageCount} images`} referenced below by absolute file path. Use read_file to view ${imageCount === 1 ? 'it' : 'each one, in order,'} before answering. Do not use any tool other than read_file. Do not cite file paths or links in your answer.`,
+      );
+    }
+    parts.push(...contentParts);
+    const prompt = parts.join('\n\n');
+
+    const cleanModel = model.replace(/^google\//, '');
+    const effectiveTimeoutMs = Math.max(timeoutMs, Number(process.env.AGY_TIMEOUT_MS || 300000));
+    const timeoutSec = Math.max(1, Math.ceil(effectiveTimeoutMs / 1000));
+    const args = [
+      '-p',
+      prompt,
+      '--model',
+      cleanModel,
+      '--output-format',
+      'json',
+      '--dangerously-skip-permissions',
+      '--disable-slash-commands',
+      '--print-timeout',
+      `${timeoutSec}s`,
+    ];
+    if (process.env.AGY_EFFORT) {
+      args.push('--effort', process.env.AGY_EFFORT);
+    }
+
+    const agyBin = resolveAgyBin();
+    const env = buildAgyEnv(process.env);
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        return await runAgyOnce({ agyBin, args, cwd: workDir, env, timeoutMs: effectiveTimeoutMs });
+      } catch (err) {
+        const msg = String(err?.message || err);
+        const transient = /429|RESOURCE_EXHAUSTED|500|502|503|504|ECONNRESET|ETIMEDOUT|timed out/i.test(msg);
+        if (transient && attempt < retries) {
+          const waitMs = 5000 * Math.pow(1.6, attempt);
+          console.warn(`[retry] agy CLI (${msg.slice(0, 80)}...), retrying in ${(waitMs / 1000).toFixed(1)}s (attempt ${attempt + 1}/${retries})`);
+          await new Promise((resolve) => setTimeout(resolve, waitMs));
+          continue;
+        }
+        throw err;
+      }
+    }
+  } finally {
+    rmSync(workDir, { recursive: true, force: true });
+  }
+}
+
 export async function callGemini({
   model = 'gemini-3.6-flash',
   content,
@@ -259,6 +443,9 @@ export async function callGemini({
   timeoutMs = 120000,
   retries = 5,
 }) {
+  if (process.env.AGY_CLI === '1') {
+    return callAgyCli({ model, content, timeoutMs, retries });
+  }
   const parts = content.map((part) => {
     if (part.type === 'input_text') return { text: part.text };
     if (part.type === 'input_image' && typeof part.image_url === 'string') {

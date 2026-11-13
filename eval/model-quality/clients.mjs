@@ -6,6 +6,7 @@ export function inferenceSettings(model) {
     : /claude/i.test(model) ? 'claude' : /kimi/i.test(model) ? 'kimi' : 'responses';
   const reasoning = family === 'grok' ? process.env.GROK_QUALITY_REASONING_EFFORT || 'high'
     : family === 'responses' ? process.env.QUALITY_REASONING || (/gpt-6/i.test(model) ? 'low' : 'none')
+    : family === 'gemini' && process.env.AGY_CLI === '1' ? process.env.AGY_EFFORT || 'provider-default'
     : 'provider-default';
   return { family, reasoning };
 }
@@ -13,7 +14,7 @@ export async function callModel(args) {
   if (!args || typeof args.model !== 'string' || !Array.isArray(args.content) || !Number.isInteger(args.maxOutputTokens) || args.maxOutputTokens <= 0 || !Number.isFinite(args.timeoutMs) || args.timeoutMs <= 0) throw new TypeError('Quality call requires model, content and positive output/timeout budgets');
   const { family, reasoning } = inferenceSettings(args.model);
   // Do not send a pre-rendered eval through pxpipe for a second transformation.
-  if (family !== 'claude') {
+  if (family !== 'claude' && !(family === 'gemini' && process.env.AGY_CLI === '1')) {
     const base = family === 'kimi' ? process.env.KIMI_QUALITY_BASE_URL : process.env.OPENAI_BASE_URL;
     if (!base || new URL(base).port === '47821') throw new Error('Quality eval needs an explicit direct upstream, not the pxpipe port');
   }

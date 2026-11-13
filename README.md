@@ -180,6 +180,7 @@ numbers predate it).
 
 | model | numbers at | arithmetic (N=100) | gist (N=98) | state (N=18) | never-stated (N=16) | dense hex, pure image (N=15) | profile provenance and receipts |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `gemini-4-hydrogen` (`xhigh` via `agy`) | Spleen 5×8, 312 cols (shipped) | **100/100** | **95/98** | **18/18** | **0/16** | — | profile-aligned v2 suite (100/100 pure-image arithmetic; 15/15 hex with compact factsheet): [quality results](eval/model-quality/results/gemini-4-hydrogen/QUALITY_RESULTS.md) |
 | `gemini-4-argon` (default) | Spleen 5×8, 312 cols (shipped) | **100/100** | **98/98** | **18/18** | **0/16** | **15/15** | shipped Gemini 4 profile; 100/100 pure-image arithmetic & 15/15 pure-image hex: [quality results](eval/gemini-profile/QUALITY_RESULTS.md) |
 | `google/gemini-3.6-flash`, `3.7-flash`, `3.8-flash` (default) | Spleen 5×8, 312 cols (shipped) | **100/100** | **98/98** | **18/18** | **0/16** | **14/15** | current shipped Gemini 3.x profile: [quality results](eval/gemini-profile/QUALITY_RESULTS.md) |
 | `claude-fable-5` (default) | Spleen 5×8, 312 cols (shipped) | **100/100** | **98/98** | **18/18** | **0/16** | 13/15 | June 2026 production profiles: [arithmetic + hex](FINDINGS.md), [gist/state/guards](eval/gist-recall/) |
@@ -216,9 +217,10 @@ profile cost on this corpus, not a universal workload savings rate. Sol's paid
 fixtures estimated 42% while reading 7/8 exact with no unsupported inventions.
 
 The runs use different transports and profile generations, not one identical
-image geometry. Fable and Opus use Claude; Gemini uses Google AI Studio; Sol
-and Grok use Codex Responses; Kimi K3 uses Cloudflare's OpenAI-compatible
-transport. All `dense hex (N=15)` scores are pure-image reads with no factsheet.
+image geometry. Fable and Opus use Claude; Gemini 3.x and Argon use Google AI
+Studio while Gemini 4 Hydrogen uses `agy` CLI (`AGY_CLI=1`); Sol and Grok use
+Codex Responses; Kimi K3 uses Cloudflare's OpenAI-compatible transport. All
+`dense hex (N=15)` scores are pure-image reads with no factsheet.
 Current production profiles include the adjacent bounded factsheet on runtime requests;
 historical or pure-image exceptions are identified in the linked evaluation.
 

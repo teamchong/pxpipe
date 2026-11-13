@@ -7,7 +7,9 @@ import { grade } from './tasks.mjs';
 import { renderTextToPngs, reflow, neutralizeSentinel } from '../../dist/core/render.js';
 import { factSheetText } from '../../dist/core/factsheet.js';
 import { openAIImageDetail, historyFactSheet } from '../../dist/core/openai.js';
-import { summarize } from './summarize.mjs';
+import { summarize, normalizedUsage } from './summarize.mjs';
+import { inferenceSettings } from './clients.mjs';
+import { buildAgyEnv, agyUsageToMetadata, parseAgyOutput } from '../gemini-profile/gemini-client.mjs';
 
 test('built modules are fresh before paid evaluation', () => assertBuildFresh());
 
@@ -19,6 +21,7 @@ for (const model of [
   'grok-4.7',
   'gemini-3.6-flash',
   'gemini-3.8-flash',
+  'gemini-4-hydrogen',
   'claude-fable-5',
   'claude-opus-5',
   'workers-ai/@cf/qwen/qwen3.8-27b',
@@ -106,5 +109,55 @@ test('all standard provider launchers delegate to the common runner', () => {
       assert(!source.includes('renderTextToPngs'));
       assert(!source.includes('page${'));
     }
+  }
+});
+test('agy CLI adapter scrubs proxy/parent env and maps usage to Gemini usageMetadata', () => {
+  const cleaned = buildAgyEnv({
+    PATH: '/usr/bin',
+    HTTP_PROXY: 'http://127.0.0.1:64720',
+    https_proxy: 'http://127.0.0.1:64720',
+    NODE_EXTRA_CA_CERTS: '/tmp/ca.pem',
+    PXPIPE: '1',
+    PXPIPE_MODELS: 'claude-fable-5',
+    ANTIGRAVITY_CONVERSATION_ID: 'abc',
+    OPENAI_BASE_URL: 'http://127.0.0.1:47821',
+    HOME: '/Users/test',
+  });
+  assert.deepEqual(cleaned, { PATH: '/usr/bin', HOME: '/Users/test' });
+
+  const meta = agyUsageToMetadata({ input_tokens: 12547, output_tokens: 665, thinking_tokens: 465, cache_read_tokens: 7175 });
+  assert.deepEqual(meta, {
+    promptTokenCount: 19722,
+    candidatesTokenCount: 200,
+    thoughtsTokenCount: 465,
+    cachedContentTokenCount: 7175,
+  });
+  assert.deepEqual(normalizedUsage(meta, 'gemini'), {
+    inputTokens: 19722,
+    outputTokens: 665,
+    reasoningTokens: 465,
+    cachedTokens: 7175,
+    cacheWriteTokens: 0,
+  });
+
+  const parsed = parseAgyOutput(JSON.stringify({
+    status: 'SUCCESS',
+    response: '  007653054bdf  ',
+    usage: { input_tokens: 100, output_tokens: 30, thinking_tokens: 20, cache_read_tokens: 50 },
+  }));
+  assert.equal(parsed.text, '007653054bdf');
+  assert.equal(parsed.usage.promptTokenCount, 150);
+
+  const oldCli = process.env.AGY_CLI;
+  const oldEff = process.env.AGY_EFFORT;
+  try {
+    process.env.AGY_CLI = '1';
+    delete process.env.AGY_EFFORT;
+    assert.deepEqual(inferenceSettings('gemini-4-hydrogen'), { family: 'gemini', reasoning: 'provider-default' });
+    process.env.AGY_EFFORT = 'high';
+    assert.deepEqual(inferenceSettings('gemini-4-hydrogen'), { family: 'gemini', reasoning: 'high' });
+  } finally {
+    if (oldCli === undefined) delete process.env.AGY_CLI; else process.env.AGY_CLI = oldCli;
+    if (oldEff === undefined) delete process.env.AGY_EFFORT; else process.env.AGY_EFFORT = oldEff;
   }
 });

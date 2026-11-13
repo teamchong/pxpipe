@@ -44,6 +44,7 @@ import {
   stripPinCommandsFromSystem, type Pin,
 } from './pin.js';
 import { factSheetText } from './factsheet.js';
+import { addSplitStats, bindSplitBlock, planSegments, SPLIT_MAX_IMAGE_SEGMENTS, type SplitBlock, type SplitCost, type SplitSegment } from './split-block.js';
 import { stripSchemaDescriptions, schemaHasStructure } from './schema-strip.js';
 import { bytesToBase64 } from './png.js';
 import {
@@ -141,6 +142,11 @@ export interface TransformOptions {
    *  for every block rendered to images. Off by default (entries inflate `info`;
    *  only a stateful harness can use them). */
   emitRecoverable?: boolean;
+  /** Caller hook that decides, per block about to be imaged, whether it is sent as
+   *  images, kept as text, or split into text and image segments in source order.
+   *  Called for tool_result text, the static slab and history chunks. Must be
+   *  deterministic per block for prompt-cache safety. See split-block.ts. */
+  splitBlock?: SplitBlock | null;
 }
 
 const DEFAULTS: Required<TransformOptions> = {
@@ -164,6 +170,7 @@ const DEFAULTS: Required<TransformOptions> = {
   reflow: true,
   keepSharp: () => false,
   emitRecoverable: false,
+  splitBlock: null,
   // GPT-only knobs; the Anthropic transform ignores them but Required<> needs them.
   collapseHistory: true,
   gptHistory: {},
@@ -410,6 +417,37 @@ function maybeReflow(text: string, enabled: boolean): string {
   return reflow(safe) ?? safe;
 }
 
+/** Token estimates a split hook uses, priced like the path that renders the block. */
+function splitCost(geometry: GateGeometry, charsPerToken: number, reflowEnabled: boolean): SplitCost {
+  return {
+    imageTokens: (text) =>
+      text.length === 0 ? 0 : imageTokensCost(maybeReflow(text, reflowEnabled), geometry.cols, undefined, true, geometry.maxChars, geometry),
+    textTokens: (text) => text.length / charsPerToken,
+  };
+}
+
+/**
+ * Turn plan segments into render pieces in source order. An image segment that
+ * is not profitable on its own stays text; neighbouring text pieces merge.
+ */
+function splitPieces(
+  text: string,
+  segments: readonly SplitSegment[],
+  reflowEnabled: boolean,
+  profitable: (imageText: string) => boolean,
+): Array<{ kind: 'text' | 'image'; text: string }> {
+  const pieces: Array<{ kind: 'text' | 'image'; text: string }> = [];
+  for (const segment of segments) {
+    const source = text.slice(segment.start, segment.end);
+    const imageText = segment.kind === 'image' ? maybeReflow(source.replace(/\n$/, ''), reflowEnabled) : '';
+    const kind = segment.kind === 'image' && profitable(imageText) ? 'image' : 'text';
+    const previous = pieces[pieces.length - 1];
+    if (kind === 'text' && previous?.kind === 'text') previous.text += source;
+    else pieces.push({ kind, text: kind === 'image' ? imageText : source });
+  }
+  return pieces;
+}
+
 /** Decompose the break-even gate into components for telemetry. Returns the
  *  imageTokens, textTokens, and symmetric burn terms the gate uses internally,
  *  or `null` for empty/non-finite input. */
@@ -528,10 +566,11 @@ export function isCompressionProfitableAmortized(
 /** Increment a passthrough-reason counter on `info`. Lazily allocates `passthroughReasons`. */
 function bumpPassthrough(
   info: TransformInfo,
-  reason: 'below_threshold' | 'not_profitable' | 'kept_sharp' | 'image_budget',
+  reason: 'below_threshold' | 'not_profitable' | 'kept_sharp' | 'image_budget' | 'split_pending',
+  count = 1,
 ): void {
   if (!info.passthroughReasons) info.passthroughReasons = {};
-  info.passthroughReasons[reason] = (info.passthroughReasons[reason] ?? 0) + 1;
+  info.passthroughReasons[reason] = (info.passthroughReasons[reason] ?? 0) + count;
 }
 
 /** Invoke `keepSharp` defensively; a throw or non-`true` return means "image as usual". */
@@ -720,7 +759,7 @@ export interface TransformInfo {
   /** Top dropped codepoints by frequency (`U+HHHH` → count), at most 20 entries. */
   droppedCodepointsTop?: Record<string, number>;
   /** Why blocks passed through without compression. Only present when count > 0. */
-  passthroughReasons?: { below_threshold?: number; not_profitable?: number; kept_sharp?: number; image_budget?: number };
+  passthroughReasons?: { below_threshold?: number; not_profitable?: number; kept_sharp?: number; image_budget?: number; split_pending?: number };
   /** Slab gate diagnostics — imageTokens, textTokens, burn terms, and verdict.
    *  Lets hosts measure flap-prevention efficacy and tune amortization horizon. */
   gateEval?: {
@@ -739,6 +778,8 @@ export interface TransformInfo {
   historyTextChars?: number;
   /** Blocks pinned as text by the caller's `keepSharp` predicate this request. */
   keptSharpBlocks?: number;
+  /** Counters returned by the `splitBlock` hook, summed over the request. */
+  splitStats?: Record<string, number>;
   /** Imaged live-region blocks with original text + provenance, when `emitRecoverable`. */
   recoverable?: RecoverableBlock[];
   truncatedToolResults?: number;
@@ -1958,6 +1999,79 @@ function historyGridTuning(
  * the delta (no tools, system = billing line), so this is where its tool_results live.
  * Must run AFTER history collapse; see the ORDERING INVARIANT at the main-path call.
  */
+/**
+ * Ask the `splitBlock` hook how one tool_result text is sent. Returns `image`
+ * for the default image path (no hook or an image plan), `text` when the block
+ * stays text (including a plan that is not valid), or the replacement parts in source order.
+ * Segment admission is atomic, like the default path: every image fits the
+ * per-result cap, the wire headroom and the byte headroom, or the block stays text.
+ */
+async function splitToolText(
+  raw: string,
+  o: Required<TransformOptions>,
+  info: TransformInfo,
+  denseGeo: ReturnType<typeof denseGateGeometry>,
+  droppedCodepoints: Map<number, number>,
+  site: 'tool_result' | 'tool_result_part',
+): Promise<Array<TextBlock | ImageBlock> | 'text' | 'image'> {
+  const hook = bindSplitBlock(o.splitBlock ?? undefined, site, splitCost(denseGeo, o.charsPerToken, o.reflow));
+  if (!hook) return 'image';
+  const source = compactSlabWhitespace(raw);
+  const plan = await hook(source, [], o.maxImagesPerToolResult);
+  addSplitStats(info, plan.stats);
+  if (plan.kind === 'image') return 'image';
+  if (plan.kind === 'text') {
+    bumpPassthrough(info, plan.reason === 'pending' ? 'split_pending' : 'not_profitable');
+    return 'text';
+  }
+  const segments = planSegments(source, plan, o.maxImagesPerToolResult);
+  const imageCap = Math.min(o.maxImagesPerToolResult, imageHeadroom(info));
+  if (!segments) {
+    bumpPassthrough(info, 'not_profitable');
+    return 'text';
+  }
+  const pieces = splitPieces(source, segments, o.reflow, (imageText) =>
+    isCompressionProfitable(imageText, denseGeo.cols, o.maxImagesPerToolResult, o.charsPerToken, 0, 0, true, denseGeo.maxChars, denseGeo));
+  const parts: Array<TextBlock | ImageBlock> = [];
+  const rendered: Array<Awaited<ReturnType<typeof textToImageBlocks>>> = [];
+  for (const piece of pieces) {
+    if (piece.kind === 'text') {
+      parts.push({ type: 'text', text: piece.text });
+      continue;
+    }
+    const group = await textToImageBlocks(piece.text, o.cols, true, denseGeo.style, denseGeo.maxHeightPx);
+    rendered.push(group);
+    parts.push(...group.blocks);
+  }
+  const images = rendered.flatMap((group) => group.blocks);
+  if (images.length === 0) {
+    bumpPassthrough(info, 'not_profitable');
+    return 'text';
+  }
+  if (images.length > imageCap) {
+    bumpPassthrough(info, 'image_budget');
+    info.imageBudgetSkips = (info.imageBudgetSkips ?? 0) + 1;
+    return 'text';
+  }
+  const bytes = images.reduce((sum, img) => sum + approxBlockBytes(img), 0);
+  if (bytes > imageByteHeadroom(info, o.maxImageBytes)) {
+    bumpPassthrough(info, 'image_budget');
+    info.imageByteSkips = (info.imageByteSkips ?? 0) + 1;
+    return 'text';
+  }
+  for (const group of rendered) {
+    (info.imagePngs ??= []).push(...group.pngs);
+    (info.imageDims ??= []).push(...group.dims);
+    info.imagePixels = (info.imagePixels ?? 0) + group.pixels;
+    info.droppedChars = (info.droppedChars ?? 0) + group.droppedChars;
+    for (const [cp, n] of group.droppedCodepoints) droppedCodepoints.set(cp, (droppedCodepoints.get(cp) ?? 0) + n);
+  }
+  info.imageBytes += bytes;
+  info.toolResultImgs = (info.toolResultImgs ?? 0) + images.length;
+  info.imageCount += images.length;
+  return parts;
+}
+
 async function compressToolResultsInPlace(
   req: MessagesRequest,
   info: TransformInfo,
@@ -2007,6 +2121,24 @@ async function compressToolResultsInPlace(
               bumpPassthrough(info, 'not_profitable');
               rewritten.push(blk);
             } else {
+              const split = await splitToolText(innerRaw, o, info, denseGeo, droppedCodepoints, 'tool_result');
+              if (split === 'text') {
+                rewritten.push(blk);
+                continue;
+              }
+              if (split !== 'image') {
+                await recordRecoverable(info, o.emitRecoverable, {
+                  kind: 'tool_result',
+                  toolUseId: tr.tool_use_id,
+                  text: innerRaw,
+                  imageCount: split.filter((part) => part.type === 'image').length,
+                });
+                info.compressedChars += innerRaw.length;
+                rewritten.push({ ...tr, content: split });
+                changed = true;
+                bumpBucket(info, toolResultBucket(classifyContent(inner)), innerRaw.length);
+                continue;
+              }
               // Paging: truncate before render if it would blow the image cap.
               // The per-result cap is the SMALLER of the configured max and what
               // is actually left on the wire — the headroom shrinks as earlier
@@ -2120,6 +2252,27 @@ async function compressToolResultsInPlace(
               if (!isCompressionProfitable(innerTextR, denseGeo.cols, o.maxImagesPerToolResult, o.charsPerToken, 0, 0, true, denseGeo.maxChars, denseGeo)) {
                 bumpPassthrough(info, 'not_profitable');
                 newInner.push(ib as TextBlock | ImageBlock);
+                continue;
+              }
+              const split = await splitToolText(innerTextRaw, o, info, denseGeo, droppedCodepoints, 'tool_result_part');
+              if (split === 'text') {
+                newInner.push(ib as TextBlock | ImageBlock);
+                continue;
+              }
+              if (split !== 'image') {
+                const partCacheControl = demoteRelocatedCacheControl((ib as { cache_control?: unknown }).cache_control);
+                const last = split.length - 1;
+                split.forEach((part, index) =>
+                  newInner.push(index === last && partCacheControl !== undefined ? { ...part, cache_control: partCacheControl } as TextBlock | ImageBlock : part));
+                await recordRecoverable(info, o.emitRecoverable, {
+                  kind: 'tool_result_part',
+                  toolUseId: tr.tool_use_id,
+                  text: innerTextRaw,
+                  imageCount: split.filter((part) => part.type === 'image').length,
+                });
+                info.compressedChars += innerTextRaw.length;
+                bumpBucket(info, toolResultBucket(classifyContent(innerText)), innerTextRaw.length);
+                innerChanged = true;
                 continue;
               }
               const linesPerImage = Math.max(
@@ -2272,6 +2425,7 @@ async function runHistoryCollapseAndFinalize(
         imageBudget: tuning.imageBudget,
         packFill: tuning.packFill,
         minFreezeStep: tuning.minFreezeStep,
+        splitBlock: bindSplitBlock(o.splitBlock ?? undefined, 'history', splitCost(historyGeometry, historyCpt, o.reflow)) ?? null,
       },
     );
     recordFreezeStep(info.firstUserSha8, histInfo.freezeStep);
@@ -2310,6 +2464,8 @@ async function runHistoryCollapseAndFinalize(
       }
       info.historyReason = 'collapsed';
       info.historyTextChars = histInfo.collapsedChars;
+      addSplitStats(info, histInfo.splitStats);
+      if (histInfo.splitPending) bumpPassthrough(info, 'split_pending', histInfo.splitPending);
       info.historyImageSha = await historyImageSha8(newMessages);
       bumpBucket(info, 'history', histInfo.collapsedChars);
       collapsedFlag = true;
@@ -2726,12 +2882,34 @@ export async function transformRequest(
   // Same style as the dense path above, so both Anthropic surfaces resolve the same
   // atlas. No-op for ASCII (gray and bitmap atlases are bit-identical there); it keeps
   // non-ASCII glyphs from depending on which code path happened to render them.
-  const images = await renderTextToPngs(
-    combinedWithHeader,
-    slabCols,
-    denseGeo.style,
-    denseGeo.maxHeightPx,
-  );
+  const slabSource = compactSlabWhitespace(combinedRaw);
+  const slabHook = bindSplitBlock(o.splitBlock ?? undefined, 'slab', splitCost(denseGeo, slabCpt, o.reflow));
+  const slabPlan = slabHook ? await slabHook(slabSource, [], SPLIT_MAX_IMAGE_SEGMENTS) : undefined;
+  addSplitStats(info, slabPlan?.stats);
+  const slabSegments = planSegments(slabSource, slabPlan, SPLIT_MAX_IMAGE_SEGMENTS);
+  const slabSplit = slabSegments !== null;
+  const slabPieces = slabSegments
+    ? splitPieces(slabSource, slabSegments, o.reflow, (imageText) =>
+      isCompressionProfitable(imageText, o.cols, undefined, slabCpt, 0, 0, true, READABLE_CHARS_PER_IMAGE, denseGeo))
+    : [{ kind: slabPlan === undefined || slabPlan.kind === 'image' ? 'image' as const : 'text' as const, text: combined }];
+  const firstImagePiece = slabPieces.findIndex((piece) => piece.kind === 'image');
+  if (slabPlan?.kind === 'text' || firstImagePiece < 0) {
+    const pending = slabPlan?.kind === 'text' && slabPlan.reason === 'pending';
+    info.reason = `split_${pending ? 'pending' : 'not_profitable'} (slab=${combined.length} chars)`;
+    bumpPassthrough(info, pending ? 'split_pending' : 'not_profitable');
+    const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints, pins);
+    if (finalized.changed) {
+      info.compressed = true;
+      return { body: finalized.body, info };
+    }
+    return { body: pinsRewrote ? finalized.body : body, info };
+  }
+  slabPieces[firstImagePiece]!.text = imageInstructionHeader + slabPieces[firstImagePiece]!.text;
+  const slabRenders = await Promise.all(slabPieces.map((piece) =>
+    piece.kind === 'image'
+      ? renderTextToPngs(piece.text, shrinkColsToContent(piece.text, o.cols, 1, denseGeo.style.font), denseGeo.style, denseGeo.maxHeightPx)
+      : Promise.resolve([])));
+  const images = slabRenders.flat();
   // Quantitative cap, not just "is there room": the slab is many pages, and a
   // boolean "headroom > 0" check happily emitted 15 of them into a single slot
   // (measured: 94 client images + 400k slab -> 109 on the wire -> 400). All or
@@ -2756,21 +2934,27 @@ export async function transformRequest(
   }
 
   const imageBlocks: ImageBlock[] = [];
-  for (let i = 0; i < images.length; i++) {
-    const img = images[i]!;
-    const b64 = bytesToBase64(img.png);
-    info.imageBytes += img.png.length;
-    info.imagePixels = (info.imagePixels ?? 0) + img.width * img.height;
-    info.droppedChars = (info.droppedChars ?? 0) + img.droppedChars;
-    for (const [cp, n] of img.droppedCodepoints) {
-      droppedCodepoints.set(cp, (droppedCodepoints.get(cp) ?? 0) + n);
+  const slabBlocks: Array<TextBlock | ImageBlock> = [];
+  slabPieces.forEach((piece, index) => {
+    if (piece.kind === 'text') {
+      slabBlocks.push({ type: 'text', text: piece.text });
+      return;
     }
-    const imageBlock = makeImageBlock(b64, i === images.length - 1);
-    imageBlocks.push(
-      i === images.length - 1 && systemStaticCacheControl !== undefined
-        ? { ...imageBlock, cache_control: demoteRelocatedCacheControl(systemStaticCacheControl) }
-        : imageBlock,
-    );
+    for (const img of slabRenders[index]!) {
+      info.imageBytes += img.png.length;
+      info.imagePixels = (info.imagePixels ?? 0) + img.width * img.height;
+      info.droppedChars = (info.droppedChars ?? 0) + img.droppedChars;
+      for (const [cp, n] of img.droppedCodepoints) {
+        droppedCodepoints.set(cp, (droppedCodepoints.get(cp) ?? 0) + n);
+      }
+      const imageBlock = makeImageBlock(bytesToBase64(img.png));
+      imageBlocks.push(imageBlock);
+      slabBlocks.push(imageBlock);
+    }
+  });
+  if (systemStaticCacheControl !== undefined && slabBlocks.length > 0) {
+    const last = slabBlocks.length - 1;
+    slabBlocks[last] = { ...slabBlocks[last]!, cache_control: demoteRelocatedCacheControl(systemStaticCacheControl) } as TextBlock | ImageBlock;
   }
   info.imageCount = imageBlocks.length;
   // Credit raw (pre-compaction) length — what Anthropic would have billed.
@@ -2830,9 +3014,9 @@ export async function transformRequest(
       // byte-identically next turn. Rendering them lost more to cache misses
       // than it saved in tokens, so the path is gone rather than flag-gated.
 
-      const slabFactSheet = factSheetText(combinedRaw);
+      const slabFactSheet = slabSplit ? '' : factSheetText(combinedRaw);
       m.content = [
-        ...imageBlocks,
+        ...slabBlocks,
         ...(slabFactSheet ? [{ type: 'text' as const, text: slabFactSheet }] : []),
         { type: 'text' as const, text: '[End of rendered context.]' },
         ...existing,
@@ -2877,6 +3061,7 @@ export async function transformRequest(
         imageBudget: tuning.imageBudget,
         packFill: tuning.packFill,
         minFreezeStep: tuning.minFreezeStep,
+        splitBlock: bindSplitBlock(o.splitBlock ?? undefined, 'history', splitCost(historyGeometry, historyCpt, o.reflow)) ?? null,
       },
     );
     recordFreezeStep(info.firstUserSha8, histInfo.freezeStep);
@@ -2915,6 +3100,8 @@ export async function transformRequest(
       }
       info.historyReason = 'collapsed';
       info.historyTextChars = histInfo.collapsedChars;
+      addSplitStats(info, histInfo.splitStats);
+      if (histInfo.splitPending) bumpPassthrough(info, 'split_pending', histInfo.splitPending);
       info.historyImageSha = await historyImageSha8(newMessages);
       bumpBucket(info, 'history', histInfo.collapsedChars);
       // Move the single cache anchor onto the history image so slab + history

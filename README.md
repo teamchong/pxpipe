@@ -284,7 +284,10 @@ const { body, applied, info } = await transformAnthropicMessages({
 ```
 
 `options.keepSharp(block)` pins blocks as text; `options.emitRecoverable`
-returns the originals of imaged blocks. Pure-JS runtime (Node and
+returns the originals of imaged blocks. `options.splitBlock(input)` decides,
+per block about to be imaged, whether it is sent as images, kept as text, or
+split into text and image segments in source order; the proxy loads one from
+`PXPIPE_PLUGIN=<module>` (see `src/core/split-block.ts`). Pure-JS runtime (Node and
 edge/Workers); `@napi-rs/canvas` is build-time only. Full API:
 `src/core/index.ts`.
 

@@ -86,6 +86,8 @@ export interface RecoverableBlock {
 export interface TransformOptions {
   /** Resolved model id. Its profile supplies font, columns, height, and history defaults. */
   model?: string;
+  /** Client session discriminator. Only its hash is exposed in TransformInfo. */
+  claudeCodeSessionId?: string;
   /** Master switch — false makes this a no-op pass-through. */
   compress?: boolean;
   /** Move tool descriptions into the same image (and stub the originals). */
@@ -168,6 +170,7 @@ const DEFAULTS: Required<TransformOptions> = {
   collapseHistory: true,
   gptHistory: {},
   model: '',
+  claudeCodeSessionId: '',
 };
 
 /**
@@ -677,6 +680,9 @@ export interface TransformInfo {
   systemSha8?: string;
   /** sha8 of first user message text (first 4 KiB). Rough thread/session id. */
   firstUserSha8?: string;
+  /** Session-state key; includes a validated client session id when available. */
+  sessionKey?: string;
+  sessionKeySource?: 'client' | 'anchor';
   /** Raw bytes of the first rendered image. Dashboard preview only; NOT persisted to JSONL. */
   firstImagePng?: Uint8Array;
   firstImageWidth?: number;
@@ -1372,6 +1378,16 @@ export function firstUserText(req: MessagesRequest): string {
   return sessionAnchorText(texts);
 }
 
+async function recordSessionIdentity(info: TransformInfo, anchor: string, clientId: string): Promise<void> {
+  if (!anchor) return;
+  info.firstUserSha8 = await sha8(anchor);
+  const fromClient = /^[A-Za-z0-9_-]{8,128}$/.test(clientId);
+  info.sessionKey = fromClient
+    ? await sha8('cc-session:' + clientId + '\n' + anchor)
+    : info.firstUserSha8;
+  info.sessionKeySource = fromClient ? 'client' : 'anchor';
+}
+
 /**
  * True when the first message carries a `<system-reminder>` block — the
  * envelope Claude Code uses to inject CLAUDE.md project instructions. Such a
@@ -1945,7 +1961,7 @@ function historyGridTuning(
 ): { imageBudget: number; packFill: boolean; minFreezeStep: number } {
   const headroom = imageHeadroom(info);
   const imageBudget = Math.max(1, Math.min(ANTHROPIC_HISTORY_IMAGE_BUDGET, headroom));
-  const session = noteHistoryRequest(info.firstUserSha8);
+  const session = noteHistoryRequest(info.sessionKey);
   return { imageBudget, packFill: session.cold, minFreezeStep: session.minFreezeStep };
 }
 
@@ -2274,7 +2290,7 @@ async function runHistoryCollapseAndFinalize(
         minFreezeStep: tuning.minFreezeStep,
       },
     );
-    recordFreezeStep(info.firstUserSha8, histInfo.freezeStep);
+    recordFreezeStep(info.sessionKey, histInfo.freezeStep);
     if (histInfo.freezeStep !== undefined) info.historyFreezeStep = histInfo.freezeStep;
     if (histInfo.budgetTrimmed) info.historyBudgetTrimmed = true;
     if (tuning.packFill) info.historyPackFill = true;
@@ -2508,9 +2524,8 @@ export async function transformRequest(
   // Privacy-safe fingerprints that don't depend on tool docs (computed
   // here so they're available even if we below_min_chars out below).
   // systemSha8 is set later, after we know the combined image-bound text.
-  const firstUser = firstUserText(req);
-  const firstUserSha = firstUser ? await sha8(firstUser) : undefined;
-  if (firstUserSha) info.firstUserSha8 = firstUserSha;
+  await recordSessionIdentity(info, firstUserText(req), o.claudeCodeSessionId);
+  const firstUserSha = info.firstUserSha8;
 
   // Canary: slab tags whose content churns within a session bust the image
   // cache every turn — report them regardless of the hardcoded lists.
@@ -2879,7 +2894,7 @@ export async function transformRequest(
         minFreezeStep: tuning.minFreezeStep,
       },
     );
-    recordFreezeStep(info.firstUserSha8, histInfo.freezeStep);
+    recordFreezeStep(info.sessionKey, histInfo.freezeStep);
     if (histInfo.freezeStep !== undefined) info.historyFreezeStep = histInfo.freezeStep;
     if (histInfo.budgetTrimmed) info.historyBudgetTrimmed = true;
     if (tuning.packFill) info.historyPackFill = true;

@@ -6,6 +6,11 @@ behavioral changes, patch = fixes).
 
 ## Unreleased
 
+### Added
+- Documented routing to UberLLM's OpenAI- and Anthropic-compatible endpoints via
+  the existing `OPENAI_UPSTREAM` / `OPENAI_MODELS` and `ANTHROPIC_UPSTREAM`
+  mechanisms (no new code path).
+
 ## 0.16.0 — 2026-11-11
 
 ### Added

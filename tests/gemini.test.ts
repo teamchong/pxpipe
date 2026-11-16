@@ -21,6 +21,7 @@ describe('Gemini Model Profiles & Identification', () => {
     expect(isGeminiModel('google/gemini-3.6-flash')).toBe(true);
     expect(isGeminiModel('google/gemini-3.7-flash')).toBe(true);
     expect(isGeminiModel('gemini-4-argon')).toBe(true);
+    expect(isGeminiModel('gemini-4-carbon')).toBe(true);
     expect(isGeminiModel('gemini-4-hydrogen')).toBe(true);
     expect(isGeminiModel('GEMINI-PRO')).toBe(true);
     expect(isGeminiModel('google/gemini-3.6-pro')).toBe(true);
@@ -42,6 +43,8 @@ describe('Gemini Model Profiles & Identification', () => {
     expect(hasGeminiMeasuredProfile('gemini-3.9-pro')).toBe(true);
     expect(hasGeminiMeasuredProfile('gemini-4-flash')).toBe(true);
     expect(hasGeminiMeasuredProfile('gemini-4-argon')).toBe(true);
+    expect(hasGeminiMeasuredProfile('gemini-4-carbon')).toBe(true);
+    expect(hasGeminiMeasuredProfile('gemini-4-carbon-xhigh')).toBe(true);
     expect(hasGeminiMeasuredProfile('gemini-4-hydrogen')).toBe(true);
     expect(hasGeminiMeasuredProfile('gemini-4-hydrogen-xhigh')).toBe(true);
     expect(hasGeminiMeasuredProfile('gemini-5-pro')).toBe(true);
@@ -80,6 +83,8 @@ describe('Gemini Model Profiles & Identification', () => {
 
     const profArgon = resolveGeminiProfile('gemini-4-argon');
     expect(profArgon).toBe(GEMINI_PROFILE);
+    expect(resolveGeminiProfile('gemini-4-carbon')).toBe(GEMINI_PROFILE);
+    expect(resolveGeminiProfile('gemini-4-carbon-xhigh')).toBe(GEMINI_PROFILE);
     expect(resolveGeminiProfile('gemini-4-hydrogen')).toBe(GEMINI_PROFILE);
     expect(resolveGeminiProfile('gemini-4-hydrogen-xhigh')).toBe(GEMINI_PROFILE);
     expect(profArgon.history.maxImages).toBe(96);
@@ -105,6 +110,7 @@ describe('Gemini Model Profiles & Identification', () => {
     expect(visionTokensForModel('gemini-3.7-flash', 1568, 728)).toBe(1078);
     expect(visionTokensForModel('google/gemini-3.7-flash', 1568, 728)).toBe(1078);
     expect(visionTokensForModel('gemini-4-flash', 1568, 728)).toBe(1078);
+    expect(visionTokensForModel('gemini-4-carbon', 1568, 728)).toBe(1078);
     expect(visionTokensForModel('gemini-4-hydrogen', 1568, 728)).toBe(1078);
   });
 

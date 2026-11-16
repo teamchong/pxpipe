@@ -21,6 +21,7 @@ for (const model of [
   'grok-4.7',
   'gemini-3.6-flash',
   'gemini-3.8-flash',
+  'gemini-4-carbon',
   'gemini-4-hydrogen',
   'claude-fable-5',
   'claude-opus-5',

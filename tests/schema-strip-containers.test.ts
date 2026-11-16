@@ -5,32 +5,30 @@
  * user property NAME in another, so it strips annotations only at schema-node
  * level and recurses into the *values* of the containers whose keys are property
  * names. That works for every container it lists. For one it does not list, the
- * walk falls through to the bottom of the loop, which has two fallbacks and both
- * are wrong for a container:
- *
- *   - an unknown key's OBJECT value is recursed into as if it were a schema node,
- *     so the container's property names are read as annotations and a subschema
- *     keyed `description` / `title` / `default` / `examples` is deleted outright;
- *   - an unknown key's ARRAY value is returned unchanged (arrays are handled by
- *     their parent), so annotations inside it are never stripped.
+ * walk falls through to the bottom of the loop, whose fallback is wrong for a
+ * container: an unknown key's OBJECT value is recursed into as if it were a
+ * schema node, so the container's property names are read as annotations and a
+ * subschema keyed `description` / `title` / `default` / `examples` is deleted
+ * outright.
  *
  * Observed before the fix:
  *   dependentSchemas: {description: {required:['title']}}  ->  dependentSchemas: {}
  *   dependencies:     {description: ['title']}             ->  dependencies: {}
  *   dependentRequired:{description: ['title']}             ->  dependentRequired: {}
- *   prefixItems: [{type:'string', description:'…'}]        ->  description kept
  *
  * The three deletions are the same mistake as stripping a property named
  * `description`, one level up: the outbound tool schema silently loses a
  * validation constraint, so the model can emit a payload the real tool rejects.
- * `prefixItems` is the 2020-12 spelling of the tuple form this module already
- * handles as `items: [...]`, so its annotations shipped at text rates.
+ *
+ * `prefixItems` is left unlisted on purpose. An unknown key's ARRAY value is
+ * returned unchanged, so tuple element descriptions stay in the native schema,
+ * where the model needs them to tell the positions apart.
  *
  * Contract being verified:
  *   - A container keyed by a property name that collides with an annotation
  *     keyword keeps its subschema, in every such container.
  *   - Annotations nested inside those subschemas are still stripped.
- *   - Array-valued containers are walked, not passed through.
+ *   - `prefixItems` passes through untouched.
  *   - The containers that already worked keep working, and `required` / `enum` /
  *     `const` stay untouched.
  */
@@ -106,25 +104,19 @@ describe('containers keyed by property names keep their subschemas', () => {
   });
 });
 
-describe('array-valued containers are walked, not passed through', () => {
-  it('strips annotations inside 2020-12 prefixItems', () => {
-    const out = strip({
-      type: 'array',
-      prefixItems: [
-        { type: 'string', description: 'STRIP ME', enum: ['a', 'b'] },
-        { type: 'number', title: 'STRIP ME', minimum: 0 },
-      ],
-      items: false,
-    });
+describe('2020-12 prefixItems passes through untouched', () => {
+  it('keeps tuple element descriptions', () => {
+    const prefixItems = [
+      { type: 'string', description: 'KEEP ME', enum: ['a', 'b'] },
+      { type: 'number', title: 'KEEP ME', minimum: 0 },
+    ];
+    const out = strip({ type: 'array', prefixItems, items: false });
 
-    expect(out['prefixItems']).toEqual([
-      { type: 'string', enum: ['a', 'b'] },
-      { type: 'number', minimum: 0 },
-    ]);
+    expect(out['prefixItems']).toEqual(prefixItems);
     expect(out['items']).toBe(false);
   });
 
-  it('control: the draft-07 tuple spelling already worked', () => {
+  it('control: the draft-07 tuple spelling is still stripped', () => {
     const out = strip({
       type: 'array',
       items: [
@@ -136,19 +128,13 @@ describe('array-valued containers are walked, not passed through', () => {
     expect(out['items']).toEqual([{ type: 'string' }, { type: 'number' }]);
   });
 
-  it('recurses into a nested prefixItems', () => {
-    const out = strip({
-      type: 'object',
-      properties: {
-        rows: {
-          type: 'array',
-          prefixItems: [{ type: 'object', properties: { id: { type: 'string', description: 'STRIP ME' } } }],
-        },
-      },
-    });
+  it('keeps descriptions in a nested prefixItems', () => {
+    const rows = {
+      type: 'array',
+      prefixItems: [{ type: 'object', properties: { id: { type: 'string', description: 'KEEP ME' } } }],
+    };
+    const out = strip({ type: 'object', properties: { rows } });
 
-    expect(out['properties']).toEqual({
-      rows: { type: 'array', prefixItems: [{ type: 'object', properties: { id: { type: 'string' } } }] },
-    });
+    expect(out['properties']).toEqual({ rows });
   });
 });

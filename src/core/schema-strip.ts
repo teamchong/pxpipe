@@ -55,15 +55,14 @@ const SCHEMA_NAMED_SUBSCHEMA_KEYS = new Set([
   'dependentRequired', // 2019-09+; values are arrays of names, nothing to strip
 ]);
 
-/** JSON Schema keys whose value is a single subschema, or an array of them.
- *  An array-valued container must be listed here even though the fallback
- *  recurses into unknown object values: that recursion returns an array
- *  unchanged (arrays are handled by their parent), so annotations inside
- *  `prefixItems` — the 2020-12 spelling of the tuple form this module already
- *  handles as `items: [...]` — survived the strip and shipped at text rates. */
+/** JSON Schema keys whose value is a single subschema.
+ *  `prefixItems` is deliberately NOT here: its array value falls through the
+ *  walk unchanged, so tuple element descriptions stay in the native schema.
+ *  They are often the only statement of which position means what. Stripping
+ *  them took a reversed-order tuple probe from 10/10 to 0/10 on gpt-6-astra,
+ *  and rendering them into the tool-doc image did not recover it (#359). */
 const SCHEMA_SINGLE_SUBSCHEMA_KEYS = new Set([
   'items',
-  'prefixItems', // 2020-12 tuple form
   'additionalProperties',
   'not',
   'contains',

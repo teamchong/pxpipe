@@ -160,6 +160,17 @@ async function callCloudCodeRequest({
   }
 }
 
+function getExtraHeaders() {
+  const raw = process.env.PXPIPE_GATEWAY_HEADERS?.trim();
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
 export async function callGeminiRequest({
   model = 'gemini-3.6-flash',
   request,
@@ -177,46 +188,62 @@ export async function callGeminiRequest({
   }
 
   const key = readEnvApiKey();
-  if (!key) throw new Error('OPENAI_API_KEY or GEMINI_API_KEY is required');
+  const extraHeaders = getExtraHeaders();
+  const hasExtraHeaders = Object.keys(extraHeaders).length > 0;
+  if (!key && !hasExtraHeaders) {
+    throw new Error('OPENAI_API_KEY, GEMINI_API_KEY, or PXPIPE_GATEWAY_HEADERS is required');
+  }
   const cleanModel = model
     .replace(/^google\//, '')
     .replace(/[^a-zA-Z0-9._-]+/g, '');
   const origin = gatewayOrigin();
   const hostname = new URL(origin).hostname.toLowerCase();
   const isDirect = hostname === 'googleapis.com' || hostname.endsWith('.googleapis.com');
+  if (isDirect && !key) {
+    throw new Error('OPENAI_API_KEY or GEMINI_API_KEY is required for direct Google AI Studio');
+  }
   const url = isDirect
     ? `${origin}/v1beta/models/${cleanModel}:generateContent`
     : `${origin}/google-ai-studio/v1beta/models/${cleanModel}:generateContent`;
+  // Google generateContent counts hidden thoughtsTokenCount inside maxOutputTokens;
+  // give Gemini 4 reasoning models enough headroom so long thoughts do not clip answers.
+  const effectiveMaxTokens = /^gemini-4/i.test(cleanModel)
+    ? Math.max(maxOutputTokens, Number(process.env.GEMINI_QUALITY_MAX_TOKENS || 32768))
+    : maxOutputTokens;
+  const effectiveTimeoutMs = Math.max(
+    timeoutMs,
+    Number(process.env.GEMINI_TIMEOUT_MS || (/^gemini-4/i.test(cleanModel) ? 300000 : 0)),
+  );
+  const headers = {
+    'content-type': 'application/json',
+    ...(!isDirect ? extraHeaders : {}),
+  };
+  if (key) headers['x-goog-api-key'] = key;
 
   for (let attempt = 0; attempt <= retries; attempt++) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const timer = setTimeout(() => controller.abort(), effectiveTimeoutMs);
     const started = Date.now();
     try {
       const response = await fetch(url, {
         method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          'x-goog-api-key': key,
-        },
+        headers,
         body: JSON.stringify({
           ...request,
           generationConfig: {
             ...request.generationConfig,
-            maxOutputTokens,
+            maxOutputTokens: effectiveMaxTokens,
           },
         }),
         signal: controller.signal,
       });
       const raw = await response.text();
-      let json;
+      let json = null;
       try {
         json = JSON.parse(raw);
-      } catch {
-        throw new Error(`non-JSON HTTP ${response.status}: ${raw.slice(0, 160)}`);
-      }
+      } catch {}
       if (!response.ok) {
-        const msg = json?.error?.message || raw.slice(0, 160);
+        const msg = json?.error?.message || raw.replace(/\s+/g, ' ').slice(0, 160);
         if ((response.status === 429 || response.status >= 500) && attempt < retries) {
           let waitMs = 5000 * Math.pow(1.6, attempt);
           const match = /retry in ([\d.]+)s/i.exec(msg);
@@ -231,23 +258,50 @@ export async function callGeminiRequest({
         }
         throw new Error(`HTTP ${response.status}: ${msg}`);
       }
+      if (!json) {
+        throw new Error(`non-JSON HTTP ${response.status}: ${raw.slice(0, 160)}`);
+      }
       const candidateParts = json.candidates?.[0]?.content?.parts || [];
       const nonThoughtText = candidateParts
         .filter((p) => !p.thought)
         .map((p) => p.text)
         .filter(Boolean)
         .join('');
-      const text =
+      const text = (
         nonThoughtText ||
         candidateParts
           .map((p) => p.text)
           .filter(Boolean)
-          .join('');
+          .join('')
+      ).trim();
+      if (!text && attempt < retries) {
+        const reason = json.candidates?.[0]?.finishReason || 'NO_CANDIDATES';
+        const waitMs = 5000 * (attempt + 1);
+        console.warn(
+          `  [retry] empty response (${reason}), retrying in ${(waitMs / 1000).toFixed(1)}s (attempt ${attempt + 1}/${retries})`,
+        );
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+        continue;
+      }
       return {
-        text: text.trim(),
+        text,
         usage: json.usageMetadata || null,
         ms: Date.now() - started,
       };
+    } catch (err) {
+      if (
+        attempt < retries &&
+        (err.name === 'AbortError' ||
+          /fetch failed|ECONNRESET|ETIMEDOUT|UND_ERR|socket/i.test(String(err)))
+      ) {
+        const waitMs = 5000 * (attempt + 1);
+        console.warn(
+          `  [retry] ${err.name || 'Error'} (${String(err?.message || err).slice(0, 80)}), retrying in ${(waitMs / 1000).toFixed(1)}s (attempt ${attempt + 1}/${retries})`,
+        );
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+        continue;
+      }
+      throw err;
     } finally {
       clearTimeout(timer);
     }

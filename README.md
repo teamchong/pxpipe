@@ -85,7 +85,7 @@ Built-in default routes divert:
 - `daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent*` and `:generateContent*` (`agy` / Antigravity CLI)
 - `generativelanguage.googleapis.com/v1beta/models/*:streamGenerateContent*` and `:generateContent*` (Gemini CLI / Google AI Studio)
 
-When `agy` or a Gemini client runs **Gemini 4** (`gemini-4-carbon`, `gemini-4-hydrogen`, `gemini-4-argon`, `gemini-4-pro`, `gemini-4-flash`), pxpipe automatically selects `GEMINI_PROFILE`: 312-col Spleen 5×8, 96-page history cap, and a compact factsheet alongside a vision encoder that reads dense 5×8 pages at **15/15** verbatim hex and **100/100** arithmetic directly from pixels.
+When `agy` or a Gemini client runs **Gemini 4** (`gemini-4-neon`, `gemini-4-carbon`, `gemini-4-hydrogen`, `gemini-4-argon`, `gemini-4-pro`, `gemini-4-flash`), pxpipe automatically selects `GEMINI_PROFILE`: 312-col Spleen 5×8, 96-page history cap, and a compact factsheet alongside a vision encoder that reads dense 5×8 pages at **15/15** verbatim hex and **100/100** arithmetic directly from pixels.
 
 Agents that reach their provider over a custom or local gateway base URL (such
 as `omp` or `opencode` using an OpenAI/Cloudflare gateway, or `codex` on a local
@@ -122,6 +122,7 @@ Not every vision encoder can read dense 5×8 bitmap glyphs. **Gemini 4 (`gemini-
 
 | tier | models | dense hex (pure image, N=15) | gist (N=98) | arithmetic (N=100) | runtime status & guidance |
 | --- | --- | ---: | ---: | ---: | --- |
+| **Tier 1 — Full-fidelity readers** | `gemini-4-neon` | **14/15** (15/15 w/ factsheet) | **95/98** | **100/100** | **On by default.** 96-page history cap + compact factsheet; 15/15 dense hex with shipped factsheet. |
 | **Tier 1 - Full-fidelity readers** | `gemini-4-carbon` | **14/15** (15/15 w/ factsheet) | **96/98** | **100/100** | **On by default.** 96-page history cap + compact factsheet; 15/15 dense hex with shipped factsheet. |
 | **Tier 1 — Full-fidelity readers** | `gemini-4-argon` (`gemini-4*`) | **15/15** | **98/98** | **100/100** | **On by default.** First model to hit 15/15 hex and 100/100 arithmetic on pure images; 96-page history cap + compact factsheet. |
 | **Tier 1 — Full-fidelity readers** | `google/gemini-3.6-flash`, `3.7-flash`, `3.8-flash` | **14/15** | **98/98** | **100/100** | **On by default** (compact factsheet). ~5.0–5.3× text capacity. |
@@ -181,6 +182,7 @@ numbers predate it).
 
 | model | numbers at | arithmetic (N=100) | gist (N=98) | state (N=18) | never-stated (N=16) | dense hex, pure image (N=15) | profile provenance and receipts |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `gemini-4-neon` (`xhigh` via `agy`) | Spleen 5×8, 312 cols (shipped) | **100/100** | **95/98** | **18/18** | **0/16** | **14/15** | profile-aligned v2 suite (100/100 pure-image arithmetic; 15/15 hex with compact factsheet, 14/15 pure-image): [quality results](eval/model-quality/results/gemini-4-neon/QUALITY_RESULTS.md) |
 | `gemini-4-carbon` (default) | Spleen 5×8, 312 cols (shipped) | **100/100** | **96/98** | **18/18** | **0/16** | **14/15** | profile-aligned v2 suite (100/100 pure-image arithmetic; 15/15 hex with compact factsheet, 14/15 pure-image): [quality results](eval/model-quality/results/gemini-4-carbon/QUALITY_RESULTS.md) |
 | `gemini-4-hydrogen` (`xhigh` via `agy`) | Spleen 5×8, 312 cols (shipped) | **100/100** | **95/98** | **18/18** | **0/16** | — | profile-aligned v2 suite (100/100 pure-image arithmetic; 15/15 hex with compact factsheet): [quality results](eval/model-quality/results/gemini-4-hydrogen/QUALITY_RESULTS.md) |
 | `gemini-4-argon` (default) | Spleen 5×8, 312 cols (shipped) | **100/100** | **98/98** | **18/18** | **0/16** | **15/15** | shipped Gemini 4 profile; 100/100 pure-image arithmetic & 15/15 pure-image hex: [quality results](eval/gemini-profile/QUALITY_RESULTS.md) |
@@ -222,7 +224,7 @@ fixtures estimated 42% while reading 7/8 exact with no unsupported inventions.
 
 The runs use different transports and profile generations, not one identical
 image geometry. Fable and Opus use Claude; Gemini 3.x, Argon, and Carbon use
-Google AI Studio while Gemini 4 Hydrogen uses `agy` CLI (`AGY_CLI=1`); Sol and Grok use
+Google AI Studio while Gemini 4 Hydrogen and Neon use `agy` CLI (`AGY_CLI=1`); Sol and Grok use
 Codex Responses; Kimi K3 uses Cloudflare's OpenAI-compatible transport. All
 `dense hex (N=15)` scores are pure-image reads with no factsheet.
 Current production profiles include the adjacent bounded factsheet on runtime requests;

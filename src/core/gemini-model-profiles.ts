@@ -84,6 +84,11 @@ const GEMINI_MEASURED_PROFILES: Readonly<Record<string, GptModelProfile>> = {
   'gemini-4-carbon-high': GEMINI_PROFILE,
   'gemini-4-carbon-medium': GEMINI_PROFILE,
   'gemini-4-carbon-low': GEMINI_PROFILE,
+  'gemini-4-neon': GEMINI_PROFILE,
+  'gemini-4-neon-xhigh': GEMINI_PROFILE,
+  'gemini-4-neon-high': GEMINI_PROFILE,
+  'gemini-4-neon-medium': GEMINI_PROFILE,
+  'gemini-4-neon-low': GEMINI_PROFILE,
 };
 function normalizeGeminiId(model: string | null | undefined): string {
   const id = (model ?? '').toLowerCase();

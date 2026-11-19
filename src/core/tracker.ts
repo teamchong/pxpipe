@@ -188,6 +188,9 @@ export interface TrackEvent {
   baseline_cacheable_tokens?: number;
   /** Probe outcome. Dashboards must only attribute "$ saved" to rows where status === 'ok'. */
   baseline_probe_status?: 'ok' | 'partial' | 'failed';
+  /** Server-side thread continuation: the body (and so baseline_tokens) is the delta only,
+   *  while provider usage includes the server-held thread. Probe status is 'partial'. */
+  thread_continue?: boolean;
 
   // Errors:
   error?: string;
@@ -355,6 +358,7 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     if (info.baselineProbeStatus !== undefined) {
       out.baseline_probe_status = info.baselineProbeStatus;
     }
+    if (info.threadContinue) out.thread_continue = true;
   }
   if (env) {
     if (env.cwd) out.cwd = env.cwd;

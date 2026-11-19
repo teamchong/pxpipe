@@ -23,6 +23,7 @@ describe('Gemini Model Profiles & Identification', () => {
     expect(isGeminiModel('gemini-4-argon')).toBe(true);
     expect(isGeminiModel('gemini-4-carbon')).toBe(true);
     expect(isGeminiModel('gemini-4-hydrogen')).toBe(true);
+    expect(isGeminiModel('gemini-4-neon')).toBe(true);
     expect(isGeminiModel('GEMINI-PRO')).toBe(true);
     expect(isGeminiModel('google/gemini-3.6-pro')).toBe(true);
     expect(isGeminiModel('gpt-5.6-sol')).toBe(false);
@@ -47,6 +48,8 @@ describe('Gemini Model Profiles & Identification', () => {
     expect(hasGeminiMeasuredProfile('gemini-4-carbon-xhigh')).toBe(true);
     expect(hasGeminiMeasuredProfile('gemini-4-hydrogen')).toBe(true);
     expect(hasGeminiMeasuredProfile('gemini-4-hydrogen-xhigh')).toBe(true);
+    expect(hasGeminiMeasuredProfile('gemini-4-neon')).toBe(true);
+    expect(hasGeminiMeasuredProfile('gemini-4-neon-xhigh')).toBe(true);
     expect(hasGeminiMeasuredProfile('gemini-5-pro')).toBe(true);
     expect(hasGeminiMeasuredProfile('gemini-pro')).toBe(true);
     expect(hasGeminiMeasuredProfile('gpt-5.6-sol')).toBe(false);
@@ -87,6 +90,8 @@ describe('Gemini Model Profiles & Identification', () => {
     expect(resolveGeminiProfile('gemini-4-carbon-xhigh')).toBe(GEMINI_PROFILE);
     expect(resolveGeminiProfile('gemini-4-hydrogen')).toBe(GEMINI_PROFILE);
     expect(resolveGeminiProfile('gemini-4-hydrogen-xhigh')).toBe(GEMINI_PROFILE);
+    expect(resolveGeminiProfile('gemini-4-neon')).toBe(GEMINI_PROFILE);
+    expect(resolveGeminiProfile('gemini-4-neon-xhigh')).toBe(GEMINI_PROFILE);
     expect(profArgon.history.maxImages).toBe(96);
     expect(profArgon.history.responsesMode).toBe('mixed');
     expect(resolveGeminiProfile('gemini-4')).toBe(GEMINI_PROFILE);
@@ -103,6 +108,7 @@ describe('Gemini Model Profiles & Identification', () => {
     expect(geminiVisionTokens('gemini-3.7-flash', 1568, 728)).toBe(1078);
     expect(geminiVisionTokens('gemini-4-flash', 1568, 728)).toBe(1078);
     expect(geminiVisionTokens('gemini-4-hydrogen', 1568, 728)).toBe(1078);
+    expect(geminiVisionTokens('gemini-4-neon', 1568, 728)).toBe(1078);
     expect(geminiVisionTokens('gemini-5-pro', 1568, 728)).toBe(1078);
 
     expect(visionTokensForModel('gemini-3.6-flash', 1568, 728)).toBe(1078);
@@ -112,6 +118,7 @@ describe('Gemini Model Profiles & Identification', () => {
     expect(visionTokensForModel('gemini-4-flash', 1568, 728)).toBe(1078);
     expect(visionTokensForModel('gemini-4-carbon', 1568, 728)).toBe(1078);
     expect(visionTokensForModel('gemini-4-hydrogen', 1568, 728)).toBe(1078);
+    expect(visionTokensForModel('gemini-4-neon', 1568, 728)).toBe(1078);
   });
 
   it('fails closed for unvalidated models and invalid dimensions', () => {

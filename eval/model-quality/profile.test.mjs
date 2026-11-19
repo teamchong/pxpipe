@@ -23,6 +23,7 @@ for (const model of [
   'gemini-3.8-flash',
   'gemini-4-carbon',
   'gemini-4-hydrogen',
+  'gemini-4-neon',
   'claude-fable-5',
   'claude-opus-5',
   'workers-ai/@cf/qwen/qwen3.8-27b',

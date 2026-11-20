@@ -147,6 +147,7 @@ export interface TrackEvent {
   // Fingerprints:
   system_sha8?: string;
   first_user_sha8?: string;
+  session_key_source?: 'client' | 'anchor';
 
   // From Anthropic/OpenAI Usage:
   input_tokens?: number;
@@ -343,6 +344,7 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
       out.churning_static_tags = info.churningStaticTags;
     if (info.systemSha8) out.system_sha8 = info.systemSha8;
     if (info.firstUserSha8) out.first_user_sha8 = info.firstUserSha8;
+    if (info.sessionKeySource) out.session_key_source = info.sessionKeySource;
     if (info.baselineTokens !== undefined && info.baselineTokens > 0) {
       out.baseline_tokens = info.baselineTokens;
     }

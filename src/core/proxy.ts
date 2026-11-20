@@ -1777,6 +1777,7 @@ let responseContentType: string | undefined;
         // count_tokens probes, so the timer closes here rather than after them —
         // otherwise network latency would be charged to our own CPU.
         const tTransform = Date.now();
+        const clientSessionId = req.headers.get('x-claude-code-session-id');
         let r = isGoogle
           ? await transformGoogleGenerateContent(bodyIn, model!, effectiveOpts)
           : isMessages
@@ -1784,7 +1785,11 @@ let responseContentType: string | undefined;
               ? await transformOpenAIResponses(bridgeBody, effectiveOpts)
               : bridgedChatMessages
                 ? await transformOpenAIChatCompletions(bridgeBody, effectiveOpts)
-                : await transformRequest(bodyIn, { ...effectiveOpts, model: effectiveModel ?? undefined })
+                : await transformRequest(bodyIn, {
+                    ...effectiveOpts, model: effectiveModel ?? undefined,
+                    claudeCodeSessionId: clientSessionId !== null && /^[A-Za-z0-9_-]{8,128}$/.test(clientSessionId)
+                      ? clientSessionId : undefined,
+                  })
             : isOpenAIChat
               ? await transformOpenAIChatCompletions(bodyIn, effectiveOpts)
               : await transformOpenAIResponses(bodyIn, effectiveOpts);
@@ -2159,14 +2164,14 @@ let teed: Response;
       // freeze this session was protecting protects nothing: let the next turn
       // re-cut the grid for density instead of preserving dead bytes.
       if (responseLeftNoCache(upstreamRes.status, errorBody)) {
-        markCacheDead(info?.firstUserSha8);
+        markCacheDead(info?.sessionKey);
       }
       // Feed the provider's own cache accounting back into the session store. A
       // read proves the prefix was live; a create proves one was just written.
       // Either way the next turn must not re-cut the grid — which the wall clock
       // alone could not tell, and got wrong on most gaps that mattered.
       noteCacheOutcome(
-        info?.firstUserSha8,
+        info?.sessionKey,
         usage?.cache_read_input_tokens,
         usage?.cache_creation_input_tokens,
       );

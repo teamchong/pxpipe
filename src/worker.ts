@@ -12,11 +12,14 @@
  */
 
 import type { ExecutionContext } from '@cloudflare/workers-types';
-import { createProxy, type ProxyConfig } from './core/proxy.js';
+import { createProxy, resolveTrustAdjacentToolRoundsEnv, type ProxyConfig } from './core/proxy.js';
 import type { TransformOptions } from './core/transform.js';
 import { toTrackEvent, JsonLogTracker, noopTracker, type Tracker } from './core/tracker.js';
 import { setAllowedModelBases } from './core/applicability.js';
 import { setRenderCacheMaxBytes } from './core/render.js';
+
+/** Invalid PXPIPE_TRUST_ADJACENT_TOOL_ROUNDS values already warned about in this isolate. */
+const warnedTrustAdjacentRaw = new Set<string>();
 
 export interface Env {
   /** Optional single upstream base for every API family. Family-specific env vars override it. */
@@ -48,6 +51,10 @@ export interface Env {
    *  Cloudflare ingests console.log as Workers Logs; pipe via Logpush to
    *  R2/S3 for the same JSONL shape Node writes to disk. */
   PXPIPE_TRACK?: string;
+  /** "1" lets history collapse split adjacent tool call/result pairs for every
+   *  client; "0" never. Unset decides per request from the client headers (on
+   *  only for Claude Code: `claude-cli/*` UA + `x-app: cli`). Same semantics as the Node host. */
+  PXPIPE_TRUST_ADJACENT_TOOL_ROUNDS?: string;
   /** Max bytes of rendered pages held in memory, or "0" to disable the cache.
    *  Unset uses the core edge default (8 MiB), which is deliberately far below
    *  the Node default: a Worker isolate has ~128 MiB for the request body, the
@@ -157,6 +164,19 @@ export default {
       // COLS remains an explicit operator override for every family.
       ...(env.COLS ? { cols: Number(env.COLS) } : {}),
     };
+    // An explicit value wins over the per-request client-header guess in
+    // withClientToolRoundShape(); an unrecognized one falls back to it.
+    // env is only reachable per request, so warn once per isolate and raw value
+    // instead of on every request (Workers Logs expects one JSON line per event).
+    const trustAdjacentRaw = env.PXPIPE_TRUST_ADJACENT_TOOL_ROUNDS;
+    const trustAdjacent = resolveTrustAdjacentToolRoundsEnv(trustAdjacentRaw);
+    if (trustAdjacent.warning && !warnedTrustAdjacentRaw.has(trustAdjacentRaw ?? '')) {
+      warnedTrustAdjacentRaw.add(trustAdjacentRaw ?? '');
+      console.warn(trustAdjacent.warning);
+    }
+    if (trustAdjacent.value !== undefined) {
+      transform.separateAdjacentToolPairs = trustAdjacent.value;
+    }
     const trackingOn = truthy(env.PXPIPE_TRACK, true);
     // Workers Logs ingests stdout as separate log lines. Emit one JSON line
     // per event so downstream (Logpush → R2/S3) reads the same JSONL shape

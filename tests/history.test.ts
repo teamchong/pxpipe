@@ -105,6 +105,50 @@ describe('findClosedPrefixBoundary', () => {
     expect(findClosedPrefixBoundary(msgs, 6)).toBe(5);
   });
 
+  it('splits adjacent closed pairs when the client merges parallel batches', () => {
+    // Claude Code sends a parallel batch as one assistant message, so a pure
+    // tool loop (no text-only assistant turn) must still yield boundaries.
+    // Without the flag such a loop pins the boundary at 0 forever.
+    const msgs: Message[] = [usr('review this diff')];
+    for (let i = 0; i < 20; i++) {
+      msgs.push(asst([{ type: 'tool_use', id: `t${i}`, name: 'Read', input: {} }]));
+      msgs.push(usr([{ type: 'tool_result', tool_use_id: `t${i}`, content: 'ok' }]));
+    }
+    const cutoff = msgs.length - 4;
+    expect(findClosedPrefixBoundary(msgs, cutoff)).toBe(0);
+    expect(findClosedPrefixBoundary(msgs, cutoff, true)).toBe(cutoff - 1);
+    // Still never cuts through a genuinely open tool_use.
+    expect(findClosedPrefixBoundary(msgs, 2, true)).toBe(0);
+  });
+
+  it('never ends a split-mode prefix on a tool_use whose id is unusable', () => {
+    // A malformed tool_use (no string id) never enters openSet. Ending the
+    // prefix on it would image the call and leave its result live → 400.
+    const msgs: Message[] = [
+      usr('q'),
+      asst([{ type: 'tool_use', id: 't0', name: 'Read', input: {} }]),
+      usr([{ type: 'tool_result', tool_use_id: 't0', content: 'ok' }]),
+      asst([{ type: 'tool_use', name: 'Read', input: {} } as any]),
+      usr([{ type: 'tool_result', content: 'ok' } as any]),
+    ];
+    expect(findClosedPrefixBoundary(msgs, 4, true)).toBe(2);
+  });
+
+  it('never ends a round-mode prefix on a tool_use whose id is unusable', () => {
+    // Round mode's end-of-scan lookahead used to close the round at limit-1
+    // even when that message is the malformed call itself (cutoff 4 → 3).
+    const msgs: Message[] = [
+      usr('q'),
+      asst([{ type: 'tool_use', id: 't0', name: 'Read', input: {} }]),
+      usr([{ type: 'tool_result', tool_use_id: 't0', content: 'ok' }]),
+      asst([{ type: 'tool_use', name: 'Read', input: {} } as any]),
+      usr([{ type: 'tool_result', content: 'ok' } as any]),
+    ];
+    expect(findClosedPrefixBoundary(msgs, 4)).toBe(0);
+    // Once the result is inside the cutoff, the whole round may collapse.
+    expect(findClosedPrefixBoundary(msgs, 5)).toBe(4);
+  });
+
   it('returns -1 when the very first message opens a tool_use that never closes', () => {
     const msgs: Message[] = [
       asst([{ type: 'tool_use', id: 'X', name: 't', input: {} }]),

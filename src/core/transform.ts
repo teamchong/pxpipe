@@ -118,6 +118,12 @@ export interface TransformOptions {
    *  penalty `priorWarmTokens × (CC − CR)` to the image side so the gate accounts
    *  for invalidating a warm text cache. Default 0 (cold-start). ≤0 clamped to 0. */
   priorWarmTokens?: number;
+  /** History collapse: treat each closed tool call/result pair as its own round.
+   *  The proxy sets this for Claude Code (`claude-cli/` UA + `x-app: cli`), which sends a
+   *  parallel batch as one assistant message; PXPIPE_TRUST_ADJACENT_TOOL_ROUNDS
+   *  overrides. Leave false for clients that serialize a batch as adjacent
+   *  call/result pairs (OpenCode). Default false. */
+  separateAdjacentToolPairs?: boolean;
   /** Symmetric counterpart: tokens the image path would have cache-hit on. Adds the
    *  same burn formula to the TEXT side, preventing the gate from flipping out of
    *  image mode when the image prefix is already warm. Default 0. ≤0 clamped to 0. */
@@ -160,6 +166,7 @@ const DEFAULTS: Required<TransformOptions> = {
   charsPerToken: 4,
   historyAmortizationHorizon: 1,
   priorWarmTokens: 0,
+  separateAdjacentToolPairs: false,
   priorWarmImageTokens: 0,
   reflow: true,
   keepSharp: () => false,
@@ -759,6 +766,9 @@ export interface TransformInfo {
   /** The collapse re-cut the grid for page fill instead of cache freeze — only set when
    *  the session's upstream cache was provably dead (idle past TTL, or after a reject). */
   historyPackFill?: boolean;
+  /** History collapse ran with separateAdjacentToolPairs (each closed tool pair is a
+   *  boundary). Lets a 400 regression be tied to the client-shape decision. */
+  historySplitAdjacentPairs?: boolean;
   /** The image budget could not hold the whole closed prefix; the tail stayed live text. */
   historyBudgetTrimmed?: boolean;
   /** sha8 of the ACTUAL cacheable prefix sent this turn (tools + system +
@@ -2269,6 +2279,7 @@ async function runHistoryCollapseAndFinalize(
         style: historyGeometry.style,
         maxHeightPx: historyGeometry.maxHeightPx,
         pageChars: historyGeometry.maxChars,
+        separateAdjacentToolPairs: o.separateAdjacentToolPairs,
         imageBudget: tuning.imageBudget,
         packFill: tuning.packFill,
         minFreezeStep: tuning.minFreezeStep,
@@ -2278,6 +2289,7 @@ async function runHistoryCollapseAndFinalize(
     if (histInfo.freezeStep !== undefined) info.historyFreezeStep = histInfo.freezeStep;
     if (histInfo.budgetTrimmed) info.historyBudgetTrimmed = true;
     if (tuning.packFill) info.historyPackFill = true;
+    if (o.separateAdjacentToolPairs) info.historySplitAdjacentPairs = true;
     // Atomic admission by weight. The collapse is one semantic group: applying
     // it means every collapsed message becomes pages, so a group that does not
     // fit the byte budget is not applied at all and the original text stands.
@@ -2874,6 +2886,7 @@ export async function transformRequest(
         style: historyGeometry.style,
         maxHeightPx: historyGeometry.maxHeightPx,
         pageChars: historyGeometry.maxChars,
+        separateAdjacentToolPairs: o.separateAdjacentToolPairs,
         imageBudget: tuning.imageBudget,
         packFill: tuning.packFill,
         minFreezeStep: tuning.minFreezeStep,
@@ -2883,6 +2896,7 @@ export async function transformRequest(
     if (histInfo.freezeStep !== undefined) info.historyFreezeStep = histInfo.freezeStep;
     if (histInfo.budgetTrimmed) info.historyBudgetTrimmed = true;
     if (tuning.packFill) info.historyPackFill = true;
+    if (o.separateAdjacentToolPairs) info.historySplitAdjacentPairs = true;
     // Atomic admission by weight. The collapse is one semantic group: applying
     // it means every collapsed message becomes pages, so a group that does not
     // fit the byte budget is not applied at all and the original text stands.

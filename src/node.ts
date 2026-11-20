@@ -69,11 +69,16 @@ interface RuntimeConfig {
   /** Persist 4xx request and upstream error bodies for debugging. Off unless
    *  PXPIPE_DEBUG_CAPTURE_4XX=1. */
   captureErrorReqBody: boolean;
-  /** Ceiling on a buffered inbound request body. Unset leaves the core default
-   *  (16 MiB). Raise it only if a real client needs more; the default binding is
-   *  loopback, but HOST can expose this process to a network. */
+  /** Ceiling on a buffered inbound request body. Unset leaves 64 MiB on
+   *  loopback (where multimodal sessions regularly exceed 16 MiB) and 16 MiB
+   *  when HOST exposes this process off-host. */
   maxRequestBytes?: number;
 }
+
+/** Default inbound transform buffer ceiling on local loopback Node: 64 MiB.
+ *  Covers provider multimodal limits (Anthropic 32 MB, OpenAI 50 MB, Google
+ *  20+ MB) so image-heavy tool sessions stay compressed and keep cache hits. */
+const DEFAULT_NODE_MAX_REQUEST_BYTES = 64 << 20;
 
 const DEFAULT_CONFIG_FILE = path.join(os.homedir(), '.config', 'pxpipe', 'config.json');
 const DEFAULT_EVENTS_FILE = path.join(os.homedir(), '.pxpipe', 'events.jsonl');
@@ -341,6 +346,10 @@ Environment:
                           chunks are byte-identical across turns, so
                           re-rendering them is wasted CPU; 0 disables the cache.
                           Live counters at /proxy-stats under render_cache.
+  PXPIPE_MAX_REQUEST_BYTES  max inbound request body buffered for compression,
+                          in bytes (default 64 MiB on loopback, 16 MiB on
+                          non-loopback HOST / Workers). On loopback, larger
+                          bodies stream through untouched instead of 413ing.
   PXPIPE_DEBUG_CAPTURE_4XX  debug: set to 1 to persist full 4xx request and
                           upstream error bodies (prompts + any secrets in
                           context) to disk. Off by default.
@@ -383,17 +392,67 @@ function toWebRequest(req: IncomingMessage): Request {
   const method = req.method ?? 'GET';
   const hasBody = method !== 'GET' && method !== 'HEAD';
 
-  // Buffer the body — proxy needs to read /v1/messages bodies fully anyway,
-  // and Node's IncomingMessage → ReadableStream conversion has duplex quirks.
   let body: BodyInit | undefined;
   if (hasBody) {
-    body = new ReadableStream<Uint8Array>({
-      start(controller) {
-        req.on('data', (chunk) => controller.enqueue(chunk));
-        req.on('end', () => controller.close());
-        req.on('error', (e) => controller.error(e));
+    let closed = false;
+    let controllerRef: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const cleanup = () => {
+      req.off('data', onData);
+      req.off('end', onEnd);
+      req.off('error', onError);
+      req.off('aborted', onAborted);
+    };
+    const onData = (chunk: Buffer) => {
+      if (closed) return;
+      controllerRef!.enqueue(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+      // Pause until the consumer pulls again so large streaming passthroughs do
+      // not pile up unboundedly in the ReadableStream's internal queue.
+      if ((controllerRef!.desiredSize ?? 0) <= 0) req.pause();
+    };
+    const onEnd = () => {
+      if (closed) return;
+      closed = true;
+      cleanup();
+      controllerRef!.close();
+    };
+    const onError = (e: Error) => {
+      if (closed) return;
+      closed = true;
+      cleanup();
+      controllerRef!.error(e);
+    };
+    const onAborted = () => {
+      if (closed) return;
+      closed = true;
+      cleanup();
+      controllerRef!.error(new Error('request aborted'));
+    };
+    body = new ReadableStream<Uint8Array>(
+      {
+        start(controller) {
+          controllerRef = controller;
+          req.on('data', onData);
+          req.on('end', onEnd);
+          req.on('error', onError);
+          req.on('aborted', onAborted);
+          // Stay paused until a reader actually pulls: an early rejection (e.g.
+          // declared content-length over limit) then reads zero bytes off the socket.
+          req.pause();
+        },
+        pull() {
+          if (!closed) req.resume();
+        },
+        cancel() {
+          if (closed) return;
+          closed = true;
+          cleanup();
+          // Pause rather than destroy: `req` shares its TCP socket with `res`,
+          // so destroying `req` here would drop the 413 response before it sends.
+          req.pause();
+        },
       },
-    });
+      { highWaterMark: 0 },
+    );
   }
 
   return new Request(url, {
@@ -1272,6 +1331,7 @@ async function main(): Promise<void> {
   // doesn't reset what you can see in the UI. Best-effort; ignored on error.
   await dashboard.replay(opts.eventsFile).catch(() => {});
 
+  const isLoopbackHost = isLoopbackHostname(opts.host);
   const config: ProxyConfig = {
     authToken: anthropicAuthToken,
     provider: opts.provider,
@@ -1286,7 +1346,8 @@ async function main(): Promise<void> {
     openAIModels: opts.openAIModels,
     cloudflareModels: opts.cloudflareModels,
     captureErrorReqBody: opts.captureErrorReqBody,
-    maxRequestBytes: opts.maxRequestBytes,
+    maxRequestBytes: opts.maxRequestBytes ?? (isLoopbackHost ? DEFAULT_NODE_MAX_REQUEST_BYTES : undefined),
+    oversizedBodyPolicy: isLoopbackHost ? 'passthrough' : 'reject',
     // Per-request transform options:
     //   1. Runtime kill switch — when the dashboard "passthrough" toggle
     //      is off, force compress=false so /v1/messages forwards
@@ -1429,6 +1490,10 @@ async function main(): Promise<void> {
         }
         const webReq = toWebRequest(req);
         const webRes = await handle(webReq);
+        // If the handler answered without draining the request body (e.g. an
+        // early 413), close the keep-alive socket after flushing the response
+        // so unread body bytes cannot desync the next pipelined request.
+        if (!req.complete && !res.headersSent) res.setHeader('connection', 'close');
         await writeWebResponse(webRes, res);
       })
       .catch((err) => {
@@ -1441,8 +1506,6 @@ async function main(): Promise<void> {
   server.on('connection', (socket) => socket.setNoDelay(true));
   // IPv6 literals need bracket notation to form a valid URL (http://[::1]:47821).
   const displayHost = opts.host.includes(':') ? `[${opts.host}]` : opts.host;
-  const isLoopbackHost =
-    opts.host === '127.0.0.1' || opts.host === 'localhost' || opts.host === '::1';
   const announce = () => {
     const routes = resolveUpstreams(config);
     console.log(`[pxpipe] anthropic upstream → ${routes.anthropic}`);

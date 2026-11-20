@@ -116,13 +116,16 @@ const LIMIT = 4096;
 function proxyWithLimit(
   maxRequestBytes: number | undefined,
   events?: ProxyEvent[],
+  extra: Partial<ProxyConfig> = {},
 ): ReturnType<typeof createProxy> {
   const config: ProxyConfig = {
     upstream: 'https://upstream.invalid',
     openAIUpstream: 'https://openai.invalid',
+    googleUpstream: 'https://google.invalid',
     transform: { compress: false },
     ...(maxRequestBytes === undefined ? {} : { maxRequestBytes }),
     ...(events ? { onRequest: (e: ProxyEvent) => void events.push(e) } : {}),
+    ...extra,
   };
   return createProxy(config);
 }
@@ -274,5 +277,106 @@ describe('an unusable limit falls back to the default instead of to none', () =>
   it('exports a default that is a positive whole number of bytes', () => {
     expect(Number.isSafeInteger(DEFAULT_MAX_REQUEST_BYTES)).toBe(true);
     expect(DEFAULT_MAX_REQUEST_BYTES).toBeGreaterThan(0);
+  });
+});
+
+describe('oversizedBodyPolicy: passthrough streams past the ceiling without rejecting', () => {
+  it('forwards an oversized declared-length body byte-for-byte and records body_too_large', async () => {
+    const up = mockUpstream();
+    const events: ProxyEvent[] = [];
+    try {
+      const payload = jsonOfSize(LIMIT * 4);
+      const res = await proxyWithLimit(LIMIT, events, { oversizedBodyPolicy: 'passthrough' })(
+        post('/v1/messages', payload, { 'content-length': String(payload.length) }),
+      );
+      expect(res.status).toBe(200);
+      expect(up.calls).toBe(1);
+      expect(up.bodies[0]).toBe(payload);
+      expect((await settledEvents(events)).at(-1)?.info?.reason).toBe('body_too_large');
+    } finally {
+      up.restore();
+    }
+  });
+
+  it('streams an oversized chunked body with no content-length intact to upstream', async () => {
+    const up = mockUpstream();
+    const events: ProxyEvent[] = [];
+    try {
+      const payload = jsonOfSize(LIMIT * 4);
+      const res = await proxyWithLimit(LIMIT, events, { oversizedBodyPolicy: 'passthrough' })(
+        post('/v1/messages', chunkedBody(payload, 333)),
+      );
+      expect(res.status).toBe(200);
+      expect(up.calls).toBe(1);
+      expect(up.bodies[0]).toBe(payload);
+      expect((await settledEvents(events)).at(-1)?.info?.reason).toBe('body_too_large');
+    } finally {
+      up.restore();
+    }
+  });
+
+  it('streams an oversized body that under-declares its content-length intact', async () => {
+    const up = mockUpstream();
+    const events: ProxyEvent[] = [];
+    try {
+      const payload = jsonOfSize(LIMIT * 4);
+      const res = await proxyWithLimit(LIMIT, events, { oversizedBodyPolicy: 'passthrough' })(
+        post('/v1/messages', chunkedBody(payload, 512), { 'content-length': '10' }),
+      );
+      expect(res.status).toBe(200);
+      expect(up.calls).toBe(1);
+      expect(up.bodies[0]).toBe(payload);
+      expect((await settledEvents(events)).at(-1)?.info?.reason).toBe('body_too_large');
+    } finally {
+      up.restore();
+    }
+  });
+
+  it('streams oversized chunked Google Cloud Code and OpenAI Responses requests intact', async () => {
+    const up = mockUpstream();
+    const events: ProxyEvent[] = [];
+    try {
+      const googlePayload = JSON.stringify({
+        model: 'gemini-3-flash',
+        request: { contents: [{ role: 'user', parts: [{ text: 'g'.repeat(LIMIT * 3) }] }] },
+      });
+      const gRes = await proxyWithLimit(LIMIT, events, { oversizedBodyPolicy: 'passthrough' })(
+        post('/v1internal:streamGenerateContent?alt=sse', chunkedBody(googlePayload, 400)),
+      );
+      expect(gRes.status).toBe(200);
+
+      const openaiPayload = JSON.stringify({
+        model: 'gpt-5.6-sol',
+        input: 'o'.repeat(LIMIT * 3),
+      });
+      const oRes = await proxyWithLimit(LIMIT, events, { oversizedBodyPolicy: 'passthrough' })(
+        post('/v1/responses', chunkedBody(openaiPayload, 400)),
+      );
+      expect(oRes.status).toBe(200);
+
+      expect(up.calls).toBe(2);
+      expect(up.bodies[0]).toBe(googlePayload);
+      expect(up.bodies[1]).toBe(openaiPayload);
+      const settled = await settledEvents(events, 2);
+      expect(settled[0]?.info?.reason).toBe('body_too_large');
+      expect(settled[1]?.info?.reason).toBe('body_too_large');
+    } finally {
+      up.restore();
+    }
+  });
+
+  it('still fails closed with 413 on /v1/messages when model bridging is configured', async () => {
+    const up = mockUpstream();
+    try {
+      const payload = jsonOfSize(LIMIT * 4);
+      const res = await proxyWithLimit(LIMIT, undefined, {
+        oversizedBodyPolicy: 'passthrough',
+        openAIModels: ['gpt-5.6-sol'],
+      })(post('/v1/messages', chunkedBody(payload)));
+      expect(res.status).toBe(413);
+      expect(up.calls).toBe(0);
+    } finally {
+      up.restore();
+    }
   });
 });

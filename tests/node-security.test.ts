@@ -50,25 +50,34 @@ async function startNode(extraEnv: Record<string, string> = {}): Promise<{
   base: string;
   eventsFile: string;
   configFile: string;
+  upstreamBodies: string[];
 }> {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pxpipe-node-security-'));
   const port = await freePort();
   const upstreamPort = await freePort();
+  const upstreamBodies: string[] = [];
   upstream = createServer((req, res) => {
-    res.setHeader('content-type', 'application/json');
-    if (req.url?.endsWith('/count_tokens')) {
-      res.end(JSON.stringify({ input_tokens: 100 }));
-      return;
-    }
-    res.end(JSON.stringify({
-      id: 'msg_test',
-      type: 'message',
-      role: 'assistant',
-      model: 'claude-fable-5',
-      content: [{ type: 'text', text: 'ok' }],
-      stop_reason: 'end_turn',
-      usage: { input_tokens: 10, output_tokens: 1 },
-    }));
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    req.on('end', () => {
+      if (!req.url?.endsWith('/count_tokens')) {
+        upstreamBodies.push(Buffer.concat(chunks).toString('utf8'));
+      }
+      res.setHeader('content-type', 'application/json');
+      if (req.url?.endsWith('/count_tokens')) {
+        res.end(JSON.stringify({ input_tokens: 100 }));
+        return;
+      }
+      res.end(JSON.stringify({
+        id: 'msg_test',
+        type: 'message',
+        role: 'assistant',
+        model: 'claude-fable-5',
+        content: [{ type: 'text', text: 'ok' }],
+        stop_reason: 'end_turn',
+        usage: { input_tokens: 10, output_tokens: 1 },
+      }));
+    });
   });
   await new Promise<void>((resolve) => upstream!.listen(upstreamPort, '127.0.0.1', resolve));
   const eventsFile = path.join(dir, 'data', 'events.jsonl');
@@ -110,7 +119,7 @@ async function startNode(extraEnv: Record<string, string> = {}): Promise<{
     };
     poll();
   });
-  return { base: `http://127.0.0.1:${port}`, eventsFile, configFile };
+  return { base: `http://127.0.0.1:${port}`, eventsFile, configFile, upstreamBodies };
 }
 
 describe('Node dashboard security', () => {
@@ -197,5 +206,110 @@ describe('Node dashboard security', () => {
     expect(files.length).toBeGreaterThan(0);
     expectMode(path.join(dumpDir, files[0]!), 0o600);
     fs.rmSync(dumpDir, { recursive: true, force: true });
+  });
+
+  it('streams oversized chunked requests through untouched on loopback instead of 413ing', async () => {
+    const { base, eventsFile, upstreamBodies } = await startNode({
+      PXPIPE_MAX_REQUEST_BYTES: '4096',
+    });
+    const payload = JSON.stringify({
+      model: 'claude-fable-5',
+      max_tokens: 1,
+      messages: [{ role: 'user', content: 'p'.repeat(64 * 1024) }],
+    });
+    const bytes = new TextEncoder().encode(payload);
+    let offset = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (offset >= bytes.byteLength) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(bytes.slice(offset, offset + 1024));
+        offset += 1024;
+      },
+    });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'test' },
+      body: stream,
+      // @ts-expect-error — duplex required for streamed request bodies
+      duplex: 'half',
+    });
+    expect(res.status).toBe(200);
+    expect(upstreamBodies).toEqual([payload]);
+    for (let i = 0; i < 100 && !fs.existsSync(eventsFile); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const logged = JSON.parse(fs.readFileSync(eventsFile, 'utf8').trim()) as { reason?: string };
+    expect(logged.reason).toBe('body_too_large');
+  });
+
+  it('accepts >16 MiB payloads on loopback under the 64 MiB default ceiling', async () => {
+    const { base, eventsFile, upstreamBodies } = await startNode();
+    // 17 MiB — above the old 16 MiB cap, well below the 64 MiB loopback default.
+    const payload = JSON.stringify({
+      model: 'claude-fable-5',
+      max_tokens: 1,
+      messages: [{ role: 'user', content: 'm'.repeat(17 * 1024 * 1024) }],
+    });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'test' },
+      body: payload,
+    });
+    expect(res.status).toBe(200);
+    expect(upstreamBodies).toHaveLength(1);
+    for (let i = 0; i < 100 && !fs.existsSync(eventsFile); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const logged = JSON.parse(fs.readFileSync(eventsFile, 'utf8').trim()) as { reason?: string };
+    expect(logged.reason).not.toBe('body_too_large');
+  });
+
+  it('survives early 413 stream cancellation on a chunked bridged upload without crashing', async () => {
+    const { base, upstreamBodies } = await startNode({
+      PXPIPE_MAX_REQUEST_BYTES: '4096',
+      OPENAI_MODELS: 'gpt-5.6-sol',
+    });
+    const payload = JSON.stringify({
+      model: 'claude-fable-5',
+      max_tokens: 1,
+      messages: [{ role: 'user', content: 'z'.repeat(128 * 1024) }],
+    });
+    const bytes = new TextEncoder().encode(payload);
+    let offset = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (offset >= bytes.byteLength) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(bytes.slice(offset, offset + 2048));
+        offset += 2048;
+      },
+    });
+    const rejected = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'test' },
+      body: stream,
+      // @ts-expect-error — duplex required for streamed request bodies
+      duplex: 'half',
+    });
+    expect(rejected.status).toBe(413);
+    expect(upstreamBodies).toHaveLength(0);
+
+    // Server must still be alive and handle a normal follow-up request cleanly.
+    const followUp = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'test' },
+      body: JSON.stringify({
+        model: 'claude-fable-5',
+        max_tokens: 1,
+        messages: [{ role: 'user', content: 'still alive' }],
+      }),
+    });
+    expect(followUp.status).toBe(200);
+    expect(upstreamBodies).toHaveLength(1);
   });
 });

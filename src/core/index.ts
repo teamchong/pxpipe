@@ -33,6 +33,15 @@ export {
   type KeepSharpBlock,
   type RecoverableBlock,
 } from './transform.js';
+export {
+  type SplitBlock,
+  type SplitBlockInput,
+  type SplitBlockPlan,
+  type SplitBlockSite,
+  type SplitCost,
+  type SplitSegment,
+  type SplitSpan,
+} from './split-block.js';
 export { transformOpenAIChatCompletions, transformOpenAIResponses, resolveVisionCost, openAIVisionTokens } from './openai.js';
 export { createProxy, type ProxyConfig, type ProxyEvent } from './proxy.js';
 export {

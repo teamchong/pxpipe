@@ -94,6 +94,8 @@ For each `/v1/messages` request, pxpipe records three measurements:
 2. `baseline_tokens`: `/count_tokens` on the original body before compression.
 3. `baseline_cacheable_tokens`: `/count_tokens` on the original body truncated at the last `cache_control` marker.
 
+A server-side thread continuation (`thread: {type: "continue"}`) sends only the delta, and upstream usage also bills the server-held thread (mostly as `cr`). The probe can only count the delta, so the row is recorded with `thread_continue: true` and `baseline_probe_status: "partial"`. Rollups exclude it from measured savings instead of pairing a delta baseline with full-thread usage.
+
 The actual input cost is:
 
 ```text

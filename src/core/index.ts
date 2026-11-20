@@ -13,6 +13,7 @@ export {
   buildBaselineCountTokensBody,
   buildCacheablePrefixCountTokensBody,
   countCacheControlMarkers,
+  isThreadContinuation,
   type CountTokensBodies,
 } from './measurement.js';
 export {

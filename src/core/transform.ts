@@ -811,9 +811,12 @@ export interface TransformInfo {
    *  Absent when the original body has no cache_control markers (cacheable=0 exactly). */
   baselineCacheableTokens?: number;
   /** 'ok': both probes resolved. 'partial': full-body resolved but cacheable-prefix
-   *  didn't (exclude from rollup — cacheable=0 fallback is dishonest). 'failed': no
-   *  baseline. undefined: no probe attempted. */
+   *  didn't, or the body is a server-side thread continuation whose probe covers
+   *  only the delta (exclude from rollup either way). 'failed': no baseline.
+   *  undefined: no probe attempted. */
   baselineProbeStatus?: 'ok' | 'partial' | 'failed';
+  /** Request was a server-side thread continuation (`thread.type === "continue"`). */
+  threadContinue?: boolean;
 }
 
 // --- helpers ---------------------------------------------------------------

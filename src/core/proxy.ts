@@ -10,6 +10,7 @@ import { isAnthropicMessagesPath, isPxpipeSupportedGptModel, isPxpipeSupportedMo
 import {
   buildBaselineCountTokensBody,
   buildCacheablePrefixCountTokensBody,
+  isThreadContinuation,
 } from './measurement.js';
 import type { Usage } from './types.js';
 import {
@@ -1569,9 +1570,13 @@ let responseContentType: string | undefined;
             info.baselineProbeStatus = 'failed';
           } else if (cacheableExpected && cacheableResolved === null) {
             info.baselineProbeStatus = 'partial'; // dashboard excludes row; must not treat as cacheable=0
+          } else if (threadContinue) {
+            // Delta-only baseline vs full-thread usage: rollups must exclude the row.
+            info.baselineProbeStatus = 'partial';
           } else {
             info.baselineProbeStatus = 'ok';
           }
+          if (threadContinue) info.threadContinue = true;
         }
         // The Messages compatibility response exposes Anthropic's disjoint
         // usage buckets to the client. Dashboard accounting still needs the
@@ -1665,6 +1670,9 @@ let responseContentType: string | undefined;
     let baselinePromise: Promise<number | null> | undefined;
     let baselineCacheablePromise: Promise<number | null> | undefined;
     let baselineStatusApplies = false;
+    // Server-side thread continuation: the probe sees only the delta, while usage
+    // bills the server-held thread too, so the pair is not a counterfactual.
+    let threadContinue = false;
     let responsesStreaming = false;
 
     if (bypass && isOpenAIResponsesWire
@@ -1855,6 +1863,7 @@ let responseContentType: string | undefined;
 
         if (isMessages && messagesAnthropic) {
           baselineStatusApplies = true;
+          threadContinue = isThreadContinuation(bodyIn);
           // Probes fire on the ORIGINAL body before the main forward so all three overlap.
           // count_tokens is not billed; ~30-80ms latency is hidden by the main forward.
           const ctBody = buildBaselineCountTokensBody(bodyIn);

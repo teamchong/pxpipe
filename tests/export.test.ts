@@ -244,6 +244,52 @@ describe('parseExportArgv', () => {
     if (result.kind !== 'error') return;
     expect(result.message).toContain('unknown option');
   });
+
+  // Every value-taking flag has the same contract: the next argv entry is its
+  // value, and a flag cannot be one. --include/--exclude/--diff enforced it;
+  // --out/--model did not, so a forgotten value silently consumed the next flag.
+  describe.each([
+    ['--include'], ['--exclude'], ['--diff'], ['--out'], ['--model'],
+  ])('%s requires a real value', (flag) => {
+    it('rejects a following flag instead of swallowing it', () => {
+      const result = parseExportArgv([flag, '--json', 'a.ts'], '/tmp');
+      expect(result.kind).toBe('error');
+      if (result.kind !== 'error') return;
+      expect(result.message).toBe(`${flag} requires a value`);
+    });
+
+    it('rejects a missing value at the end of argv', () => {
+      const result = parseExportArgv(['a.ts', flag], '/tmp');
+      expect(result.kind).toBe('error');
+    });
+  });
+
+  it('does not write an export into a directory named after a flag', () => {
+    // The concrete failure: node.ts mkdirSync(opts.out) then mkdtempSync inside it,
+    // so out="--json" created a literal ./--json directory — and --json was gone,
+    // so the run that was asked for machine-readable output printed human text.
+    const result = parseExportArgv(['--out', '--json', 'a.ts'], '/tmp');
+    expect(result.kind).toBe('error');
+  });
+
+  it('does not price an export for a model the user never named', () => {
+    // An unknown model resolves to the fallback profile rather than erroring, so a
+    // swallowed flag here renders and costs the export against the wrong model.
+    const result = parseExportArgv(['--model', '--json', 'a.ts'], '/tmp');
+    expect(result.kind).toBe('error');
+  });
+
+  it('still accepts a dash-leading value through the = form', () => {
+    const out = parseExportArgv(['--out=-weird-dir'], '/tmp');
+    expect(out.kind).toBe('opts');
+    if (out.kind !== 'opts') return;
+    expect(out.parsed.out).toBe('-weird-dir');
+
+    const model = parseExportArgv(['--model=-weird-model'], '/tmp');
+    expect(model.kind).toBe('opts');
+    if (model.kind !== 'opts') return;
+    expect(model.parsed.model).toBe('-weird-model');
+  });
 });
 
 // ---------------------------------------------------------------------------

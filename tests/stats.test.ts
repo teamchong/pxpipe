@@ -87,6 +87,40 @@ describe('stats aggregator', () => {
     expect(s.cacheCreateTokensTotal).toBe(5000);
   });
 
+  it('aggregates Google/OpenAI subset cached_tokens without double-counting total input', () => {
+    const s = newSummary();
+    fold(
+      s,
+      ev({
+        path: '/v1internal:streamGenerateContent',
+        input_tokens: 40000,
+        cached_tokens: 36000,
+        output_tokens: 500,
+        baseline_tokens: 120000,
+        baseline_probe_status: 'ok',
+      }),
+    );
+    fold(
+      s,
+      ev({
+        path: '/v1internal:streamGenerateContent',
+        input_tokens: 10000,
+        cached_tokens: 0,
+        output_tokens: 200,
+      }),
+    );
+    expect(s.eventsWithUsage).toBe(2);
+    expect(s.cacheHitEvents).toBe(1);
+    // Uncached input = (40000 - 36000) + 10000 = 14000; cached = 36000; totalIn = 50000.
+    expect(s.inputTokensTotal).toBe(14000);
+    expect(s.cacheReadTokensTotal).toBe(36000);
+    expect(s.measuredActualTokensTotal).toBe(40000);
+    const out = renderTextReport(s);
+    // 36000 / 50000 = 72.0% by tokens, 1 / 2 = 50.0% by events.
+    expect(out).toMatch(/cache hit rate \(by tokens\):\s+72.0%/);
+    expect(out).toMatch(/cache hit rate \(by events\):\s+50.0%/);
+  });
+
   it('buckets by cwd and tracks system_sha8 reuse', () => {
     const s = newSummary();
     fold(s, ev({ cwd: '/a', system_sha8: 'aaa', orig_chars: 100, image_bytes: 20 }));

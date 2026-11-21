@@ -16,7 +16,7 @@ import {
 } from './render.js';
 import { geminiVisionTokens, hasGeminiMeasuredProfile, resolveGeminiProfile } from './gemini-model-profiles.js';
 import { bytesToBase64 } from './png.js';
-import { classifyContent, compactSlabWhitespace, type TransformInfo } from './transform.js';
+import { classifyContent, compactSlabWhitespace, sha8, type TransformInfo } from './transform.js';
 import {
   prepareImagedRenderText,
   droppedCodepointsTop,
@@ -113,9 +113,17 @@ interface GoogleHistoryUnit {
   opaque: boolean;
 }
 
+interface GoogleHistoryChunk {
+  images: RenderedImage[];
+  imageSources: string[];
+  text: string;
+  factSheet: string;
+}
+
 interface GoogleHistoryPlan {
   start: number;
   endExclusive: number;
+  chunks: GoogleHistoryChunk[];
   images: RenderedImage[];
   imageSources: string[];
   text: string;
@@ -636,8 +644,18 @@ async function planGoogleHistory(
   const eligibleTokens = selected.reduce((sum, unit) => sum + unit.baselineTokens, 0);
   if (eligibleTokens < profile.history.minCollapseTokens) return null;
 
-  // Admit only complete turns whose rendered pages fit. Rendering the entire history and
-  // slicing its PNGs would remove an unrendered suffix from the native request.
+  // Seal threshold for each immutable Google history chunk (~85% of one full
+  // 1568x728 page). Sealing slightly below READABLE_CHARS_PER_IMAGE keeps each
+  // chunk on a single dense page while leaving the unsealed remainder as native
+  // text so previously sealed chunks stay byte-identical for Gemini's implicit
+  // prefix cache.
+  const GOOGLE_CHUNK_SEAL_CHARS = Math.floor(READABLE_CHARS_PER_IMAGE * 0.85);
+
+  // Admit only complete sealed chunks whose rendered pages fit. Leave any
+  // unsealed trailing remainder native until it crosses GOOGLE_CHUNK_SEAL_CHARS
+  // at a closed tool boundary so previously sealed chunks stay byte-identical
+  // across turns for Gemini's implicit prefix cache.
+  const chunks: GoogleHistoryChunk[] = [];
   const admitted: GoogleHistoryUnit[] = [];
   const images: RenderedImage[] = [];
   const imageSources: string[] = [];
@@ -645,21 +663,19 @@ async function planGoogleHistory(
   let cursor = 0;
   while (cursor < selected.length && images.length < profile.history.maxImages) {
     const remaining = profile.history.maxImages - images.length;
-    let targetEnd = Math.min(selected.length, cursor + minChunkTurns);
+    let targetEnd = -1;
     let accruedChars = 0;
     for (let i = cursor; i < selected.length; i++) {
       accruedChars += selected[i]!.text.length + 2;
-      if (i + 1 >= cursor + minChunkTurns && accruedChars >= READABLE_CHARS_PER_IMAGE) {
+      if (i + 1 >= cursor + minChunkTurns && accruedChars >= GOOGLE_CHUNK_SEAL_CHARS) {
         const closed = googleClosedBoundary(selected, cursor, i + 1) + 1;
         if (closed > cursor) {
           targetEnd = closed;
           break;
         }
       }
-      if (i === selected.length - 1) {
-        targetEnd = selected.length;
-      }
     }
+    if (targetEnd <= cursor) break;
     let candidateEnd = googleClosedBoundary(selected, cursor, targetEnd) + 1;
     let accepted = false;
     while (candidateEnd > cursor) {
@@ -674,9 +690,17 @@ async function planGoogleHistory(
         profile.maxHeightPx,
       );
       if (chunkImages.length > 0 && chunkImages.length <= remaining) {
+        const chunkFactSheet = factSheetText(chunkText, profile.factSheetFormat) ?? '';
+        const chunkImageSources = chunkImages.map(() => chunkText);
+        chunks.push({
+          images: chunkImages,
+          imageSources: chunkImageSources,
+          text: chunkText,
+          factSheet: chunkFactSheet,
+        });
         admitted.push(...chunk);
         images.push(...chunkImages);
-        imageSources.push(...chunkImages.map(() => chunkText));
+        imageSources.push(...chunkImageSources);
         cursor = candidateEnd;
         accepted = true;
         break;
@@ -694,7 +718,7 @@ async function planGoogleHistory(
     (sum, image) => sum + geminiVisionTokens(modelName, image.width, image.height),
     0,
   );
-  const factSheet = factSheetText(text, profile.factSheetFormat);
+  const factSheet = chunks.map((c) => c.factSheet).filter(Boolean).join('\n\n');
   const compactFraming = profile.history.framing === 'compact';
   const intro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_INTRO : HISTORY_TRANSCRIPT_INTRO;
   const outro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_OUTRO : HISTORY_TRANSCRIPT_OUTRO;
@@ -777,6 +801,7 @@ async function planGoogleHistory(
   return {
     start,
     endExclusive,
+    chunks,
     images,
     imageSources,
     text,
@@ -983,11 +1008,11 @@ export async function transformGoogleGenerateContent(
     const compactFraming = resolveGeminiProfile(modelName).history.framing === 'compact';
     const intro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_INTRO : HISTORY_TRANSCRIPT_INTRO;
     const outro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_OUTRO : HISTORY_TRANSCRIPT_OUTRO;
-    const historyParts: GooglePart[] = [
-      { text: intro },
-      ...historyPlan.images.map(imagePart),
-    ];
-    if (historyPlan.factSheet) historyParts.push({ text: historyPlan.factSheet });
+    const historyParts: GooglePart[] = [{ text: intro }];
+    for (const chunk of historyPlan.chunks) {
+      historyParts.push(...chunk.images.map(imagePart));
+      if (chunk.factSheet) historyParts.push({ text: chunk.factSheet });
+    }
     historyParts.push({ text: outro });
     if (historyPlan.pinnedUserText) {
       historyParts.push({ text: historyPlan.pinnedUserText });
@@ -1124,6 +1149,16 @@ export async function transformGoogleGenerateContent(
     info.toolResultImgs = toolResultPlan.images.length;
     info.bucketChars = { ...info.bucketChars, ...toolResultPlan.bucketChars };
     info.droppedChars = (info.droppedChars ?? 0) + toolResultPlan.droppedChars;
+  }
+
+  if (historyPlan && historyPlan.images.length > 0) {
+    info.historyImageSha = await sha8(
+      historyPlan.images.map((image) => bytesToBase64(image.png)).join(''),
+    );
+  }
+  const totalPixels = info.imageDims.reduce((sum, d) => sum + d.width * d.height, 0);
+  if (totalPixels > 0) {
+    info.imagePixels = totalPixels;
   }
 
   const outPayload = isEnvelope ? { ...reqRecord, request: transformedReq } : transformedReq;

@@ -243,6 +243,8 @@ export async function aggregateSessions(
     }
     if (typeof ev.cache_read_tokens === 'number') {
       s.cacheReadTokens += ev.cache_read_tokens;
+    } else if (typeof ev.cached_tokens === 'number') {
+      s.cacheReadTokens += ev.cached_tokens;
     }
     if (ev.req_body_sample_path) {
       let set = sidecarsBySession.get(id);

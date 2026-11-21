@@ -555,6 +555,43 @@ async function gzipBytes(body: Uint8Array): Promise<Uint8Array> {
   return new Uint8Array(buf);
 }
 
+/**
+ * Upstream hosts verified to accept `Content-Encoding: gzip` on JSON inference
+ * POST bodies. Base64-encoded PNG payloads shrink ~24% under gzip and raw JSON
+ * text shrinks ~60-70%, cutting upload latency on bandwidth-constrained links
+ * without altering the decoded JSON payload. Unverified custom/third-party
+ * gateways and local loopback mock servers are intentionally excluded.
+ */
+const GZIP_UPSTREAM_HOSTS = new Set([
+  'api.anthropic.com',
+  'daily-cloudcode-pa.googleapis.com',
+  'cloudcode-pa.googleapis.com',
+  'generativelanguage.googleapis.com',
+]);
+
+/** Minimum buffered JSON body size before spending CPU to gzip an outbound POST. */
+export const GZIP_UPSTREAM_MIN_BYTES = 16 * 1024;
+
+/** True when an outbound request is safe and worthwhile to gzip on the wire. */
+export function shouldGzipUpstreamRequest(
+  upstreamUrl: string,
+  method: string,
+  headers: Headers,
+  body: unknown,
+): body is Uint8Array {
+  if (method !== 'POST') return false;
+  if (!(body instanceof Uint8Array) || body.byteLength < GZIP_UPSTREAM_MIN_BYTES) return false;
+  if (headers.has('content-encoding')) return false;
+  const ct = headers.get('content-type')?.toLowerCase() ?? '';
+  if (!ct.includes('json')) return false;
+  try {
+    const host = new URL(upstreamUrl).hostname.toLowerCase();
+    return GZIP_UPSTREAM_HOSTS.has(host);
+  } catch {
+    return false;
+  }
+}
+
 /** SHA-256 hex of a byte buffer. */
 async function sha256Bytes(body: Uint8Array): Promise<string> {
   // Cast: Web Crypto accepts Uint8Array at runtime despite the BufferSource type.
@@ -2166,15 +2203,28 @@ let responseContentType: string | undefined;
       }
     };
 
+    let wireBody: BodyInit | null = bodyOut;
+    if (shouldGzipUpstreamRequest(upstreamUrl, req.method, outHeaders, bodyOut)) {
+      try {
+        const gz = await gzipBytes(bodyOut);
+        if (gz.byteLength < bodyOut.byteLength) {
+          wireBody = gz as unknown as BodyInit;
+          outHeaders.set('content-encoding', 'gzip');
+        }
+      } catch {
+        // Compression failure is never fatal: fall back to the uncompressed body.
+      }
+    }
+
     let upstreamRes: Response;
     try {
       const upstreamFetch = fetch(upstreamUrl, {
         method: req.method,
         headers: outHeaders,
-        body: bodyOut,
+        body: wireBody,
         signal: upstreamAbort.signal,
         // duplex is required by spec when sending a stream as body
-        ...(bodyOut instanceof ReadableStream ? { duplex: 'half' } : {}),
+        ...(wireBody instanceof ReadableStream ? { duplex: 'half' } : {}),
       } as RequestInit);
       const raced =
         headersTimeoutMs > 0 ? await Promise.race([upstreamFetch, headersDeadline]) : await upstreamFetch;

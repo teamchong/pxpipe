@@ -1878,7 +1878,12 @@ let responseContentType: string | undefined;
               ? await transformOpenAIChatCompletions(bodyIn, effectiveOpts)
               : await transformOpenAIResponses(bodyIn, effectiveOpts);
         transformMs = Date.now() - tTransform;
-        if (isGoogle && r.info.compressed) {
+        // Cloud Code PA (/v1internal:*) does not accept the Gemini Developer API :countTokens
+        // payload shapes; probing it blocks every compressed turn for up to COUNT_TOKENS_TIMEOUT_MS
+        // (30s) while uploading both the raw and imaged bodies twice before always failing.
+        // Local profitability from transformGoogleGenerateContent still gates compression.
+        const isCloudCodePa = url.pathname.startsWith('/v1internal:');
+        if (isGoogle && r.info.compressed && !isCloudCodePa) {
           const countHeaders = applyGatewayHeaders(filterHeaders(req.headers, STRIP_REQ_HEADERS));
           countHeaders.set('content-type', 'application/json');
           const countUrl = new URL(

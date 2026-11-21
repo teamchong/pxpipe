@@ -69,4 +69,55 @@ describe('PNG encoder is lossless', () => {
     const one = await decode(await encodeGrayPng(new Uint8Array([137]), 1, 1));
     expect(one.data[0]).toBe(137);
   });
+
+  it('round-trips 1-bit, 2-bit, 4-bit indexed and 8-bit grayscale across odd widths', async () => {
+    const cases: Array<{ name: string; palette: number[]; expectedBitDepth: number; expectedColorType: number }> = [
+      { name: '1-bit (2 colors)', palette: [0, 255], expectedBitDepth: 1, expectedColorType: 3 },
+      { name: '2-bit (4 colors)', palette: [0, 68, 170, 255], expectedBitDepth: 2, expectedColorType: 3 },
+      { name: '4-bit (5 AA grays)', palette: [0, 31, 68, 119, 255], expectedBitDepth: 4, expectedColorType: 3 },
+      { name: '4-bit (16 grays)', palette: Array.from({ length: 16 }, (_, i) => i * 17), expectedBitDepth: 4, expectedColorType: 3 },
+      { name: '8-bit (>16 grays)', palette: Array.from({ length: 20 }, (_, i) => i * 13), expectedBitDepth: 8, expectedColorType: 0 },
+    ];
+    for (const c of cases) {
+      for (const W of [1, 3, 7, 13, 31]) {
+        const H = 21;
+        const pixels = new Uint8Array(W * H);
+        for (let i = 0; i < pixels.length; i++) {
+          pixels[i] = c.palette[i % c.palette.length]!;
+        }
+        const png = await encodeGrayPng(pixels, W, H);
+        expect(png[24], `${c.name} W=${W} bitDepth`).toBe(c.expectedBitDepth);
+        expect(png[25], `${c.name} W=${W} colorType`).toBe(c.expectedColorType);
+        const out = await decode(png);
+        expect([out.w, out.h]).toEqual([W, H]);
+        for (let i = 0; i < pixels.length; i++) {
+          expect(out.data[i * 4], `${c.name} W=${W} px ${i}`).toBe(pixels[i]);
+        }
+      }
+    }
+  });
+
+  it('round-trips indexed PLTE RGB (<=16 colors) and 8-bit RGB (>16 colors) bit-exact', async () => {
+    const W = 19, H = 11;
+    const palette: Array<[number, number, number]> = [
+      [255, 255, 255], [0, 0, 0], [220, 38, 38], [30, 64, 175], [22, 163, 74],
+    ];
+    const pixels = new Uint8Array(W * H * 3);
+    for (let i = 0; i < W * H; i++) {
+      const [r, g, b] = palette[(i * 3 + Math.floor(i / W)) % palette.length]!;
+      pixels[i * 3] = r;
+      pixels[i * 3 + 1] = g;
+      pixels[i * 3 + 2] = b;
+    }
+    const png = await encodeRgbPng(pixels, W, H);
+    expect(png[24]).toBe(4); // 5 colors -> 4-bit PLTE
+    expect(png[25]).toBe(3); // indexed-color
+    const out = await decode(png);
+    expect([out.w, out.h]).toEqual([W, H]);
+    for (let i = 0; i < W * H; i++) {
+      expect([out.data[i * 4], out.data[i * 4 + 1], out.data[i * 4 + 2]]).toEqual([
+        pixels[i * 3], pixels[i * 3 + 1], pixels[i * 3 + 2],
+      ]);
+    }
+  });
 });

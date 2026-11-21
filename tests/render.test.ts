@@ -2469,15 +2469,38 @@ describe('colorByRole (structure-through slot string)', () => {
     expect(ROLE_PALETTE[0]).not.toEqual(ROLE_PALETTE[1]);
   });
 
-  it('emits RGB truecolor PNG when slot coloring is on, grayscale when off', async () => {
+  it('emits colored PNG when slot coloring is on, grayscale when off', async () => {
     const text = '<user>\nhello user\n</user>\n\n<assistant>\nhello model\n</assistant>';
     const slot =
       `${roleSlotSegment('user', 'hello user', SLOT_MARK_USER)}\n\n` +
       `${roleSlotSegment('assistant', 'hello model', SLOT_MARK_ASSISTANT)}`;
     const colored = await renderChunkToPng(text, 40, { colorByRole: true }, undefined, slot);
     const plain = await renderChunkToPng(text, 40, {});
-    // PNG IHDR colorType byte: sig(8) + len(4) + "IHDR"(4) + ihdr[9] = offset 25.
-    expect(colored.png[25]).toBe(2); // 2 = truecolor RGB
-    expect(plain.png[25]).toBe(0); // 0 = grayscale
+    // Helper: inspect IHDR colorType (offset 25) and, for indexed PLTE (colorType 3),
+    // whether any palette entry has non-gray R/G/B channels.
+    const hasChroma = (png: Uint8Array): boolean => {
+      const colorType = png[25];
+      if (colorType === 2) return true;
+      if (colorType === 0) return false;
+      if (colorType === 3) {
+        const dv = new DataView(png.buffer, png.byteOffset, png.byteLength);
+        let off = 8;
+        while (off + 8 <= png.byteLength) {
+          const len = dv.getUint32(off, false);
+          const type = String.fromCharCode(png[off + 4]!, png[off + 5]!, png[off + 6]!, png[off + 7]!);
+          if (type === 'PLTE') {
+            for (let i = 0; i < len; i += 3) {
+              const r = png[off + 8 + i]!, g = png[off + 8 + i + 1]!, b = png[off + 8 + i + 2]!;
+              if (r !== g || g !== b) return true;
+            }
+            return false;
+          }
+          off += 12 + len;
+        }
+      }
+      return false;
+    };
+    expect(hasChroma(colored.png)).toBe(true);
+    expect(hasChroma(plain.png)).toBe(false);
   });
 });

@@ -550,9 +550,13 @@ describe('transformGoogleGenerateContent', () => {
 
     expect(result.info.compressed).toBe(true);
     expect(result.info.historyReason).toBe('collapsed');
-    // All 296 turns before keepTail=4 collapse (used to stall at 191 turns / 32 images).
-    expect(result.info.collapsedTurns).toBe(296);
+    // Sealed chunks pack well past the legacy 191-turn / 32-image stall while
+    // leaving only the <1-page unsealed remainder native for prefix-cache stability.
+    expect(result.info.collapsedTurns).toBeGreaterThanOrEqual(240);
+    expect(result.info.collapsedTurns).toBeLessThanOrEqual(296);
     expect(result.info.collapsedImages ?? 0).toBeLessThanOrEqual(16);
+    expect(result.info.imagePixels ?? 0).toBeGreaterThan(0);
+    expect(result.info.historyImageSha).toMatch(/^[0-9a-f]{8}$/);
     expect((result.info.imageSources ?? []).join('\n')).not.toContain('internal reasoning trace 0');
   });
 
@@ -765,6 +769,74 @@ describe('transformGoogleGenerateContent', () => {
     expect(serialized).toContain('First task: inspect old module.');
     expect(serialized).toContain('The live current request is in the user message(s) that follow');
     expect(serialized).toContain('Second task: now explain the new module.');
+  });
+
+  it('keeps contents[0] byte-identical between chunk seals and append-only across seals for Gemini prefix caching', async () => {
+    const buildSession = (pairs: number) => {
+      const contents: Array<Record<string, unknown>> = [
+        { role: 'user', parts: [{ text: 'LIVE TASK: maintain byte-stable prefix across turns.' }] },
+      ];
+      for (let i = 0; i < pairs; i++) {
+        contents.push({
+          role: 'model',
+          parts: [{ functionCall: { name: 'bash', args: { command: `echo run-${i}` } } }],
+        });
+        contents.push({
+          role: 'user',
+          parts: [{ functionResponse: { name: 'bash', response: { output: `run-output-${i} token_${i} `.repeat(95) } } }],
+        });
+      }
+      return {
+        systemInstruction: { parts: [{ text: 'You are a coding agent. '.repeat(250) }] },
+        contents,
+      };
+    };
+
+    // 18 pairs (~38k chars) seals Chunk 0 while leaving an unsealed trailing remainder.
+    const r1 = await transformGoogleGenerateContent(
+      new TextEncoder().encode(JSON.stringify(buildSession(18))),
+      'gemini-4-neon-high',
+      { compress: true, compressToolResults: false },
+    );
+    // 19 pairs adds 1 tool round without crossing Chunk 1's seal threshold.
+    const r2 = await transformGoogleGenerateContent(
+      new TextEncoder().encode(JSON.stringify(buildSession(19))),
+      'gemini-4-neon-high',
+      { compress: true, compressToolResults: false },
+    );
+    // 32 pairs seals Chunk 1 after Chunk 0.
+    const r3 = await transformGoogleGenerateContent(
+      new TextEncoder().encode(JSON.stringify(buildSession(32))),
+      'gemini-4-neon-high',
+      { compress: true, compressToolResults: false },
+    );
+
+    expect(r1.info.historyReason).toBe('collapsed');
+    expect(r2.info.historyReason).toBe('collapsed');
+    expect(r3.info.historyReason).toBe('collapsed');
+
+    // Between chunk seals: exact same sealed boundary, SHA, and byte-identical prefix.
+    expect(r2.info.collapsedTurns).toBe(r1.info.collapsedTurns);
+    expect(r2.info.historyImageSha).toBe(r1.info.historyImageSha);
+    expect(r1.info.imagePixels ?? 0).toBeGreaterThan(0);
+    const out1 = JSON.parse(new TextDecoder().decode(r1.body));
+    const out2 = JSON.parse(new TextDecoder().decode(r2.body));
+    const out3 = JSON.parse(new TextDecoder().decode(r3.body));
+    expect(out2.contents[0]).toEqual(out1.contents[0]);
+    expect(out2.contents.slice(0, out1.contents.length)).toEqual(out1.contents);
+
+    // Across a chunk seal: Chunk 1 appends after Chunk 0 without mutating any earlier parts.
+    expect(r3.info.collapsedTurns).toBeGreaterThan(r1.info.collapsedTurns!);
+    expect(r3.info.collapsedImages).toBeGreaterThan(r1.info.collapsedImages!);
+    const parts1 = out1.contents[0].parts as Array<Record<string, unknown>>;
+    const parts3 = out3.contents[0].parts as Array<Record<string, unknown>>;
+    // Everything before the closing outro part in out1 (static slab, user prompt, intro,
+    // Chunk 0 PNGs, Chunk 0 fact sheet) must be byte-identical in out3.
+    const outroIdx1 = parts1.findIndex(
+      (p) => typeof p.text === 'string' && p.text.includes('End earlier conversation.'),
+    );
+    expect(outroIdx1).toBeGreaterThan(0);
+    expect(parts3.slice(0, outroIdx1)).toEqual(parts1.slice(0, outroIdx1));
   });
 
   describe('normalizeGoogleTurnRoles', () => {

@@ -767,6 +767,43 @@ describe('transformGoogleGenerateContent', () => {
     expect(serialized).toContain('Second task: now explain the new module.');
   });
 
+  it('populates stable systemSha8 and firstUserSha8 across turns for session grouping', async () => {
+    const sys = { parts: [{ text: 'You are a coding agent. '.repeat(250) }] };
+    const turn1 = await transformGoogleGenerateContent(
+      new TextEncoder().encode(JSON.stringify({
+        systemInstruction: sys,
+        contents: [
+          {
+            role: 'user',
+            parts: [{ text: '<system-reminder>t=1</system-reminder>\nInspect the proxy cache.' }],
+          },
+        ],
+      })),
+      'gemini-4-neon-high',
+      { compress: true },
+    );
+    const turn2 = await transformGoogleGenerateContent(
+      new TextEncoder().encode(JSON.stringify({
+        systemInstruction: sys,
+        contents: [
+          {
+            role: 'user',
+            parts: [{ text: '<system-reminder>t=2</system-reminder>\nInspect the proxy cache.' }],
+          },
+          { role: 'model', parts: [{ text: 'Checked src/core/proxy.ts.' }] },
+          { role: 'user', parts: [{ text: 'Now check src/core/google.ts.' }] },
+        ],
+      })),
+      'gemini-4-neon-high',
+      { compress: true },
+    );
+
+    expect(turn1.info.systemSha8).toMatch(/^[0-9a-f]{8}$/);
+    expect(turn1.info.firstUserSha8).toMatch(/^[0-9a-f]{8}$/);
+    expect(turn2.info.systemSha8).toBe(turn1.info.systemSha8);
+    expect(turn2.info.firstUserSha8).toBe(turn1.info.firstUserSha8);
+  });
+
   describe('normalizeGoogleTurnRoles', () => {
     it('appends a user turn if the last turn is model', () => {
       const turns = [

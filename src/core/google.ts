@@ -16,7 +16,7 @@ import {
 } from './render.js';
 import { geminiVisionTokens, hasGeminiMeasuredProfile, resolveGeminiProfile } from './gemini-model-profiles.js';
 import { bytesToBase64 } from './png.js';
-import { classifyContent, compactSlabWhitespace, type TransformInfo } from './transform.js';
+import { classifyContent, compactSlabWhitespace, sha8, type TransformInfo } from './transform.js';
 import {
   prepareImagedRenderText,
   droppedCodepointsTop,
@@ -920,6 +920,7 @@ export async function transformGoogleGenerateContent(
 
   if (combinedRaw) {
     const combined = compactSlabWhitespace(combinedRaw).trimEnd();
+    info.systemSha8 = await sha8(combined);
     const reflowNote = options.reflow !== false
       ? ' The glyph ↵ (U+21B5) marks an original hard line break in content; treat it as a real newline.'
       : '';
@@ -972,6 +973,21 @@ export async function transformGoogleGenerateContent(
   for (const content of originalContents) {
     if (!record(content) || (content.parts !== undefined && !Array.isArray(content.parts))) {
       return { body: pinBody, info: createDefaultInfo(modelName) };
+    }
+  }
+  for (const content of originalContents) {
+    if (content.role === 'model' || !Array.isArray(content.parts)) continue;
+    const textParts: string[] = [];
+    for (const rawPart of content.parts) {
+      const part = record(rawPart);
+      if (part && typeof part.text === 'string' && !part.thought) {
+        textParts.push(part.text);
+      }
+    }
+    const prompt = extractGoogleUserPrompt(textParts);
+    if (prompt?.text) {
+      info.firstUserSha8 = await sha8(prompt.text.slice(0, 4096));
+      break;
     }
   }
 

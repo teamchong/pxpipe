@@ -452,6 +452,25 @@ function googleHistoryUnit(content: GoogleContent, index: number): GoogleHistory
   };
 }
 
+/**
+ * File-reading tools whose outputs are commonly quoted verbatim by an immediately
+ * following edit tool (`edit_file`, `Edit`, `replace`). Keeping them as native text
+ * in the live tail avoids OCR/whitespace misses while a file is actively being edited;
+ * once those turns age into collapsed history, `planGoogleHistory` still compresses them.
+ */
+const EXACT_TEXT_TOOL_NAMES = new Set([
+  'read',
+  'read_file',
+  'view_file',
+  'file_read',
+  'get_file_contents',
+]);
+
+function isExactTextTool(name: string): boolean {
+  const bare = name.includes(':') ? name.slice(name.lastIndexOf(':') + 1) : name;
+  return EXACT_TEXT_TOOL_NAMES.has(bare.toLowerCase());
+}
+
 async function compressGoogleToolResults(
   contents: GoogleContent[],
   modelName: string,
@@ -513,6 +532,10 @@ async function compressGoogleToolResults(
       }
 
       const name = typeof response.name === 'string' ? response.name : 'tool';
+      if (isExactTextTool(name)) {
+        rewrittenParts.push(rawPart);
+        continue;
+      }
       const compact = compactSlabWhitespace(raw);
       const safe = neutralizeSentinel(compact);
       const packed = options.reflow !== false ? reflow(safe) ?? safe : safe;

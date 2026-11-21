@@ -767,6 +767,40 @@ describe('transformGoogleGenerateContent', () => {
     expect(serialized).toContain('Second task: now explain the new module.');
   });
 
+  it('keeps file-read tool results as verbatim text in the live tail while still compressing other tools', async () => {
+    const fileBody = Array.from(
+      { length: 250 },
+      (_, i) => `const line_${i} = 'exact_whitespace_${i}'; // col=${i}`,
+    ).join('\n');
+    const makeReq = (toolName: string) => ({
+      systemInstruction: { parts: [{ text: 'You are a coding agent. '.repeat(250) }] },
+      contents: [
+        { role: 'user', parts: [{ text: 'Edit this file.' }] },
+        { role: 'model', parts: [{ functionCall: { name: toolName, args: { path: 'src/app.ts' } } }] },
+        { role: 'user', parts: [{ functionResponse: { name: toolName, response: { content: fileBody } } }] },
+      ],
+    });
+    for (const toolName of ['read_file', 'read', 'view_file', 'file_read', 'get_file_contents', 'default_api:read_file']) {
+      const res = await transformGoogleGenerateContent(
+        new TextEncoder().encode(JSON.stringify(makeReq(toolName))),
+        'gemini-4-neon-high',
+        { compress: true, collapseHistory: false },
+      );
+      expect(res.info.toolResultImgs ?? 0).toBe(0);
+      const out = JSON.parse(new TextDecoder().decode(res.body));
+      const resp = out.contents[2].parts[0].functionResponse;
+      expect(resp.response.content).toBe(fileBody);
+      expect(resp.parts).toBeUndefined();
+    }
+    // Non-read bulky tools (grep, bash) still compress into PNGs
+    const grepRes = await transformGoogleGenerateContent(
+      new TextEncoder().encode(JSON.stringify(makeReq('grep'))),
+      'gemini-4-neon-high',
+      { compress: true, collapseHistory: false },
+    );
+    expect(grepRes.info.toolResultImgs ?? 0).toBeGreaterThan(0);
+  });
+
   describe('normalizeGoogleTurnRoles', () => {
     it('appends a user turn if the last turn is model', () => {
       const turns = [

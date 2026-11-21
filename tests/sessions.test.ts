@@ -420,6 +420,27 @@ describe('aggregateSessions', () => {
     // 9900 (warm via cr) + 9900 (cold: 35000 - 25100).
     expect(sessions.get('eeeeeeee')!.tokensSavedEst).toBe(19_800);
   });
+
+  it('counts Google/OpenAI cached_tokens in session cacheReadTokens', async () => {
+    writeEvents(tmp, [
+      ev({
+        first_user_sha8: 'gggggggg',
+        path: '/v1internal:streamGenerateContent',
+        input_tokens: 40_000,
+        cached_tokens: 36_000,
+        output_tokens: 500,
+      }),
+      ev({
+        first_user_sha8: 'gggggggg',
+        path: '/v1internal:streamGenerateContent',
+        input_tokens: 42_000,
+        cached_tokens: 38_000,
+        output_tokens: 400,
+      }),
+    ]);
+    const { sessions } = await aggregateSessions(tmp);
+    expect(sessions.get('gggggggg')!.cacheReadTokens).toBe(74_000);
+  });
 });
 
 // ---- filter + list ---------------------------------------------------------

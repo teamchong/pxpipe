@@ -120,18 +120,27 @@ export function fold(s: Summary, ev: TrackEvent): Summary {
   if (typeof ev.duration_ms === 'number') s.durationMs.push(ev.duration_ms);
   if (typeof ev.first_byte_ms === 'number') s.firstByteMs.push(ev.first_byte_ms);
 
+  const isSubsetCached =
+    ev.cache_read_tokens === undefined && typeof ev.cached_tokens === 'number';
+  const cacheRead = isSubsetCached
+    ? ev.cached_tokens!
+    : (ev.cache_read_tokens ?? 0);
+  const uncachedInput = isSubsetCached
+    ? Math.max(0, (ev.input_tokens ?? 0) - cacheRead)
+    : (ev.input_tokens ?? 0);
   const hasUsage =
     typeof ev.input_tokens === 'number' ||
     typeof ev.cache_read_tokens === 'number' ||
     typeof ev.cache_create_tokens === 'number' ||
+    typeof ev.cached_tokens === 'number' ||
     typeof ev.output_tokens === 'number';
   if (hasUsage) {
     s.eventsWithUsage++;
-    s.inputTokensTotal += ev.input_tokens ?? 0;
+    s.inputTokensTotal += uncachedInput;
     s.outputTokensTotal += ev.output_tokens ?? 0;
     s.cacheCreateTokensTotal += ev.cache_create_tokens ?? 0;
-    s.cacheReadTokensTotal += ev.cache_read_tokens ?? 0;
-    if ((ev.cache_read_tokens ?? 0) > 0) s.cacheHitEvents++;
+    s.cacheReadTokensTotal += cacheRead;
+    if (cacheRead > 0) s.cacheHitEvents++;
   }
 
   // Measured savings: pair count_tokens(original body) against real usage on

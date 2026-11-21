@@ -199,4 +199,56 @@ describe('Antigravity CloudCode PA inference routing', () => {
     expect(capturedUrl).toBe('https://mock-google-gateway.internal/google-ai-studio/v1beta/models/gemini-4-argon:streamGenerateContent?alt=sse');
     expect(capturedHeaders?.get('authorization')).toBe('Bearer google-test-token');
   });
+
+  it('skips blocking :countTokens probes on compressed /v1internal requests', async () => {
+    const requestedUrls: string[] = [];
+    let capturedInfo: { compressed?: boolean; baselineProbeStatus?: string } | undefined;
+
+    globalThis.fetch = async (input: RequestInfo | URL) => {
+      requestedUrls.push(input.toString());
+      const ssePayload = [
+        'data: {"response": {"candidates": [{"content": {"role": "model", "parts": [{"text": "OK"}]}}], "usageMetadata": {"promptTokenCount": 1200, "candidatesTokenCount": 10, "totalTokenCount": 1210}}}\n\n',
+      ].join('');
+      return new Response(ssePayload, {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      });
+    };
+
+    const proxy = createProxy({
+      transform: { compress: true },
+      onRequest: (ev) => { capturedInfo = ev.info; },
+    });
+
+    const envelope = {
+      project: 'aicode-consumers',
+      model: 'gemini-4-neon-high',
+      request: {
+        systemInstruction: {
+          parts: [{ text: 'System instruction text for Antigravity compression test. '.repeat(300) }],
+        },
+        contents: [{ role: 'user', parts: [{ text: 'Explain how pxpipe works.' }] }],
+      },
+    };
+
+    const req = new Request('http://127.0.0.1:47821/v1internal:streamGenerateContent?alt=sse', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'authorization': 'Bearer ya29.test-google-token',
+        'host': 'daily-cloudcode-pa.googleapis.com',
+      },
+      body: JSON.stringify(envelope),
+    });
+
+    const res = await proxy(req);
+    expect(res.status).toBe(200);
+    await res.text();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(requestedUrls).toEqual([
+      'https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse',
+    ]);
+    expect(capturedInfo?.compressed).toBe(true);
+    expect(capturedInfo?.baselineProbeStatus).toBeUndefined();
+  });
 });

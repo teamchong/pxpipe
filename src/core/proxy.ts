@@ -1340,6 +1340,7 @@ async function countTokensUpstream(
   countTokensUrl: string,
   body: Uint8Array,
   headers: Headers,
+  onError?: (reason: string) => void,
 ): Promise<number | null> {
   try {
     const res = await fetch(countTokensUrl, {
@@ -1348,10 +1349,20 @@ async function countTokensUpstream(
       body: body as unknown as BodyInit,
       signal: AbortSignal.timeout(COUNT_TOKENS_TIMEOUT_MS),
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      // Record why the probe failed so a 'failed' row is diagnosable. Error bodies
+      // are Anthropic error JSON (type + message), never request content or credentials.
+      let detail = '';
+      try { detail = (await res.text()).slice(0, 300); } catch { /* ignore */ }
+      onError?.(`http_${res.status}${detail ? ` ${detail}` : ''}`);
+      return null;
+    }
     const json = (await res.json()) as { input_tokens?: unknown };
-    return typeof json.input_tokens === 'number' ? json.input_tokens : null;
-  } catch {
+    if (typeof json.input_tokens === 'number') return json.input_tokens;
+    onError?.('no_input_tokens_in_response');
+    return null;
+  } catch (e) {
+    onError?.(`fetch_error ${(e as Error)?.name ?? ''}: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
     return null;
   }
 }
@@ -1587,6 +1598,8 @@ let responseContentType: string | undefined;
     let reqBodySha256: string | undefined;
     // Set once the transform returns; read by fire() at event time.
     let transformMs: number | undefined;
+    // Why the baseline count_tokens probe failed (status + upstream error), if it did.
+    let baselineProbeError: string | undefined;
 
     const fire = (
       status: number,
@@ -1636,6 +1649,7 @@ let responseContentType: string | undefined;
           }
           if (baselineResolved === null) {
             info.baselineProbeStatus = 'failed';
+            if (baselineProbeError) info.baselineProbeError = baselineProbeError;
           } else if (cacheableExpected && cacheableResolved === null) {
             info.baselineProbeStatus = 'partial'; // dashboard excludes row; must not treat as cacheable=0
           } else {
@@ -1962,7 +1976,9 @@ let responseContentType: string | undefined;
             const ctUrl = providerPrefixed
               ? joinProviderPath(passthroughUpstream, url.pathname + '/count_tokens')
               : upstream + url.pathname + '/count_tokens';
-            baselinePromise = countTokensUpstream(ctUrl, ctBody, ctHeaders);
+            baselinePromise = countTokensUpstream(ctUrl, ctBody, ctHeaders, (reason) => {
+              baselineProbeError = reason;
+            });
             // Null = no markers → cacheable=0 by definition, no probe needed.
             const ctCacheableBody = buildCacheablePrefixCountTokensBody(bodyIn);
             if (ctCacheableBody) {

@@ -188,6 +188,8 @@ export interface TrackEvent {
   baseline_cacheable_tokens?: number;
   /** Probe outcome. Dashboards must only attribute "$ saved" to rows where status === 'ok'. */
   baseline_probe_status?: 'ok' | 'partial' | 'failed';
+  /** Why the baseline probe failed (HTTP status + upstream error snippet). Present only on failure. */
+  baseline_probe_error?: string;
 
   // Errors:
   error?: string;
@@ -354,6 +356,9 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     }
     if (info.baselineProbeStatus !== undefined) {
       out.baseline_probe_status = info.baselineProbeStatus;
+    }
+    if (info.baselineProbeError !== undefined) {
+      out.baseline_probe_error = info.baselineProbeError;
     }
   }
   if (env) {

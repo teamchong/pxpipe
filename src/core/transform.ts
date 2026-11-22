@@ -814,6 +814,8 @@ export interface TransformInfo {
    *  didn't (exclude from rollup — cacheable=0 fallback is dishonest). 'failed': no
    *  baseline. undefined: no probe attempted. */
   baselineProbeStatus?: 'ok' | 'partial' | 'failed';
+  /** When baselineProbeStatus is 'failed': why (e.g. `http_401 {...}`, `fetch_error ...`). */
+  baselineProbeError?: string;
 }
 
 // --- helpers ---------------------------------------------------------------

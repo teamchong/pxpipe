@@ -15,6 +15,7 @@ import type { CacheControl, ContentBlock, ImageBlock, Message, TextBlock, ToolUs
 import type { RenderedImage } from './render.js';
 import { DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_CONTENT_COLS, maxCharsPerImage, DENSE_RENDER_STYLE, MAX_HEIGHT_PX, neutralizeSentinel, reflow, renderTextToPngsWithCharLimit, roleSlotSegment, SLOT_MARK_ASSISTANT, SLOT_MARK_USER, type RenderStyle } from './render.js';
 import { factSheetText } from './factsheet.js';
+import { addSplitStats, planSegments, SPLIT_MAX_IMAGE_SEGMENTS, type BoundSplitBlock, type SplitSpan } from './split-block.js';
 import { bytesToBase64 } from './png.js';
 
 /**
@@ -74,6 +75,8 @@ export interface HistoryCollapseOptions {
   reflow: boolean;
   /** Model-profile render style. */
   style: RenderStyle;
+  /** Split hook with site and cost bound by the caller. See split-block.ts. */
+  splitBlock: BoundSplitBlock | null;
   /** Model-profile page-height cap. */
   maxHeightPx: number;
   /** Chars one rendered page holds. Only an ESTIMATOR input (the renderer paginates
@@ -120,6 +123,7 @@ export const HISTORY_DEFAULTS: HistoryCollapseOptions = {
   protectedPrefix: 0,
   reflow: true,
   style: DENSE_RENDER_STYLE,
+  splitBlock: null,
   maxHeightPx: MAX_HEIGHT_PX,
   // MUST agree with `cols` above: pageChars is what the budget arithmetic thinks
   // one image holds, and DENSE_CONTENT_CHARS_PER_IMAGE is only true at 312 cols.
@@ -131,6 +135,10 @@ export const HISTORY_DEFAULTS: HistoryCollapseOptions = {
 
 /** Per-request telemetry surfaced back to TransformInfo. */
 export interface HistoryCollapseInfo {
+  /** Counters returned by the split hook. */
+  splitStats?: Record<string, number>;
+  /** Chunks the split hook kept as text because its decision is not ready yet. */
+  splitPending?: number;
   /** Number of turns collapsed into the history image. */
   collapsedTurns: number;
   /** Total chars of text that went into the history image. */
@@ -626,6 +634,7 @@ async function userTurnBlocks(
   fromInclusive: number,
   upToExclusive: number,
   onImage: (img: RenderedImage) => void,
+  keepLongAsText: boolean,
 ): Promise<ContentBlock[]> {
   const out: ContentBlock[] = [];
   let pending: string[] = [];
@@ -651,7 +660,7 @@ async function userTurnBlocks(
     if (m.role !== 'user') continue;
     const typed = typedUserText(m.content);
     if (!typed) continue;
-    if (typed.length <= USER_TEXT_MAX_CHARS) {
+    if (keepLongAsText || typed.length <= USER_TEXT_MAX_CHARS) {
       pending.push(`<user t="${i}">${typed}</user>`);
       continue;
     }
@@ -733,6 +742,52 @@ function latestCollapsedUserPointer(
 }
 
 /**
+ * Reflow a history text and its parallel slot string in lockstep, then render.
+ * The two have identical newline structure (slot bodies are verbatim copies), so
+ * minify/reflow mutate them the same way and role attribution stays
+ * codepoint-aligned; reflow() only bails on a ↵ collision, which hits both
+ * identically. Pre-existing ↵ is neutralized first (a 1:1 swap at identical
+ * positions) — otherwise reflow bails and the chunk renders raw, unpacked. The
+ * dense readable profile keeps code/config legible; colorByRole tints the
+ * structural <role> tags so turn boundaries are scannable. It is token-free
+ * (vision cost is by pixel dims) and carries the serialize-time slot string.
+ */
+async function renderHistoryText(text: string, slot: string, o: HistoryCollapseOptions): Promise<RenderedImage[]> {
+  let renderText = text;
+  let renderSlot = slot;
+  if (o.reflow) {
+    const safeText = neutralizeSentinel(text);
+    const safeSlot = neutralizeSentinel(slot);
+    const reflowedText = reflow(safeText);
+    const reflowedSlot = reflow(safeSlot);
+    if (reflowedText !== null && reflowedSlot !== null) {
+      renderText = reflowedText;
+      renderSlot = reflowedSlot;
+    } else {
+      renderText = safeText;
+      renderSlot = safeSlot;
+    }
+  }
+  return renderTextToPngsWithCharLimit(
+    renderText,
+    o.cols,
+    DENSE_CONTENT_CHARS_PER_IMAGE,
+    { ...o.style, colorByRole: true },
+    o.maxHeightPx,
+    renderSlot,
+  );
+}
+
+/** The role tags of a history chunk (`<user t="N">`, `</assistant>`, ...): the marker runs of its slot string. */
+export function historyProtectedSpans(slotText: string): SplitSpan[] {
+  const spans: SplitSpan[] = [];
+  for (const match of slotText.matchAll(new RegExp(`[${SLOT_MARK_USER}${SLOT_MARK_ASSISTANT}]+`, 'g'))) {
+    spans.push({ start: match.index, end: match.index + match[0].length });
+  }
+  return spans;
+}
+
+/**
  * Collapse the closed-prefix run into one synthetic user message with 1+ history images.
  * Returns original messages unchanged on any no-collapse path (reason set in info).
  * Image blocks are returned with NO cache_control — caller decides placement.
@@ -807,7 +862,7 @@ export async function collapseHistory(
     msgLen.push(seg.length === 0 ? 0 : seg.length + 2); // +2 = the "\n\n" joiner
     const m = messages[i]!;
     const typed = m.role === 'user' ? typedUserText(m.content) : '';
-    userImgLen.push(typed && typed.length > USER_TEXT_MAX_CHARS ? typed.length + 20 : 0);
+    userImgLen.push(!o.splitBlock && typed && typed.length > USER_TEXT_MAX_CHARS ? typed.length + 20 : 0);
   }
   const sumOf = (arr: number[], from: number, to: number): number => {
     let n = 0;
@@ -938,6 +993,12 @@ export async function collapseHistory(
     }
   };
   let chunkStart = protectedPrefix;
+  const wholeImageTexts: string[] = [];
+  const gateText = (piece: string): string => {
+    if (!o.reflow) return piece;
+    const safe = neutralizeSentinel(piece);
+    return reflow(safe) ?? safe;
+  };
   for (const chunkEnd of sortedEnds) {
     // messagesToHistorySegments already omits the user's typed words; userTurnBlocks
     // below carries them as text so a prompt is never read back out of pixels.
@@ -947,59 +1008,45 @@ export async function collapseHistory(
     if (!seg.text || seg.text.length === 0) {
       // Transcript empty (e.g. the chunk was nothing but user prompts) — the
       // prompts themselves still belong in the output.
-      blocks.push(...(await userTurnBlocks(messages, userFrom, chunkEnd, countImage)));
+      blocks.push(...(await userTurnBlocks(messages, userFrom, chunkEnd, countImage, o.splitBlock !== null)));
       continue;
     }
-    // Reflow the text and its parallel slot string in lockstep so role attribution
-    // stays codepoint-aligned with the rendered text. The two have identical newline
-    // structure (slot bodies are verbatim copies), so minify/reflow mutate them the
-    // same way; reflow() only bails on a ↵ collision, which hits both identically.
-    let chunkRender = seg.text;
-    let chunkSlot = seg.slotText;
-    if (o.reflow) {
-      // Neutralize pre-existing ↵ first (1:1 swap at identical positions in text+slot, so
-      // they stay codepoint-aligned) — otherwise reflow bails and the chunk renders raw,
-      // unpacked. This conversation's transcript literally contains ↵, which would defeat
-      // packing on exactly the long sessions where collapse matters most.
-      const safeText = neutralizeSentinel(seg.text);
-      const safeSlot = neutralizeSentinel(seg.slotText);
-      const rt = reflow(safeText);
-      const rs = reflow(safeSlot);
-      if (rt !== null && rs !== null) {
-        chunkRender = rt;
-        chunkSlot = rs;
-      } else {
-        chunkRender = safeText;
-        chunkSlot = safeSlot;
+    const protectedSpans = o.splitBlock ? historyProtectedSpans(seg.slotText) : [];
+    const plan = o.splitBlock ? await o.splitBlock(seg.text, protectedSpans, SPLIT_MAX_IMAGE_SEGMENTS) : undefined;
+    addSplitStats(info, plan?.stats);
+    if (plan?.kind === 'text' && plan.reason === 'pending') info.splitPending = (info.splitPending ?? 0) + 1;
+    const segments = planSegments(seg.text, plan, SPLIT_MAX_IMAGE_SEGMENTS, protectedSpans)
+      ?? [{ kind: plan === undefined || plan.kind === 'image' ? 'image' as const : 'text' as const, start: 0, end: seg.text.length }];
+    if (plan?.kind === 'image') wholeImageTexts.push(seg.text);
+    const markerCC = markerByEnd.get(chunkEnd);
+    const chunkFirst = blocks.length;
+    for (const segment of segments) {
+      const pieceText = seg.text.slice(segment.start, segment.end);
+      const keepAsText = segment.kind === 'text' || (segments.length > 1 && !isProfitable(gateText(pieceText), o.cols));
+      if (keepAsText) {
+        const previous = blocks.length > chunkFirst ? blocks[blocks.length - 1] : undefined;
+        if (previous?.type === 'text') blocks[blocks.length - 1] = { type: 'text', text: previous.text + pieceText };
+        else blocks.push({ type: 'text', text: pieceText });
+        continue;
+      }
+      const pieceSlot = seg.slotText.slice(segment.start, segment.end);
+      const trim = segments.length > 1 && pieceText.endsWith('\n') ? 1 : 0;
+      const imgs = await renderHistoryText(pieceText.slice(0, pieceText.length - trim), pieceSlot.slice(0, pieceSlot.length - trim), o);
+      for (const img of imgs) {
+        blocks.push({
+          type: 'image',
+          source: {
+            type: 'base64',
+            media_type: 'image/png',
+            data: bytesToBase64(img.png),
+          },
+        });
+        countImage(img);
       }
     }
-    // Use the dense readable profile (not full-canvas) to keep code/config legible.
-    // colorByRole tints the structural <role> tags so turn boundaries are scannable
-    // in the history image; it's token-free (vision cost is by pixel dims, not PNG
-    // byte depth) and carries the serialize-time slot string instead of re-parsing.
-    const imgs = await renderTextToPngsWithCharLimit(
-      chunkRender,
-      o.cols,
-      DENSE_CONTENT_CHARS_PER_IMAGE,
-      { ...o.style, colorByRole: true },
-      o.maxHeightPx,
-      chunkSlot,
-    );
-    const markerCC = markerByEnd.get(chunkEnd);
-    for (let k = 0; k < imgs.length; k++) {
-      const img = imgs[k]!;
-      const block: ImageBlock & { cache_control?: CacheControl } = {
-        type: 'image',
-        source: {
-          type: 'base64',
-          media_type: 'image/png',
-          data: bytesToBase64(img.png),
-        },
-      };
-      // Mark the LAST image of a marked segment — the caller's breakpoint anchor.
-      if (markerCC !== undefined && k === imgs.length - 1) block.cache_control = markerCC;
-      blocks.push(block);
-      countImage(img);
+    // Mark the LAST block of a marked segment — the caller's breakpoint anchor.
+    if (markerCC !== undefined && blocks.length > chunkFirst) {
+      blocks[blocks.length - 1] = { ...blocks[blocks.length - 1]!, cache_control: markerCC } as ContentBlock;
     }
     // The carry-over chunk's LAST image is the newest byte-stable history image.
     // Record its ordinal so the relocator pins the cache breakpoint here instead of
@@ -1007,14 +1054,35 @@ export async function collapseHistory(
     if (chunkEnd === carryOverEnd) carryOverOrdinal = imageCount - 1;
     // This chunk's user prompts, as text, immediately after the image they were
     // pulled out of — attribution stays local and the ordering matches the render.
-    blocks.push(...(await userTurnBlocks(messages, userFrom, chunkEnd, countImage)));
+    blocks.push(...(await userTurnBlocks(messages, userFrom, chunkEnd, countImage, o.splitBlock !== null)));
   }
   if (imageCount === 0) {
     info.reason = 'render_empty';
     return { messages, info };
   }
+  // Split pages are not in the grid estimate. A hook owns every history image, so a
+  // split that overruns the budget keeps the history as text for this turn.
+  if (o.splitBlock && imageCount > budget) {
+    return {
+      messages,
+      info: {
+        collapsedTurns: 0,
+        collapsedChars: 0,
+        collapsedImages: 0,
+        collapsedImageBytes: 0,
+        collapsedImagePixels: 0,
+        collapsedPngs: [],
+        collapsedImageDims: [],
+        droppedChars: 0,
+        droppedCodepoints: new Map(),
+        reason: 'over_budget',
+        ...(info.splitStats ? { splitStats: info.splitStats } : {}),
+        ...(info.splitPending ? { splitPending: info.splitPending } : {}),
+      },
+    };
+  }
   const latestUserPointer = latestCollapsedUserPointer(messages, collapseLen, protectedPrefix);
-  const historyFactSheet = factSheetText(text);
+  const historyFactSheet = factSheetText(o.splitBlock ? wholeImageTexts.join('\n\n') : text);
   const syntheticContent: ContentBlock[] = [
     { type: 'text', text: HISTORY_SYNTHETIC_INTRO },
     ...blocks,

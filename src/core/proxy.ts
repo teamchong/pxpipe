@@ -1848,7 +1848,8 @@ let responseContentType: string | undefined;
         if ((bridgedGptMessages || bridgedChatMessages) && effectiveModel) {
           requestModel = effectiveModel;
         }
-        const effectiveOpts = modelOk
+        const hookPath = isMessages && !bridgedGptMessages && !bridgedChatMessages;
+        const effectiveOpts = modelOk && (hookPath || !transformOpts?.splitBlock)
           ? transformOpts
           : { ...transformOpts, compress: false };
         const bridgeBody = bridgedGptMessages
@@ -1914,6 +1915,7 @@ let responseContentType: string | undefined;
           }
         }
         if (!modelOk) r.info.reason = 'unsupported_model';
+        else if (!hookPath && transformOpts?.splitBlock) r.info.reason = 'split_hook_unsupported_route';
         bodyOut = r.body as unknown as BodyInit; // TS narrows Uint8Array away from BodyInit
         info = r.info;
         reqBodyBytes = r.body;

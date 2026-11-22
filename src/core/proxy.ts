@@ -1336,22 +1336,78 @@ function isCanonicalOpenAIPath(pathname: string, headers: Headers, hasOpenAIKey:
  *  on the PRE-COMPRESSION body to get the ground-truth baseline. Actual
  *  post-compression tokens already come back free in the /v1/messages usage
  *  block (input_tokens + cache_create + cache_read), so no second probe. */
+/** anthropic-beta values count_tokens has rejected in this process. The client
+ *  (e.g. Claude Code) may send betas that /v1/messages accepts but
+ *  /v1/messages/count_tokens does not; we learn them from the 400 and drop them. */
+const countTokensRejectedBetas = new Set<string>();
+
+const REJECTED_BETA_RE = /Unexpected value\(s\) (.+?) for the `anthropic-beta` header/;
+
+/** Extract the beta names a count_tokens 400 complained about (backtick-quoted). */
+export function parseRejectedBetas(errorBody: string): string[] {
+  let msg = errorBody;
+  try {
+    const j = JSON.parse(errorBody) as { error?: { message?: unknown } };
+    if (typeof j?.error?.message === 'string') msg = j.error.message;
+  } catch { /* not JSON — scan raw text */ }
+  const m = REJECTED_BETA_RE.exec(msg);
+  if (!m) return [];
+  return [...(m[1] ?? "").matchAll(/`([^`]+)`/g)].map((x) => (x[1] ?? "").trim()).filter(Boolean);
+}
+
+function dropRejectedBetas(headers: Headers): void {
+  const raw = headers.get('anthropic-beta');
+  if (!raw || countTokensRejectedBetas.size === 0) return;
+  const kept = raw.split(',').map((b) => b.trim()).filter((b) => b && !countTokensRejectedBetas.has(b));
+  if (kept.length) headers.set('anthropic-beta', kept.join(','));
+  else headers.delete('anthropic-beta');
+}
+
+/** Test hook. */
+export function resetCountTokensRejectedBetasForTests(): void {
+  countTokensRejectedBetas.clear();
+}
+
 async function countTokensUpstream(
   countTokensUrl: string,
   body: Uint8Array,
   headers: Headers,
+  onError?: (reason: string) => void,
+  retried = false,
 ): Promise<number | null> {
   try {
+    headers = new Headers(headers);
+    dropRejectedBetas(headers);
     const res = await fetch(countTokensUrl, {
       method: 'POST',
       headers,
       body: body as unknown as BodyInit,
       signal: AbortSignal.timeout(COUNT_TOKENS_TIMEOUT_MS),
     });
-    if (!res.ok) return null;
+    if (res.status === 400 && !retried) {
+      const text = await res.text().catch(() => '');
+      const rejected = parseRejectedBetas(text);
+      if (rejected.length && rejected.some((b) => !countTokensRejectedBetas.has(b))) {
+        for (const b of rejected) countTokensRejectedBetas.add(b);
+        return countTokensUpstream(countTokensUrl, body, headers, onError, true);
+      }
+      onError?.(`http_400${text ? ` ${text.slice(0, 300)}` : ''}`);
+      return null;
+    }
+    if (!res.ok) {
+      // Record why the probe failed so a 'failed' row is diagnosable. Error bodies
+      // are Anthropic error JSON (type + message), never request content or credentials.
+      let detail = '';
+      try { detail = (await res.text()).slice(0, 300); } catch { /* ignore */ }
+      onError?.(`http_${res.status}${detail ? ` ${detail}` : ''}`);
+      return null;
+    }
     const json = (await res.json()) as { input_tokens?: unknown };
-    return typeof json.input_tokens === 'number' ? json.input_tokens : null;
-  } catch {
+    if (typeof json.input_tokens === 'number') return json.input_tokens;
+    onError?.('no_input_tokens_in_response');
+    return null;
+  } catch (e) {
+    onError?.(`fetch_error ${(e as Error)?.name ?? ''}: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
     return null;
   }
 }
@@ -1587,6 +1643,8 @@ let responseContentType: string | undefined;
     let reqBodySha256: string | undefined;
     // Set once the transform returns; read by fire() at event time.
     let transformMs: number | undefined;
+    // Why the baseline count_tokens probe failed (status + upstream error), if it did.
+    let baselineProbeError: string | undefined;
 
     const fire = (
       status: number,
@@ -1636,6 +1694,7 @@ let responseContentType: string | undefined;
           }
           if (baselineResolved === null) {
             info.baselineProbeStatus = 'failed';
+            if (baselineProbeError) info.baselineProbeError = baselineProbeError;
           } else if (cacheableExpected && cacheableResolved === null) {
             info.baselineProbeStatus = 'partial'; // dashboard excludes row; must not treat as cacheable=0
           } else {
@@ -1962,7 +2021,9 @@ let responseContentType: string | undefined;
             const ctUrl = providerPrefixed
               ? joinProviderPath(passthroughUpstream, url.pathname + '/count_tokens')
               : upstream + url.pathname + '/count_tokens';
-            baselinePromise = countTokensUpstream(ctUrl, ctBody, ctHeaders);
+            baselinePromise = countTokensUpstream(ctUrl, ctBody, ctHeaders, (reason) => {
+              baselineProbeError = reason;
+            });
             // Null = no markers → cacheable=0 by definition, no probe needed.
             const ctCacheableBody = buildCacheablePrefixCountTokensBody(bodyIn);
             if (ctCacheableBody) {

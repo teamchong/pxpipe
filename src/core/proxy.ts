@@ -1336,19 +1336,64 @@ function isCanonicalOpenAIPath(pathname: string, headers: Headers, hasOpenAIKey:
  *  on the PRE-COMPRESSION body to get the ground-truth baseline. Actual
  *  post-compression tokens already come back free in the /v1/messages usage
  *  block (input_tokens + cache_create + cache_read), so no second probe. */
+/** anthropic-beta values count_tokens has rejected in this process. The client
+ *  (e.g. Claude Code) may send betas that /v1/messages accepts but
+ *  /v1/messages/count_tokens does not; we learn them from the 400 and drop them. */
+const countTokensRejectedBetas = new Set<string>();
+
+const REJECTED_BETA_RE = /Unexpected value\(s\) (.+?) for the `anthropic-beta` header/;
+
+/** Extract the beta names a count_tokens 400 complained about (backtick-quoted). */
+export function parseRejectedBetas(errorBody: string): string[] {
+  let msg = errorBody;
+  try {
+    const j = JSON.parse(errorBody) as { error?: { message?: unknown } };
+    if (typeof j?.error?.message === 'string') msg = j.error.message;
+  } catch { /* not JSON — scan raw text */ }
+  const m = REJECTED_BETA_RE.exec(msg);
+  if (!m) return [];
+  return [...(m[1] ?? "").matchAll(/`([^`]+)`/g)].map((x) => (x[1] ?? "").trim()).filter(Boolean);
+}
+
+function dropRejectedBetas(headers: Headers): void {
+  const raw = headers.get('anthropic-beta');
+  if (!raw || countTokensRejectedBetas.size === 0) return;
+  const kept = raw.split(',').map((b) => b.trim()).filter((b) => b && !countTokensRejectedBetas.has(b));
+  if (kept.length) headers.set('anthropic-beta', kept.join(','));
+  else headers.delete('anthropic-beta');
+}
+
+/** Test hook. */
+export function resetCountTokensRejectedBetasForTests(): void {
+  countTokensRejectedBetas.clear();
+}
+
 async function countTokensUpstream(
   countTokensUrl: string,
   body: Uint8Array,
   headers: Headers,
   onError?: (reason: string) => void,
+  retried = false,
 ): Promise<number | null> {
   try {
+    headers = new Headers(headers);
+    dropRejectedBetas(headers);
     const res = await fetch(countTokensUrl, {
       method: 'POST',
       headers,
       body: body as unknown as BodyInit,
       signal: AbortSignal.timeout(COUNT_TOKENS_TIMEOUT_MS),
     });
+    if (res.status === 400 && !retried) {
+      const text = await res.text().catch(() => '');
+      const rejected = parseRejectedBetas(text);
+      if (rejected.length && rejected.some((b) => !countTokensRejectedBetas.has(b))) {
+        for (const b of rejected) countTokensRejectedBetas.add(b);
+        return countTokensUpstream(countTokensUrl, body, headers, onError, true);
+      }
+      onError?.(`http_400${text ? ` ${text.slice(0, 300)}` : ''}`);
+      return null;
+    }
     if (!res.ok) {
       // Record why the probe failed so a 'failed' row is diagnosable. Error bodies
       // are Anthropic error JSON (type + message), never request content or credentials.

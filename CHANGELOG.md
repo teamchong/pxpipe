@@ -7,7 +7,7 @@ behavioral changes, patch = fixes).
 ## Unreleased
 
 ### Added
-- Documented routing to UberLLM's OpenAI- and Anthropic-compatible endpoints via
+- Documented routing to MartLLM's OpenAI- and Anthropic-compatible endpoints via
   the existing `OPENAI_UPSTREAM` / `OPENAI_MODELS` and `ANTHROPIC_UPSTREAM`
   mechanisms (no new code path).
 

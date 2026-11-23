@@ -1250,6 +1250,8 @@ export type InboundCredential =
   | 'opaque-bearer';
 
 const ANTHROPIC_BEARER_RE = /^Bearer\s+sk-ant-/i;
+/** The same shape without the `Bearer` wrapper, for a raw `x-api-key` value. */
+const ANTHROPIC_KEY_RE = /^\s*sk-ant-/i;
 const API_KEY_BEARER_RE = /^Bearer\s+sk-/i;
 /** Three base64url segments whose first decodes to a JSON header (`eyJ…`). */
 const JWT_BEARER_RE = /^Bearer\s+eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$/;
@@ -2057,6 +2059,16 @@ let responseContentType: string | undefined;
       }
     } else if (isGoogleRoute) {
       // Inbound Google credential (Bearer or API key) is preserved; do not inject Anthropic keys.
+      // An Anthropic-shaped credential is still dropped, for the same reason the OpenAI branch
+      // above drops it: forwarding it is a cross-provider credential disclosure. An `sk-ant-…`
+      // value is Anthropic by construction (see isCanonicalOpenAIPath), so this keys on that
+      // shape alone — a Google bearer or API key arriving in these same headers is untouched.
+      if (ANTHROPIC_BEARER_RE.test(outHeaders.get('authorization') ?? '')) {
+        outHeaders.delete('authorization');
+      }
+      if (ANTHROPIC_KEY_RE.test(outHeaders.get('x-api-key') ?? '')) {
+        outHeaders.delete('x-api-key');
+      }
     } else if (!providerPrefixed || url.pathname.startsWith('/anthropic/')) {
       if (config.apiKey) outHeaders.set('x-api-key', config.apiKey);
       const bearer = resolveAuthToken(config);

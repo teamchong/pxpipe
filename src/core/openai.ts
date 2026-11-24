@@ -1172,7 +1172,11 @@ export async function transformOpenAIChatCompletions(
   }
 
   const firstUser = firstUserText(req);
-  if (firstUser) info.firstUserSha8 = await sha8(firstUser);
+  if (firstUser) {
+    info.firstUserSha8 = await sha8(firstUser);
+    info.sessionKey = info.firstUserSha8;
+    info.sessionKeySource = 'anchor';
+  }
 
   const combined = compactSlabWhitespace(combinedRaw).trimEnd();
   const minCompressTokens = profile.minCompressTokens;
@@ -1430,7 +1434,11 @@ export async function transformOpenAIResponses(
   }
 
   const firstUser = firstResponsesUserText(inputWasString, originalInputString, inputItems);
-  if (firstUser) info.firstUserSha8 = await sha8(firstUser);
+  if (firstUser) {
+    info.firstUserSha8 = await sha8(firstUser);
+    info.sessionKey = info.firstUserSha8;
+    info.sessionKeySource = 'anchor';
+  }
 
   const combined = compactSlabWhitespace(combinedRaw).trimEnd();
   const minCompressTokens = profile.minCompressTokens;

@@ -68,6 +68,32 @@ than 404, confirming the routes exist); the actual model reply was not
 exercised end to end, so treat the routing as reachable but unverified, same
 disclaimer as everything past Kimi K3 above.
 
+### OrcaRouter (Anthropic- and OpenAI-compatible gateway)
+
+[OrcaRouter](https://www.orcarouter.ai) is an OpenAI-compatible AI gateway that
+exposes both Anthropic Messages and OpenAI Responses/Chat Completions on one
+`https://api.orcarouter.ai/v1` namespace, so pxpipe can route either wire shape
+through it without translation. It is a first-class named provider: set
+`PXPIPE_PROVIDER=orcarouter` and both API families resolve to the same base.
+
+```bash
+PXPIPE_PROVIDER=orcarouter \
+ANTHROPIC_API_KEY=your-orcarouter-key \
+npx pxpipe-proxy
+```
+
+The provider default is `https://api.orcarouter.ai`; override it with
+`PXPIPE_GATEWAY_BASE_URL` if you self-host a gateway. With Claude Code, point
+`ANTHROPIC_BASE_URL` at the proxy and use an `anthropic/...` model ID from the
+OrcaRouter catalog (for example `anthropic/claude-fable-5`) so pxpipe applies
+its image compression, or an `orcarouter/...` model ID to pass through:
+
+```bash
+ANTHROPIC_BASE_URL=http://127.0.0.1:47821 \
+ANTHROPIC_AUTH_TOKEN=local-pxpipe \
+claude --model anthropic/claude-fable-5
+```
+
 ## Connect Claude Code
 
 ```bash

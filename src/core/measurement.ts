@@ -29,6 +29,21 @@ function toUint8Array(bytes: BytesLike): Uint8Array {
   return new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
 }
 
+/** True when the body is a server-side thread continuation
+ *  (`thread: {type: "continue", ...}`). Such a body carries only the delta; the
+ *  upstream bills the server-held thread on top (as cache_read/cache_create), so a
+ *  count_tokens probe on it is not a full-request counterfactual and must not be
+ *  paired against provider usage. */
+export function isThreadContinuation(bytes: BytesLike): boolean {
+  try {
+    const obj = JSON.parse(new TextDecoder().decode(toUint8Array(bytes))) as { thread?: unknown };
+    const thread = obj?.thread;
+    return !!thread && typeof thread === 'object' && (thread as { type?: unknown }).type === 'continue';
+  } catch {
+    return false;
+  }
+}
+
 export function buildCountTokensBodies(bytes: BytesLike): CountTokensBodies {
   const b = toUint8Array(bytes);
   return {

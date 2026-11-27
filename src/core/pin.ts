@@ -921,16 +921,58 @@ export function relocateOpenAIPins(req: OpenAIPinRequest): number {
   return pinText.length;
 }
 
+/**
+ * Strip command lines from a list of wire text parts.
+ *
+ * Both Messages-path strippers refuse to emit a part the strip emptied:
+ * stripFromMessage drops the block ("`{text: ''}` is rejected by the API, so
+ * the block cannot stay") and stripPinCommandsFromSystem does the same. The
+ * OpenAI and Gemini relocators mapped in place instead, so an emptied part went
+ * upstream as `text: ''` / `content: ''`. Apply the same rule here.
+ *
+ * A part that was ALREADY blank before the strip is pushed through untouched —
+ * dropping it would be rewriting bytes we were not asked to touch.
+ *
+ * When every part would go, the original list is returned: stripFromMessage
+ * likewise "returns the original when stripping would leave the message with no
+ * content", because dropping the turn outright breaks role alternation and this
+ * layer only relocates, it cannot remove a turn and the reply that answered it.
+ */
+function stripTextParts<T extends { text?: unknown }>(
+  parts: readonly T[],
+  strippable: (part: T) => boolean = () => true,
+): T[] {
+  const out: T[] = [];
+  for (const part of parts) {
+    if (!part || typeof part.text !== 'string' || !strippable(part)) {
+      out.push(part);
+      continue;
+    }
+    const text = stripLines(part.text);
+    if (text !== part.text && !text.trim()) continue; // emptied by the strip
+    out.push({ ...part, text });
+  }
+  return out.length > 0 ? out : [...parts];
+}
+
+/** True for the OpenAI part types whose `text` is prose we may strip. */
+function isStrippableOpenAIPart(part: { type?: string }): boolean {
+  return part.type === undefined || part.type === 'text'
+    || part.type === 'input_text' || part.type === 'output_text';
+}
+
 function stripOpenAIContent(content: unknown): unknown {
-  if (typeof content === 'string') return stripLines(content);
+  if (typeof content === 'string') {
+    const text = stripLines(content);
+    // Same rule as the array form, one level up: a turn the strip emptied is
+    // left exactly as the client sent it rather than sent as `content: ''`.
+    return text !== content && !text.trim() ? content : text;
+  }
   if (!Array.isArray(content)) return content;
-  return content.map((raw) => {
-    const part = raw as { type?: string; text?: unknown };
-    if (!part || typeof part.text !== 'string') return raw;
-    if (part.type !== undefined && part.type !== 'text'
-      && part.type !== 'input_text' && part.type !== 'output_text') return raw;
-    return { ...part, text: stripLines(part.text) };
-  });
+  return stripTextParts(
+    content as Array<{ type?: string; text?: unknown }>,
+    isStrippableOpenAIPart,
+  );
 }
 
 type GooglePinPart = { text?: unknown; [key: string]: unknown };
@@ -972,15 +1014,11 @@ export function relocateGooglePins(req: GooglePinRequest): number {
   if (!target || !Array.isArray(target.parts)) return 0;
 
   if (Array.isArray(req.systemInstruction?.parts)) {
-    req.systemInstruction.parts = req.systemInstruction.parts.map((part) =>
-      typeof part?.text === 'string' ? { ...part, text: stripLines(part.text) } : part,
-    );
+    req.systemInstruction.parts = stripTextParts(req.systemInstruction.parts);
   }
   for (const content of req.contents) {
     if (content.role !== 'user' || !Array.isArray(content.parts)) continue;
-    content.parts = content.parts.map((part) =>
-      typeof part?.text === 'string' ? { ...part, text: stripLines(part.text) } : part,
-    );
+    content.parts = stripTextParts(content.parts);
   }
   target.parts.push({ text: pinText });
   return pinText.length;
